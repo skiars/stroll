@@ -174,3 +174,5 @@ dialogs in a Wayland window after changes to paint order or focus handling.
   `cargo test --release --locked cpp_highlights_survive_delayed_semantic_responses`
   and `cargo test --release --locked inlay_hints` to verify paint, wrapping,
   projected diff hints, and stale language-service responses.
+  Inlay hints use the light weight of the current editor font. The light and
+  dark editor theme captures include a rendered hint.

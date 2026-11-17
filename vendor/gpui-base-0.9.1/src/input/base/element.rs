@@ -6,7 +6,7 @@ use gpui::Corners;
 use gpui::Half;
 use gpui::{
     AnyElement, App, Bounds, ContentMask, Edges, Element, ElementId, ElementInputHandler, Entity,
-    GlobalElementId,
+    Font, FontWeight, GlobalElementId,
 };
 use gpui::{
     HighlightStyle, Hitbox, HitboxBehavior, Hsla, InteractiveElement, IntoElement, LayoutId,
@@ -3513,7 +3513,10 @@ impl<M: InputModeKind> TextElement<M> {
                             &line_runs,
                             &TextRun {
                                 len: 0,
-                                font: window.text_style().font(),
+                                font: Font {
+                                    weight: FontWeight::LIGHT,
+                                    ..window.text_style().font()
+                                },
                                 color: state.editor_style.muted_foreground,
                                 background_color: None,
                                 underline: None,

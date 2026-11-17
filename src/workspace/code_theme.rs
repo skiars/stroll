@@ -1486,7 +1486,7 @@ fn editor_renders_web_theme_decorations_in_light_and_dark() -> anyhow::Result<()
     };
     use gpui_component::{
         ActiveTheme as _, Root,
-        input::{DocumentRangeSemanticTokensProvider, Editor, EditorState, Rope},
+        input::{DocumentRangeSemanticTokensProvider, Editor, EditorState, InlayHint, Rope},
     };
     use gpui_wgpu::WgpuHeadlessRenderer;
     use lsp_types::{
@@ -1503,6 +1503,7 @@ fn editor_renders_web_theme_decorations_in_light_and_dark() -> anyhow::Result<()
         "readonly_property: string;\n",
         "old_api();\n",
         "service.method_with_error();\n",
+        "let count = 3;\n",
     );
     struct Tokens;
     impl DocumentRangeSemanticTokensProvider for Tokens {
@@ -1620,7 +1621,8 @@ fn editor_renders_web_theme_decorations_in_light_and_dark() -> anyhow::Result<()
         gpui_component::init(cx);
         super::apply_theme(ThemeMode::Light, cx);
     });
-    let window = cx.open_window(size(px(440.), px(222.)), |window, cx| {
+    let mut opened = None;
+    let window = cx.open_window(size(px(440.), px(250.)), |window, cx| {
         let editor = cx.new(|cx| {
             let mut state = EditorState::new(window, cx)
                 .language("rust")
@@ -1635,10 +1637,22 @@ fn editor_renders_web_theme_decorations_in_light_and_dark() -> anyhow::Result<()
             });
             state
         });
+        opened = Some(editor.clone());
         let probe = cx.new(|_| EditorProbe(editor));
         cx.new(|cx| Root::new(probe, window, cx))
     })?;
     cx.update_window(window.into(), |_, window, cx| window.draw(cx).clear(cx))?;
+    cx.update(|cx| {
+        opened.unwrap().update(cx, |state, cx| {
+            state.set_inlay_hints(
+                vec![InlayHint {
+                    offset: TEXT.find("count").unwrap() + "count".len(),
+                    label: ": i32".into(),
+                }],
+                cx,
+            );
+        });
+    });
     cx.run_until_parked();
     cx.advance_clock(Duration::from_millis(200));
     cx.run_until_parked();
