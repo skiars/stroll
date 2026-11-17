@@ -1,7 +1,7 @@
 use super::*;
 use crate::workspace::{
-    DiffSource, OpenFile, SourcePosition, WorkspaceView, editor_git::hunk_toolbar_row,
-    inlay_hints::InlayHints, line_alignment::LineAlignment,
+    DiffSource, OpenFile, WorkspaceView, editor_git::hunk_toolbar_row, inlay_hints::InlayHints,
+    line_alignment::LineAlignment,
 };
 use gpui_component::{
     diff::{DiffEditorRow, DiffSide},
@@ -18,6 +18,10 @@ use std::{
 };
 
 const FILE_HEADER_HEIGHT: Pixels = px(28.);
+
+#[derive(Clone, PartialEq, Action)]
+#[action(namespace = git, no_json, no_register)]
+struct OpenDiffRowInEditor(DiffLinePosition);
 
 #[derive(Clone)]
 struct Line {
@@ -693,6 +697,7 @@ pub(super) struct ReviewEditor {
     highlight_revision: usize,
     theme: Option<gpui_component::ThemeMode>,
     pending_caret: Option<(DiffLinePosition, usize)>,
+    context_click: Rc<RefCell<Option<DiffLinePosition>>>,
     alignment_task: Option<Task<()>>,
 }
 
@@ -723,6 +728,7 @@ impl ReviewEditor {
             highlight_revision: 0,
             theme: None,
             pending_caret: None,
+            context_click: Rc::default(),
             alignment_task: None,
         }
     }
@@ -977,44 +983,50 @@ impl ReviewEditor {
         }
     }
 
-    pub(super) fn file_source_position(
-        &self,
-        path: &str,
-        workspace: &WeakEntity<Workspace>,
-        window: &Window,
-        cx: &App,
-    ) -> Option<SourcePosition> {
-        let focused = self.focused_column(window, cx);
-        let editor = focused.read(cx);
-        if !editor.focus_handle(cx).is_focused(window) {
+    fn row_at_point(&self, point: Point<Pixels>, cx: &App) -> Option<DiffLinePosition> {
+        let left = self.split
+            && self
+                .original
+                .editor
+                .read(cx)
+                .input_bounds()
+                .contains(&point);
+        let column = if left { &self.original } else { &self.modified };
+        let editor = column.editor.read(cx);
+        if !editor.input_bounds().contains(&point) {
             return None;
         }
-        let column = if focused == &self.original.editor {
-            &self.original
-        } else {
-            &self.modified
+        let row = editor.visible_row_range()?.find(|&row| {
+            editor
+                .projected_line_bounds(row)
+                .is_some_and(|bounds| point.y >= bounds.top() && point.y < bounds.bottom())
+        })?;
+        let position = |column: &Column| {
+            Some(
+                column
+                    .projection
+                    .borrow()
+                    .lines
+                    .get(row)?
+                    .as_ref()?
+                    .position
+                    .clone(),
+            )
         };
-        let projection = column.projection.borrow();
-        let offset = editor.cursor();
-        let point = projection.text.offset_to_point(offset);
-        let line = projection.lines.get(point.row)?.as_ref()?;
-        // The staged and unstaged projections can share a single file header.
-        if line.position.path().as_str().trim_start_matches('\0') != path {
-            return None;
+        if !self.split {
+            return position(column);
         }
-        let source = projection
-            .language_source(offset, workspace, cx)
-            .or_else(|| {
-                line.source.as_ref()?;
-                projection.snapshot_source(point.row, point.column, cx)
-            })
-            .map(|(source, offset)| DiffSource {
-                editor: source.entity_id(),
-                revision: source.read(cx).document_revision(),
-                text: source.read(cx).text().clone(),
-                offset,
-            });
-        Some(SourcePosition::Diff(source))
+        // Context on the left has the same text at the modified-side position.
+        if !left
+            || matches!(
+                self.rows.get(row),
+                Some(DiffEditorRow::Code { changed: false, .. })
+            )
+        {
+            position(&self.modified).or_else(|| position(&self.original))
+        } else {
+            position(&self.original).or_else(|| position(&self.modified))
+        }
     }
 
     pub(super) fn focus(&self, window: &mut Window, cx: &mut App) {
@@ -1463,7 +1475,11 @@ impl ReviewEditor {
         let hover = weak.clone();
         let wheel_view = weak.clone();
         let hunk_font = font.clone();
+        let context_click = self.context_click.clone();
+        let menu_panel = weak.clone();
         let editor = |state, readonly| {
+            let panel = menu_panel.clone();
+            let context_click = self.context_click.clone();
             Editor::new(state)
                 .external_search_panel()
                 .with_size(gpui_component::Size::XSmall)
@@ -1473,6 +1489,22 @@ impl ReviewEditor {
                 .bordered(false)
                 .readonly(readonly)
                 .size_full()
+                .extend_context_menu(move |menu, _, cx| {
+                    let Some(position) = context_click.borrow_mut().take() else {
+                        return menu;
+                    };
+                    let can_open = panel
+                        .read_with(cx, |panel, _| {
+                            panel.openable_review_file(position.path()).is_some()
+                        })
+                        .unwrap_or(false);
+                    menu.separator().menu_with_icon_disabled(
+                        t!("git.open_in_editor"),
+                        IconName::Pencil,
+                        !can_open,
+                        Box::new(OpenDiffRowInEditor(position)),
+                    )
+                })
         };
         let controls = canvas(
             move |bounds, window, cx| {
@@ -1839,6 +1871,26 @@ impl ReviewEditor {
                 crate::workspace::editor_scroll_viewport(&focus, colors.bg, !locator_open)
                     .id("git-diff-editor")
                     .debug_selector(|| "git-diff-editor".into())
+                    .capture_any_mouse_down({
+                        let panel = menu_panel.clone();
+                        move |event, _, cx| {
+                            if event.button == MouseButton::Right {
+                                // Keep the clicked source row even if right-click moves the caret.
+                                let position = panel
+                                    .read_with(cx, |panel, cx| {
+                                        panel.editor.row_at_point(event.position, cx)
+                                    })
+                                    .ok()
+                                    .flatten();
+                                context_click.replace(position);
+                            }
+                        }
+                    })
+                    .on_action(
+                        cx.listener(|panel, action: &OpenDiffRowInEditor, window, cx| {
+                            panel.open_diff_row_in_editor(&action.0, window, cx);
+                        }),
+                    )
                     .flex_1()
                     .min_h_0()
                     .overflow_hidden()
@@ -1887,6 +1939,31 @@ fn hunk_neighbors(rows: &[DiffEditorRow]) -> HashMap<usize, [Option<usize>; 2]> 
         previous = Some((row, path));
     }
     neighbors
+}
+
+fn deletion_target(document: &DiffFile, line: usize) -> Option<usize> {
+    let [(old_start, old_count), (new_start, new_count)] = document
+        .hunk_locations()
+        .filter_map(|(header, _)| git::hunk_ranges(&header))
+        .find(|ranges| {
+            let (start, count) = ranges[0];
+            (start..start + count).contains(&line)
+        })?;
+    if new_count == 0 {
+        return Some(new_start + 1);
+    }
+    let mut cursor = new_start;
+    for (side, source_line, _) in document.patch_source_lines() {
+        match side {
+            DiffSide::Original if source_line == line => return Some(cursor),
+            DiffSide::Modified if (new_start..new_start + new_count).contains(&source_line) => {
+                cursor = source_line + 1;
+            }
+            _ => {}
+        }
+    }
+    // An original-side context row can outlive its projected counterpart.
+    Some(new_start + (line - old_start).min(new_count.min(old_count) - 1))
 }
 
 impl Projection {
@@ -2137,6 +2214,66 @@ impl GitPanel {
             .editor
             .read(cx)
             .projected_line_bounds(projection.text.offset_to_point(offset).row)
+    }
+
+    pub(super) fn diff_source(&self, position: &DiffLinePosition, cx: &App) -> Option<DiffSource> {
+        let review = self.review.as_ref()?;
+        let ix = *review.by_path.get(position.path().as_str())?;
+        let document = if position.path().starts_with('\0') {
+            review.secondary.get(&ix)?
+        } else {
+            &review.documents[ix]
+        };
+        let deletion = (position.side() == DiffSide::Original
+            && document.modified_path().is_some())
+        .then(|| deletion_target(document, position.line()))
+        .flatten();
+        let target = deletion.map_or_else(
+            || position.clone(),
+            |line| DiffLinePosition::new(position.path().clone(), DiffSide::Modified, line),
+        );
+        let snapshot = if self.working_path(&target).is_some() {
+            None
+        } else if let Some(source) = review
+            .sources
+            .get(&ix)
+            .and_then(|sources| sources.get(&(target.path().clone(), target.side())))
+        {
+            Some(Task::ready(Some(source.editor.read(cx).text().clone())))
+        } else {
+            // The tree can request navigation before the review has loaded its language assets.
+            let backend = self.backend.clone();
+            let detail = review.detail.clone();
+            let layer = self.document_layer(ix, target.path());
+            let side = if target.side() == DiffSide::Modified {
+                Side::New
+            } else {
+                Side::Old
+            };
+            Some(cx.background_spawn(async move {
+                let file = &detail.files[ix];
+                let snapshot = if let Some(layer) = layer {
+                    backend.layer_snapshot(&file.path, layer, side)
+                } else {
+                    backend.snapshot(&detail, file, side)
+                };
+                match snapshot.ok()? {
+                    git::Snapshot::Text {
+                        text,
+                        truncated: false,
+                    } => Some(Rope::from(
+                        text.trim_start_matches('\u{feff}')
+                            .replace("\r\n", "\n")
+                            .as_str(),
+                    )),
+                    _ => None,
+                }
+            }))
+        };
+        Some(DiffSource {
+            row: target.line() - 1,
+            snapshot,
+        })
     }
 
     fn working_path(&self, position: &DiffLinePosition) -> Option<PathBuf> {

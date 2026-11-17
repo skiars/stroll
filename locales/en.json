@@ -142,7 +142,6 @@
   "git.detached_head": "Detached HEAD",
   "git.diff_search": "Search diffs in this comparison",
   "git.editor_history_conflict": "Undo later edits in the affected files first.",
-  "git.editor_location_unavailable": "The selected diff line has no verified location in the current file",
   "git.empty_branch": "This branch has no commits",
   "git.empty_snapshot": "The file is empty",
   "git.empty_subject": "(No commit subject)",

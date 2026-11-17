@@ -3,7 +3,7 @@ use std::path::Path;
 use rust_i18n::t;
 
 use super::*;
-use crate::workspace::{baseline_shift, file_name_font_size};
+use crate::workspace::{SourcePosition, WorkspaceView, baseline_shift, file_name_font_size};
 
 use gpui_component::{
     diff::DiffSide,
@@ -655,6 +655,9 @@ impl GitPanel {
         let blame_navigation = preserve && position.is_some() && !restoring && changed.is_none();
         self.loading_session_diff = position;
         self.pending_file_reveal = None;
+        if !keep || !background {
+            self.pending_editor_open = None;
+        }
         self.pending_review_anchor = None;
         if self.selection.as_ref() != Some(&selection) {
             self.cancel_ai_commit();
@@ -976,6 +979,9 @@ impl GitPanel {
                     }
                     Err(error) => {
                         this.detail_error = Some(error.to_string());
+                        if let Some(path) = this.pending_editor_open.take() {
+                            this.open_diff_file_in_editor(&path, window, cx);
+                        }
                     }
                 }
                 this.apply_repo_changes(window, cx);
@@ -993,6 +999,7 @@ impl GitPanel {
     ) {
         let Some(review) = &self.review else { return };
         if review.detail.files.is_empty() {
+            self.pending_editor_open = None;
             return;
         }
         let detail = review.detail.clone();
@@ -1000,20 +1007,23 @@ impl GitPanel {
         let files = detail.clone();
         let openable = cx.background_spawn(async move { backend.openable(&files.files) });
         self.metadata_tasks[0] = cx.spawn_in(window, async move |this, cx| {
-            if let Ok(openable) = openable.await {
-                _ = this.update_in(cx, |this, window, cx| {
-                    if let Some(review) = this
+            let openable = openable.await;
+            _ = this.update_in(cx, |this, window, cx| {
+                if let Ok(openable) = openable
+                    && let Some(review) = this
                         .review
                         .as_mut()
                         .filter(|review| review.openable != openable)
-                    {
-                        review.openable = openable;
-                        this.editor.invalidate();
-                        this.preload_working_buffers(window, cx);
-                        App::notify(cx, this.review_pane.entity_id());
-                    }
-                });
-            }
+                {
+                    review.openable = openable;
+                    this.editor.invalidate();
+                    this.preload_working_buffers(window, cx);
+                    App::notify(cx, this.review_pane.entity_id());
+                }
+                if let Some(path) = this.pending_editor_open.take() {
+                    this.open_diff_file_in_editor(&path, window, cx);
+                }
+            });
         });
         if !needs_stats {
             return;
@@ -1145,6 +1155,7 @@ impl GitPanel {
         let secondary = review.secondary.get(&ix).map(|doc| doc.path().clone());
         review.active = Some(ix);
         if expand {
+            self.pending_editor_open = None;
             review.collapsed.remove(&path);
         }
         self.snapshot = None;
@@ -1182,6 +1193,114 @@ impl GitPanel {
         };
         self.reveal_file(ix, true, window, cx);
         self.pending_file_reveal = Some(path.to_owned());
+    }
+
+    pub(super) fn openable_review_file(&self, path: &str) -> Option<usize> {
+        let review = self.review.as_ref()?;
+        let ix = *review.by_path.get(path)?;
+        review.openable[ix].then_some(ix)
+    }
+
+    pub(super) fn open_diff_file_in_editor(
+        &mut self,
+        path: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.pending_editor_open = None;
+        if let Some(ix) = self.openable_review_file(path) {
+            self.open_first_hunk_in_editor(ix, window, cx);
+        }
+    }
+
+    fn open_first_hunk_in_editor(
+        &mut self,
+        ix: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(review) = self.review.as_ref().filter(|review| review.openable[ix]) else {
+            return;
+        };
+        if self.detail_loading
+            || matches!(
+                review.patches[ix],
+                PatchState::Pending | PatchState::Loading
+            )
+        {
+            self.pending_editor_open = Some(review.detail.files[ix].path.clone());
+            self.request_patch(ix, window, cx);
+            return;
+        }
+        let source = if matches!(review.patches[ix], PatchState::Ready) {
+            std::iter::once(&review.documents[ix])
+                .chain(review.secondary.get(&ix))
+                .filter(|doc| doc.hunk_locations().next().is_some())
+                .find_map(|doc| {
+                    let (side, line, _) = doc.patch_source_lines().next()?;
+                    let position = DiffLinePosition::new(doc.path().clone(), side, line);
+                    self.diff_source(&position, cx)
+                })
+                .map(SourcePosition::Diff)
+        } else {
+            None
+        };
+        self.open_worktree_file(ix, window, cx, move |workspace, path, window, cx| {
+            workspace.open_document_source_at(path, source, window, cx);
+        });
+    }
+
+    pub(super) fn open_diff_row_in_editor(
+        &mut self,
+        position: &DiffLinePosition,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.pending_editor_open = None;
+        let Some(ix) = self.openable_review_file(position.path()) else {
+            return;
+        };
+        let source = self.diff_source(position, cx).map(SourcePosition::Diff);
+        self.open_worktree_file(ix, window, cx, move |workspace, path, window, cx| {
+            workspace.open_document_source_at(path, source, window, cx);
+        });
+    }
+
+    pub(super) fn open_diff_markdown(
+        &mut self,
+        path: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.pending_editor_open = None;
+        if let Some(ix) = self.openable_review_file(path) {
+            self.open_worktree_file(ix, window, cx, Workspace::open_markdown_in_docs);
+        }
+    }
+
+    fn open_worktree_file(
+        &self,
+        ix: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        open: impl FnOnce(&mut Workspace, PathBuf, &mut Window, &mut Context<Workspace>) + 'static,
+    ) {
+        let path = PathBuf::from(&self.review.as_ref().unwrap().detail.files[ix].path);
+        let root = self.root.clone();
+        let workspace = self.workspace.clone();
+        // Switching views reads this panel to save its session.
+        window.defer(cx, move |window, cx| {
+            _ = workspace.update(cx, |workspace, cx| {
+                if workspace.view == WorkspaceView::Git
+                    && workspace
+                        .repository
+                        .as_ref()
+                        .is_some_and(|repo| repo.root == root)
+                {
+                    open(workspace, path, window, cx);
+                }
+            });
+        });
     }
 
     pub(super) fn prefetch_patches(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1228,13 +1347,20 @@ impl GitPanel {
 
     pub(super) fn request_patch(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
         let Some(review) = &self.review else { return };
+        let editor_request = self
+            .pending_editor_open
+            .as_ref()
+            .and_then(|path| review.by_path.get(path))
+            .copied();
         if self.detail_loading
-            || review.collapsed.contains(&review.detail.files[ix].path)
+            || (editor_request != Some(ix)
+                && review.collapsed.contains(&review.detail.files[ix].path))
             || !matches!(review.patches[ix], PatchState::Pending)
         {
             return;
         }
-        self.patch_requests.clear();
+        self.patch_requests
+            .retain(|&request| request != ix && editor_request == Some(request));
         self.patch_requests.push_front(ix);
         self.start_next_patch(window, cx);
     }
@@ -1261,8 +1387,10 @@ impl GitPanel {
         let mut requests = Vec::new();
         while requests.len() < if explicit { 1 } else { 2 } {
             let Some(ix) = queue.pop_front() else { break };
+            let path = &review.detail.files[ix].path;
             if matches!(review.patches[ix], PatchState::Pending)
-                && !review.collapsed.contains(&review.detail.files[ix].path)
+                && (self.pending_editor_open.as_ref() == Some(path)
+                    || !review.collapsed.contains(path))
             {
                 review.patches[ix] = PatchState::Loading;
                 requests.push((ix, review.contexts.get(&ix).copied().unwrap_or(3)));
@@ -1480,6 +1608,14 @@ impl GitPanel {
         self.start_patch_assets(window, cx);
         App::notify(cx, self.review_pane.entity_id());
         App::notify(cx, self.tree_pane.entity_id());
+        let file = &self.review.as_ref().unwrap().detail.files[ix];
+        if self
+            .pending_editor_open
+            .take_if(|path| *path == file.path)
+            .is_some()
+        {
+            self.open_first_hunk_in_editor(ix, window, cx);
+        }
     }
 
     fn start_patch_assets(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -2014,6 +2150,7 @@ impl GitPanel {
         self.confirm_restore = None;
         self.viewport_queue.clear();
         self.pending_file_reveal = None;
+        self.pending_editor_open = None;
         self.snapshot = Some(Snapshot {
             detail: review.detail.clone(),
             file: ix,
@@ -2991,6 +3128,7 @@ impl GitPanel {
             let show_stage = stage_allowed && state.as_ref().is_some_and(|state| !state.conflict);
             let editor_view = view.clone();
             let editor_path = path.clone();
+            let editor_selector = format!("git-open-file-in-editor:{path}");
             let line = selected
                 .as_ref()
                 .filter(|range| range.path().as_str() == path)
@@ -3040,7 +3178,7 @@ impl GitPanel {
                         IconName::Pencil,
                         t!("git.open_in_editor"),
                     )
-                    .debug_selector(|| "git-open-file-in-editor".into())
+                    .debug_selector(move || editor_selector)
                     .tooltip(if can_open {
                         t!("git.open_in_editor")
                     } else {
@@ -3048,37 +3186,8 @@ impl GitPanel {
                     })
                     .disabled(!can_open)
                     .on_click(move |_, window, cx| {
-                        let Some(panel) = editor_view.upgrade() else {
-                            return;
-                        };
-                        let panel = panel.read(cx);
-                        let openable = panel.review.as_ref().is_some_and(|review| {
-                            review
-                                .by_path
-                                .get(editor_path.as_str())
-                                .is_some_and(|&ix| review.openable[ix])
-                        });
-                        if !openable {
-                            return;
-                        }
-                        let root = panel.root.clone();
-                        let workspace = panel.workspace.clone();
-                        let path = PathBuf::from(editor_path.as_str());
-                        let position = panel.editor.file_source_position(
-                            editor_path.as_str(),
-                            &workspace,
-                            window,
-                            cx,
-                        );
-                        // Switching views reads this panel to save its session.
-                        _ = workspace.update(cx, |workspace, cx| {
-                            if workspace
-                                .repository
-                                .as_ref()
-                                .is_some_and(|repo| repo.root == root)
-                            {
-                                workspace.open_document_source_at(path, position, window, cx);
-                            }
+                        _ = editor_view.update(cx, |panel, cx| {
+                            panel.open_diff_file_in_editor(&editor_path, window, cx);
                         });
                     }),
                 )

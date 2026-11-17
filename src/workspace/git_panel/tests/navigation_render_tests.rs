@@ -17,7 +17,7 @@ fn settle(visual: &mut VisualTestContext) {
 }
 
 #[::core::prelude::v1::test]
-fn diff_open_in_editor_reveals_the_selected_source_column() {
+fn diff_file_and_row_menus_reveal_worktree_lines() {
     use gpui_component::{Root, WindowExt as _, input::RopeExt as _};
 
     let fixture = tempfile::tempdir().unwrap();
@@ -31,11 +31,15 @@ fn diff_open_in_editor_reveals_the_selected_source_column() {
         .map(|row| match row {
             31 => "😀 shared marker\n".to_owned(),
             32 => "historical line\n".to_owned(),
+            36 => "removed from the worktree\n".to_owned(),
             _ => format!("row {row}\n"),
         })
         .collect::<String>();
     let path = "new.txt";
     fs::write(root.join("old.txt"), &original).unwrap();
+    let guide = "z-guide.md";
+    let guide_original = original.replace("historical line", "## Initial section");
+    fs::write(root.join(guide), &guide_original).unwrap();
     git(&root, &["add", "."]);
     git(&root, &["commit", "-qm", "Initial"]);
     git(&root, &["mv", "old.txt", path]);
@@ -45,8 +49,21 @@ fn diff_open_in_editor_reveals_the_selected_source_column() {
     git(&root, &["commit", "-qm", "Rename"]);
     let current = renamed
         .replace("row 29\n", "row 29\ninserted working line\n")
-        .replace("committed line", "😀 working marker");
+        .replace(
+            "committed line",
+            &format!("😀 working marker {}", "wrapped ".repeat(30)),
+        )
+        .replace("row 34\n", "\n")
+        .replace("removed from the worktree\n", "");
     fs::write(root.join(path), &current).unwrap();
+    let changed_guide = guide_original.replace("## Initial section", "## Staged section");
+    fs::write(root.join(guide), &changed_guide).unwrap();
+    git(&root, &["add", guide]);
+    fs::write(
+        root.join(guide),
+        changed_guide.replace("row 5", "early draft row"),
+    )
+    .unwrap();
 
     let mut app = TestAppContext::build_with_text_system(
         TestDispatcher::new(0),
@@ -66,6 +83,7 @@ fn diff_open_in_editor_reveals_the_selected_source_column() {
     let workspace = workspace.unwrap();
     visual.simulate_resize(size(px(1200.), px(780.)));
     visual.update(|window, cx| {
+        window.activate_window();
         workspace.update(cx, |workspace, cx| {
             workspace.open_repository(Location { root, file: None }, window, cx);
         });
@@ -76,47 +94,56 @@ fn diff_open_in_editor_reveals_the_selected_source_column() {
         let oid = panel.read(cx).commits[0].oid.to_string();
         (panel, Selection::Commit(oid, None))
     });
-    for (split, history, text, column, expected, unavailable) in [
-        (
-            false,
-            false,
-            "😀 working marker",
-            "😀 ".len(),
-            (33, 2),
-            false,
-        ),
-        (
-            true,
-            false,
-            "😀 working marker",
-            "😀 ".len(),
-            (33, 2),
-            false,
-        ),
-        (true, true, "😀 shared marker", "😀 ".len(), (32, 2), false),
-        (true, true, "historical line", 3, (32, 2), true),
-    ] {
+    let show_diff = |visual: &mut VisualTestContext, split, history| {
         visual.update(|window, cx| {
             workspace.update(cx, |workspace, cx| {
                 workspace.switch_view(WorkspaceView::Git, window, cx);
             });
             panel.update(cx, |panel, cx| {
                 panel.show_history = false;
+                panel.show_tree = true;
                 panel.split = split;
+                panel.wrap = true;
                 let selection = if history {
                     commit.clone()
                 } else {
                     Selection::Worktree(Mode::All)
                 };
                 panel.load_review(selection, false, window, cx);
+                panel.reveal_tree_file(path, window, cx);
                 cx.notify();
             });
         });
         settle(visual);
+    };
+    let assert_editor = |visual: &mut VisualTestContext, file: &str, expected| {
         visual.update(|window, cx| {
-            if !history {
-                panel.update(cx, |panel, cx| panel.editor.focus(window, cx));
+            let owner = workspace.read(cx);
+            assert_eq!(owner.view, WorkspaceView::Editor);
+            assert_eq!(owner.tabs.active(), Some(Path::new(file)));
+            let editor = owner.files[Path::new(file)].editor.read(cx);
+            if file == path {
+                assert_eq!(editor.text(), current.as_str());
             }
+            let offset = editor.cursor();
+            let position = editor.text().offset_to_position(offset);
+            assert_eq!((position.line, position.character), (expected, 0));
+            let caret = editor.range_to_bounds(&(offset..offset)).unwrap();
+            assert!(editor.input_bounds().contains(&caret.center()));
+            assert!(window.notifications(cx).is_empty());
+        });
+    };
+    let menu_click = |visual: &mut VisualTestContext, target, keys| {
+        visual.simulate_mouse_down(target, MouseButton::Right, Modifiers::default());
+        visual.simulate_mouse_up(target, MouseButton::Right, Modifiers::default());
+        settle(visual);
+        visual.simulate_keystrokes(keys);
+        settle(visual);
+    };
+
+    for split in [false, true] {
+        show_diff(visual, split, false);
+        visual.update(|window, cx| {
             let panel = panel.read(cx);
             assert_eq!(
                 panel.diff.read(cx).mode(),
@@ -126,43 +153,124 @@ fn diff_open_in_editor_reveals_the_selected_source_column() {
                     DiffMode::Unified
                 },
             );
-            if history {
-                assert_eq!(
-                    panel.review.as_ref().unwrap().detail.files[0]
-                        .old_path
-                        .as_deref(),
-                    Some("old.txt")
-                );
-            }
-            let editor = if history {
-                panel.editor.original_state().clone()
-            } else {
-                panel.editor.focused_column(window, cx).clone()
-            };
+            let editor = panel.editor.focused_column(window, cx).clone();
             editor.update(cx, |editor, cx| {
-                let offset = editor.text().to_string().find(text).unwrap() + column;
+                let offset = editor.text().to_string().find("😀 working marker").unwrap();
                 editor.set_selected_range(offset..offset, cx);
                 editor.focus(window, cx);
             });
         });
         settle(visual);
-        let button = visual.debug_bounds("git-open-file-in-editor").unwrap();
+        let button = visual
+            .debug_bounds("git-open-file-in-editor:new.txt")
+            .unwrap();
         visual.simulate_click(button.center(), Modifiers::default());
         settle(visual);
-        visual.update(|window, cx| {
-            let owner = workspace.read(cx);
-            assert_eq!(owner.view, WorkspaceView::Editor);
-            assert_eq!(owner.tabs.active(), Some(Path::new(path)));
-            let editor = owner.files[Path::new(path)].editor.read(cx);
-            assert_eq!(editor.text(), current.as_str());
-            let offset = editor.cursor();
-            let position = editor.text().offset_to_position(offset);
-            assert_eq!((position.line, position.character), expected);
-            let caret = editor.range_to_bounds(&(offset..offset)).unwrap();
-            assert!(editor.input_bounds().contains(&caret.center()));
-            assert_eq!(!window.notifications(cx).is_empty(), unavailable);
-        });
+        assert_editor(visual, path, 27);
+
+        show_diff(visual, split, false);
+        let tree_file = visual.debug_bounds("git-tree-row:file:new.txt").unwrap();
+        menu_click(visual, tree_file.center(), "down enter");
+        assert_editor(visual, path, 27);
     }
+
+    for (split, history, side, line, opposite_padding, wrapped, expected) in [
+        (false, false, DiffSide::Modified, 34, false, true, 33),
+        (true, false, DiffSide::Modified, 36, false, false, 35),
+        (false, false, DiffSide::Original, 37, false, false, 37),
+        (true, false, DiffSide::Original, 37, true, false, 37),
+        (true, true, DiffSide::Original, 32, false, false, 32),
+        (true, true, DiffSide::Original, 33, false, false, 33),
+    ] {
+        show_diff(visual, split, history);
+        let position = DiffLinePosition::new(path, side, line);
+        let column = visual.update(|window, cx| {
+            let panel = panel.read(cx);
+            let column = if split && (side == DiffSide::Original) != opposite_padding {
+                panel.editor.original_state()
+            } else {
+                panel.editor.focused_column(window, cx)
+            }
+            .clone();
+            let clicked = panel.review_source_bounds(&position, cx).unwrap();
+            column.update(cx, |editor, cx| {
+                editor.focus(window, cx);
+                let row = editor
+                    .visible_row_range()
+                    .unwrap()
+                    .find(|&row| editor.projected_line_bounds(row).unwrap().top() == clicked.top())
+                    .unwrap();
+                let text = editor.text();
+                // A right click inside an existing selection preserves its caret.
+                editor.set_selected_range(
+                    text.line_start_offset(row)..text.line_start_offset(row + 2),
+                    cx,
+                );
+            });
+            column
+        });
+        settle(visual);
+        let target = visual.update(|_, cx| {
+            let panel = panel.read(cx);
+            let bounds = panel.review_source_bounds(&position, cx).unwrap();
+            let column_bounds = column.read(cx).input_bounds();
+            let y = if wrapped {
+                assert!(bounds.size.height > column.read(cx).line_height().unwrap());
+                bounds.bottom() - px(4.)
+            } else {
+                bounds.center().y
+            };
+            let target = point(column_bounds.center().x, y);
+            assert!(column_bounds.contains(&target));
+            target
+        });
+        menu_click(visual, target, "up enter");
+        assert_editor(visual, path, expected);
+    }
+
+    show_diff(visual, false, false);
+    let guide_index = visual.update(|_, cx| {
+        panel.update(cx, |panel, cx| {
+            panel.set_files_collapsed(true, cx);
+            let review = panel.review.as_mut().unwrap();
+            let ix = review.by_path[guide];
+            review.patches[ix] = PatchState::Pending;
+            review.documents[ix] = git::placeholder(&review.detail.files[ix], "").unwrap();
+            panel.patch_loading[1] = true;
+            ix
+        })
+    });
+    settle(visual);
+    let tree_guide = visual.debug_bounds("git-tree-row:file:z-guide.md").unwrap();
+    menu_click(visual, tree_guide.center(), "down enter");
+    visual.update(|window, cx| {
+        assert_eq!(workspace.read(cx).view, WorkspaceView::Git);
+        panel.update(cx, |panel, cx| {
+            assert_eq!(panel.pending_editor_open.as_deref(), Some(guide));
+            let review = panel.review.as_ref().unwrap();
+            assert!(review.collapsed.contains(guide));
+            assert!(
+                review.documents[guide_index]
+                    .hunk_locations()
+                    .next()
+                    .is_none()
+            );
+            panel.patch_loading[1] = false;
+            panel.prefetch_patches(window, cx);
+        });
+    });
+    settle(visual);
+    // The staged hunk is displayed first even though the unstaged hunk is near line five.
+    assert_editor(visual, guide, 29);
+
+    show_diff(visual, false, false);
+    let tree_guide = visual.debug_bounds("git-tree-row:file:z-guide.md").unwrap();
+    menu_click(visual, tree_guide.center(), "down down enter");
+    visual.update(|_, cx| {
+        let owner = workspace.read(cx);
+        assert_eq!(owner.view, WorkspaceView::Docs);
+        assert_eq!(owner.doc.as_ref().unwrap().read(cx).path, Path::new(guide));
+    });
 }
 
 #[::core::prelude::v1::test]

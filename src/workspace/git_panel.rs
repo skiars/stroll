@@ -285,6 +285,7 @@ pub(super) struct GitPanel {
     snapshot: Option<Snapshot>,
     editor: editor::ReviewEditor,
     pending_file_reveal: Option<String>,
+    pending_editor_open: Option<String>,
     pending_position: Option<DiffLinePosition>,
     pending_review_anchor: Option<DiffViewportAnchor>,
     loading_session_diff: Option<DiffPosition>,
@@ -547,6 +548,7 @@ impl GitPanel {
             snapshot: None,
             editor,
             pending_file_reveal: None,
+            pending_editor_open: None,
             pending_position: None,
             pending_review_anchor: None,
             loading_session_diff: None,
@@ -623,7 +625,8 @@ impl GitPanel {
         self.refresh(window, cx);
     }
 
-    pub(super) fn focus(&self, window: &mut Window, cx: &mut App) {
+    pub(super) fn focus(&mut self, window: &mut Window, cx: &mut App) {
+        self.pending_editor_open = None;
         if self
             .review
             .as_ref()
@@ -3091,7 +3094,7 @@ mod tests {
         #[cfg(debug_assertions)]
         {
             let editor_button = visual
-                .debug_bounds("git-open-file-in-editor")
+                .debug_bounds("git-open-file-in-editor:review.txt")
                 .unwrap()
                 .center();
             visual.simulate_mouse_move(editor_button, None, Modifiers::default());

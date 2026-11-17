@@ -155,6 +155,34 @@ impl LineAlignment {
         }
     }
 
+    /// Guess a navigation target in the gap between verified matching lines.
+    pub(super) fn approximate_current_row(&self, original: usize) -> Option<usize> {
+        if let Some(current) = self.current_row(original) {
+            return Some(current);
+        }
+        let Self::Partial(blocks) = self else {
+            return None;
+        };
+        let index = blocks.partition_point(|block| block.original < original);
+        let before = index.checked_sub(1).map(|index| &blocks[index]);
+        let after = blocks.get(index);
+        let lower = before.map_or(0, |block| block.current + block.len);
+        let upper = after.map_or(usize::MAX, |block| block.current);
+        let from_before = before.map(|block| {
+            let distance = original - (block.original + block.len - 1);
+            (distance, lower + distance - 1)
+        });
+        let from_after = after.map(|block| {
+            let distance = block.original - original;
+            (distance, upper.saturating_sub(distance))
+        });
+        from_before
+            .into_iter()
+            .chain(from_after)
+            .min_by_key(|&(distance, _)| distance)
+            .map(|(_, row)| row.clamp(lower, upper))
+    }
+
     pub(super) fn original_rows(
         &self,
         current: RangeInclusive<usize>,
@@ -205,6 +233,18 @@ mod tests {
         assert_eq!(alignment.current_row(1), None);
         assert_eq!(alignment.current_row(2), None);
         assert_eq!(alignment.original_rows(1..=1), None);
+    }
+
+    #[test]
+    fn estimates_navigation_rows_without_marking_changed_lines_as_verified() {
+        let alignment = align(
+            "first\nbefore\nold\nafter\nremoved\nlast",
+            "insert\nfirst\nbefore\nnew\nafter\nlast",
+        );
+        assert_eq!(alignment.current_row(2), None);
+        assert_eq!(alignment.current_row(4), None);
+        assert_eq!(alignment.approximate_current_row(2), Some(3));
+        assert_eq!(alignment.approximate_current_row(4), Some(5));
     }
 
     #[test]

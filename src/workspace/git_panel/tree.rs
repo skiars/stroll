@@ -549,7 +549,42 @@ impl GitPanel {
                                     this.reveal_tree_file(&select_path, window, cx)
                                 });
                             })
-                            .context_menu(move |mut menu, _, _| {
+                            .context_menu(move |mut menu, _, cx| {
+                                let can_open = menu_view
+                                    .read_with(cx, |panel, _| {
+                                        panel.openable_review_file(&path).is_some()
+                                    })
+                                    .unwrap_or(false);
+                                let view = menu_view.clone();
+                                let editor_path = path.clone();
+                                menu = menu.item(
+                                    PopupMenuItem::new(t!("git.open_in_editor"))
+                                        .disabled(!can_open)
+                                        .on_click(move |_, window, cx| {
+                                            _ = view.update(cx, |panel, cx| {
+                                                panel.open_diff_file_in_editor(
+                                                    &editor_path,
+                                                    window,
+                                                    cx,
+                                                );
+                                            });
+                                        }),
+                                );
+                                if can_open && crate::docs::is_markdown(std::path::Path::new(&path))
+                                {
+                                    let view = menu_view.clone();
+                                    let docs_path = path.clone();
+                                    menu = menu.item(
+                                        PopupMenuItem::new(t!("tabs.open_in_docs")).on_click(
+                                            move |_, window, cx| {
+                                                _ = view.update(cx, |panel, cx| {
+                                                    panel
+                                                        .open_diff_markdown(&docs_path, window, cx);
+                                                });
+                                            },
+                                        ),
+                                    );
+                                }
                                 let path = path.clone();
                                 menu = menu.item(
                                     PopupMenuItem::new(t!("git.copy_file_path")).on_click(
@@ -899,8 +934,10 @@ impl GitPanel {
 }
 
 fn tree_row((kind, path): (&str, String), depth: usize, colors: Palette) -> Stateful<Div> {
+    let id = format!("git-tree-row:{kind}:{path}");
     h_flex()
-        .id(SharedString::from(format!("git-tree-row:{kind}:{path}")))
+        .id(SharedString::from(id.clone()))
+        .debug_selector(move || id)
         .h(TREE_ROW_HEIGHT)
         .w_full()
         .gap_1()

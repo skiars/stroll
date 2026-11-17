@@ -798,18 +798,23 @@ fn regular_patch(header: &[u8]) -> bool {
     })
 }
 
-fn parse_block(section: &[u8], actionable: bool) -> Option<Block> {
-    let mut lines = section.split(|&byte| byte == b'\n');
-    let header = std::str::from_utf8(lines.next()?).ok()?;
+pub(crate) fn hunk_ranges(header: &str) -> Option<[(usize, usize); 2]> {
     let mut fields = header.split_ascii_whitespace();
-    fields.next()?;
+    if fields.next()? != "@@" {
+        return None;
+    }
     let range = |field: &str, prefix| {
         let field = field.strip_prefix(prefix)?;
         let (start, count) = field.split_once(',').unwrap_or((field, "1"));
         Some((start.parse::<usize>().ok()?, count.parse::<usize>().ok()?))
     };
-    let (old_start, old_count) = range(fields.next()?, '-')?;
-    let (new_start, new_count) = range(fields.next()?, '+')?;
+    Some([range(fields.next()?, '-')?, range(fields.next()?, '+')?])
+}
+
+fn parse_block(section: &[u8], actionable: bool) -> Option<Block> {
+    let mut lines = section.split(|&byte| byte == b'\n');
+    let header = std::str::from_utf8(lines.next()?).ok()?;
+    let [(old_start, old_count), (new_start, new_count)] = hunk_ranges(header)?;
     let mut new_line = new_start.saturating_sub(usize::from(new_count > 0));
     let mut changes = Vec::new();
     let mut current: Option<BlockRange> = None;

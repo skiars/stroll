@@ -407,14 +407,12 @@ enum FileOpen {
 enum SourcePosition {
     Lsp(lsp_types::Position),
     MarkdownFragment(String),
-    Diff(Option<DiffSource>),
+    Diff(DiffSource),
 }
 
 struct DiffSource {
-    editor: EntityId,
-    revision: u64,
-    text: Rope,
-    offset: usize,
+    row: usize,
+    snapshot: Option<Task<Option<Rope>>>,
 }
 
 fn reveal_editor_range(
@@ -1974,12 +1972,8 @@ impl Workspace {
                     }
                     offset
                 }
-                SourcePosition::Diff(Some(source)) => {
+                SourcePosition::Diff(source) => {
                     self.reveal_diff_source(path.clone(), source, window, cx);
-                    None
-                }
-                SourcePosition::Diff(None) => {
-                    toast::info(window, cx, t!("git.editor_location_unavailable"));
                     None
                 }
             };
@@ -2018,34 +2012,27 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        use gpui_component::input::RopeExt as _;
-
         let file = self.files.get_mut(&path).unwrap();
+        let DiffSource { row, snapshot } = source;
+        let Some(snapshot) = snapshot else {
+            Self::reveal_diff_row(file, row, window, cx);
+            return;
+        };
         let editor = file.editor.clone();
         let current = editor.read(cx);
         let revision = current.document_revision();
-        if source.editor == editor.entity_id() && source.revision == revision {
-            file.restore_position = None;
-            editor.update(cx, |editor, cx| {
-                let offset = source.offset;
-                reveal_editor_range(editor, offset..offset, None, window, cx);
-            });
-            return;
-        }
         let selection = current.selected_range();
         let current = current.text().clone();
         let mapping = cx.background_spawn(async move {
-            let point = source.text.offset_to_point(source.offset);
-            let row = line_alignment::LineAlignment::between(&source.text, &current)?
-                .current_row(point.row)?;
-            let offset = current.line_start_offset(row) + point.column;
-            (row < current.lines_len()
-                && point.column <= current.line_len(row)
-                && current.is_char_boundary(offset))
-            .then_some(offset)
+            let Some(snapshot) = snapshot.await else {
+                return row;
+            };
+            line_alignment::LineAlignment::between(&snapshot, &current)
+                .and_then(|alignment| alignment.approximate_current_row(row))
+                .unwrap_or(row)
         });
         self.file_task = cx.spawn_in(window, async move |this, cx| {
-            let offset = mapping.await;
+            let mapped = mapping.await;
             _ = this.update_in(cx, |this, window, cx| {
                 if this.view != WorkspaceView::Editor || this.tabs.active() != Some(path.as_path())
                 {
@@ -2063,15 +2050,29 @@ impl Workspace {
                 {
                     return;
                 }
-                if let Some(offset) = offset.filter(|_| state.document_revision() == revision) {
-                    file.restore_position = None;
-                    editor.update(cx, |editor, cx| {
-                        reveal_editor_range(editor, offset..offset, None, window, cx);
-                    });
+                let target = if state.document_revision() == revision {
+                    mapped
                 } else {
-                    toast::info(window, cx, t!("git.editor_location_unavailable"));
-                }
+                    row
+                };
+                Self::reveal_diff_row(file, target, window, cx);
             });
+        });
+    }
+
+    fn reveal_diff_row(
+        file: &mut OpenFile,
+        row: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        use gpui_component::input::RopeExt as _;
+
+        file.restore_position = None;
+        file.editor.update(cx, |editor, cx| {
+            let text = editor.text();
+            let offset = text.line_start_offset(row.min(text.lines_len().saturating_sub(1)));
+            reveal_editor_range(editor, offset..offset, None, window, cx);
         });
     }
 
