@@ -28,6 +28,22 @@ use super::{
     language_for, status_button,
 };
 
+impl Workspace {
+    pub(super) fn block_pending_completion_acceptance(&self, window: &Window, cx: &mut App) {
+        if let Some(file) = self.active_file() {
+            let editor = file.editor.read(cx);
+            let menu = editor.completion_menu_state();
+            if menu.open
+                && menu.origin().0 != editor.document_revision()
+                && editor.focus_handle(cx).is_focused(window)
+            {
+                // Let the refresh finish without inserting a stale item or editing the buffer.
+                cx.stop_propagation();
+            }
+        }
+    }
+}
+
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub(super) struct ServerKey {
     server: ServiceServer,

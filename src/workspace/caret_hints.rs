@@ -151,6 +151,7 @@ impl Workspace {
             && let Some(file) = self.files.get_mut(path)
             && file.caret_hints.signature_active
             && !file.editor.read(cx).completion_menu_state().open
+            && !file.editor.read(cx).code_action_menu_state().open
         {
             file.caret_hints.dismiss_signature();
             cx.notify();

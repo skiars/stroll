@@ -187,6 +187,41 @@ impl DiagnosticSet {
         self.clear();
     }
 
+    pub(in crate::input) fn adjust_for_edit(
+        &mut self,
+        text: &Rope,
+        edited: &Range<usize>,
+        inserted_len: usize,
+    ) {
+        if self.is_empty() {
+            self.text = text.clone();
+            return;
+        }
+
+        let first_row = self.text.offset_to_point(edited.start).row;
+        let last_row = self.text.offset_to_point(edited.end).row;
+        let first_byte = self.text.line_start_offset(first_row);
+        let next_line = self.text.line_start_offset(last_row + 1);
+        let delta = inserted_len as isize - edited.len() as isize;
+        let retained = self.diagnostics.iter().filter_map(|entry| {
+            if entry.range.start < first_byte && entry.range.end <= first_byte {
+                return Some(entry.clone());
+            }
+            if last_row + 1 >= self.text.lines_len() || entry.range.start < next_line {
+                return None;
+            }
+            let mut entry = entry.clone();
+            entry.range.start = entry.range.start.saturating_add_signed(delta);
+            entry.range.end = entry.range.end.saturating_add_signed(delta);
+            entry.diagnostic.range = text.offset_to_position(entry.range.start)
+                ..text.offset_to_position(entry.range.end);
+            Some(entry)
+        });
+        self.diagnostics = SumTree::from_iter(retained, &());
+        self.text = text.clone();
+        self.revision = self.revision.wrapping_add(1);
+    }
+
     pub fn push(&mut self, diagnostic: impl Into<Diagnostic>) {
         self.revision = self.revision.wrapping_add(1);
         let diagnostic = diagnostic.into();

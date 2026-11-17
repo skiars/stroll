@@ -419,6 +419,14 @@ impl InputBaseState<EditorMode> {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
+        let insertion_start = match input {
+            CompletionInput::Typed {
+                insertion_start, ..
+            } => insertion_start,
+            CompletionInput::Invoked => None,
+        };
+        let was_open =
+            std::mem::take(&mut self.extras.context_menu_content.completion.open_before_edit);
         let Some((start, task)) = provider.prepare_completion(self, input, window, cx) else {
             return false;
         };
@@ -427,6 +435,13 @@ impl InputBaseState<EditorMode> {
             return true;
         }
         let query = self.text().slice(start..caret).to_string();
+        let menu = &mut self.extras.context_menu_content.completion;
+        // Keep the last list on screen when typing extends its query. Its
+        // origin still describes the old document until fresh items arrive.
+        menu.open = was_open
+            && menu.trigger_start_offset == Some(start)
+            && insertion_start == Some(start + menu.query.len())
+            && query.starts_with(&menu.query);
         self.present_completion_task(start, query, task, window, cx);
         true
     }
@@ -486,6 +501,9 @@ impl InputBaseState<EditorMode> {
                         || editor.disabled
                         || editor.readonly
                     {
+                        if editor.extras.context_menu_content.completion.open {
+                            editor.hide_context_menu(cx);
+                        }
                         return;
                     }
 
@@ -502,10 +520,12 @@ impl InputBaseState<EditorMode> {
             provider.completion_dismissed();
         }
         self.hide_context_menu_for_edit(cx);
+        self.extras.context_menu_content.completion.open_before_edit = false;
     }
 
     pub(crate) fn hide_context_menu_for_edit(&mut self, cx: &mut Context<Self>) {
-        self.extras.context_menu_content.completion.open = false;
+        let menu = &mut self.extras.context_menu_content.completion;
+        menu.open_before_edit = std::mem::take(&mut menu.open);
         self.extras.context_menu_content.code_action.open = false;
         self.extras.context_menu_task = Task::ready(Ok(()));
         cx.notify();
@@ -532,9 +552,7 @@ impl InputBaseState<EditorMode> {
             return false;
         }
 
-        let closes_overlay = crate::input::Enter::is_primary(&*action)
-            || action.partial_eq(&crate::input::Escape)
-            || action.partial_eq(&crate::input::IndentInline);
+        let dismisses_completion = action.partial_eq(&crate::input::Escape);
         let kind = if self.extras.context_menu_content.completion.open {
             Some(super::InputOverlayKind::Completion)
         } else if self.extras.context_menu_content.code_action.open {
@@ -546,7 +564,7 @@ impl InputBaseState<EditorMode> {
             return false;
         };
         let handled = handler(kind, action, window, cx);
-        if handled && closes_overlay && kind == super::InputOverlayKind::Completion {
+        if handled && dismisses_completion && kind == super::InputOverlayKind::Completion {
             self.hide_context_menu(cx);
         }
         handled

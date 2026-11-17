@@ -2,9 +2,9 @@ use std::{ops::Range, rc::Rc};
 
 use gpui::{
     Action, AnyElement, App, AppContext, Context, DismissEvent, Empty, Entity, EventEmitter,
-    FontWeight, HighlightStyle, InteractiveElement as _, IntoElement, ParentElement, Pixels,
-    Render, RenderOnce, SharedString, Styled, StyledText, Subscription, WeakEntity, Window,
-    deferred, div, prelude::FluentBuilder, px, relative,
+    Focusable as _, FontWeight, HighlightStyle, InteractiveElement as _, IntoElement,
+    ParentElement, Pixels, Render, RenderOnce, SharedString, Styled, StyledText, Subscription,
+    WeakEntity, Window, deferred, div, prelude::FluentBuilder, px, relative,
 };
 use gpui_base::TestSupportExt as _;
 use gpui_base::input::CompletionHighlighter;
@@ -97,9 +97,22 @@ struct ContextMenuDelegate {
 }
 
 impl ContextMenuDelegate {
-    fn set_items(&mut self, items: Vec<CompletionItem>) {
+    fn set_items(&mut self, items: Vec<CompletionItem>, preserve_selection: bool) {
+        self.selected_ix = self
+            .selected_item()
+            .filter(|_| preserve_selection)
+            .and_then(|selected| {
+                items.iter().position(|item| {
+                    item.label == selected.label
+                        && item.label_details == selected.label_details
+                        && item.kind == selected.kind
+                        && item.detail == selected.detail
+                        && item.filter_text == selected.filter_text
+                        && item.insert_text == selected.insert_text
+                })
+            })
+            .unwrap_or(0);
         self.items = items.into_iter().map(Rc::new).collect();
-        self.selected_ix = 0;
     }
 
     fn selected_item(&self) -> Option<&Rc<CompletionItem>> {
@@ -305,18 +318,9 @@ impl CompletionMenu {
 
             let list = cx.new(|cx| ListState::new(menu, window, cx));
 
-            let _subscriptions =
-                vec![
-                    cx.subscribe(&list, |this: &mut Self, _, ev: &ListEvent, cx| {
-                        match ev {
-                            ListEvent::Confirm(_) => {
-                                this.dismiss(cx);
-                            }
-                            _ => {}
-                        }
-                        cx.notify();
-                    }),
-                ];
+            let _subscriptions = vec![cx.subscribe(&list, |_: &mut Self, _, _: &ListEvent, cx| {
+                cx.notify();
+            })];
 
             Self {
                 offset: 0,
@@ -341,19 +345,21 @@ impl CompletionMenu {
 
         cx.spawn_in(window, async move |_, cx| {
             editor.update_in(cx, |editor, window, cx| {
+                let completion = editor.completion_menu_state();
                 if editor.cursor() == offset
+                    && editor.focus_handle(cx).is_focused(window)
                     && revision.is_none_or(|(document, menu)| {
-                        editor.document_revision() == document
-                            && editor.completion_menu_state().revision() == menu
+                        completion.open
+                            && editor.document_revision() == document
+                            && completion.revision() == menu
                     })
                 {
+                    editor.dismiss_completion_overlay(cx);
                     editor.insert_completion(&item, range, window, cx);
                 }
             })
         })
         .detach();
-
-        self.dismiss(cx);
     }
 
     pub(crate) fn handle_action(
@@ -443,12 +449,15 @@ impl CompletionMenu {
         cx: &mut Context<Self>,
     ) {
         let items = items.into();
+        let preserve_selection = self.open && offset != self.offset;
         self.offset = offset;
         self.open = true;
         self.list.update(cx, |this, cx| {
-            this.delegate_mut().query = self.query.clone();
-            this.delegate_mut().set_items(items);
-            this.set_selected_index(Some(IndexPath::new(0)), window, cx);
+            let delegate = this.delegate_mut();
+            delegate.query = self.query.clone();
+            delegate.set_items(items, preserve_selection);
+            let selected = delegate.selected_ix;
+            this.set_selected_index(Some(IndexPath::new(selected)), window, cx);
         });
 
         cx.notify();

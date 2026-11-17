@@ -241,9 +241,18 @@ fn workspace_completion_triggers_filters_applies_and_drops_stale_replies() -> Re
 
         visual.simulate_keystrokes(".");
         wait(visual, "trigger character result", |visual| {
-            labels(visual, editor) == ["member"]
+            labels(visual, editor) == ["member", "method"]
         })?;
         visual.simulate_keystrokes("m e");
+        frame(visual);
+        assert!(visual.debug_bounds("completion-menu").is_some());
+        visual.simulate_keystrokes("tab enter");
+        visual.update(|_, cx| {
+            assert_eq!(
+                editor.read(cx).text().to_string(),
+                source.replace("object", "object.me")
+            );
+        });
         wait(visual, "incomplete result refresh", |visual| {
             labels(visual, editor) == ["Field via LSP", "method"]
         })?;
@@ -301,6 +310,40 @@ fn workspace_completion_triggers_filters_applies_and_drops_stale_replies() -> Re
         });
         Ok(())
     })
+}
+
+#[test]
+fn workspace_completion_keeps_the_selected_candidate_across_a_refresh() -> Result<()> {
+    let fixture = tempfile::tempdir()?;
+    let script = fixture.path().join("server.py");
+    fs::write(
+        &script,
+        include_str!("../../../tests/fixtures/lsp_completion.py"),
+    )?;
+    let command = format!("python3 -u {}", script.display());
+    let source = "void run() {\n  /* 😀 */ object;\n}\n";
+    with_editor(
+        fixture.path(),
+        &command,
+        source,
+        source.find(';').unwrap(),
+        |visual, editor| {
+            visual.simulate_keystrokes(".");
+            wait(visual, "initial candidates", |visual| {
+                labels(visual, editor) == ["member", "method"]
+            })?;
+            visual.simulate_keystrokes("down m e");
+            wait(visual, "refreshed candidates", |visual| {
+                labels(visual, editor) == ["Field via LSP", "method"]
+            })?;
+            visual.simulate_keystrokes("tab");
+            wait(visual, "the selected method is accepted", |visual| {
+                visual.update(|_, cx| {
+                    editor.read(cx).text().to_string() == source.replace("object", "object.method")
+                })
+            })
+        },
+    )
 }
 
 #[test]
@@ -377,6 +420,26 @@ fn workspace_caret_hints_use_the_latest_symbol_and_signature() -> Result<()> {
             wait(visual, "signature restored after completion", |visual| {
                 visual.debug_bounds("editor-signature-help").is_some()
             })?;
+            visual.update(|window, cx| {
+                editor.update(cx, |state, cx| {
+                    state.open_code_actions(state.selected_range(), window, cx);
+                })
+            });
+            wait(visual, "code actions obscure the signature", |visual| {
+                visual.update(|_, cx| {
+                    let menu = editor.read(cx).code_action_menu_state();
+                    menu.open && !menu.loading && menu.items.len() == 1
+                }) && visual.debug_bounds("editor-signature-help").is_none()
+            })?;
+            visual.simulate_keystrokes("escape");
+            wait(
+                visual,
+                "Escape dismisses the visible code action menu",
+                |visual| {
+                    visual.update(|_, cx| !editor.read(cx).code_action_menu_state().open)
+                        && visual.debug_bounds("editor-signature-help").is_some()
+                },
+            )?;
             visual.simulate_keystrokes("escape");
             frame(visual);
             assert!(visual.debug_bounds("editor-signature-help").is_none());

@@ -55,7 +55,7 @@ while (message := receive()) is not None:
         if prefix.endswith("object."):
             assert column == utf16("  /* 😀 */ object.")
             assert context == {"triggerKind": 2, "triggerCharacter": "."}
-            result = {"isIncomplete": True, "items": [{"label": "member"}]}
+            result = {"isIncomplete": True, "items": [{"label": "member"}, {"label": "method"}]}
         elif prefix.endswith("object.me"):
             assert column == utf16("  /* 😀 */ object.me")
             assert context == {"triggerKind": 3}

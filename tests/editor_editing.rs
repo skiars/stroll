@@ -88,6 +88,54 @@ fn select(
 }
 
 #[test]
+fn edits_keep_diagnostics_on_untouched_lines_until_the_next_reply() {
+    let source = "edit me\n😀 error\n";
+    with_editor(source, true, false, false, |visual, editor| {
+        visual.update(|_, cx| {
+            editor.update(cx, |editor, _| {
+                let diagnostics = editor.diagnostics_mut().unwrap();
+                for (line, start, end, message) in [(0, 0, 4, "edited"), (1, 2, 7, "untouched")] {
+                    diagnostics.push(lsp_types::Diagnostic {
+                        range: lsp_types::Range::new(
+                            lsp_types::Position::new(line, start),
+                            lsp_types::Position::new(line, end),
+                        ),
+                        message: message.into(),
+                        ..Default::default()
+                    });
+                }
+            });
+        });
+        select(visual, editor, 4..4);
+        visual.simulate_input("\n");
+        draw(visual);
+        visual.update(|_, cx| {
+            let state = editor.read(cx);
+            let diagnostics = state.diagnostics().unwrap();
+            assert_eq!(diagnostics.len(), 1);
+            let entry = diagnostics.iter().next().unwrap();
+            assert_eq!(entry.message.as_str(), "untouched");
+            assert_eq!(
+                entry.diagnostic.range,
+                Position::new(2, 2)..Position::new(2, 7)
+            );
+            assert_eq!(state.text().slice(entry.range.clone()).to_string(), "error");
+        });
+        visual.update(|window, cx| {
+            editor.update(cx, |state, cx| state.replay_text_history(true, window, cx));
+        });
+        visual.update(|_, cx| {
+            let state = editor.read(cx);
+            let entry = state.diagnostics().unwrap().iter().next().unwrap();
+            assert_eq!(
+                entry.diagnostic.range,
+                Position::new(1, 2)..Position::new(1, 7)
+            );
+        });
+    });
+}
+
+#[test]
 fn inlay_hints_keep_their_wrap_rows_after_line_insertion_and_undo() {
     let source = "before\nstable line\nafter";
     let row_start = source.find("stable").unwrap();

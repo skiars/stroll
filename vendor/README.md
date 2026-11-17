@@ -167,6 +167,9 @@ dialogs in a Wayland window after changes to paint order or focus handling.
   for offscreen geometry and selection coverage. Set
   `STROLL_COMPLETION_SCREENSHOTS` to save the popup screenshots.
   Candidate text and kind icons use the current editor font size minus 0.5 px.
+  The list stays visible when typing extends its query and keeps the selected
+  candidate when it survives the refresh. The menu validates the document and
+  menu revisions before applying a candidate's edits.
 
 - C++ overload names use function captures, and primitive type captures
   recover after declaration macros. The editor maps unaffected semantic token
@@ -176,6 +179,11 @@ dialogs in a Wayland window after changes to paint order or focus handling.
   projected diff hints, and stale language-service responses.
   Inlay hints use the light weight of the current editor font. The light and
   dark editor theme captures include a rendered hint.
+
+- On text edits, the diagnostic set discards diagnostics touching edited
+  lines and maps the remaining diagnostics to their new positions. Run
+  `cargo test --release --locked --test editor_editing edits_keep_diagnostics`
+  to verify line insertion and undo.
 
 - The shared caret-anchored popup can prefer the space above the caret. The
   workspace uses this placement for LSP signature help and hides the hint while

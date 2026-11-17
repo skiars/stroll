@@ -5106,6 +5106,9 @@ impl<M: InputModeKind> InputBaseState<M> {
             self.text.replace(range.clone(), new_text);
 
             M::adjust_annotations(self, range, new_text.len());
+            if let Some(diagnostics) = self.mode.diagnostics_mut() {
+                diagnostics.adjust_for_edit(&self.text, range, new_text.len());
+            }
             recorded |= self.push_history(
                 &old_text,
                 range,
@@ -5166,9 +5169,6 @@ impl<M: InputModeKind> InputBaseState<M> {
         }
 
         // One observable update per batch instead of one per edit.
-        if let Some(diagnostics) = self.mode.diagnostics_mut() {
-            diagnostics.reset(&self.text)
-        }
         M::refresh_language_features(self, window, cx);
         self.update_search(cx);
 

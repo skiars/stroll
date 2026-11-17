@@ -32,6 +32,7 @@ send(id=initialize["id"], result={"capabilities": {
     "documentHighlightProvider": True,
     "signatureHelpProvider": {"triggerCharacters": ["(", ","]},
     "completionProvider": {},
+    "codeActionProvider": True,
 }})
 
 directory = Path(__file__).parent
@@ -88,6 +89,8 @@ while (message := receive()) is not None:
             (directory / "replied").touch()
     elif method == "textDocument/completion":
         send(id=message["id"], result=[{"label": "candidate"}])
+    elif method == "textDocument/codeAction":
+        send(id=message["id"], result=[{"title": "Fix", "kind": "quickfix"}])
     elif method == "shutdown":
         send(id=message["id"], result=None)
     elif method == "exit":

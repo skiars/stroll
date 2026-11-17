@@ -10,6 +10,7 @@ pub struct CompletionMenuState {
     pub trigger_start_offset: Option<usize>,
     pub query: String,
     pub items: Vec<CompletionItem>,
+    pub(super) open_before_edit: bool,
     pub(super) document_revision: u64,
     pub(super) caret: usize,
     revision: u64,

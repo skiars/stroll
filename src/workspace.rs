@@ -54,7 +54,7 @@ use gpui_component::{
     StyledExt, Theme, ThemeMode, TitleBar, WindowExt as _,
     button::{Button, ButtonVariants},
     h_flex,
-    input::{Editor, EditorState, InputEvent, Rope, Search},
+    input::{Editor, EditorState, Enter, IndentInline, InputEvent, Rope, Search},
     menu::{DropdownMenu, PopupMenuItem},
     resizable::{HandleEdge, resize_handle},
     scroll::thin_scrollbar,
@@ -3555,6 +3555,14 @@ impl Workspace {
                         .on_action(cx.listener(Self::close_editor_git_hunk))
                         .on_action(cx.listener(Self::show_signature_help))
                         .capture_key_down(cx.listener(Self::dismiss_signature_help))
+                        .capture_action(cx.listener(|this, action: &Enter, window, cx| {
+                            if !action.secondary && !action.shift {
+                                this.block_pending_completion_acceptance(window, cx);
+                            }
+                        }))
+                        .capture_action(cx.listener(|this, _: &IndentInline, window, cx| {
+                            this.block_pending_completion_acceptance(window, cx);
+                        }))
                         .flex_1()
                         .min_h_0()
                         .w_full()
