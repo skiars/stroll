@@ -14,6 +14,9 @@ use serde_json::{Map, Value, json};
 
 use crate::config::{CodeContrast, CodeTheme};
 
+const ACTIVE_LINE_ALPHA: u8 = 0x0f;
+const SEMANTIC_UNDERLINE_CONTRAST: f64 = 3.;
+
 /// Contrast targets for the code text presets.
 fn contrast_target(contrast: CodeContrast) -> f64 {
     match contrast {
@@ -769,6 +772,12 @@ fn syntax_style(colors: &Colors, semantics: bool) -> Value {
         additional.insert(name.into(), color(value));
     }
     if semantics {
+        let surface = hsla(&colors.surface);
+        let active_line =
+            surface.blend(hsla(&colors.text).opacity(f32::from(ACTIVE_LINE_ALPHA) / 255.));
+        let underline_backgrounds = [surface, active_line];
+        let method_underline = underline_color(&colors.function, underline_backgrounds);
+        let property_underline = underline_color(&colors.property, underline_backgrounds);
         for &role in crate::lsp::SEMANTIC_ROLES {
             let foreground = match role {
                 "namespace" => &colors.namespace,
@@ -794,8 +803,13 @@ fn syntax_style(colors: &Colors, semantics: bool) -> Value {
                 "keyword" | "keyword.self" => &colors.keyword,
                 _ => unreachable!("unknown semantic role {role}"),
             };
+            let underline = match role {
+                "function.method" => Some((method_underline.as_str(), "dashed")),
+                "property" => Some((property_underline.as_str(), "dotted")),
+                _ => None,
+            };
             for flags in 0..crate::lsp::SEMANTIC_VARIANTS {
-                let (key, style) = semantic_style(role, flags, foreground);
+                let (key, style) = semantic_style(role, flags, foreground, underline);
                 additional.insert(key, style);
             }
         }
@@ -841,7 +855,7 @@ fn style(colors: &Colors, mode: ThemeMode) -> Value {
     // Blend in 6% foreground for the current line to keep diff backgrounds visible.
     style.insert(
         "editor.active_line.background".into(),
-        json!(format!("{}0f", colors.text)),
+        json!(format!("{}{:02x}", colors.text, ACTIVE_LINE_ALPHA)),
     );
     style.insert("editor.line_number".into(), json!(colors.dim.clone()));
     style.insert(
@@ -872,7 +886,12 @@ fn style(colors: &Colors, mode: ThemeMode) -> Value {
     Value::Object(style)
 }
 
-fn semantic_style(role: &str, flags: u32, foreground: &str) -> (String, Value) {
+fn semantic_style(
+    role: &str,
+    flags: u32,
+    foreground: &str,
+    underline: Option<(&str, &str)>,
+) -> (String, Value) {
     use crate::lsp::{DECLARATION, DEPRECATED, READONLY, semantic_style_key};
 
     let declaration = flags & DECLARATION != 0;
@@ -894,16 +913,37 @@ fn semantic_style(role: &str, flags: u32, foreground: &str) -> (String, Value) {
     }
     if deprecated {
         style["strikethrough"] = json!({ "thickness": 1.0 });
-    } else if role == "function.method" {
+    } else if let Some((color, pattern)) = underline
+        && (role == "function.method" || (declaration && flags & READONLY != 0))
+    {
         style["underline"] = json!({
-            "color": format!("{foreground}4d"), "thickness": 1.0, "wavy": false, "pattern": "dashed",
-        });
-    } else if role == "property" && declaration && flags & READONLY != 0 {
-        style["underline"] = json!({
-            "color": format!("{foreground}a6"), "thickness": 1.0, "wavy": false, "pattern": "dotted",
+            "color": color, "thickness": 1.0, "wavy": false, "pattern": pattern,
         });
     }
     (semantic_style_key(role, flags), style)
+}
+
+/// Blend toward the token color just far enough to be visible on both editor backgrounds.
+fn underline_color(foreground: &str, backgrounds: [Hsla; 2]) -> String {
+    let color = hsla(foreground);
+    let [surface, _] = backgrounds;
+    let luminances = backgrounds.map(|background| luminance(&hsla_hex(background)));
+    let (mut low, mut high) = (0u8, 255u8);
+    // Resolve the tint to an opaque color so the underline pipeline does not have to blend it.
+    let blend = |alpha| hsla_hex(surface.blend(color.opacity(f32::from(alpha) / 255.)));
+    while low < high {
+        let alpha = low + (high - low) / 2;
+        let candidate = luminance(&blend(alpha));
+        if luminances
+            .iter()
+            .all(|&background| contrast_ratio(candidate, background) >= SEMANTIC_UNDERLINE_CONTRAST)
+        {
+            high = alpha;
+        } else {
+            low = alpha + 1;
+        }
+    }
+    blend(low)
 }
 
 fn hsla(hex: &str) -> Hsla {
@@ -1199,17 +1239,16 @@ mod tests {
     fn every_theme_builds_a_parseable_highlight_theme() {
         for theme in ALL {
             for mode in [ThemeMode::Light, ThemeMode::Dark] {
+                let backgrounds = app_backgrounds(mode)
+                    .iter()
+                    .map(|background| hsla(background))
+                    .collect::<Vec<_>>();
                 for contrast in [
                     CodeContrast::Standard,
                     CodeContrast::Enhanced,
                     CodeContrast::High,
                 ] {
-                    let highlight = highlight_theme(
-                        theme,
-                        contrast,
-                        mode,
-                        &[hsla("#141518"), hsla("#1c1d22"), hsla("#232428")],
-                    );
+                    let highlight = highlight_theme(theme, contrast, mode, &backgrounds);
                     assert_eq!(highlight.appearance, mode);
                     assert!(highlight.style.editor_background.is_some());
                     for capture in ["keyword", "string", "comment", "function", "type"] {
@@ -1217,6 +1256,22 @@ mod tests {
                             highlight.style(capture).is_some(),
                             "{theme:?} {mode:?} {contrast:?}: {capture}"
                         );
+                    }
+                    let surface = highlight.style.editor_background.unwrap();
+                    let active_line = surface.blend(highlight.style.editor_active_line.unwrap());
+                    for capture in ["function.method.lsp.0", "property.lsp.3"] {
+                        let underline = highlight.style(capture).unwrap().underline.unwrap();
+                        let color = underline.color.unwrap();
+                        for background in [surface, active_line] {
+                            let ratio = contrast_ratio(
+                                luminance(&hsla_hex(background.blend(color))),
+                                luminance(&hsla_hex(background)),
+                            );
+                            assert!(
+                                (3. ..=3.8).contains(&ratio),
+                                "{theme:?} {mode:?} {contrast:?}: {capture} has {ratio:.2}:1 contrast"
+                            );
+                        }
                     }
                 }
             }
@@ -1698,6 +1753,27 @@ fn editor_renders_web_theme_decorations_in_light_and_dark() -> anyhow::Result<()
             "{label}: structured underlines"
         );
         assert!(dashed_marks[0].bounds.size.width > dotted_marks[0].bounds.size.width);
+        for (name, marks, color) in [
+            ("dashed", &dashed_marks, dashed),
+            ("dotted", &dotted_marks, dotted),
+        ] {
+            let expected = u32::from(Rgba::from(color)).to_be_bytes();
+            assert!(
+                marks.iter().any(|mark| {
+                    let center = mark.bounds.center();
+                    screenshot
+                        .get_pixel_checked(center.x.into(), center.y.into())
+                        .is_some_and(|pixel| {
+                            pixel
+                                .0
+                                .into_iter()
+                                .zip(expected)
+                                .all(|(actual, expected)| actual.abs_diff(expected) <= 1)
+                        })
+                }),
+                "{label}: {name} underline paints its theme color"
+            );
+        }
         assert!(
             underlines
                 .iter()
