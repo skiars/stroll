@@ -23,6 +23,9 @@ dialogs in a Wayland window after changes to paint order or focus handling.
 - The application uses the UI font size as its window rem size and as the shared
   control font size for inputs, searchable select rows, dropdown buttons, and
   popup menu options. The Git comparison integration test covers live changes.
+- In-window context menus use a leading icon column two logical pixels wider
+  than the default menu icon size. The popup integration test checks the
+  leading column and label alignment.
 - Default inputs and dropdowns are twice the UI font size. Custom
   heights are respected, and fixed-height input groups fit the inner field inside
   the group's border. The popup and Git integration tests check control geometry.

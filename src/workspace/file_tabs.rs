@@ -17,7 +17,7 @@ use gpui_kit_assets::IconName;
 
 use crate::{docs, paths, tabs::labels};
 
-use super::{FILE_TOOLBAR_HEIGHT, Palette, Workspace, icon, icon_button};
+use super::{FILE_TOOLBAR_HEIGHT, Palette, Workspace, file_type_icon, icon_button};
 
 impl Workspace {
     pub(super) fn tab_bar(&self, cx: &Context<Self>, colors: Palette) -> impl IntoElement {
@@ -187,13 +187,12 @@ impl Workspace {
                             this.keep_tab(&select, cx);
                         }
                     }))
-                    .when(path.is_absolute(), |tab| {
-                        tab.child(div().flex_shrink_0().mr_1().child(icon(
-                            IconName::FileText,
-                            colors.muted,
-                            12.,
-                        )))
-                    })
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .mr_1()
+                            .child(file_type_icon(path, colors, 12.)),
+                    )
                     .child(
                         div()
                             .truncate()
@@ -330,6 +329,7 @@ impl Workspace {
                             .min_w_0()
                             .text_size(px(13.))
                             .gap(px(3.))
+                            .child(file_type_icon(path, colors, 14.))
                             .child(
                                 div()
                                     .min_w_0()
@@ -402,40 +402,47 @@ impl Workspace {
                 ] {
                     let path = path.clone();
                     let workspace = workspace.clone();
-                    menu = menu.item(PopupMenuItem::new(label).disabled(!enabled).on_click(
-                        move |_, window, cx| {
-                            _ = workspace.update(cx, |this, cx| {
-                                let paths = this.tabs.paths();
-                                let Some(index) = this.tabs.index(&path) else {
-                                    return;
-                                };
-                                let closing = paths
-                                    .iter()
-                                    .enumerate()
-                                    .filter(|(i, candidate)| match action {
-                                        TabClose::This => *i == index,
-                                        TabClose::Others => *i != index,
-                                        TabClose::Right => *i > index,
-                                        TabClose::Saved => !this.tab_is_dirty(candidate),
-                                    })
-                                    .map(|(_, path)| path.clone())
-                                    .collect();
-                                this.close_tabs(closing, window, cx);
-                            });
-                        },
-                    ));
+                    menu = menu.item(
+                        PopupMenuItem::new(label)
+                            .when(matches!(action, TabClose::This), |item| {
+                                item.icon(IconName::X)
+                            })
+                            .disabled(!enabled)
+                            .on_click(move |_, window, cx| {
+                                _ = workspace.update(cx, |this, cx| {
+                                    let paths = this.tabs.paths();
+                                    let Some(index) = this.tabs.index(&path) else {
+                                        return;
+                                    };
+                                    let closing = paths
+                                        .iter()
+                                        .enumerate()
+                                        .filter(|(i, candidate)| match action {
+                                            TabClose::This => *i == index,
+                                            TabClose::Others => *i != index,
+                                            TabClose::Right => *i > index,
+                                            TabClose::Saved => !this.tab_is_dirty(candidate),
+                                        })
+                                        .map(|(_, path)| path.clone())
+                                        .collect();
+                                    this.close_tabs(closing, window, cx);
+                                });
+                            }),
+                    );
                 }
                 menu = menu.separator();
                 if docs::is_markdown(&path) {
                     let target = path.clone();
                     let workspace = workspace.clone();
-                    menu = menu.item(PopupMenuItem::new(t!("tabs.open_in_docs")).on_click(
-                        move |_, window, cx| {
-                            _ = workspace.update(cx, |this, cx| {
-                                this.open_markdown_in_docs(target.clone(), window, cx)
-                            });
-                        },
-                    ));
+                    menu = menu.item(
+                        PopupMenuItem::new(t!("tabs.open_in_docs"))
+                            .icon(IconName::BookOpen)
+                            .on_click(move |_, window, cx| {
+                                _ = workspace.update(cx, |this, cx| {
+                                    this.open_markdown_in_docs(target.clone(), window, cx)
+                                });
+                            }),
+                    );
                 }
                 for (label, absolute) in [
                     (t!("tabs.copy_relative_path"), false),
@@ -446,21 +453,25 @@ impl Workspace {
                     }
                     let path = path.clone();
                     let workspace = workspace.clone();
-                    menu = menu.item(PopupMenuItem::new(label).on_click(move |_, _, cx| {
-                        let path = if absolute && !path.is_absolute() {
-                            workspace
-                                .read_with(cx, |this, _| {
-                                    this.repository.as_ref().map(|repo| repo.root.join(&path))
-                                })
-                                .ok()
-                                .flatten()
-                        } else {
-                            Some(path.clone())
-                        };
-                        if let Some(path) = path {
-                            cx.write_to_clipboard(ClipboardItem::new_string(paths::display(&path)));
-                        }
-                    }));
+                    menu = menu.item(PopupMenuItem::new(label).icon(IconName::Link2).on_click(
+                        move |_, _, cx| {
+                            let path = if absolute && !path.is_absolute() {
+                                workspace
+                                    .read_with(cx, |this, _| {
+                                        this.repository.as_ref().map(|repo| repo.root.join(&path))
+                                    })
+                                    .ok()
+                                    .flatten()
+                            } else {
+                                Some(path.clone())
+                            };
+                            if let Some(path) = path {
+                                cx.write_to_clipboard(ClipboardItem::new_string(paths::display(
+                                    &path,
+                                )));
+                            }
+                        },
+                    ));
                 }
                 menu
             })
@@ -930,7 +941,11 @@ mod tests {
     /// The ellipsis menu, not an icon of its own, carries the save entry that
     /// used to sit next to it.
     #[::core::prelude::v1::test]
-    fn tab_bar_actions_menu_saves_the_open_draft() -> anyhow::Result<()> {
+    fn tab_bar_actions_menu_shows_bound_keys_and_saves_the_open_draft() -> anyhow::Result<()> {
+        use gpui_component::input::Search;
+
+        use super::super::{SaveFile, ToggleTerminal};
+
         let fixture = tempfile::tempdir()?;
         let root = fixture.path().join("repo");
         fs::create_dir(&root)?;
@@ -970,7 +985,14 @@ mod tests {
             None,
             platform.text_system(),
         );
-        cx.update(gpui_component::init);
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            cx.bind_keys([
+                KeyBinding::new("f9", SaveFile, Some("!Terminal && !Locator")),
+                KeyBinding::new("f10", ToggleTerminal, Some("!Locator")),
+                KeyBinding::new("f11", Search, Some("Input")),
+            ]);
+        });
         let mut workspace = None;
         let (_, mut visual) = cx.add_window_view(|window, cx| {
             let view = cx
@@ -1013,9 +1035,19 @@ mod tests {
             });
         });
         visual.simulate_input("rewritten\n");
+        // The editor's search binding is resolved even if the file tree had focus.
+        visual.update(|window, cx| {
+            workspace.update(cx, |this, cx| this.focus_tree(PathBuf::new(), window, cx));
+        });
         draw(&mut visual);
         visual.simulate_click(trigger.center(), Default::default());
         draw(&mut visual);
+        let keys = ["kbd:f9", "kbd:f11", "kbd:f10"].map(|id| {
+            visual
+                .debug_bounds(id)
+                .expect("menu shows the active shortcut")
+        });
+        assert!(keys[0].top() < keys[1].top() && keys[1].top() < keys[2].top());
         visual.simulate_keystrokes("down enter");
         for _ in 0..100 {
             visual.run_until_parked();

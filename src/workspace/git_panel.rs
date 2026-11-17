@@ -1386,13 +1386,13 @@ impl GitPanel {
                         let view = menu_view.clone();
                         let base = base.clone();
                         menu.item(
-                            PopupMenuItem::new(t!("git.compare_with", target = target)).on_click(
-                                move |_, window, cx| {
+                            PopupMenuItem::new(t!("git.compare_with", target = target))
+                                .icon(IconName::GitCompareArrows)
+                                .on_click(move |_, window, cx| {
                                     _ = view.update(cx, |this, cx| {
                                         this.compare_with_base(&base, window, cx)
                                     });
-                                },
-                            ),
+                                }),
                         )
                     })
                     .into_any_element()

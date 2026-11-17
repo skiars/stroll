@@ -1531,7 +1531,7 @@ impl ReviewEditor {
                         .unwrap_or(false);
                     menu.separator().menu_with_icon_disabled(
                         t!("git.open_in_editor"),
-                        IconName::Pencil,
+                        IconName::FileInput,
                         !can_open,
                         Box::new(OpenDiffRowInEditor(position)),
                     )

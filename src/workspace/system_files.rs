@@ -197,12 +197,18 @@ impl Workspace {
             } else {
                 t!("workspace.tree_open_with_default")
             };
-            menu = menu.item(PopupMenuItem::new(label).disabled(!enabled).on_click(
-                move |_, window, cx| open.clone().open(target.clone(), false, window, cx),
-            ));
+            menu = menu.item(
+                PopupMenuItem::new(label)
+                    .icon(IconName::ExternalLink)
+                    .disabled(!enabled)
+                    .on_click(move |_, window, cx| {
+                        open.clone().open(target.clone(), false, window, cx)
+                    }),
+            );
         }
         menu.item(
             PopupMenuItem::new(actions.manager_label(historical))
+                .icon(IconName::FolderOpen)
                 .disabled(!actions.can_reveal() || reveal.is_none())
                 .on_click(move |_, window, cx| {
                     if let Some(path) = &reveal {

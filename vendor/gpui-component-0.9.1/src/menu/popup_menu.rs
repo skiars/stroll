@@ -342,6 +342,7 @@ pub struct PopupMenu {
     motion: PopupMotion,
     closing: bool,
     in_dropdown: bool,
+    in_context_menu: bool,
 
     _subscriptions: Vec<Subscription>,
 }
@@ -372,6 +373,7 @@ impl PopupMenu {
             motion: PopupMotion::new(PopupMotionKind::Menu, Instant::now()),
             closing: false,
             in_dropdown: false,
+            in_context_menu: false,
             _subscriptions: vec![],
         }
     }
@@ -1178,6 +1180,11 @@ impl PopupMenu {
         self
     }
 
+    pub(crate) fn in_context_menu(mut self) -> Self {
+        self.in_context_menu = true;
+        self
+    }
+
     pub(crate) fn begin_open(&mut self) {
         self.closing = false;
         self.motion = PopupMotion::new(PopupMotionKind::Menu, Instant::now());
@@ -1305,8 +1312,7 @@ impl PopupMenu {
         has_icon: bool,
         checked: bool,
         icon: Option<Icon>,
-        _: &mut Window,
-        _: &mut Context<Self>,
+        size: Size,
     ) -> Option<impl IntoElement> {
         if !has_icon {
             return None;
@@ -1320,7 +1326,7 @@ impl PopupMenu {
             Icon::empty()
         };
 
-        Some(icon.with_default_size(Size::XSmall))
+        Some(icon.with_default_size(size))
     }
 
     /// Calculate the anchor corner and left offset for child submenu
@@ -1364,6 +1370,7 @@ impl PopupMenu {
         cx: &mut Context<Self>,
     ) -> MenuItemElement {
         let has_left_icon = options.has_left_icon;
+        let icon_size = options.icon_size;
         let is_left_check = options.check_side.is_left() && item.is_checked();
         let right_check_icon = if options.check_side.is_right() && item.is_checked() {
             Some(Icon::new(IconName::Check).xsmall())
@@ -1438,7 +1445,7 @@ impl PopupMenu {
                     .cursor_default()
                     .items_center()
                     .gap_x_1()
-                    .children(Self::render_icon(has_left_icon, false, None, window, cx))
+                    .children(Self::render_icon(has_left_icon, false, None, icon_size))
                     .child(div().flex_1().child(label.clone())),
             ),
             PopupMenuItem::ElementItem {
@@ -1463,8 +1470,7 @@ impl PopupMenu {
                             has_left_icon,
                             is_left_check,
                             icon.clone(),
-                            window,
-                            cx,
+                            icon_size,
                         ))
                         .child((render)(window, cx))
                         .children(right_check_icon.map(|icon| icon.ml_3())),
@@ -1493,8 +1499,7 @@ impl PopupMenu {
                     has_left_icon,
                     is_left_check,
                     icon.clone(),
-                    window,
-                    cx,
+                    icon_size,
                 ))
                 .child(
                     h_flex()
@@ -1545,8 +1550,7 @@ impl PopupMenu {
                             has_left_icon,
                             false,
                             icon.clone(),
-                            window,
-                            cx,
+                            icon_size,
                         ))
                         .child(
                             h_flex()
@@ -1600,6 +1604,7 @@ impl Focusable for PopupMenu {
 #[derive(Clone, Copy)]
 struct RenderOptions {
     has_left_icon: bool,
+    icon_size: Size,
     check_side: Side,
     radius: Pixels,
 }
@@ -1648,6 +1653,11 @@ impl Render for PopupMenu {
 
         let options = RenderOptions {
             has_left_icon,
+            icon_size: if self.in_context_menu {
+                Size::Size(rems(0.75).to_pixels(window.rem_size()) + px(2.))
+            } else {
+                Size::XSmall
+            },
             check_side: self.check_side,
             radius: px(4.),
         };

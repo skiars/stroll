@@ -359,6 +359,60 @@ fn dismissed_menu_restores_focus_and_does_not_capture_clicks_while_fading(
     assert!(!activated.get());
 }
 
+#[gpui::test]
+fn context_menu_reserves_two_extra_pixels_for_leading_icons(cx: &mut gpui::TestAppContext) {
+    use gpui::{
+        AppContext as _, Context, InteractiveElement as _, IntoElement, MouseButton,
+        ParentElement as _, Render, Styled, VisualTestContext, Window, div, px,
+    };
+    use gpui_component::{
+        Icon, IconName, Root, Sizable as _,
+        menu::{ContextMenuExt as _, PopupMenuItem},
+    };
+
+    struct Probe;
+
+    impl Render for Probe {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let label = |id: &'static str| {
+                PopupMenuItem::element(move |_, _| {
+                    div().id(id).debug_selector(move || id.into()).child(id)
+                })
+            };
+            div()
+                .id("icon-size-probe")
+                .size_full()
+                .context_menu(move |menu, window, _| {
+                    let original_size = window.rem_size() * 0.75;
+                    menu.item(label("default-icon").icon(IconName::Copy))
+                        .item(label("empty-icon"))
+                        .item(
+                            label("explicit-icon")
+                                .icon(Icon::new(IconName::Copy).with_size(original_size)),
+                        )
+                })
+                .shared_layer()
+        }
+    }
+
+    cx.update(gpui_component::init);
+    let (_, cx) = cx.add_window_view(|window, cx| {
+        let probe = cx.new(|_| Probe);
+        Root::new(probe, window, cx)
+    });
+    cx.simulate_mouse_down(
+        point(px(28.), px(28.)),
+        MouseButton::Right,
+        Default::default(),
+    );
+    VisualTestContext::update(cx, |window, cx| {
+        window.draw(cx).clear(cx);
+    });
+    let mut left = |id| cx.debug_bounds(id).expect("context menu label").left();
+    assert_eq!(left("default-icon"), left("empty-icon"));
+    assert_eq!(left("default-icon") - left("explicit-icon"), px(2.));
+}
+
 #[cfg(target_os = "linux")]
 #[gpui::test]
 fn popup_material_uses_the_web_theme_colors_and_filter(cx: &mut gpui::TestAppContext) {

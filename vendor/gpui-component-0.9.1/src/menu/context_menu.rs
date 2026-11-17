@@ -506,6 +506,7 @@ fn open_menu(
                     .filter(|input| input.focus_handle(cx).is_focused(window))
                     .or(previous_selection_input);
             let menu = PopupMenu::build(window, cx, move |menu, window, cx| {
+                let menu = menu.in_context_menu();
                 let Some(build) = &builder else {
                     return menu;
                 };

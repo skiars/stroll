@@ -479,13 +479,13 @@ impl GitPanel {
                                 );
                                 let path = directory.clone();
                                 menu = menu.item(
-                                    PopupMenuItem::new(t!("git.copy_directory")).on_click(
-                                        move |_, _, cx| {
+                                    PopupMenuItem::new(t!("git.copy_directory"))
+                                        .icon(IconName::Link2)
+                                        .on_click(move |_, _, cx| {
                                             cx.write_to_clipboard(ClipboardItem::new_string(
                                                 path.clone(),
                                             ));
-                                        },
-                                    ),
+                                        }),
                                 );
                                 for (staged, label) in [
                                     (true, t!("git.stage_directory")),
@@ -497,6 +497,11 @@ impl GitPanel {
                                         let view = context_view.clone();
                                         menu = menu.item(
                                             PopupMenuItem::new(label)
+                                                .icon(if staged {
+                                                    IconName::Plus
+                                                } else {
+                                                    IconName::Minus
+                                                })
                                                 .disabled(stage_busy)
                                                 .on_click(move |_, window, cx| {
                                                     _ = view.update(cx, |this, cx| {
@@ -581,6 +586,7 @@ impl GitPanel {
                                 let editor_path = path.clone();
                                 menu = menu.item(
                                     PopupMenuItem::new(t!("git.open_in_editor"))
+                                        .icon(IconName::FileInput)
                                         .disabled(!can_open)
                                         .on_click(move |_, window, cx| {
                                             _ = view.update(cx, |panel, cx| {
@@ -597,14 +603,14 @@ impl GitPanel {
                                     let view = menu_view.clone();
                                     let docs_path = path.clone();
                                     menu = menu.item(
-                                        PopupMenuItem::new(t!("tabs.open_in_docs")).on_click(
-                                            move |_, window, cx| {
+                                        PopupMenuItem::new(t!("tabs.open_in_docs"))
+                                            .icon(IconName::BookOpen)
+                                            .on_click(move |_, window, cx| {
                                                 _ = view.update(cx, |panel, cx| {
                                                     panel
                                                         .open_diff_markdown(&docs_path, window, cx);
                                                 });
-                                            },
-                                        ),
+                                            }),
                                     );
                                 }
                                 menu = append_system_menu(
@@ -617,13 +623,13 @@ impl GitPanel {
                                 );
                                 let copy_path = path.clone();
                                 menu = menu.item(
-                                    PopupMenuItem::new(t!("git.copy_file_path")).on_click(
-                                        move |_, _, cx| {
+                                    PopupMenuItem::new(t!("git.copy_file_path"))
+                                        .icon(IconName::Link2)
+                                        .on_click(move |_, _, cx| {
                                             cx.write_to_clipboard(ClipboardItem::new_string(
                                                 copy_path.clone(),
                                             ));
-                                        },
-                                    ),
+                                        }),
                                 );
                                 for (paths, staged, label) in [
                                     (&stage, true, t!("git.stage_file")),
@@ -634,6 +640,11 @@ impl GitPanel {
                                         let paths = paths.clone();
                                         menu = menu.item(
                                             PopupMenuItem::new(label)
+                                                .icon(if staged {
+                                                    IconName::Plus
+                                                } else {
+                                                    IconName::Minus
+                                                })
                                                 .disabled(stage_busy)
                                                 .on_click(move |_, window, cx| {
                                                     _ = view.update(cx, |this, cx| {
@@ -1094,6 +1105,7 @@ fn tree_restore_item(
     let owner = owner.clone();
     Some(
         PopupMenuItem::new(format!("{label}…"))
+            .icon(IconName::RotateCcw)
             .disabled(busy)
             .on_click(move |_, window, cx| {
                 _ = owner.update(cx, |panel, cx| {

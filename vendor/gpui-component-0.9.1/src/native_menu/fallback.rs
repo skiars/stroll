@@ -88,7 +88,8 @@ fn build_popup(
     window: &mut Window,
     cx: &mut App,
 ) -> Entity<PopupMenu> {
-    PopupMenu::build(window, cx, move |mut menu, window, cx| {
+    PopupMenu::build(window, cx, move |menu, window, cx| {
+        let mut menu = menu.in_context_menu();
         if let Some(handle) = action_context.clone() {
             menu = menu.action_context(handle);
         }

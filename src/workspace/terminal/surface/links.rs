@@ -3,6 +3,7 @@ use gpui_component::{
     menu::{PopupMenu, PopupMenuItem},
     tooltip::{ManagedTooltipExt as _, Tooltip, TooltipRequest},
 };
+use gpui_kit_assets::IconName;
 use rust_i18n::t;
 
 use crate::terminal::{Emulator, Link};
@@ -128,6 +129,7 @@ impl Session {
         let mut menu = menu
             .item(
                 PopupMenuItem::new(t!("terminal.copy"))
+                    .icon(IconName::Copy)
                     .disabled(terminal.selection_text().is_none())
                     .on_click(move |_, _, cx| {
                         _ = copy.update(cx, |this, cx| this.copy_selection(cx));
@@ -135,6 +137,7 @@ impl Session {
             )
             .item(
                 PopupMenuItem::new(t!("terminal.paste"))
+                    .icon(IconName::ClipboardPaste)
                     .disabled(!terminal.can_paste())
                     .on_click(move |_, _, cx| {
                         _ = paste.update(cx, |this, cx| this.paste_clipboard(cx));
@@ -148,9 +151,11 @@ impl Session {
                     target.to_string(),
                 ))
                 .item(
-                    PopupMenuItem::new(t!("terminal.copy_link")).on_click(move |_, _, cx| {
-                        cx.write_to_clipboard(ClipboardItem::new_string(target.to_string()));
-                    }),
+                    PopupMenuItem::new(t!("terminal.copy_link"))
+                        .icon(IconName::Link2)
+                        .on_click(move |_, _, cx| {
+                            cx.write_to_clipboard(ClipboardItem::new_string(target.to_string()));
+                        }),
                 );
         }
         menu

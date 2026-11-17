@@ -68,6 +68,28 @@ enum TreeAction {
     Collapse,
 }
 
+impl TreeAction {
+    fn icon(self) -> IconName {
+        match self {
+            Self::Open(true) => IconName::FileInput,
+            Self::Open(false) => IconName::Pin,
+            Self::OpenInDocs => IconName::BookOpen,
+            Self::PreviewAudio => IconName::Play,
+            Self::SaveCopy => IconName::Download,
+            Self::Create(false) => IconName::FilePlus,
+            Self::Create(true) => IconName::FolderPlus,
+            Self::CopyPath(_) => IconName::Link2,
+            Self::CopyEntry(false) => IconName::Copy,
+            Self::CopyEntry(true) => IconName::Scissors,
+            Self::PasteEntry => IconName::ClipboardPaste,
+            Self::Rename => IconName::Pencil,
+            Self::Delete => IconName::Trash,
+            Self::Refresh => IconName::RefreshCw,
+            Self::Collapse => IconName::ChevronsDownUp,
+        }
+    }
+}
+
 pub(super) fn tree_menu(
     element: Stateful<Div>,
     entry: Option<Entry>,
@@ -113,11 +135,12 @@ pub(super) fn tree_menu(
                     )
                     .separator();
             }
-            let item = |action, label: SharedString, enabled: bool| {
+            let item = |action: TreeAction, label: SharedString, enabled: bool| {
                 let workspace = workspace.clone();
                 let repo = repo.clone();
                 let entry = entry.clone();
                 PopupMenuItem::new(label)
+                    .icon(action.icon())
                     .disabled(!enabled)
                     .on_click(move |_, window, cx| {
                         _ = workspace.update(cx, |this, cx| {

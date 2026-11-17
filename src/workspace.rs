@@ -7,6 +7,7 @@ mod documents;
 mod edit_history;
 mod editor_git;
 mod file_drop;
+mod file_icons;
 mod file_tabs;
 mod file_tree;
 mod git_history;
@@ -35,6 +36,7 @@ mod window_bounds;
 
 pub use window_bounds::{repository_window_bounds, standalone_window_bounds};
 
+use file_icons::file_type_icon;
 use git_panel::GitPanel;
 use language_service::{LanguageService, ServerKey, ServerProject};
 use repository_ui::RepositoryUi;
@@ -3394,14 +3396,26 @@ impl Workspace {
                     .flatten();
                 let glyph = if entry.directory {
                     if row.expanded {
-                        IconName::FolderOpen
+                        Some(IconName::FolderOpen)
                     } else {
-                        IconName::Folder
+                        Some(IconName::Folder)
                     }
                 } else if entry.symlink {
-                    IconName::Link
+                    Some(IconName::Link)
                 } else {
-                    IconName::FileText
+                    None
+                };
+                let entry_icon = match glyph {
+                    Some(glyph) => icon(
+                        glyph,
+                        if selected {
+                            colors.accent
+                        } else {
+                            colors.muted
+                        },
+                        15.,
+                    ),
+                    None => file_type_icon(&entry.path, colors, 15.),
                 };
                 let element = h_flex()
                     .id(SharedString::from(row_id.clone()))
@@ -3434,15 +3448,7 @@ impl Workspace {
                             this.tree_click(clicked.clone(), event, window, cx)
                         });
                     })
-                    .child(icon(
-                        glyph,
-                        if selected {
-                            colors.accent
-                        } else {
-                            colors.muted
-                        },
-                        15.,
-                    ))
+                    .child(entry_icon)
                     .child(
                         div()
                             .min_w_0()
@@ -3980,7 +3986,9 @@ impl Workspace {
     /// the row of buttons it replaced.
     fn workspace_actions(&self, cx: &Context<Self>) -> impl IntoElement {
         let view = cx.weak_entity();
-        let editing = self.active_file().is_some();
+        let editor = self
+            .active_file()
+            .map(|file| file.editor.read(cx).focus_handle(cx));
         let standalone = self.standalone.is_some();
         div()
             .debug_selector(|| "workspace-actions-trigger".into())
@@ -3994,13 +4002,19 @@ impl Workspace {
                 .tooltip_placement(Placement::Bottom)
                 .dropdown_menu_with_anchor(
                     Anchor::TopRight,
-                    move |mut menu, _, _| {
+                    move |mut menu, window, _| {
                         let view = view.clone();
-                        if editing {
+                        let action_icon = |name| {
+                            Icon::new(name)
+                                .with_size(rems(0.75).to_pixels(window.rem_size()) + px(2.))
+                        };
+                        if let Some(editor) = &editor {
+                            menu = menu.action_context(editor.clone());
                             let save = view.clone();
                             menu = menu.item(
                                 PopupMenuItem::new(t!("common.save"))
-                                    .icon(IconName::Save)
+                                    .icon(action_icon(IconName::Save))
+                                    .action(Box::new(SaveFile))
                                     .on_click(move |_, window, cx| {
                                         _ = save.update(cx, |this, cx| {
                                             this.save(&SaveFile, window, cx)
@@ -4010,7 +4024,8 @@ impl Workspace {
                             let find = view.clone();
                             menu = menu.item(
                                 PopupMenuItem::new(t!("common.find"))
-                                    .icon(IconName::Search)
+                                    .icon(action_icon(IconName::Search))
+                                    .action(Box::new(Search))
                                     .on_click(move |_, window, _| {
                                         // Let the menu restore its own focus before
                                         // the editor takes it for the search field.
@@ -4029,7 +4044,8 @@ impl Workspace {
                         }
                         menu.item(
                             PopupMenuItem::new(t!("workspace.toggle_terminal"))
-                                .icon(IconName::Terminal)
+                                .icon(action_icon(IconName::Terminal))
+                                .action(Box::new(ToggleTerminal))
                                 .on_click(move |_, window, _| {
                                     // Let the menu restore its own focus before the terminal takes it.
                                     let view = view.clone();
