@@ -113,6 +113,8 @@ impl Render for PaneDrag {
 
 const FILE_TOOLBAR_HEIGHT: Pixels = px(36.);
 const PANE_RESIZE_GUTTER: Pixels = px(5.);
+const PANE_SHADOW_OPACITY: f32 = 0.09;
+const DARK_PANE_DIVIDER: u32 = 0x3d4048;
 const RECENT_REPOSITORY_LIMIT: usize = 3;
 const EDITOR_JUMP_CONTEXT_LINES: usize = 5;
 
@@ -131,6 +133,41 @@ pub(crate) fn panel_resize(id: &'static str, edge: HandleEdge, top: Pixels) -> i
                 .inside(edge)
                 .on_drag(PaneDrag { edge }, |drag, _, _, cx| cx.new(|_| *drag)),
         )
+}
+
+fn pane_edge(edge: HandleEdge, top: Pixels, mode: ThemeMode) -> impl IntoElement {
+    let line = px(1.);
+    let (inset, width, background) = if mode.is_dark() {
+        (px(0.), line, rgb(DARK_PANE_DIVIDER).into())
+    } else {
+        let black = Hsla::black();
+        let (start, end) = match edge {
+            HandleEdge::Leading => (black.opacity(PANE_SHADOW_OPACITY), black.opacity(0.)),
+            HandleEdge::Trailing => (black.opacity(0.), black.opacity(PANE_SHADOW_OPACITY)),
+        };
+        (
+            line,
+            PANE_RESIZE_GUTTER - line,
+            linear_gradient(
+                90.,
+                linear_color_stop(start, 0.),
+                linear_color_stop(end, 1.),
+            ),
+        )
+    };
+    // Paint inside the resize band without inserting a hitbox over the handle.
+    let edge_paint = canvas(
+        |_, _, _| (),
+        move |bounds, (), window, _| window.paint_quad(fill(bounds, background)),
+    )
+    .absolute()
+    .top(top)
+    .bottom_0()
+    .w(width);
+    match edge {
+        HandleEdge::Leading => edge_paint.left(inset),
+        HandleEdge::Trailing => edge_paint.right(inset),
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -3617,6 +3654,11 @@ impl Workspace {
                 HandleEdge::Trailing,
                 FILE_TOOLBAR_HEIGHT,
             ))
+            .child(pane_edge(
+                HandleEdge::Trailing,
+                FILE_TOOLBAR_HEIGHT,
+                cx.theme().mode,
+            ))
     }
 
     fn editor_font_family(&self, cx: &App) -> SharedString {
@@ -4523,6 +4565,179 @@ mod tests {
         highlighter::{HighlightTheme, SyntaxHighlighter},
     };
     use std::path::Path;
+
+    #[gpui::test]
+    fn file_tree_edge_paints_inside_the_resize_band(cx: &mut gpui::TestAppContext) {
+        use super::*;
+
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path().join("repo");
+        assert!(
+            std::process::Command::new("git")
+                .args(["init", "-q"])
+                .arg(&root)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let repository = Arc::new(Repository::open(&root).unwrap());
+        let store = Arc::new(Store::new(fixture.path().join("state")).unwrap());
+        let config = ConfigFile::load(Some(fixture.path().join("config.toml")));
+        cx.update(gpui_component::init);
+        let (workspace, visual) = cx.add_window_view(move |window, cx| {
+            let mut workspace =
+                Workspace::with_config(store, config, WorkspaceView::Editor, window, cx);
+            workspace.repository = Some(repository);
+            workspace
+        });
+        visual.simulate_resize(size(px(800.), px(600.)));
+
+        let black = Hsla::black();
+        let gradient = linear_gradient(
+            90.,
+            linear_color_stop(black.opacity(0.), 0.),
+            linear_color_stop(black.opacity(0.09), 1.),
+        );
+        let shadow = visual.update(|window, cx| {
+            apply_theme(ThemeMode::Light, cx);
+            window.draw(cx).clear(cx);
+            window
+                .painted_quads()
+                .into_iter()
+                .find(|quad| quad.background == gradient)
+                .expect("light theme paints the file tree shadow")
+                .bounds
+        });
+        let drag_start = visual.update(|window, cx| {
+            let scale = window.scale_factor();
+            assert_eq!(px(shadow.size.width.0 / scale), px(4.));
+            apply_theme(ThemeMode::Dark, cx);
+            window.draw(cx).clear(cx);
+            let quads = window.painted_quads();
+            assert!(quads.iter().all(|quad| quad.background != gradient));
+            let line = quads
+                .iter()
+                .find(|quad| quad.background == Background::from(rgb(0x3d4048)))
+                .expect("dark theme paints a brighter divider")
+                .bounds;
+            assert_eq!(px(line.size.width.0 / scale), px(1.));
+            assert_eq!(shadow.right(), line.left());
+            assert_eq!(shadow.top(), line.top());
+            assert_eq!(shadow.bottom(), line.bottom());
+            point(
+                px(line.left().0 / scale - 2.),
+                px(line.center().y.0 / scale),
+            )
+        });
+        let initial_width = visual.update(|_, cx| workspace.read(cx).editor_tree_width);
+        visual.simulate_mouse_down(drag_start, MouseButton::Left, Modifiers::default());
+        for offset in [10., 40.] {
+            visual.simulate_mouse_move(
+                point(drag_start.x + px(offset), drag_start.y),
+                Some(MouseButton::Left),
+                Modifiers::default(),
+            );
+            visual.update(|window, cx| window.draw(cx).clear(cx));
+        }
+        visual.simulate_mouse_up(
+            point(drag_start.x + px(40.), drag_start.y),
+            MouseButton::Left,
+            Modifiers::default(),
+        );
+        assert!(visual.update(|_, cx| workspace.read(cx).editor_tree_width) > initial_width);
+    }
+
+    #[gpui::test]
+    fn git_side_pane_shadows_stay_outside_the_diff(cx: &mut gpui::TestAppContext) {
+        use super::*;
+
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path().join("repo");
+        assert!(
+            std::process::Command::new("git")
+                .args(["init", "-q"])
+                .arg(&root)
+                .status()
+                .unwrap()
+                .success()
+        );
+        std::fs::write(root.join("changed.txt"), "Added line\n").unwrap();
+        let repository = Arc::new(Repository::open(&root).unwrap());
+        let store = Arc::new(Store::new(fixture.path().join("state")).unwrap());
+        let config = ConfigFile::load(Some(fixture.path().join("config.toml")));
+        cx.update(gpui_component::init);
+        let (_, visual) = cx.add_window_view(move |window, cx| {
+            let mut workspace =
+                Workspace::with_config(store, config, WorkspaceView::Git, window, cx);
+            workspace.repository = Some(repository);
+            workspace.open_git_panel(window, cx);
+            workspace
+        });
+        visual.simulate_resize(size(px(1280.), px(800.)));
+        visual.run_until_parked();
+
+        let gradient = |start, end| {
+            let black = Hsla::black();
+            linear_gradient(
+                90.,
+                linear_color_stop(black.opacity(start), 0.),
+                linear_color_stop(black.opacity(end), 1.),
+            )
+        };
+        let shadows = visual.update(|window, cx| {
+            apply_theme(ThemeMode::Light, cx);
+            window.draw(cx).clear(cx);
+            let quads = window.painted_quads();
+            [gradient(0., 0.09), gradient(0.09, 0.)].map(|gradient| {
+                quads
+                    .iter()
+                    .find(|quad| quad.background == gradient)
+                    .expect("each visible side pane paints an inward shadow")
+                    .bounds
+            })
+        });
+        let divider = Background::from(rgb(0x3d4048));
+        visual.update(|window, cx| {
+            apply_theme(ThemeMode::Dark, cx);
+            window.draw(cx).clear(cx);
+            let quads = window.painted_quads();
+            assert!(quads.iter().all(|quad| {
+                quad.background != gradient(0., 0.09) && quad.background != gradient(0.09, 0.)
+            }));
+            let mut lines: Vec<_> = quads
+                .iter()
+                .filter(|quad| quad.background == divider)
+                .map(|quad| quad.bounds)
+                .collect();
+            lines.sort_by(|a, b| a.left().0.total_cmp(&b.left().0));
+            let [history_line, tree_line] = lines.as_slice() else {
+                panic!("dark theme paints two dividers");
+            };
+            for (shadow, line) in shadows.iter().zip(&lines) {
+                let scale = window.scale_factor();
+                assert_eq!(shadow.size.width.0 / scale, 4.);
+                assert_eq!(line.size.width.0 / scale, 1.);
+                assert_eq!(shadow.top(), line.top());
+                assert_eq!(shadow.bottom(), line.bottom());
+            }
+            assert_eq!(shadows[0].right(), history_line.left());
+            assert_eq!(shadows[1].left(), tree_line.right());
+            assert!(history_line.right() < tree_line.left());
+        });
+
+        visual.simulate_resize(size(px(900.), px(800.)));
+        visual.update(|window, cx| {
+            window.draw(cx).clear(cx);
+            assert_eq!(
+                window
+                    .painted_quads()
+                    .iter()
+                    .filter(|quad| quad.background == divider)
+                    .count(),
+                1,
+            );
+        });
+    }
 
     #[gpui::test]
     fn appearance_fonts_follow_theme_changes_and_reset(cx: &mut gpui::TestAppContext) {

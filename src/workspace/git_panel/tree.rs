@@ -947,6 +947,11 @@ impl GitPanel {
                 HandleEdge::Leading,
                 super::GIT_TOOLBAR_HEIGHT,
             ))
+            .child(super::pane_edge(
+                HandleEdge::Leading,
+                super::GIT_TOOLBAR_HEIGHT,
+                cx.theme().mode,
+            ))
     }
 
     fn set_directories(&mut self, closed: bool, cx: &mut Context<Self>) {

@@ -7,7 +7,7 @@ default-run = "stroll"
 
 [features]
 default = ["desktop"]
-desktop = ["dep:glob", "dep:alacritty_terminal", "dep:gpui", "dep:gpui_platform", "dep:gpui-component", "dep:gpui-kit-assets", "dep:toml_edit", "dep:markdown", "dep:merman", "dep:ratex-layout", "dep:ratex-parser", "dep:ratex-svg", "dep:percent-encoding", "dep:ratex-types", "dep:roxmltree", "dep:sys-locale", "dep:blocking", "dep:image", "dep:ureq", "dep:shlex", "dep:similar", "dep:chrono", "dep:keyring", "dep:giallo", "dep:jsonc-parser", "dep:tree-sitter", "dep:objc2", "dep:objc2-app-kit", "dep:objc2-foundation"]
+desktop = ["dep:glob", "dep:alacritty_terminal", "dep:gpui", "dep:gpui_platform", "dep:gpui-base", "dep:gpui-component", "dep:gpui-kit-assets", "dep:toml_edit", "dep:markdown", "dep:merman", "dep:ratex-layout", "dep:ratex-parser", "dep:ratex-svg", "dep:percent-encoding", "dep:ratex-types", "dep:roxmltree", "dep:sys-locale", "dep:blocking", "dep:image", "dep:ureq", "dep:shlex", "dep:similar", "dep:chrono", "dep:keyring", "dep:giallo", "dep:jsonc-parser", "dep:tree-sitter", "dep:objc2", "dep:objc2-app-kit", "dep:objc2-foundation"]
 
 [[bin]]
 name = "stroll"
@@ -30,6 +30,7 @@ blocking = { version = "1.6", optional = true }
 futures-channel = "0.3"
 gpui = { package = "gpui-pre", version = "=0.3.12", optional = true }
 gpui_platform = { package = "gpui-pre-platform", version = "=0.3.12", features = ["font-kit", "x11", "wayland", "runtime_shaders"], optional = true }
+gpui-base = { version = "=0.9.1", path = "vendor/gpui-base-0.9.1", optional = true }
 gpui-component = { version = "=0.9.1", features = [
     "tree-sitter-bash",
     "tree-sitter-c",

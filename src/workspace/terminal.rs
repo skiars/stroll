@@ -2,9 +2,10 @@ use rust_i18n::t;
 
 mod surface;
 
-use std::{collections::HashMap, path::PathBuf};
+use std::{collections::HashMap, path::PathBuf, time::Duration};
 
 use gpui::{prelude::FluentBuilder as _, *};
+use gpui_base::motion::{Easing, Transition, TransitionState};
 use gpui_component::{
     ActiveTheme, Disableable as _, ElementExt as _, InteractiveElementExt as _, Selectable as _,
     StyledExt as _, WindowExt as _,
@@ -19,8 +20,8 @@ use gpui_kit_assets::IconName;
 use crate::{repository::Store, terminal::Process};
 
 use super::{
-    NextTab, Palette, PreviousTab, ToggleTerminal, Workspace, WorkspaceView, compact_icon_button,
-    icon_button,
+    DARK_PANE_DIVIDER, NextTab, PANE_SHADOW_OPACITY, Palette, PreviousTab, ToggleTerminal,
+    Workspace, WorkspaceView, compact_icon_button, icon_button,
 };
 use surface::{Session, SessionEvent, Status};
 
@@ -52,6 +53,7 @@ struct Tab {
     session: Entity<Session>,
     focus: FocusHandle,
     close_focus: FocusHandle,
+    indicator: TransitionState<f32>,
     _subscription: Subscription,
 }
 
@@ -252,6 +254,7 @@ impl Workspace {
             session,
             focus: cx.focus_handle().tab_stop(true),
             close_focus: cx.focus_handle().tab_stop(true),
+            indicator: TransitionState::default(),
             _subscription: subscription,
         });
         panel.open = true;
@@ -498,6 +501,7 @@ impl Workspace {
 
         let toolbar = h_flex()
             .id("terminal-toolbar")
+            .debug_selector(|| "terminal-toolbar".into())
             .relative()
             .w_full()
             .h(px(28.))
@@ -618,7 +622,30 @@ impl Workspace {
                     el.flex_shrink_0()
                         .h(height)
                         .border_t_1()
-                        .border_color(colors.border)
+                        .border_color(if dark {
+                            rgb(DARK_PANE_DIVIDER).into()
+                        } else {
+                            colors.border
+                        })
+                })
+                .when(!panel.maximized && !dark, |el| {
+                    let black = Hsla::black();
+                    let shadow = linear_gradient(
+                        180.,
+                        linear_color_stop(black.opacity(PANE_SHADOW_OPACITY), 0.),
+                        linear_color_stop(black.opacity(0.), 1.),
+                    );
+                    el.child(
+                        canvas(
+                            |_, _, _| (),
+                            move |bounds, (), window, _| window.paint_quad(fill(bounds, shadow)),
+                        )
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .right_0()
+                        .h(px(4.)),
+                    )
                 })
                 .child(toolbar)
                 .child(
@@ -691,6 +718,8 @@ impl Workspace {
         let scroll = panel.scroll.clone();
         let active = panel.active;
         let len = panel.tabs.len();
+        let indicator_transition = Transition::new(Duration::from_millis(150))
+            .easing(Easing::cubic_bezier(0.2, 0., 0., 1.).expect("valid tab easing"));
         let root = self.repository.as_ref().unwrap().root.clone();
         let status_error: Hsla = rgb(if cx.theme().mode == gpui_component::ThemeMode::Dark {
             0xe68a8c
@@ -755,6 +784,8 @@ impl Workspace {
                     Status::Exited(_) | Status::Failed(_)
                 );
                 let close_label = t!("terminal.close_session", number = number).into_owned();
+                let indicator = tab.indicator.clone();
+                let transition = indicator_transition.clone();
                 h_flex()
                     .id(("terminal-tab", number as usize))
                     .relative()
@@ -814,18 +845,29 @@ impl Workspace {
                                 this.close_terminal(&root, number, true, window, cx)
                             })),
                     )
-                    .when(selected, |el| {
-                        el.child(
-                            div()
-                                .absolute()
-                                .left(px(6.))
-                                .right(px(6.))
-                                .bottom(px(1.))
-                                .h(px(2.))
-                                .rounded_full()
-                                .bg(colors.accent),
+                    .child(
+                        canvas(
+                            |_, _, _| (),
+                            move |mut bounds, (), window, cx| {
+                                let opacity = indicator
+                                    .sample(if selected { 1. } else { 0. }, transition, window, cx)
+                                    .value;
+                                if opacity > 0. {
+                                    let inset = bounds.size.width * (0.15 * (1. - opacity));
+                                    bounds.origin.x += inset;
+                                    bounds.size.width -= inset * 2.;
+                                    let mut bar = fill(bounds, colors.accent.opacity(opacity));
+                                    bar.corner_radii = px(1.).into();
+                                    window.paint_quad(bar);
+                                }
+                            },
                         )
-                    })
+                        .absolute()
+                        .left(px(6.))
+                        .right(px(6.))
+                        .bottom(px(1.))
+                        .h(px(2.)),
+                    )
             }));
         h_flex()
             .relative()

@@ -1271,6 +1271,146 @@ mod tests {
         }
     }
 
+    #[gpui::test]
+    fn terminal_divider_and_active_indicator_follow_theme_and_motion(cx: &mut TestAppContext) {
+        use gpui::{linear_color_stop, linear_gradient};
+        use gpui_component::ThemeMode;
+
+        use crate::workspace::{DARK_PANE_DIVIDER, PANE_SHADOW_OPACITY, Palette, apply_theme};
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("repo");
+        assert!(
+            std::process::Command::new("git")
+                .args(["init", "-q"])
+                .arg(&root)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let repo = Arc::new(Repository::open(&root).unwrap());
+        let store = Arc::new(Store::new(temp.path().join("state")).unwrap());
+        let config = ConfigFile::load(Some(temp.path().join("config.toml")));
+        cx.update(gpui_component::init);
+        let mut workspace = None;
+        let (_, visual) = cx.add_window_view(|window, cx| {
+            let view = cx.new(|cx| {
+                let mut view =
+                    Workspace::with_config(store, config, WorkspaceView::Editor, window, cx);
+                view.repository = Some(repo);
+                view
+            });
+            view.update(cx, |view, cx| {
+                apply_theme(ThemeMode::Light, cx);
+                cx.set_reduce_motion(false);
+                view.show_terminal(window, cx);
+                view.create_terminal(window, cx);
+                for tab in &view.current_terminal().unwrap().tabs {
+                    tab.session.update(cx, |session, _| session.pending = None);
+                }
+            });
+            workspace = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        let workspace = workspace.unwrap();
+        visual.simulate_resize(size(px(1000.), px(760.)));
+
+        let paint_indicators = |visual: &mut VisualTestContext| {
+            visual.update(|window, cx| {
+                window.simulate_next_frame(cx);
+                window.draw(cx).clear(cx);
+            });
+            let toolbar = visual.debug_bounds("terminal-toolbar").unwrap();
+            visual.update(|window, cx| {
+                let accent = Palette::for_mode(cx.theme().mode).accent;
+                let scale = window.scale_factor();
+                let mut bars: Vec<_> = window
+                    .painted_quads()
+                    .iter()
+                    .filter_map(|quad| {
+                        let color = quad.background.as_solid()?;
+                        (color == accent.opacity(color.a)
+                            && quad.bounds.size.height.0 == 2. * scale
+                            && quad.bounds.bottom().0
+                                == ((toolbar.bottom() - px(1.)).as_f32() * scale).round())
+                        .then_some((quad.bounds, color.a))
+                    })
+                    .collect();
+                bars.sort_by(|(a, _), (b, _)| a.left().0.total_cmp(&b.left().0));
+                bars
+            })
+        };
+        let settled = paint_indicators(visual);
+        assert_eq!(settled.len(), 1);
+        assert_eq!(settled[0].1, 1.);
+        let select = |visual: &mut VisualTestContext, index| {
+            visual.update(|window, cx| {
+                workspace.update(cx, |view, cx| {
+                    view.select_terminal(index, false, window, cx)
+                });
+            });
+        };
+        select(visual, 0);
+        paint_indicators(visual);
+        visual.executor().advance_clock(Duration::from_millis(75));
+        let switching = paint_indicators(visual);
+        assert_eq!(switching.len(), 2);
+        assert!(switching.iter().all(|(_, alpha)| (0. ..1.).contains(alpha)));
+        assert!(switching[1].0.size.width < settled[0].0.size.width);
+        visual.executor().advance_clock(Duration::from_millis(75));
+        let settled = paint_indicators(visual);
+        assert_eq!(settled.len(), 1);
+        assert!(switching[0].0.size.width < settled[0].0.size.width);
+
+        let black = Hsla::black();
+        let shadow = linear_gradient(
+            180.,
+            linear_color_stop(black.opacity(PANE_SHADOW_OPACITY), 0.),
+            linear_color_stop(black.opacity(0.), 1.),
+        );
+        visual.update(|window, cx| {
+            let quads = window.painted_quads();
+            let shadow = quads.iter().find(|quad| quad.background == shadow).unwrap();
+            let scale = window.scale_factor();
+            assert_eq!(shadow.bounds.size.height.0, 4. * scale);
+            assert!(shadow.bounds.bottom() < settled[0].0.top());
+            apply_theme(ThemeMode::Dark, cx);
+            cx.set_reduce_motion(true);
+        });
+        select(visual, 1);
+        assert_eq!(paint_indicators(visual).len(), 1);
+        visual.update(|window, cx| {
+            let quads = window.painted_quads();
+            assert!(quads.iter().all(|quad| quad.background != shadow));
+            let divider = Hsla::from(rgb(DARK_PANE_DIVIDER));
+            let scale = window.scale_factor();
+            let top_border = quads
+                .iter()
+                .find(|quad| quad.border_color == divider && quad.border_widths.top.0 == scale)
+                .unwrap();
+            assert!(top_border.bounds.top() < settled[0].0.top());
+            workspace.update(cx, |view, cx| {
+                view.current_terminal_mut().unwrap().maximized = true;
+                cx.notify();
+            });
+            window.draw(cx).clear(cx);
+            assert!(
+                window
+                    .painted_quads()
+                    .iter()
+                    .all(|quad| quad.border_color != divider)
+            );
+            apply_theme(ThemeMode::Light, cx);
+            window.draw(cx).clear(cx);
+            assert!(
+                window
+                    .painted_quads()
+                    .iter()
+                    .all(|quad| quad.background != shadow)
+            );
+        });
+    }
+
     #[test]
     fn ctrl_tab_cycles_only_the_focused_terminal_tabs() -> anyhow::Result<()> {
         let temp = tempfile::tempdir()?;

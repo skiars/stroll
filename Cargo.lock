@@ -7370,6 +7370,7 @@ dependencies = [
  "giallo",
  "glob",
  "globset",
+ "gpui-base",
  "gpui-component",
  "gpui-kit-assets",
  "gpui-pre",

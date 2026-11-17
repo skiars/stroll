@@ -1,4 +1,4 @@
-use super::{PaneDrag, panel_resize};
+use super::{PaneDrag, pane_edge, panel_resize};
 use rust_i18n::t;
 
 mod editor;
@@ -1599,6 +1599,11 @@ impl GitPanel {
                 "git-resize-history",
                 HandleEdge::Trailing,
                 GIT_TOOLBAR_HEIGHT,
+            ))
+            .child(pane_edge(
+                HandleEdge::Trailing,
+                GIT_TOOLBAR_HEIGHT,
+                cx.theme().mode,
             ))
     }
 
