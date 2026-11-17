@@ -734,10 +734,10 @@ impl GitPanel {
                                     t!("git.close_files_index"),
                                     false,
                                 )
+                                .debug_selector(|| "git-close-files".into())
                                 .on_click(cx.listener(
                                     |this, _, _, cx| {
-                                        this.show_tree = false;
-                                        cx.notify();
+                                        this.set_tree_visible(false, cx);
                                     },
                                 )),
                             ),

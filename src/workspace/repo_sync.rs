@@ -77,7 +77,7 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         if self.view != WorkspaceView::Editor
-            || !self.editor_tree_visible
+            || !self.session.panels.editor_tree
             || self.tree_edit.is_some()
         {
             return;

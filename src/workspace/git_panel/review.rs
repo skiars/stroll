@@ -2317,12 +2317,12 @@ impl GitPanel {
 
     pub(super) fn review_panel(
         &mut self,
-        tree_visible: bool,
-        width: Pixels,
+        layout: PaneLayout,
         colors: Palette,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
+        let width = layout.center;
         let summary_height = if let Some(review) = &self.review
             && self.snapshot.is_none()
         {
@@ -2368,7 +2368,7 @@ impl GitPanel {
             .min_w_0()
             .min_h_0()
             .overflow_hidden()
-            .child(self.review_toolbar(tree_visible, width < px(650.), cx, colors))
+            .child(self.review_toolbar(layout, cx, colors))
             .when_some(self.detail_error.clone(), |panel, error| {
                 panel.child(
                     h_flex()
@@ -2442,11 +2442,16 @@ impl GitPanel {
 
     fn review_toolbar(
         &self,
-        tree_visible: bool,
-        compact: bool,
+        layout: PaneLayout,
         cx: &Context<Self>,
         colors: Palette,
     ) -> impl IntoElement {
+        let compact = layout.center < px(650.);
+        let PaneLayout {
+            show_history,
+            show_tree,
+            ..
+        } = layout;
         let review = self.review.as_ref();
         let has_changes = review.is_some_and(|review| !review.detail.files.is_empty());
 
@@ -2464,17 +2469,14 @@ impl GitPanel {
                     "git-toggle-history",
                     IconName::PanelLeft,
                     t!("git.history"),
-                    self.show_history,
+                    show_history,
                 )
-                .on_click(cx.listener(|this, _, window, cx| {
-                    this.show_history = !this.show_history;
-                    if this.show_history && window.viewport_size().width < px(1000.) {
-                        this.show_tree = false;
-                    }
-                    cx.notify();
+                .debug_selector(|| "git-toggle-history".into())
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.set_history_visible(!show_history, cx);
                 })),
             )
-            .when(!self.show_history, |row| {
+            .when(!show_history, |row| {
                 row.child(
                     icon_control(
                         "git-refresh-center",
@@ -2531,14 +2533,11 @@ impl GitPanel {
                         "git-toggle-files",
                         IconName::ListTree,
                         t!("git.files_index"),
-                        tree_visible,
+                        show_tree,
                     )
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.show_tree = !tree_visible;
-                        if this.show_tree && window.viewport_size().width < px(1000.) {
-                            this.show_history = false;
-                        }
-                        cx.notify();
+                    .debug_selector(|| "git-toggle-files".into())
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.set_tree_visible(!show_tree, cx);
                     })),
                 )
             })

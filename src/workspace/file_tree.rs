@@ -655,6 +655,9 @@ impl Workspace {
             }
         }
         self.tabs.remap(&map);
+        if let Some(history) = self.source_history_mut() {
+            history.remap(&map);
+        }
         self.expanded = self.expanded.iter().map(|path| map(path)).collect();
         self.docs_expanded = self.docs_expanded.iter().map(|path| map(path)).collect();
         self.session.documents = std::mem::take(&mut self.session.documents)
@@ -703,6 +706,15 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         let previous = self.tabs.active().map(Path::to_owned);
+        if matches!(
+            self.loading_file,
+            Some((_, super::FileOpen::History { .. }))
+        ) {
+            self.cancel_file_open();
+        }
+        if let Some(history) = self.source_history_mut() {
+            history.remove(target);
+        }
         for path in paths {
             if let Some(file) = self.files.remove(&path) {
                 let mut pending = file.draft_write.lock().unwrap();

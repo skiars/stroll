@@ -69,7 +69,14 @@ impl Workspace {
             self.session_revision += 1;
         }
         if let Some(panel) = &self.git {
-            let message = panel.read(cx).commit_draft(cx);
+            let panel = panel.read(cx);
+            let (history, tree) = panel.panel_visibility();
+            if self.session.panels.git_history != history || self.session.panels.git_tree != tree {
+                self.session.panels.git_history = history;
+                self.session.panels.git_tree = tree;
+                self.session_revision += 1;
+            }
+            let message = panel.commit_draft(cx);
             let draft = (!message.is_empty()).then_some(message.as_str());
             if self.session.commit_draft.as_deref() != draft {
                 self.session.commit_draft = draft.map(str::to_owned);
@@ -163,18 +170,34 @@ impl Workspace {
 }
 
 fn file_position(editor: &EditorState) -> Option<FilePosition> {
-    let (top, inset) = editor.viewport_anchor()?;
+    Some(file_position_at(editor, editor.viewport_anchor()?))
+}
+
+pub(super) fn source_file_position(
+    editor: &EditorState,
+    pending: Option<FilePosition>,
+) -> FilePosition {
+    let mut position = file_position_at(editor, editor.viewport_anchor().unwrap_or_default());
+    if let Some(pending) = pending {
+        position.top = pending.top;
+        position.inset = pending.inset;
+        position.horizontal = pending.horizontal;
+    }
+    position
+}
+
+fn file_position_at(editor: &EditorState, (top, inset): (Position, Pixels)) -> FilePosition {
     let selection = editor.selected_range();
     let start = editor.text().offset_to_position(selection.start);
     let end = editor.text().offset_to_position(selection.end);
-    Some(FilePosition {
+    FilePosition {
         selection_start: (start.line, start.character),
         selection_end: (end.line, end.character),
         reversed: editor.is_selection_reversed(),
         top: (top.line, top.character),
         inset: inset.into(),
         horizontal: editor.scroll_offset().x.into(),
-    })
+    }
 }
 
 pub(super) fn restore_file_selection(

@@ -23,6 +23,7 @@ mod repo_sync;
 mod repository_ui;
 mod session;
 mod settings;
+mod source_history;
 mod standalone;
 mod terminal;
 mod toast;
@@ -400,6 +401,10 @@ enum FileOpen {
         position: Option<SourcePosition>,
     },
     Locate(Option<(std::ops::Range<usize>, [u8; 32])>),
+    History {
+        index: usize,
+        position: Option<FilePosition>,
+    },
     Startup,
     Restore,
 }
@@ -580,8 +585,6 @@ pub struct Workspace {
     standalone: Option<PathBuf>,
     docs_tree_width: Pixels,
     editor_tree_width: Pixels,
-    docs_tree_visible: bool,
-    editor_tree_visible: bool,
     pub(crate) outline_width: Pixels,
     pub(crate) outline_visibility: Option<bool>,
     language_servers: HashMap<ServerKey, LanguageService>,
@@ -594,6 +597,7 @@ pub struct Workspace {
     tree_scroll: UniformListScrollHandle,
     tree_motion: std::cell::RefCell<tree_motion::TreeMotion<TreeRow>>,
     tabs: TabSession,
+    source_histories: HashMap<Vec<u8>, source_history::SourceHistory>,
     files: HashMap<PathBuf, OpenFile>,
     tab_scroll: ScrollHandle,
     tab_viewport_width: Pixels,
@@ -687,6 +691,7 @@ impl Workspace {
     ) -> Self {
         let repository_mode = standalone.is_none();
         Self::bind_git_history_keys(cx);
+        Self::bind_source_navigation_keys(cx);
         let focus = cx.focus_handle();
         focus.focus(window, cx);
         cx.on_app_quit(|this, cx| {
@@ -746,8 +751,6 @@ impl Workspace {
             standalone,
             docs_tree_width: px(240.),
             editor_tree_width: px(240.),
-            docs_tree_visible: true,
-            editor_tree_visible: true,
             outline_width: px(195.),
             outline_visibility: None,
             language_servers: HashMap::new(),
@@ -760,6 +763,7 @@ impl Workspace {
             tree_scroll: UniformListScrollHandle::new(),
             tree_motion: Default::default(),
             tabs: TabSession::default(),
+            source_histories: HashMap::new(),
             files: HashMap::new(),
             tab_scroll: ScrollHandle::new(),
             tab_viewport_width: px(0.),
@@ -1221,8 +1225,9 @@ impl Workspace {
             .as_ref()
             .is_some_and(|current| current.storage_key() == repo.storage_key())
         {
-            // The target session was read before flushing the current draft.
+            // The target session was read before flushing the current UI state.
             session.commit_draft = self.session.commit_draft.take();
+            session.panels = self.session.panels;
         }
         self.tabs = session.tabs.clone();
         self.session = session;
@@ -1837,9 +1842,7 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if matches!(request, FileOpen::Select { .. } | FileOpen::Locate(_))
-            && self.terminal_maximized()
-        {
+        if !matches!(request, FileOpen::Startup | FileOpen::Restore) && self.terminal_maximized() {
             self.restore_terminal_split();
             cx.notify();
         }
@@ -1847,6 +1850,11 @@ impl Workspace {
             && loading == &path
         {
             match request {
+                FileOpen::Select { .. } | FileOpen::Locate(_)
+                    if matches!(pending, FileOpen::History { .. }) =>
+                {
+                    *pending = request;
+                }
                 FileOpen::Select {
                     preview: true,
                     position: None,
@@ -1859,7 +1867,9 @@ impl Workspace {
                 } => match pending {
                     FileOpen::Select { preview, .. } => *preview = false,
                     FileOpen::Locate(_) => {}
-                    FileOpen::Startup | FileOpen::Restore => *pending = request,
+                    FileOpen::History { .. } | FileOpen::Startup | FileOpen::Restore => {
+                        *pending = request
+                    }
                 },
                 _ => *pending = request,
             }
@@ -1887,13 +1897,7 @@ impl Workspace {
             if !self.images.contains_key(&path) {
                 self.load_image_tab(path.clone(), window, cx);
             }
-            let preview = match request {
-                FileOpen::Select { preview, .. } => preview,
-                FileOpen::Locate(_) => false,
-                FileOpen::Startup | FileOpen::Restore => true,
-            };
-            self.select_file_tab(&path, preview, window, cx);
-            self.locator_visit(&path);
+            self.select_loaded_file(path, request, window, cx);
             return;
         }
         let load = if let Some(repo) = self.repository.clone() {
@@ -1935,7 +1939,9 @@ impl Workspace {
                                 }
                             }
                             FileOpen::Startup => this.restore_active_file(window, cx),
-                            FileOpen::Select { .. } | FileOpen::Locate(_) => {}
+                            FileOpen::Select { .. }
+                            | FileOpen::Locate(_)
+                            | FileOpen::History { .. } => {}
                         }
                         this.show_error(error, window, cx);
                         cx.notify();
@@ -1953,15 +1959,22 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let (preview, position, location) = match request {
-            FileOpen::Select { preview, position } => (preview, position, None),
-            FileOpen::Locate(location) => (false, None, location),
-            FileOpen::Startup | FileOpen::Restore => (true, None, None),
+        let navigate = self.view == WorkspaceView::Editor
+            && !matches!(request, FileOpen::Startup | FileOpen::Restore);
+        let source = navigate.then(|| self.source_location(cx)).flatten();
+        let same_file = self.tabs.active() == Some(path.as_path());
+        let (preview, position, location, replay) = match request {
+            FileOpen::Select { preview, position } => (preview, position, None, None),
+            FileOpen::Locate(location) => (false, None, location, None),
+            FileOpen::History { index, position } => (true, None, None, Some((index, position))),
+            FileOpen::Startup | FileOpen::Restore => (true, None, None, None),
         };
         self.select_file_tab(&path, preview, window, cx);
-        if let Some(position) = position {
+        if let Some(position) = position
+            && let Some(file) = self.files.get(&path)
+        {
             use gpui_component::input::RopeExt as _;
-            let text = self.files[&path].editor.read(cx).text();
+            let text = file.editor.read(cx).text();
             let offset = match position {
                 SourcePosition::Lsp(position) => lsp::editor_position(text, position)
                     .map(|position| text.position_to_offset(&position)),
@@ -1973,7 +1986,13 @@ impl Workspace {
                     offset
                 }
                 SourcePosition::Diff(source) => {
-                    self.reveal_diff_source(path.clone(), source, window, cx);
+                    self.reveal_diff_source(
+                        path.clone(),
+                        source,
+                        navigate && same_file,
+                        window,
+                        cx,
+                    );
                     None
                 }
             };
@@ -1985,8 +2004,9 @@ impl Workspace {
                 });
             }
         }
-        if let Some((range, fingerprint)) = location {
-            let file = self.files.get_mut(&path).unwrap();
+        if let Some((range, fingerprint)) = location
+            && let Some(file) = self.files.get_mut(&path)
+        {
             file.restore_position = None;
             let applied = file.editor.update(cx, |editor, cx| {
                 let text = editor.text();
@@ -2002,6 +2022,11 @@ impl Workspace {
                 toast::info(window, cx, t!("locator.stale"));
             }
         }
+        if let Some((index, position)) = replay {
+            self.complete_source_replay(&path, index, position, source, cx);
+        } else if navigate {
+            self.record_source_navigation(source, cx);
+        }
         self.locator_visit(&path);
     }
 
@@ -2009,6 +2034,7 @@ impl Workspace {
         &mut self,
         path: PathBuf,
         source: DiffSource,
+        record_delayed_jump: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -2038,6 +2064,9 @@ impl Workspace {
                 {
                     return;
                 }
+                let source = record_delayed_jump
+                    .then(|| this.source_location(cx))
+                    .flatten();
                 let Some(file) = this
                     .files
                     .get_mut(&path)
@@ -2056,6 +2085,9 @@ impl Workspace {
                     row
                 };
                 Self::reveal_diff_row(file, target, window, cx);
+                if record_delayed_jump {
+                    this.record_source_navigation(source, cx);
+                }
             });
         });
     }
@@ -3425,12 +3457,9 @@ impl Workspace {
                             IconName::PanelLeftClose,
                             t!("workspace.hide_file_tree"),
                         )
+                        .debug_selector(|| "hide-file-tree".into())
                         .on_click(cx.listener(|this, _, _, cx| {
-                            if this.view == WorkspaceView::Docs {
-                                this.docs_tree_visible = false;
-                            } else {
-                                this.editor_tree_visible = false;
-                            }
+                            this.set_file_tree_visible(false);
                             cx.notify();
                         })),
                     );
@@ -3725,9 +3754,9 @@ impl Workspace {
 
     fn show_file_tree_button(&self, cx: &Context<Self>) -> Option<Button> {
         let visible = if self.view == WorkspaceView::Docs {
-            self.docs_tree_visible
+            self.session.panels.docs_tree
         } else {
-            self.editor_tree_visible
+            self.session.panels.editor_tree
         };
         (!visible && self.standalone.is_none()).then(|| {
             icon_button(
@@ -3735,16 +3764,27 @@ impl Workspace {
                 IconName::PanelLeftOpen,
                 t!("workspace.show_file_tree"),
             )
+            .debug_selector(|| "show-file-tree".into())
             .on_click(cx.listener(|this, _, window, cx| {
-                if this.view == WorkspaceView::Docs {
-                    this.docs_tree_visible = true;
-                } else {
-                    this.editor_tree_visible = true;
+                this.set_file_tree_visible(true);
+                if this.view == WorkspaceView::Editor {
                     this.resume_tree_reveal(window, cx);
                 }
                 cx.notify();
             }))
         })
+    }
+
+    fn set_file_tree_visible(&mut self, visible: bool) {
+        let state = if self.view == WorkspaceView::Docs {
+            &mut self.session.panels.docs_tree
+        } else {
+            &mut self.session.panels.editor_tree
+        };
+        if *state != visible {
+            *state = visible;
+            self.session_revision += 1;
+        }
     }
 
     fn workspace_body(
@@ -3757,9 +3797,9 @@ impl Workspace {
         let width = window.viewport_size().width;
         let tree_limit = (width * 0.42).max(px(160.));
         let (visible, tree_width) = if docs {
-            (self.docs_tree_visible, self.docs_tree_width)
+            (self.session.panels.docs_tree, self.docs_tree_width)
         } else {
-            (self.editor_tree_visible, self.editor_tree_width)
+            (self.session.panels.editor_tree, self.editor_tree_width)
         };
         v_flex()
             .flex_1()
@@ -4004,6 +4044,8 @@ impl Render for Workspace {
             .when(self.view == WorkspaceView::Editor && !switching, |view| {
                 view.key_context("WorkspaceEditor")
                     .on_action(cx.listener(Self::find_references))
+                    .on_action(cx.listener(Self::source_back))
+                    .on_action(cx.listener(Self::source_forward))
                     .on_action(cx.listener(Self::format_document))
                     .on_action(cx.listener(Self::close_active_tab))
                     .on_action(cx.listener(|this, _: &NextTab, window, cx| {

@@ -784,6 +784,7 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let source = self.source_location(cx);
         let Some(file) = self.files.get_mut(path) else {
             return;
         };
@@ -803,6 +804,7 @@ impl Workspace {
                 let offset = editor.text().line_start_offset(caret_line);
                 reveal_editor_range(editor, offset..offset, Some(line), window, cx);
             });
+            self.record_source_navigation(source, cx);
         }
         cx.notify();
     }

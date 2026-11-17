@@ -30,8 +30,29 @@ pub(crate) struct WorktreeSession {
     // None represents a session saved before the first visit to the document list.
     pub open_documents: Option<Vec<OpenDocument>>,
     pub git: Option<GitSession>,
+    pub panels: PanelVisibility,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub commit_draft: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub(crate) struct PanelVisibility {
+    pub editor_tree: bool,
+    pub docs_tree: bool,
+    pub git_history: bool,
+    pub git_tree: bool,
+}
+
+impl Default for PanelVisibility {
+    fn default() -> Self {
+        Self {
+            editor_tree: true,
+            docs_tree: true,
+            git_history: true,
+            git_tree: true,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

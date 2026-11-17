@@ -17,6 +17,164 @@ fn settle(visual: &mut VisualTestContext) {
 }
 
 #[::core::prelude::v1::test]
+fn worktree_panel_preferences_survive_compact_layout_switching_and_reopen() {
+    use crate::{config::ConfigFile, repository::Repository, session::PanelVisibility};
+    use gpui_component::Root;
+
+    let fixture = tempfile::tempdir().unwrap();
+    let root = fixture.path().join("repo");
+    let other = fixture.path().join("other");
+    fs::create_dir(&root).unwrap();
+    git(&root, &["init", "-qb", "main"]);
+    fs::write(root.join("code.txt"), "original\n").unwrap();
+    fs::write(root.join("guide.md"), "# Guide\n").unwrap();
+    git(&root, &["add", "."]);
+    git(
+        &root,
+        &[
+            "-c",
+            "user.name=Reviewer",
+            "-c",
+            "user.email=reviewer@example.invalid",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-qm",
+            "initial",
+        ],
+    );
+    git(
+        &root,
+        &["worktree", "add", "-qb", "other", other.to_str().unwrap()],
+    );
+    for path in [&root, &other] {
+        fs::write(path.join("code.txt"), "changed\n").unwrap();
+    }
+    let store = Arc::new(Store::new(fixture.path().join("state")).unwrap());
+    let config = fixture.path().join("config.toml");
+    let mut app = TestAppContext::build_with_text_system(
+        TestDispatcher::new(0),
+        None,
+        gpui_platform::current_platform(true).text_system(),
+    );
+    app.update(gpui_component::init);
+
+    fn make_window<'a>(
+        app: &'a mut TestAppContext,
+        store: &Arc<Store>,
+        config: &Path,
+    ) -> (Entity<Workspace>, &'a mut VisualTestContext) {
+        let mut workspace = None;
+        let (_, visual) = app.add_window_view(|window, cx| {
+            let view = cx.new(|cx| {
+                Workspace::with_startup_view(
+                    store.clone(),
+                    ConfigFile::load(Some(config.to_owned())),
+                    Some(WorkspaceView::Git),
+                    window,
+                    cx,
+                )
+            });
+            workspace = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        visual.simulate_resize(size(px(1280.), px(760.)));
+        (workspace.unwrap(), visual)
+    }
+    let open = |workspace: &Entity<Workspace>, visual: &mut VisualTestContext, path: &Path| {
+        visual.update(|window, cx| {
+            workspace.update(cx, |workspace, cx| {
+                workspace.open_repository(
+                    Location {
+                        root: path.to_owned(),
+                        file: None,
+                    },
+                    window,
+                    cx,
+                );
+            });
+        });
+        settle(visual);
+        visual.update(|_, cx| {
+            let workspace = workspace.read(cx);
+            assert_eq!(workspace.repository.as_ref().unwrap().root, path);
+            assert!(workspace.git.as_ref().unwrap().read(cx).review.is_some());
+        });
+    };
+    let click = |visual: &mut VisualTestContext, name: &'static str| {
+        let bounds = visual
+            .debug_bounds(name)
+            .unwrap_or_else(|| panic!("Missing control {name}"));
+        visual.simulate_click(bounds.center(), Modifiers::default());
+        settle(visual);
+    };
+    let panes = |visual: &mut VisualTestContext| {
+        (
+            visual.debug_bounds("git-history-toolbar").is_some(),
+            visual.debug_bounds("git-tree-toolbar").is_some(),
+        )
+    };
+    let switch = |workspace: &Entity<Workspace>, visual: &mut VisualTestContext, view| {
+        visual.update(|window, cx| {
+            workspace.update(cx, |workspace, cx| workspace.switch_view(view, window, cx));
+        });
+        settle(visual);
+    };
+
+    let (workspace, visual) = make_window(&mut app, &store, &config);
+    open(&workspace, visual, &root);
+    assert_eq!(panes(visual), (true, true));
+    visual.simulate_resize(size(px(760.), px(760.)));
+    settle(visual);
+    assert_eq!(panes(visual), (true, false));
+    click(visual, "git-toggle-files");
+    assert_eq!(panes(visual), (false, true));
+    visual.simulate_resize(size(px(1280.), px(760.)));
+    settle(visual);
+    assert_eq!(panes(visual), (true, true));
+    click(visual, "git-hide-history");
+    click(visual, "git-close-files");
+    assert_eq!(panes(visual), (false, false));
+    switch(&workspace, visual, WorkspaceView::Editor);
+    click(visual, "hide-file-tree");
+    assert!(visual.debug_bounds("show-file-tree").is_some());
+    switch(&workspace, visual, WorkspaceView::Docs);
+    click(visual, "hide-file-tree");
+    assert!(visual.debug_bounds("show-file-tree").is_some());
+    switch(&workspace, visual, WorkspaceView::Git);
+
+    open(&workspace, visual, &other);
+    assert_eq!(panes(visual), (true, true));
+    switch(&workspace, visual, WorkspaceView::Editor);
+    assert!(visual.debug_bounds("hide-file-tree").is_some());
+    switch(&workspace, visual, WorkspaceView::Docs);
+    assert!(visual.debug_bounds("hide-file-tree").is_some());
+    switch(&workspace, visual, WorkspaceView::Git);
+    open(&workspace, visual, &root);
+    assert_eq!(panes(visual), (false, false));
+    assert_eq!(
+        store
+            .session(&Repository::open(&root).unwrap())
+            .unwrap()
+            .panels,
+        PanelVisibility {
+            editor_tree: false,
+            docs_tree: false,
+            git_history: false,
+            git_tree: false
+        },
+    );
+
+    let (reopened, visual) = make_window(&mut app, &store, &config);
+    open(&reopened, visual, &root);
+    assert_eq!(panes(visual), (false, false));
+    for view in [WorkspaceView::Editor, WorkspaceView::Docs] {
+        switch(&reopened, visual, view);
+        assert!(visual.debug_bounds("show-file-tree").is_some());
+    }
+}
+
+#[::core::prelude::v1::test]
 fn diff_file_and_row_menus_reveal_worktree_lines() {
     use gpui_component::{Root, WindowExt as _, input::RopeExt as _};
 

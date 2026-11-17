@@ -212,6 +212,14 @@ enum PaneKind {
     Tree,
 }
 
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+enum CompactPane {
+    #[default]
+    History,
+    Tree,
+    HistoryDismissed,
+}
+
 struct GitPane {
     panel: WeakEntity<GitPanel>,
     kind: PaneKind,
@@ -228,7 +236,7 @@ impl Render for GitPane {
                         .history_panel(window, cx, colors, layout.history)
                         .into_any_element(),
                     PaneKind::Review => panel
-                        .review_panel(layout.show_tree, layout.center, colors, window, cx)
+                        .review_panel(layout, colors, window, cx)
                         .into_any_element(),
                     PaneKind::Tree => panel
                         .tree_panel(layout.tree, colors, window, cx)
@@ -243,6 +251,7 @@ struct PaneLayout {
     history: Pixels,
     tree: Pixels,
     center: Pixels,
+    show_history: bool,
     show_tree: bool,
 }
 
@@ -310,6 +319,7 @@ pub(super) struct GitPanel {
     wrap: bool,
     show_history: bool,
     show_tree: bool,
+    compact_pane: CompactPane,
     history_width: Pixels,
     tree_width: Pixels,
     show_details: bool,
@@ -571,8 +581,9 @@ impl GitPanel {
             whitespace: config.ignore_whitespace,
             split: config.diff_layout == DiffLayout::Split,
             wrap: config.soft_wrap,
-            show_history: true,
-            show_tree: true,
+            show_history: session.panels.git_history,
+            show_tree: session.panels.git_tree,
+            compact_pane: CompactPane::default(),
             history_width: px(300.),
             tree_width: px(280.),
             show_details: false,
@@ -1080,7 +1091,7 @@ impl GitPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.show_history
+        if self.layout(window.viewport_size().width).show_history
             && self.history_page_error.is_none()
             && self.history_error.is_none()
             && self.commits.len() + 1 == count
@@ -1092,6 +1103,26 @@ impl GitPanel {
 
     pub(super) fn commit_draft(&self, cx: &App) -> SharedString {
         self.commit_message.read(cx).value()
+    }
+
+    pub(super) fn panel_visibility(&self) -> (bool, bool) {
+        (self.show_history, self.show_tree)
+    }
+
+    fn set_history_visible(&mut self, visible: bool, cx: &mut Context<Self>) {
+        self.show_history = visible;
+        if visible {
+            self.compact_pane = CompactPane::History;
+        }
+        cx.notify();
+    }
+
+    fn set_tree_visible(&mut self, visible: bool, cx: &mut Context<Self>) {
+        self.show_tree = visible;
+        if visible {
+            self.compact_pane = CompactPane::Tree;
+        }
+        cx.notify();
     }
 
     pub(super) fn session(&self, cx: &App) -> Option<GitSession> {
@@ -1409,10 +1440,10 @@ impl GitPanel {
                                     t!("git.close_history"),
                                     false,
                                 )
+                                .debug_selector(|| "git-hide-history".into())
                                 .on_click(cx.listener(
                                     |this, _, _, cx| {
-                                        this.show_history = false;
-                                        cx.notify();
+                                        this.set_history_visible(false, cx);
                                     },
                                 )),
                             ),
@@ -1590,7 +1621,7 @@ impl GitPanel {
         };
         self.load_review(selection, false, window, cx);
         if window.viewport_size().width < px(850.) {
-            self.show_history = false;
+            self.compact_pane = CompactPane::HistoryDismissed;
             cx.notify();
         }
     }
@@ -1604,15 +1635,19 @@ impl GitPanel {
         let tree = self
             .tree_width
             .clamp(px(215.), (width * 0.32).max(px(215.)));
-        let show_tree =
-            self.show_tree && self.review.is_some() && (width >= px(1000.) || !self.show_history);
+        let has_tree = self.show_tree && self.review.is_some();
+        let show_history = self.show_history
+            && !(width < px(1000.) && self.compact_pane == CompactPane::Tree && has_tree)
+            && !(width < px(850.) && self.compact_pane == CompactPane::HistoryDismissed);
+        let show_tree = has_tree && (width >= px(1000.) || !show_history);
         let center = width
-            - if self.show_history { history } else { px(0.) }
+            - if show_history { history } else { px(0.) }
             - if show_tree { tree } else { px(0.) };
         PaneLayout {
             history,
             tree,
             center,
+            show_history,
             show_tree,
         }
     }
@@ -1667,7 +1702,7 @@ impl Render for GitPanel {
                     cx.notify();
                 }),
             )
-            .when(self.show_history, |panel| {
+            .when(layout.show_history, |panel| {
                 panel.child(
                     self.history_pane.clone().cached(
                         div()
