@@ -126,6 +126,20 @@ impl Workspace {
         self.navigate_source(true, window, cx);
     }
 
+    pub(super) fn source_mouse_down(
+        &mut self,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let MouseButton::Navigate(direction) = event.button else {
+            return;
+        };
+        // Preserve the focused input when GPUI handles the mouse-down event.
+        window.prevent_default();
+        self.navigate_source(direction == NavigationDirection::Forward, window, cx);
+    }
+
     fn navigate_source(&mut self, forward: bool, window: &mut Window, cx: &mut Context<Self>) {
         let (source_focused, composing) = self.active_file().map_or((false, false), |file| {
             let editor = file.editor.read(cx);

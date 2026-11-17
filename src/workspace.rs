@@ -4047,6 +4047,7 @@ impl Render for Workspace {
                     .on_action(cx.listener(Self::find_references))
                     .on_action(cx.listener(Self::source_back))
                     .on_action(cx.listener(Self::source_forward))
+                    .capture_any_mouse_down(cx.listener(Self::source_mouse_down))
                     .on_action(cx.listener(Self::format_document))
                     .on_action(cx.listener(Self::close_active_tab))
                     .on_action(cx.listener(|this, _: &NextTab, window, cx| {

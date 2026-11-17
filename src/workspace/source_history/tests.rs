@@ -148,6 +148,11 @@ fn source_history_replays_files_jumps_and_worktree_positions() -> Result<()> {
             .position
             .unwrap()
     };
+    let press_side_button = |visual: &mut VisualTestContext, direction| {
+        let pointer = visual.debug_bounds("workspace-editor").unwrap().center();
+        visual.simulate_mouse_down(pointer, MouseButton::Navigate(direction), Modifiers::none());
+        pointer
+    };
 
     open(visual, &root, Some(alpha));
     wait_for(visual, |cx| active(cx, &root, alpha))?;
@@ -207,6 +212,7 @@ fn source_history_replays_files_jumps_and_worktree_positions() -> Result<()> {
         assert!(Editor::search_has_focus(&file.editor, window, cx));
     });
     visual.simulate_keystrokes("alt-left");
+    press_side_button(visual, NavigationDirection::Back);
     frame(visual);
     assert_eq!(visual.update(|_, cx| position(cx)), after_jump);
 
@@ -218,6 +224,7 @@ fn source_history_replays_files_jumps_and_worktree_positions() -> Result<()> {
     frame(visual);
     assert!(visual.update(|window, cx| workspace.read(cx).terminal_focused(window, cx)));
     visual.simulate_keystrokes("alt-left");
+    press_side_button(visual, NavigationDirection::Back);
     frame(visual);
     assert_eq!(
         visual.update(|_, cx| position(cx).selection_start),
@@ -235,11 +242,18 @@ fn source_history_replays_files_jumps_and_worktree_positions() -> Result<()> {
     });
     frame(visual);
 
-    visual.simulate_keystrokes("alt-left");
+    let pointer = press_side_button(visual, NavigationDirection::Back);
     wait_for(visual, |cx| {
         active(cx, &root, beta) && position(cx) == before_jump
     })?;
-    visual.simulate_keystrokes("alt-right");
+    visual.simulate_mouse_up(
+        pointer,
+        MouseButton::Navigate(NavigationDirection::Back),
+        Modifiers::none(),
+    );
+    frame(visual);
+    assert_eq!(visual.update(|_, cx| position(cx)), before_jump);
+    press_side_button(visual, NavigationDirection::Forward);
     wait_for(visual, |cx| {
         active(cx, &root, beta) && position(cx).selection_start == (110, 4)
     })?;
