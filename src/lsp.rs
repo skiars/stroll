@@ -82,6 +82,7 @@ struct ClientHandle {
     actions: Arc<Mutex<actions::Capabilities>>,
     references: Arc<AtomicBool>,
     completion: Arc<Mutex<Option<CompletionOptions>>>,
+    signature: Arc<Mutex<Option<lsp_types::SignatureHelpOptions>>>,
 }
 
 impl Drop for ClientHandle {
@@ -141,6 +142,7 @@ impl Client {
         let actions = Arc::new(Mutex::new(actions::Capabilities::default()));
         let references = Arc::new(AtomicBool::new(false));
         let completion = Arc::new(Mutex::new(None));
+        let signature = Arc::new(Mutex::new(None));
         let progress = ActiveProgress::default();
         let handle = ClientHandle {
             events: events.clone(),
@@ -152,6 +154,7 @@ impl Client {
             actions: actions.clone(),
             references: references.clone(),
             completion: completion.clone(),
+            signature: signature.clone(),
         };
         thread::Builder::new()
             .name("lsp-session".into())
@@ -176,6 +179,7 @@ impl Client {
                         *actions.lock().unwrap() = actions::Capabilities::from(capabilities);
                         references.store(supports_references(capabilities), Ordering::Relaxed);
                         *completion.lock().unwrap() = capabilities.completion_provider.clone();
+                        *signature.lock().unwrap() = capabilities.signature_help_provider.clone();
                         let mut state = state.lock().unwrap();
                         if *state == SessionState::Starting {
                             *state = SessionState::Ready;
@@ -383,6 +387,37 @@ impl Document {
         Ok(serde_json::from_value(response.value)?)
     }
 
+    pub(crate) fn document_highlights(
+        &self,
+        text: Rope,
+        offset: usize,
+    ) -> impl Future<Output = Result<Vec<lsp_types::DocumentHighlight>>> + use<> {
+        let position = lsp_position(&text, offset);
+        let request = self.begin_request(Query::DocumentHighlights(position), text);
+        async move {
+            let response = request?.await.context("The LSP session is closed")??;
+            Ok(serde_json::from_value::<Option<Vec<_>>>(response.value)?.unwrap_or_default())
+        }
+    }
+
+    pub(crate) fn signature_options(&self) -> Option<lsp_types::SignatureHelpOptions> {
+        self.client.0.signature.lock().unwrap().clone()
+    }
+
+    pub(crate) fn signature_help(
+        &self,
+        text: Rope,
+        offset: usize,
+        context: lsp_types::SignatureHelpContext,
+    ) -> impl Future<Output = Result<Option<lsp_types::SignatureHelp>>> + use<> {
+        let position = lsp_position(&text, offset);
+        let request = self.begin_request(Query::SignatureHelp(position, context), text);
+        async move {
+            let response = request?.await.context("The LSP session is closed")??;
+            Ok(serde_json::from_value(response.value)?)
+        }
+    }
+
     pub async fn definitions(&self, text: Rope, offset: usize) -> Result<Vec<LocationLink>> {
         self.definitions_at_version(text, offset, None).await
     }
@@ -510,6 +545,8 @@ impl Document {
 enum Query {
     Completion(Position, CompletionContext),
     Hover(Position),
+    DocumentHighlights(Position),
+    SignatureHelp(Position, lsp_types::SignatureHelpContext),
     Definition(Position, Option<i32>),
     References(Position, bool),
     Tokens(Range),
@@ -662,6 +699,14 @@ impl Session {
                     },
                     "textDocument": {
                         "hover": { "contentFormat": ["markdown", "plaintext"] },
+                        "documentHighlight": {},
+                        "signatureHelp": {
+                            "contextSupport": true,
+                            "signatureInformation": {
+                                "parameterInformation": { "labelOffsetSupport": true },
+                                "activeParameterSupport": true
+                            }
+                        },
                         "completion": {
                             "contextSupport": true,
                             "completionItem": {
@@ -955,6 +1000,24 @@ impl Session {
         if matches!(query, Query::Tokens(_) | Query::InlayHints(_)) && reply.is_canceled() {
             return Ok(());
         }
+        let supported = match &query {
+            Query::DocumentHighlights(_) => self
+                .capabilities
+                .document_highlight_provider
+                .as_ref()
+                .is_some_and(|capability| *capability != OneOf::Left(false)),
+            Query::SignatureHelp(..) => self.capabilities.signature_help_provider.is_some(),
+            _ => true,
+        };
+        if !supported
+            || (matches!(
+                query,
+                Query::DocumentHighlights(_) | Query::SignatureHelp(..)
+            ) && reply.is_canceled())
+        {
+            _ = reply.send(Ok(Response::default()));
+            return Ok(());
+        }
         let supports_newline = match &query {
             Query::IndentOnType(_) => self
                 .capabilities
@@ -1108,6 +1171,15 @@ impl Session {
                 params["position"] = json!(position);
                 params["newName"] = json!(name);
                 (Some("textDocument/rename"), None)
+            }
+            Query::DocumentHighlights(position) => {
+                params["position"] = json!(position);
+                (Some("textDocument/documentHighlight"), None)
+            }
+            Query::SignatureHelp(position, context) => {
+                params["position"] = json!(position);
+                params["context"] = json!(context);
+                (Some("textDocument/signatureHelp"), None)
             }
             Query::Hover(position)
                 if self

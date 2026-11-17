@@ -111,7 +111,10 @@ impl Workspace {
             }
         }
         match self.view {
-            WorkspaceView::Editor => self.capture_active_file_position(cx),
+            WorkspaceView::Editor => {
+                self.capture_active_file_position(cx);
+                self.capture_source_viewport(cx);
+            }
             WorkspaceView::Docs => self.capture_document_position(cx),
             WorkspaceView::Git if !disconnected => {
                 if let Some(panel) = &self.git

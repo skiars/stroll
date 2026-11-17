@@ -1,25 +1,18 @@
-use std::{
-    collections::VecDeque,
-    path::{Path, PathBuf},
-};
+use std::path::{Path, PathBuf};
 
 use super::{
     FileOpen, Workspace, WorkspaceView,
     session::{restore_file_selection, source_file_position},
 };
-use crate::session::FilePosition;
+use crate::session::{FilePosition, SourceHistory, SourceLocation};
 use gpui::*;
 use gpui_component::{WindowExt as _, input::Position};
 
 const HISTORY_LIMIT: usize = 80;
+// Page and structural keyboard moves can create a stop. Ordinary line-by-line movement does not.
+const CARET_JUMP_LINES: u32 = 8;
 
 actions!(workspace, [SourceBack, SourceForward]);
-
-#[derive(Clone)]
-pub(super) struct SourceLocation {
-    path: PathBuf,
-    position: Option<FilePosition>,
-}
 
 impl SourceLocation {
     fn same_destination(&self, other: &Self) -> bool {
@@ -36,20 +29,22 @@ impl SourceLocation {
     }
 }
 
-#[derive(Default)]
-pub(super) struct SourceHistory {
-    entries: VecDeque<SourceLocation>,
-    index: usize,
-}
-
 impl SourceHistory {
+    pub(super) fn normalize(&mut self) {
+        while self.entries.len() > HISTORY_LIMIT {
+            self.entries.pop_front();
+            self.index = self.index.saturating_sub(1);
+        }
+        self.index = self.index.min(self.entries.len().saturating_sub(1));
+    }
+
     fn record(&mut self, source: Option<SourceLocation>, target: SourceLocation) {
         self.entries.truncate(self.index + 1);
         if let Some(source) = source {
             if let Some(current) = self
                 .entries
                 .back_mut()
-                .filter(|entry| entry.path == source.path)
+                .filter(|entry| entry.same_destination(&source))
             {
                 *current = source;
             } else {
@@ -66,7 +61,7 @@ impl SourceHistory {
     fn replay(&mut self, index: usize, source: Option<SourceLocation>) {
         if let Some(source) = source
             && let Some(current) = self.entries.get_mut(self.index)
-            && current.path == source.path
+            && current.same_destination(&source)
         {
             *current = source;
         }
@@ -166,9 +161,7 @@ impl Workspace {
             cx.propagate();
             return;
         }
-        let Some(history) = self.source_history() else {
-            return;
-        };
+        let history = &self.session.source_history;
         let cursor = match &self.loading_file {
             Some((_, FileOpen::History { index, .. })) => *index,
             _ => history.index,
@@ -199,14 +192,110 @@ impl Workspace {
         );
     }
 
-    fn source_history(&self) -> Option<&SourceHistory> {
-        self.source_histories
-            .get(self.repository.as_ref()?.storage_key())
+    pub(super) fn skip_missing_source(
+        &mut self,
+        path: &Path,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(history) = self.source_history_mut() {
+            let forward = index > history.index;
+            history.remove(path);
+            self.navigate_source(forward, window, cx);
+        }
     }
 
     pub(super) fn source_history_mut(&mut self) -> Option<&mut SourceHistory> {
-        self.source_histories
-            .get_mut(self.repository.as_ref()?.storage_key())
+        self.repository.as_ref()?;
+        self.session_revision += 1;
+        Some(&mut self.session.source_history)
+    }
+
+    pub(super) fn track_source_caret(
+        &mut self,
+        editor: &Entity<gpui_component::input::EditorState>,
+        window: &Window,
+        cx: &App,
+    ) {
+        if self.view != WorkspaceView::Editor || self.repository.is_none() {
+            return;
+        }
+        let Some(file) = self.active_file().filter(|file| file.editor == *editor) else {
+            return;
+        };
+        let state = editor.read(cx);
+        if file.restore_position.is_some()
+            || !state.focus_handle(cx).is_focused(window)
+            || state.is_composing()
+        {
+            return;
+        }
+
+        let Some(target) = self.source_location(cx) else {
+            return;
+        };
+        let revision = state.document_revision();
+        let previous = self.source_caret.replace((revision, target.clone()));
+        let Some((previous_revision, previous)) = previous else {
+            return;
+        };
+        let caret_row = |position: FilePosition| {
+            if position.reversed {
+                position.selection_start.0
+            } else {
+                position.selection_end.0
+            }
+        };
+        let crossed_lines = previous
+            .position
+            .zip(target.position)
+            .is_some_and(|(old, new)| caret_row(old).abs_diff(caret_row(new)) >= CARET_JUMP_LINES);
+        if previous.path == target.path
+            && previous_revision == revision
+            && self.source_click.is_none()
+            && crossed_lines
+            && !previous.same_destination(&target)
+        {
+            self.record_source_navigation(Some(previous), cx);
+        }
+    }
+
+    pub(super) fn begin_source_click(
+        &mut self,
+        event: &MouseDownEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if event.button == MouseButton::Left {
+            self.source_click = self
+                .active_file()
+                .zip(self.source_location(cx))
+                .map(|(file, source)| (file.editor.read(cx).document_revision(), source));
+        }
+    }
+
+    pub(super) fn end_source_click(
+        &mut self,
+        event: &MouseUpEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if event.button != MouseButton::Left {
+            return;
+        }
+        let Some((revision, source)) = self.source_click.take() else {
+            return;
+        };
+        if let Some(file) = self.active_file().filter(|file| file.path == source.path) {
+            let editor = file.editor.read(cx);
+            if editor.document_revision() == revision
+                && editor.focus_handle(cx).is_focused(window)
+                && !editor.is_composing()
+            {
+                self.record_source_navigation(Some(source), cx);
+            }
+        }
     }
 
     pub(super) fn source_location(&self, cx: &App) -> Option<SourceLocation> {
@@ -226,7 +315,7 @@ impl Workspace {
     }
 
     pub(super) fn record_source_navigation(&mut self, source: Option<SourceLocation>, cx: &App) {
-        let Some((repo, target)) = self.repository.as_ref().zip(self.source_location(cx)) else {
+        let Some(target) = self.source_location(cx) else {
             return;
         };
         if source
@@ -235,10 +324,30 @@ impl Workspace {
         {
             return;
         }
-        self.source_histories
-            .entry(repo.storage_key().to_vec())
-            .or_default()
-            .record(source, target);
+        let history = &mut self.session.source_history;
+        if history
+            .entries
+            .get(history.index)
+            .is_some_and(|entry| entry.same_destination(&target))
+        {
+            return;
+        }
+        history.record(source, target);
+        self.session_revision += 1;
+    }
+
+    pub(super) fn capture_source_viewport(&mut self, cx: &App) {
+        let Some(location) = self.source_location(cx) else {
+            return;
+        };
+        let history = &mut self.session.source_history;
+        if let Some(current) = history.entries.get_mut(history.index)
+            && current.same_destination(&location)
+            && *current != location
+        {
+            *current = location;
+            self.session_revision += 1;
+        }
     }
 
     pub(super) fn complete_source_replay(

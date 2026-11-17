@@ -334,3 +334,75 @@ fn workspace_completion_with_clangd() -> Result<()> {
         Ok(())
     })
 }
+
+#[test]
+fn workspace_caret_hints_use_the_latest_symbol_and_signature() -> Result<()> {
+    let fixture = tempfile::tempdir()?;
+    let script = fixture.path().join("server.py");
+    fs::write(
+        &script,
+        include_str!("../../../tests/fixtures/lsp_caret_hints.py"),
+    )?;
+    let command = format!("python3 -u {}", script.display());
+    let source = "/* 😀 */ value;\nvalue = 0;\ninvoke\n";
+    let files = fixture.path();
+    with_editor(
+        files,
+        &command,
+        source,
+        source.find("value").unwrap() + 1,
+        |visual, editor| {
+            wait(visual, "UTF-16 document highlight request", |_| {
+                files.join("highlight-requested").exists()
+            })?;
+            visual.update(|_, cx| {
+                editor.update(cx, |state, cx| {
+                    let caret = source.rfind("invoke").unwrap() + "invoke".len();
+                    state.set_selected_range(caret..caret, cx);
+                });
+            });
+            visual.simulate_input("(");
+            wait(visual, "signature popup from open parenthesis", |visual| {
+                files.join("triggered").exists()
+                    && visual.debug_bounds("editor-signature-help").is_some()
+            })?;
+            let bounds = visual.debug_bounds("editor-signature-help").unwrap();
+            assert!(bounds.left() >= px(0.) && bounds.top() >= px(0.));
+            visual.simulate_keystrokes("ctrl-space");
+            wait(visual, "completion while signature is active", |visual| {
+                labels(visual, editor) == ["candidate"]
+                    && visual.debug_bounds("editor-signature-help").is_none()
+            })?;
+            visual.simulate_keystrokes("escape");
+            wait(visual, "signature restored after completion", |visual| {
+                visual.debug_bounds("editor-signature-help").is_some()
+            })?;
+            visual.simulate_keystrokes("escape");
+            frame(visual);
+            assert!(visual.debug_bounds("editor-signature-help").is_none());
+            visual.simulate_keystrokes("ctrl-shift-space");
+            wait(visual, "explicit signature request", |visual| {
+                files.join("invoked").exists()
+                    && visual.debug_bounds("editor-signature-help").is_some()
+            })?;
+            visual.simulate_input("1");
+            visual.simulate_input(",");
+            wait(visual, "delayed comma response", |_| {
+                files.join("delayed").exists()
+            })?;
+            visual.update(|_, cx| {
+                editor.update(cx, |state, cx| state.set_selected_range(0..0, cx));
+            });
+            fs::write(files.join("release"), "")?;
+            wait(visual, "stale signature discarded", |visual| {
+                files.join("replied").exists()
+                    && visual.debug_bounds("editor-signature-help").is_none()
+            })?;
+            for _ in 0..8 {
+                frame(visual);
+                assert!(visual.debug_bounds("editor-signature-help").is_none());
+            }
+            Ok(())
+        },
+    )
+}

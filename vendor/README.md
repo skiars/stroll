@@ -176,3 +176,8 @@ dialogs in a Wayland window after changes to paint order or focus handling.
   projected diff hints, and stale language-service responses.
   Inlay hints use the light weight of the current editor font. The light and
   dark editor theme captures include a rendered hint.
+
+- The shared caret-anchored popup can prefer the space above the caret. The
+  workspace uses this placement for LSP signature help and hides the hint while
+  the completion or code-action menu is open. The workspace caret-hint test
+  exercises the shared popup in a headless window.

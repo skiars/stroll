@@ -3,7 +3,7 @@ mod code_action_menu;
 mod completion_menu;
 mod hover_popover;
 
-pub(crate) use caret_anchored::*;
+pub use caret_anchored::CaretAnchoredPopup;
 pub(crate) use code_action_menu::*;
 pub(crate) use completion_menu::*;
 pub(crate) use hover_popover::*;

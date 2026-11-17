@@ -36,14 +36,15 @@ pub(crate) fn caret_popup_anchor(geometry: PrepaintCaretGeometry) -> Point<Pixel
 /// so position, hitboxes, accessibility bounds, and width/layout decisions
 /// are all consistent with the current frame's caret. Always use inside
 /// `deferred()` so the prepaint runs after the input's prepaint.
-pub(crate) struct CaretAnchoredPopup {
+pub struct CaretAnchoredPopup {
     editor: WeakEntity<EditorState>,
     build: Box<dyn Fn(Point<Pixels>, Pixels, Pixels, &mut Window, &mut App) -> AnyElement>,
     content: Option<AnyElement>,
+    prefer_above: bool,
 }
 
 impl CaretAnchoredPopup {
-    pub(crate) fn new(
+    pub fn new(
         editor: WeakEntity<EditorState>,
         build: impl Fn(Point<Pixels>, Pixels, Pixels, &mut Window, &mut App) -> AnyElement + 'static,
     ) -> Self {
@@ -51,7 +52,14 @@ impl CaretAnchoredPopup {
             editor,
             build: Box::new(build),
             content: None,
+            prefer_above: false,
         }
+    }
+
+    /// Prefer the space above the caret when the content fits there.
+    pub fn prefer_above(mut self) -> Self {
+        self.prefer_above = true;
+        self
     }
 }
 
@@ -117,7 +125,9 @@ impl Element for CaretAnchoredPopup {
         );
         let bottom = (viewport.height - size.height - margin).max(margin);
         let right = (viewport.width - size.width - margin).max(margin);
-        let y = if size.height <= below {
+        let y = if self.prefer_above && size.height <= above {
+            above_anchor - size.height
+        } else if size.height <= below {
             anchor.y
         } else {
             above_anchor - size.height

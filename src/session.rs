@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -25,6 +25,7 @@ pub(crate) struct WorktreeSession {
     pub view: Option<WorkspaceView>,
     pub tabs: TabSession,
     pub files: BTreeMap<PathBuf, FilePosition>,
+    pub source_history: SourceHistory,
     pub document: Option<PathBuf>,
     pub documents: BTreeMap<PathBuf, DocumentPosition>,
     // None represents a session saved before the first visit to the document list.
@@ -105,6 +106,19 @@ impl WorktreeSession {
         }
         Some(index)
     }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub(crate) struct SourceHistory {
+    pub entries: VecDeque<SourceLocation>,
+    pub index: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub(crate) struct SourceLocation {
+    pub path: PathBuf,
+    pub position: Option<FilePosition>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]

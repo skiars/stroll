@@ -1,6 +1,7 @@
 use rust_i18n::t;
 
 mod audio_preview;
+mod caret_hints;
 mod code_theme;
 mod documents;
 mod edit_history;
@@ -485,7 +486,7 @@ struct OpenFile {
     revision: u64,
     queued_revision: Option<u64>,
     _changes: Subscription,
-    _blame_observer: Subscription,
+    _editor_observer: Subscription,
     _input_edits: Subscription,
     newline: Option<crate::lsp::Newline>,
     newline_task: Task<()>,
@@ -493,6 +494,7 @@ struct OpenFile {
     language_server: Option<Rc<EditorLsp>>,
     _lsp_refresh: Task<()>,
     inlay_hints: inlay_hints::InlayHints,
+    caret_hints: caret_hints::CaretHints,
     dirty: bool,
     pending_draft: bool,
     unconfirmed_save: Option<Rope>,
@@ -597,7 +599,8 @@ pub struct Workspace {
     tree_scroll: UniformListScrollHandle,
     tree_motion: std::cell::RefCell<tree_motion::TreeMotion<TreeRow>>,
     tabs: TabSession,
-    source_histories: HashMap<Vec<u8>, source_history::SourceHistory>,
+    source_caret: Option<(u64, crate::session::SourceLocation)>,
+    source_click: Option<(u64, crate::session::SourceLocation)>,
     files: HashMap<PathBuf, OpenFile>,
     tab_scroll: ScrollHandle,
     tab_viewport_width: Pixels,
@@ -692,6 +695,7 @@ impl Workspace {
         let repository_mode = standalone.is_none();
         Self::bind_git_history_keys(cx);
         Self::bind_source_navigation_keys(cx);
+        Self::bind_caret_hint_keys(cx);
         let focus = cx.focus_handle();
         focus.focus(window, cx);
         cx.on_app_quit(|this, cx| {
@@ -763,7 +767,8 @@ impl Workspace {
             tree_scroll: UniformListScrollHandle::new(),
             tree_motion: Default::default(),
             tabs: TabSession::default(),
-            source_histories: HashMap::new(),
+            source_caret: None,
+            source_click: None,
             files: HashMap::new(),
             tab_scroll: ScrollHandle::new(),
             tab_viewport_width: px(0.),
@@ -1228,7 +1233,11 @@ impl Workspace {
             // The target session was read before flushing the current UI state.
             session.commit_draft = self.session.commit_draft.take();
             session.panels = self.session.panels;
+            session.source_history = std::mem::take(&mut self.session.source_history);
         }
+        session.source_history.normalize();
+        self.source_caret = None;
+        self.source_click = None;
         self.tabs = session.tabs.clone();
         self.session = session;
         self.restore_panel_preferences();
@@ -1927,6 +1936,17 @@ impl Workspace {
                         this.select_loaded_file(path, request, window, cx);
                     }
                     Err(error) => {
+                        if let FileOpen::History { index, .. } = &request
+                            && error.chain().any(|cause| {
+                                cause.downcast_ref::<std::io::Error>().is_some_and(|error| {
+                                    error.kind() == std::io::ErrorKind::NotFound
+                                })
+                            })
+                        {
+                            this.skip_missing_source(&path, *index, window, cx);
+                            cx.notify();
+                            return;
+                        }
                         match request {
                             FileOpen::Restore => {
                                 if this
@@ -2260,6 +2280,7 @@ impl Workspace {
             );
             editor.prepare_language(window, cx);
         });
+        let caret_hints = editor.update(cx, |editor, cx| caret_hints::CaretHints::new(editor, cx));
         let git = editor_git::EditorGit::new(&editor, cx);
         let inlay_hints = inlay_hints::InlayHints::new(&editor, cx);
         inlay_hints.set_enabled(self.config.current().editor.inlay_hints, cx);
@@ -2287,7 +2308,7 @@ impl Workspace {
                 _ => {}
             },
         );
-        let blame_observer = self.observe_editor_blame(&editor, window, cx);
+        let editor_observer = self.observe_source_editor(&editor, window, cx);
         let input_edits = self.track_editor_edits(&editor, window, cx);
         let committed = editor.read(cx).text().clone();
         let dirty = document.restored;
@@ -2303,7 +2324,7 @@ impl Workspace {
                 revision: 1,
                 queued_revision: None,
                 _changes: changes,
-                _blame_observer: blame_observer,
+                _editor_observer: editor_observer,
                 _input_edits: input_edits,
                 newline: None,
                 newline_task: Task::ready(()),
@@ -2311,6 +2332,7 @@ impl Workspace {
                 language_server: None,
                 _lsp_refresh: Task::ready(()),
                 inlay_hints,
+                caret_hints,
                 dirty,
                 pending_draft: false,
                 unconfirmed_save: None,
@@ -3527,7 +3549,12 @@ impl Workspace {
                 .child(
                     editor_scroll_viewport(&file.editor, editor_background, !self.locator.open)
                         .debug_selector(|| "workspace-editor".into())
+                        .capture_any_mouse_down(cx.listener(Self::begin_source_click))
+                        .on_mouse_up(MouseButton::Left, cx.listener(Self::end_source_click))
+                        .on_mouse_up_out(MouseButton::Left, cx.listener(Self::end_source_click))
                         .on_action(cx.listener(Self::close_editor_git_hunk))
+                        .on_action(cx.listener(Self::show_signature_help))
+                        .capture_key_down(cx.listener(Self::dismiss_signature_help))
                         .flex_1()
                         .min_h_0()
                         .w_full()
@@ -3559,6 +3586,7 @@ impl Workspace {
                                     })
                                 }),
                         )
+                        .children(file.caret_hints.popup(&file.editor, window, cx))
                         .children(editor_git::blame::hint(
                             file,
                             cx.weak_entity(),

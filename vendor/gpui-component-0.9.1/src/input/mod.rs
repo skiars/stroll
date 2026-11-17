@@ -12,6 +12,7 @@ mod number_input;
 mod otp_input;
 mod overlay;
 pub(crate) mod popovers;
+pub use popovers::CaretAnchoredPopup;
 mod search;
 mod syntax_context;
 

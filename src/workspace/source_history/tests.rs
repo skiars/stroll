@@ -82,7 +82,9 @@ fn source_history_replays_files_jumps_and_worktree_positions() -> Result<()> {
     ])?;
     git(&["worktree", "add", "-qb", "other", other.to_str().unwrap()])?;
     let state = Arc::new(Store::new(fixture.path().join("state"))?);
+    let reopened_state = state.clone();
     let config_file = fixture.path().join("config.toml");
+    let reopened_config = config_file.clone();
     fs::write(
         &config_file,
         "[lsp]\nenabled = false\n[terminal]\nshell = '/bin/sh'\n",
@@ -280,5 +282,93 @@ fn source_history_replays_files_jumps_and_worktree_positions() -> Result<()> {
     wait_for(visual, |cx| {
         active(cx, &root, alpha) && position(cx) == first
     })?;
+    let click = visual.update(|_, cx| {
+        let editor = workspace.read(cx).active_file().unwrap().editor.read(cx);
+        let offset = editor.text().position_to_offset(&Position::new(73, 7));
+        editor.range_to_bounds(&(offset..offset)).unwrap().center()
+    });
+    visual.simulate_click(click, Modifiers::none());
+    frame(visual);
+    let clicked = visual.update(|_, cx| position(cx));
+    assert_eq!(clicked.selection_start, (73, 7));
+    visual.simulate_keystrokes("alt-left");
+    wait_for(visual, |cx| position(cx) == first)?;
+
+    visual.update(|_, cx| workspace.update(cx, |this, cx| this.flush_session(cx)))?;
+    let root_to_open = root.clone();
+    let mut reopened = None;
+    let (_, visual) = app.add_window_view(|window, cx| {
+        let view = cx.new(|cx| {
+            let mut workspace = Workspace::with_config(
+                reopened_state,
+                ConfigFile::load(Some(reopened_config)),
+                WorkspaceView::Editor,
+                window,
+                cx,
+            );
+            workspace.open_repository(
+                Location {
+                    root: root_to_open,
+                    file: None,
+                },
+                window,
+                cx,
+            );
+            workspace
+        });
+        reopened = Some(view.clone());
+        Root::new(view, window, cx)
+    });
+    let reopened = reopened.unwrap();
+    visual.simulate_resize(size(px(1100.), px(520.)));
+    let restored = |cx: &App, expected| {
+        reopened
+            .read(cx)
+            .active_file()
+            .is_some_and(|file| file.restore_position.is_none())
+            && reopened
+                .read(cx)
+                .source_location(cx)
+                .and_then(|location| location.position)
+                == Some(expected)
+    };
+    wait_for(visual, |cx| restored(cx, first))?;
+    visual.simulate_keystrokes("alt-right");
+    wait_for(visual, |cx| restored(cx, clicked))?;
+    visual.simulate_keystrokes("alt-left");
+    wait_for(visual, |cx| restored(cx, first))?;
+    visual.simulate_keystrokes("pagedown");
+    wait_for(visual, |cx| {
+        reopened
+            .read(cx)
+            .source_location(cx)
+            .and_then(|location| location.position)
+            .is_some_and(|position| position.selection_end.0 > first.selection_end.0 + 8)
+    })?;
+    visual.simulate_keystrokes("alt-left");
+    wait_for(visual, |cx| restored(cx, first))?;
+
+    // Leave an unavailable location between the current entry and the next one.
+    visual.update(|_, cx| {
+        reopened.update(cx, |workspace, _| {
+            let history = workspace.source_history_mut().unwrap();
+            history.entries.insert(
+                history.index + 1,
+                SourceLocation {
+                    path: "missing.txt".into(),
+                    position: None,
+                },
+            );
+        });
+    });
+    visual.simulate_keystrokes("alt-right");
+    wait_for(visual, |cx| {
+        let history = &reopened.read(cx).session.source_history;
+        history
+            .entries
+            .iter()
+            .all(|location| location.path != Path::new("missing.txt"))
+    })?;
+    assert!(visual.update(|_, cx| !restored(cx, first)));
     Ok(())
 }

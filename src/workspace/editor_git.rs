@@ -375,13 +375,15 @@ impl Workspace {
         )
     }
 
-    pub(super) fn observe_editor_blame(
+    pub(super) fn observe_source_editor(
         &self,
         editor: &Entity<EditorState>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Subscription {
         cx.observe_in(editor, window, |this, editor, window, cx| {
+            this.track_source_caret(&editor, window, cx);
+            this.refresh_caret_hints(&editor, false, window, cx);
             if this.view == WorkspaceView::Editor
                 && this.active_file().is_some_and(|file| {
                     file.editor.entity_id() == editor.entity_id() && file.git.changes.is_some()

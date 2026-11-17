@@ -368,6 +368,7 @@ impl Workspace {
             }) as _
         });
         file.inlay_hints.set_provider(inlay_provider, cx);
+        file.caret_hints.clear(cx);
         file.editor.update(cx, |editor, cx| {
             editor.dismiss_lsp_overlays(cx);
             if let Some(diagnostics) = editor.diagnostics_mut() {
