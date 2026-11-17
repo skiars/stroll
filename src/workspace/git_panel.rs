@@ -584,8 +584,8 @@ impl GitPanel {
             show_history: session.panels.git_history,
             show_tree: session.panels.git_tree,
             compact_pane: CompactPane::default(),
-            history_width: px(300.),
-            tree_width: px(280.),
+            history_width: px(session.panels.git_history_width),
+            tree_width: px(session.panels.git_tree_width),
             show_details: false,
             show_hunks: false,
             history_task: Task::ready(()),
@@ -1105,8 +1105,11 @@ impl GitPanel {
         self.commit_message.read(cx).value()
     }
 
-    pub(super) fn panel_visibility(&self) -> (bool, bool) {
-        (self.show_history, self.show_tree)
+    pub(super) fn capture_panel_preferences(&self, panels: &mut crate::session::PanelPreferences) {
+        panels.git_history = self.show_history;
+        panels.git_tree = self.show_tree;
+        panels.git_history_width = self.history_width.into();
+        panels.git_tree_width = self.tree_width.into();
     }
 
     fn set_history_visible(&mut self, visible: bool, cx: &mut Context<Self>) {

@@ -1,12 +1,32 @@
-use std::{path::Path, time::Duration};
+use std::{
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 use anyhow::Result;
 use gpui::*;
 use gpui_component::input::{EditorState, Position, RopeExt as _};
 
-use crate::session::FilePosition;
+use crate::{
+    repository::Store,
+    session::{FilePosition, StandaloneSession, WorktreeSession},
+};
 
 use super::{Workspace, WorkspaceView};
+
+enum SavedSession {
+    Worktree(WorktreeSession),
+    Standalone(StandaloneSession),
+}
+
+impl SavedSession {
+    fn write(&self, path: &Path) -> Result<()> {
+        match self {
+            Self::Worktree(session) => Store::write_session_file(path, session),
+            Self::Standalone(session) => Store::write_session_file(path, session),
+        }
+    }
+}
 
 impl Workspace {
     // The viewport handles also change during scrollbar drags and smooth scrolling.
@@ -22,15 +42,13 @@ impl Workspace {
                     if this.session_revision == *this.session_write.lock().unwrap() {
                         return None;
                     }
-                    let repo = this.repository.clone()?;
-                    let store = this.store.clone();
-                    let session = this.session.clone();
+                    let (path, session) = this.saved_session()?;
                     let state = this.session_write.clone();
                     let revision = this.session_revision;
                     let write = cx.background_spawn(async move {
                         let mut written = state.lock().unwrap();
                         if revision > *written {
-                            store.save_session(&repo, &session)?;
+                            session.write(&path)?;
                             *written = revision;
                         }
                         Ok::<_, anyhow::Error>(())
@@ -56,10 +74,26 @@ impl Workspace {
     }
 
     pub(super) fn capture_session(&mut self, cx: &App) {
-        let Some(repo) = &self.repository else {
+        if self.repository.is_none() && self.standalone.is_none() {
             return;
-        };
-        let disconnected = repo.ssh.as_ref().is_some_and(|ssh| ssh.failure().is_some());
+        }
+        let disconnected = self
+            .repository
+            .as_ref()
+            .and_then(|repo| repo.ssh.as_ref())
+            .is_some_and(|ssh| ssh.failure().is_some());
+        let mut panels = self.session.panels;
+        panels.editor_tree_width = self.editor_tree_width.into();
+        panels.docs_tree_width = self.docs_tree_width.into();
+        panels.doc_outline_width = self.outline_width.into();
+        panels.doc_outline_visible = self.outline_visibility;
+        if let Some(panel) = &self.git {
+            panel.read(cx).capture_panel_preferences(&mut panels);
+        }
+        if panels != self.session.panels {
+            self.session.panels = panels;
+            self.session_revision += 1;
+        }
         if self.session.view != Some(self.view) {
             self.session.view = Some(self.view);
             self.session_revision += 1;
@@ -69,14 +103,7 @@ impl Workspace {
             self.session_revision += 1;
         }
         if let Some(panel) = &self.git {
-            let panel = panel.read(cx);
-            let (history, tree) = panel.panel_visibility();
-            if self.session.panels.git_history != history || self.session.panels.git_tree != tree {
-                self.session.panels.git_history = history;
-                self.session.panels.git_tree = tree;
-                self.session_revision += 1;
-            }
-            let message = panel.commit_draft(cx);
+            let message = panel.read(cx).commit_draft(cx);
             let draft = (!message.is_empty()).then_some(message.as_str());
             if self.session.commit_draft.as_deref() != draft {
                 self.session.commit_draft = draft.map(str::to_owned);
@@ -123,14 +150,41 @@ impl Workspace {
         }
     }
 
+    fn saved_session(&self) -> Option<(PathBuf, SavedSession)> {
+        if let Some(path) = &self.standalone {
+            return Some((
+                self.store.standalone_session_path(path),
+                SavedSession::Standalone(StandaloneSession {
+                    view: self.session.view,
+                    panels: self.session.panels,
+                    file_position: self.session.files.get(path).copied(),
+                    document_position: self.session.documents.get(path).copied(),
+                }),
+            ));
+        }
+        let repo = self.repository.as_ref()?;
+        Some((
+            self.store.session_path(repo),
+            SavedSession::Worktree(self.session.clone()),
+        ))
+    }
+
+    pub(super) fn restore_panel_preferences(&mut self) {
+        let panels = self.session.panels;
+        self.editor_tree_width = px(panels.editor_tree_width.max(160.));
+        self.docs_tree_width = px(panels.docs_tree_width.max(160.));
+        self.outline_width = px(panels.doc_outline_width.max(120.));
+        self.outline_visibility = panels.doc_outline_visible;
+    }
+
     pub(super) fn flush_session(&mut self, cx: &App) -> Result<()> {
         self.capture_session(cx);
-        if let Some(repo) = &self.repository {
-            let mut written = self.session_write.lock().unwrap();
-            if *written < self.session_revision {
-                self.store.save_session(repo, &self.session)?;
-                *written = self.session_revision;
-            }
+        let mut written = self.session_write.lock().unwrap();
+        if *written < self.session_revision
+            && let Some((path, session)) = self.saved_session()
+        {
+            session.write(&path)?;
+            *written = self.session_revision;
         }
         Ok(())
     }

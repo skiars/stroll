@@ -30,27 +30,39 @@ pub(crate) struct WorktreeSession {
     // None represents a session saved before the first visit to the document list.
     pub open_documents: Option<Vec<OpenDocument>>,
     pub git: Option<GitSession>,
-    pub panels: PanelVisibility,
+    pub panels: PanelPreferences,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub commit_draft: Option<String>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
-pub(crate) struct PanelVisibility {
+pub(crate) struct PanelPreferences {
     pub editor_tree: bool,
     pub docs_tree: bool,
     pub git_history: bool,
     pub git_tree: bool,
+    pub editor_tree_width: f32,
+    pub docs_tree_width: f32,
+    pub doc_outline_width: f32,
+    pub doc_outline_visible: Option<bool>,
+    pub git_history_width: f32,
+    pub git_tree_width: f32,
 }
 
-impl Default for PanelVisibility {
+impl Default for PanelPreferences {
     fn default() -> Self {
         Self {
             editor_tree: true,
             docs_tree: true,
             git_history: true,
             git_tree: true,
+            editor_tree_width: 240.,
+            docs_tree_width: 240.,
+            doc_outline_width: 195.,
+            doc_outline_visible: None,
+            git_history_width: 300.,
+            git_tree_width: 280.,
         }
     }
 }
@@ -167,7 +179,17 @@ pub(crate) struct DiffPosition {
 }
 
 #[derive(Deserialize, Serialize)]
-pub(crate) struct SessionFile {
+pub(crate) struct SessionFile<T> {
     pub version: u32,
-    pub session: WorktreeSession,
+    pub session: T,
+}
+
+#[cfg(feature = "desktop")]
+#[derive(Default, Deserialize, Serialize)]
+#[serde(default)]
+pub(crate) struct StandaloneSession {
+    pub view: Option<WorkspaceView>,
+    pub panels: PanelPreferences,
+    pub file_position: Option<FilePosition>,
+    pub document_position: Option<DocumentPosition>,
 }

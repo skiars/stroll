@@ -18,7 +18,7 @@ fn settle(visual: &mut VisualTestContext) {
 
 #[::core::prelude::v1::test]
 fn worktree_panel_preferences_survive_compact_layout_switching_and_reopen() {
-    use crate::{config::ConfigFile, repository::Repository, session::PanelVisibility};
+    use crate::{config::ConfigFile, repository::Repository, session::PanelPreferences};
     use gpui_component::Root;
 
     let fixture = tempfile::tempdir().unwrap();
@@ -141,6 +141,18 @@ fn worktree_panel_preferences_survive_compact_layout_switching_and_reopen() {
     switch(&workspace, visual, WorkspaceView::Docs);
     click(visual, "hide-file-tree");
     assert!(visual.debug_bounds("show-file-tree").is_some());
+    visual.update(|_, cx| {
+        workspace.update(cx, |workspace, cx| {
+            workspace.editor_tree_width = px(310.);
+            workspace.docs_tree_width = px(295.);
+            workspace.outline_width = px(250.);
+            workspace.outline_visibility = Some(false);
+            workspace.git.as_ref().unwrap().update(cx, |git, _| {
+                git.history_width = px(340.);
+                git.tree_width = px(330.);
+            });
+        });
+    });
     switch(&workspace, visual, WorkspaceView::Git);
 
     open(&workspace, visual, &other);
@@ -157,17 +169,33 @@ fn worktree_panel_preferences_survive_compact_layout_switching_and_reopen() {
             .session(&Repository::open(&root).unwrap())
             .unwrap()
             .panels,
-        PanelVisibility {
+        PanelPreferences {
             editor_tree: false,
             docs_tree: false,
             git_history: false,
-            git_tree: false
+            git_tree: false,
+            editor_tree_width: 310.,
+            docs_tree_width: 295.,
+            doc_outline_width: 250.,
+            doc_outline_visible: Some(false),
+            git_history_width: 340.,
+            git_tree_width: 330.,
         },
     );
 
     let (reopened, visual) = make_window(&mut app, &store, &config);
     open(&reopened, visual, &root);
     assert_eq!(panes(visual), (false, false));
+    visual.update(|_, cx| {
+        let workspace = reopened.read(cx);
+        assert_eq!(workspace.editor_tree_width, px(310.));
+        assert_eq!(workspace.docs_tree_width, px(295.));
+        assert_eq!(workspace.outline_width, px(250.));
+        assert_eq!(workspace.outline_visibility, Some(false));
+        let git = workspace.git.as_ref().unwrap().read(cx);
+        assert_eq!(git.history_width, px(340.));
+        assert_eq!(git.tree_width, px(330.));
+    });
     for view in [WorkspaceView::Editor, WorkspaceView::Docs] {
         switch(&reopened, visual, view);
         assert!(visual.debug_bounds("show-file-tree").is_some());

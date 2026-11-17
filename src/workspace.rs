@@ -1231,6 +1231,7 @@ impl Workspace {
         }
         self.tabs = session.tabs.clone();
         self.session = session;
+        self.restore_panel_preferences();
         self.session_revision += 1;
         self.files.clear();
         self.language_action_groups.clear();

@@ -1,4 +1,5 @@
 use super::*;
+use crate::session::StandaloneSession;
 
 impl Workspace {
     pub fn open_standalone(
@@ -33,8 +34,21 @@ impl Workspace {
                 return Ok(());
             }
         }
+        let session = match Store::read_session_file::<StandaloneSession>(
+            &store.standalone_session_path(&path),
+        ) {
+            Ok(session) => session.unwrap_or_default(),
+            Err(error) => {
+                eprintln!("Could not load standalone session: {error:#}");
+                StandaloneSession::default()
+            }
+        };
         let view = if docs::is_markdown(&path) {
-            WorkspaceView::Docs
+            if fragment.is_none() && session.view == Some(WorkspaceView::Editor) {
+                WorkspaceView::Editor
+            } else {
+                WorkspaceView::Docs
+            }
         } else {
             WorkspaceView::Editor
         };
@@ -67,9 +81,22 @@ impl Workspace {
                 })
                 .unwrap_or(true)
             });
-            workspace.update(cx, |this, cx| match view {
-                WorkspaceView::Docs => this.open_doc_at(path, fragment, None, prepared, window, cx),
-                _ => this.request_file(path, FileOpen::Startup, window, cx),
+            workspace.update(cx, |this, cx| {
+                this.session.view = session.view;
+                this.session.panels = session.panels;
+                if let Some(position) = session.file_position {
+                    this.session.files.insert(path.clone(), position);
+                }
+                if let Some(position) = session.document_position {
+                    this.session.documents.insert(path.clone(), position);
+                }
+                this.restore_panel_preferences();
+                match view {
+                    WorkspaceView::Docs => {
+                        this.open_doc_at(path, fragment, None, prepared, window, cx)
+                    }
+                    _ => this.request_file(path, FileOpen::Startup, window, cx),
+                }
             });
             cx.new(|cx| gpui_component::Root::new(workspace, window, cx))
         })?;
@@ -251,7 +278,13 @@ fn standalone_markdown_keeps_the_editor_buffer_and_reads_saved_text() -> Result<
     );
     app.update(gpui_component::init);
     app.update(|cx| {
-        Workspace::open_standalone(store, config, path.clone(), Some("original".into()), cx)
+        Workspace::open_standalone(
+            store.clone(),
+            config.clone(),
+            path.clone(),
+            Some("original".into()),
+            cx,
+        )
     })?;
     let handle = app.windows()[0];
     let workspace = app.update_window(handle, |root, _, cx| {
@@ -312,6 +345,42 @@ fn standalone_markdown_keeps_the_editor_buffer_and_reads_saved_text() -> Result<
         let doc = workspace.read(cx).doc.clone().unwrap();
         assert!(doc.update(cx, |doc, cx| doc.jump_to_fragment("edited", cx)));
     });
+    visual.run_until_parked();
+    visual.update(|window, cx| {
+        window.draw(cx).clear(cx);
+        workspace.update(cx, |this, cx| {
+            this.outline_visibility = Some(false);
+            this.outline_width = px(235.);
+            this.open_document_source(path.clone(), window, cx);
+            this.active_file().unwrap().editor.update(cx, |editor, cx| {
+                editor.set_selected_range(2..8, cx);
+            });
+        });
+        window.draw(cx).clear(cx);
+        assert!(workspace.update(cx, |this, cx| this.request_window_close(window, cx)));
+        window.remove_window();
+    });
+    let saved: StandaloneSession =
+        Store::read_session_file(&store.standalone_session_path(&path))?.unwrap();
+    assert!(saved.document_position.is_some());
+    app.update(|cx| Workspace::open_standalone(store, config, path.clone(), None, cx))?;
+    app.run_until_parked();
+    let reopened = app.windows()[0];
+    app.update_window(reopened, |root, _, cx| {
+        let root = root.downcast::<Root>().unwrap();
+        let workspace = root
+            .read(cx)
+            .view()
+            .clone()
+            .downcast::<Workspace>()
+            .unwrap();
+        let view = workspace.read(cx);
+        assert_eq!(view.view, WorkspaceView::Editor);
+        assert_eq!(view.outline_visibility, Some(false));
+        assert_eq!(view.outline_width, px(235.));
+        let editor = &view.active_file().unwrap().editor;
+        assert_eq!(editor.read(cx).selected_range(), 2..8);
+    })?;
     Ok(())
 }
 

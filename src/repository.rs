@@ -916,7 +916,13 @@ impl Store {
     }
 
     fn read_session(&self, repo: &Repository) -> Result<Option<WorktreeSession>> {
-        let Some(file) = read_json::<SessionFile>(&self.session_path(repo))? else {
+        Self::read_session_file(&self.session_path(repo))
+    }
+
+    pub(crate) fn read_session_file<T: serde::de::DeserializeOwned>(
+        path: &Path,
+    ) -> Result<Option<T>> {
+        let Some(file) = read_json::<SessionFile<T>>(path)? else {
             return Ok(None);
         };
         ensure!(
@@ -968,14 +974,26 @@ impl Store {
     }
 
     pub(crate) fn save_session(&self, repo: &Repository, session: &WorktreeSession) -> Result<()> {
-        let file = SessionFile {
-            version: session::VERSION,
-            session: session.clone(),
-        };
-        atomic_write(&self.session_path(repo), &serde_json::to_vec(&file)?)
+        Self::write_session_file(&self.session_path(repo), session)
     }
 
-    fn session_path(&self, repo: &Repository) -> PathBuf {
+    pub(crate) fn write_session_file(path: &Path, session: &impl Serialize) -> Result<()> {
+        let file = SessionFile {
+            version: session::VERSION,
+            session,
+        };
+        atomic_write(path, &serde_json::to_vec(&file)?)
+    }
+
+    #[cfg(feature = "desktop")]
+    pub(crate) fn standalone_session_path(&self, path: &Path) -> PathBuf {
+        let key = Sha256::digest(path.as_os_str().as_encoded_bytes());
+        self.root
+            .join("standalone-sessions")
+            .join(format!("{}.json", hex::encode(key)))
+    }
+
+    pub(crate) fn session_path(&self, repo: &Repository) -> PathBuf {
         self.worktree_state_path(repo, "sessions")
     }
 
