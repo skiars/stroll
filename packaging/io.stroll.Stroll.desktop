@@ -1,0 +1,14 @@
+[Desktop Entry]
+Type=Application
+Name=Stroll
+GenericName=Repository Reader
+Comment=Read and edit local Git repositories and Markdown documents
+Exec=stroll %f
+TryExec=stroll
+Icon=io.stroll.Stroll
+Terminal=false
+Categories=Development;TextEditor;
+Keywords=git;repository;markdown;editor;reader;documentation;
+StartupNotify=true
+StartupWMClass=io.stroll.Stroll
+MimeType=text/markdown;text/x-markdown;

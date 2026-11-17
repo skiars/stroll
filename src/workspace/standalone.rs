@@ -1,0 +1,458 @@
+use super::*;
+
+impl Workspace {
+    pub fn open_standalone(
+        store: Arc<Store>,
+        config: ConfigFile,
+        path: PathBuf,
+        fragment: Option<String>,
+        cx: &mut App,
+    ) -> Result<()> {
+        let path = path.canonicalize()?;
+        anyhow::ensure!(path.is_file(), t!("storage.local_regular_file"));
+        for handle in cx.windows() {
+            let activated = handle
+                .update(cx, |root, window, cx| {
+                    let Some(workspace) = root
+                        .downcast::<gpui_component::Root>()
+                        .ok()
+                        .and_then(|root| root.read(cx).view().clone().downcast::<Self>().ok())
+                    else {
+                        return false;
+                    };
+                    if workspace.read(cx).standalone.as_ref() != Some(&path) {
+                        return false;
+                    }
+                    workspace.update(cx, |this, cx| {
+                        this.activate_standalone(path.clone(), fragment.clone(), window, cx)
+                    });
+                    true
+                })
+                .unwrap_or(false);
+            if activated {
+                return Ok(());
+            }
+        }
+        let view = if docs::is_markdown(&path) {
+            WorkspaceView::Docs
+        } else {
+            WorkspaceView::Editor
+        };
+        let prepared = (view == WorkspaceView::Docs).then(|| {
+            let path = path.clone();
+            cx.background_spawn(async move { docs::load_local(&path) })
+        });
+        let mut options = TitleBar::window_options();
+        if let Some(titlebar) = options.titlebar.as_mut() {
+            titlebar.title = Some(file_name(&path).to_owned().into());
+        }
+        options.app_id = Some("io.stroll.Stroll".to_owned());
+        options.window_decorations = Some(WindowDecorations::Client);
+        options.window_background = WindowBackgroundAppearance::Transparent;
+        options.window_min_size = Some(size(px(400.), px(360.)));
+        options.window_bounds = Some(standalone_window_bounds(
+            &store,
+            view,
+            size(px(400.), px(360.)),
+            cx,
+        ));
+        cx.open_window(options, move |window, cx| {
+            let workspace = cx.new(|cx| {
+                Self::with_window(store, config, Some(view), Some(path.clone()), window, cx)
+            });
+            let weak = workspace.downgrade();
+            window.on_window_should_close(cx, move |window, cx| {
+                weak.update(cx, |workspace, cx| {
+                    workspace.request_window_close(window, cx)
+                })
+                .unwrap_or(true)
+            });
+            workspace.update(cx, |this, cx| match view {
+                WorkspaceView::Docs => this.open_doc_at(path, fragment, None, prepared, window, cx),
+                _ => this.request_file(path, FileOpen::Startup, window, cx),
+            });
+            cx.new(|cx| gpui_component::Root::new(workspace, window, cx))
+        })?;
+        Ok(())
+    }
+
+    fn activate_standalone(
+        &mut self,
+        path: PathBuf,
+        fragment: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        window.activate_window();
+        if fragment.is_some() && docs::is_markdown(&path) {
+            self.switch_view_to(WorkspaceView::Docs, Some(path.clone()), window, cx);
+            if self.view == WorkspaceView::Docs {
+                self.open_doc(path, fragment, window, cx);
+            }
+        }
+    }
+
+    pub(super) fn open_local_window(
+        &mut self,
+        path: PathBuf,
+        fragment: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(current) = &self.standalone
+            && path.canonicalize().is_ok_and(|path| &path == current)
+        {
+            self.activate_standalone(current.clone(), fragment, window, cx);
+            return;
+        }
+        if let Err(error) =
+            Self::open_standalone(self.store.clone(), self.config.clone(), path, fragment, cx)
+        {
+            self.show_error(error, window, cx);
+        }
+    }
+
+    pub(super) fn choose_local_file(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.repository_ui.menu_open = false;
+        let selection = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some(t!("workspace.open_local_file").into_owned().into()),
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            if let Ok(result) = selection.await {
+                _ = this.update_in(cx, |this, window, cx| match result {
+                    Ok(Some(paths)) => {
+                        if let Some(path) = paths.into_iter().next() {
+                            this.open_chosen_local_file(path, window, cx);
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(error) => this.show_error(error, window, cx),
+                });
+            }
+        })
+        .detach();
+        cx.notify();
+    }
+
+    pub(super) fn open_chosen_local_file(
+        &mut self,
+        path: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(repo) = &self.repository
+            && let Ok(key) = repo.local_file_key(&path)
+            && (!key.is_absolute() || self.tabs.index(&key).is_some())
+        {
+            self.switch_view(WorkspaceView::Editor, window, cx);
+            if self.view == WorkspaceView::Editor {
+                if self.tabs.index(&key).is_some() {
+                    self.activate_tab(&key, window, cx);
+                } else {
+                    self.open_file(key, false, window, cx);
+                }
+            }
+            return;
+        }
+        self.open_local_window(path, None, window, cx);
+    }
+
+    pub(super) fn standalone_topbar(
+        &self,
+        path: &Path,
+        window: &Window,
+        cx: &Context<Self>,
+        colors: Palette,
+    ) -> impl IntoElement {
+        let editing = self.view == WorkspaceView::Editor;
+        TitleBar::new()
+            .h(px(36.))
+            .bg(colors.bg)
+            .border_0()
+            .on_close_window(cx.listener(|this, _, window, cx| {
+                if this.request_window_close(window, cx) {
+                    window.remove_window();
+                }
+            }))
+            .child(
+                h_flex()
+                    .w_full()
+                    .min_w_0()
+                    .gap_2()
+                    .px_2()
+                    .child(icon(IconName::FileText, colors.muted, 15.))
+                    .child(
+                        div()
+                            .min_w_0()
+                            .flex_1()
+                            .truncate()
+                            .child(file_name(path).to_owned()),
+                    )
+                    .when(self.tab_is_dirty(path), |bar| {
+                        bar.child(div().size(px(6.)).rounded_full().bg(colors.warning))
+                    })
+                    .when(!editing, |bar| {
+                        bar.when_some(self.doc.as_ref(), |bar, doc| {
+                            bar.child(doc.read(cx).toolbar_actions(doc, window))
+                        })
+                    })
+                    .when(editing, |bar| {
+                        bar.child(
+                            icon_button("standalone-find", IconName::Search, t!("common.find"))
+                                .on_click(cx.listener(|this, _, window, cx| this.find(window, cx))),
+                        )
+                        .child(
+                            icon_button("standalone-save", IconName::Save, t!("common.save"))
+                                .disabled(!self.tab_is_dirty(path) || self.saving.contains(path))
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.save(&SaveFile, window, cx)
+                                })),
+                        )
+                        .when(docs::is_markdown(path), |bar| {
+                            bar.child(
+                                icon_button(
+                                    "standalone-read",
+                                    Icon::default().path("icons/book-open.svg"),
+                                    t!("docs.read_markdown"),
+                                )
+                                .on_click(cx.listener(
+                                    |this, _, window, cx| {
+                                        this.switch_view(WorkspaceView::Docs, window, cx);
+                                    },
+                                )),
+                            )
+                        })
+                        .child(self.workspace_actions(cx))
+                    })
+                    .child(self.theme_button(cx)),
+            )
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+#[::core::prelude::v1::test]
+fn standalone_markdown_keeps_the_editor_buffer_and_reads_saved_text() -> Result<()> {
+    use gpui::{TestAppContext, TestDispatcher, VisualTestContext};
+    use gpui_component::Root;
+
+    let fixture = tempfile::tempdir()?;
+    let path = fixture.path().canonicalize()?.join("notes.md");
+    fs::write(&path, "# Original\n")?;
+    let store = Arc::new(Store::new(fixture.path().join("state"))?);
+    let config = ConfigFile::load(Some(fixture.path().join("config.toml")));
+    let platform = gpui_platform::current_platform(true);
+    let mut app = TestAppContext::build_with_text_system(
+        TestDispatcher::new(0),
+        None,
+        platform.text_system(),
+    );
+    app.update(gpui_component::init);
+    app.update(|cx| {
+        Workspace::open_standalone(store, config, path.clone(), Some("original".into()), cx)
+    })?;
+    let handle = app.windows()[0];
+    let workspace = app.update_window(handle, |root, _, cx| {
+        root.downcast::<Root>()
+            .unwrap()
+            .read(cx)
+            .view()
+            .clone()
+            .downcast::<Workspace>()
+            .unwrap()
+    })?;
+    let mut visual = VisualTestContext::from_window(handle, &app);
+    visual.simulate_resize(size(px(530.), px(440.)));
+    visual.run_until_parked();
+    visual.update(|window, cx| {
+        workspace.update(cx, |this, cx| {
+            assert!(this.repository.is_none());
+            assert!(this.doc.is_some());
+            this.open_document_source(path.clone(), window, cx);
+        });
+    });
+    visual.run_until_parked();
+    let editor = visual.update(|window, cx| {
+        let editor = workspace.read(cx).active_file().unwrap().editor.clone();
+        editor.update(cx, |editor, cx| editor.select_all(window, cx));
+        window.draw(cx).clear(cx);
+        editor
+    });
+    visual.simulate_input("# Edited");
+    visual.simulate_keystrokes("enter");
+    visual.update(|window, cx| {
+        workspace.update(cx, |this, cx| {
+            assert!(this.tab_is_dirty(&path));
+            assert!(!this.request_window_close(window, cx));
+            assert!(this.confirming_close);
+            this.cancel_tab_close(window, cx);
+            window.close_dialog(cx);
+
+            this.switch_view(WorkspaceView::Docs, window, cx);
+            let doc = this.doc.as_ref().unwrap();
+            assert!(doc.update(cx, |doc, cx| doc.jump_to_fragment("original", cx)));
+            assert!(!doc.update(cx, |doc, cx| doc.jump_to_fragment("edited", cx)));
+            this.open_document_source(path.clone(), window, cx);
+            assert_eq!(this.active_file().unwrap().editor, editor);
+            this.save(&SaveFile, window, cx);
+        });
+    });
+    visual.run_until_parked();
+    assert_eq!(fs::read_to_string(&path)?, "# Edited\n");
+    visual.update(|window, cx| {
+        workspace.update(cx, |this, cx| {
+            assert!(!this.tab_is_dirty(&path));
+            this.switch_view(WorkspaceView::Docs, window, cx);
+        });
+    });
+    visual.run_until_parked();
+    visual.update(|_, cx| {
+        let doc = workspace.read(cx).doc.clone().unwrap();
+        assert!(doc.update(cx, |doc, cx| doc.jump_to_fragment("edited", cx)));
+    });
+    Ok(())
+}
+
+#[cfg(all(test, target_os = "linux"))]
+#[::core::prelude::v1::test]
+fn standalone_text_opens_and_saves_without_a_repository() -> Result<()> {
+    use gpui::{TestAppContext, TestDispatcher};
+    use gpui_component::Root;
+
+    let fixture = tempfile::tempdir()?;
+    let path = fixture.path().canonicalize()?.join("notes.txt");
+    fs::write(&path, "Original\r\n")?;
+    let store = Arc::new(Store::new(fixture.path().join("state"))?);
+    let config = ConfigFile::load(Some(fixture.path().join("config.toml")));
+    let mut app = TestAppContext::build_with_text_system(
+        TestDispatcher::new(0),
+        None,
+        gpui_platform::current_platform(true).text_system(),
+    );
+    app.update(gpui_component::init);
+    app.update(|cx| {
+        Workspace::open_standalone(store.clone(), config.clone(), path.clone(), None, cx)
+    })?;
+    let handle = app.windows()[0];
+    app.update(|cx| Workspace::open_standalone(store, config, path.clone(), None, cx))?;
+    assert_eq!(app.windows(), [handle]);
+    app.run_until_parked();
+    app.update(|cx| assert_eq!(cx.active_window(), Some(handle)));
+    let workspace = app.update_window(handle, |root, window, cx| {
+        assert_eq!(window.viewport_size(), size(px(1280.), px(850.)));
+        let root = root.downcast::<Root>().unwrap();
+        let workspace = root
+            .read(cx)
+            .view()
+            .clone()
+            .downcast::<Workspace>()
+            .unwrap();
+        let this = workspace.read(cx);
+        assert!(this.repository.is_none());
+        assert_eq!(this.view, WorkspaceView::Editor);
+        let file = this.active_file().unwrap();
+        assert_eq!(file.path, path);
+        assert_eq!(file.editor.read(cx).text().to_string(), "Original\n");
+        file.editor
+            .clone()
+            .update(cx, |editor, cx| editor.select_all(window, cx));
+        window.draw(cx).clear(cx);
+        workspace
+    })?;
+    app.simulate_input(handle, "Updated");
+    app.simulate_keystrokes(handle, "enter");
+    app.update_window(handle, |_, window, cx| {
+        workspace.update(cx, |this, cx| this.save(&SaveFile, window, cx));
+    })?;
+    app.run_until_parked();
+    assert_eq!(fs::read_to_string(&path)?, "Updated\r\n");
+
+    let other = fixture.path().join("other.txt");
+    fs::write(&other, "Other\n")?;
+    app.update_window(handle, |_, window, cx| {
+        workspace.update(cx, |this, cx| {
+            this.open_local_window(other.clone(), None, window, cx);
+            this.open_local_window(other, None, window, cx);
+        });
+    })?;
+    assert_eq!(app.windows().len(), 2);
+    app.update(|cx| assert_ne!(cx.active_window(), Some(handle)));
+    Ok(())
+}
+
+#[cfg(all(test, target_os = "linux"))]
+#[::core::prelude::v1::test]
+fn standalone_embedded_images_open_the_original_in_the_preview() -> Result<()> {
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    use gpui::{TestAppContext, TestDispatcher, VisualTestContext};
+    use image::{ImageFormat, Rgb, RgbImage};
+    use std::io::Cursor;
+
+    let fixture = tempfile::tempdir()?;
+    let path = fixture.path().canonicalize()?.join("embedded.md");
+    let mut png = Cursor::new(Vec::new());
+    RgbImage::from_pixel(192, 128, Rgb([170, 30, 190])).write_to(&mut png, ImageFormat::Png)?;
+    let uri = format!(
+        "data:image/png;base64,{}",
+        STANDARD.encode(png.into_inner())
+    );
+    let mut app = TestAppContext::build_with_text_system(
+        TestDispatcher::new(0),
+        None,
+        gpui_platform::current_platform(true).text_system(),
+    );
+    app.update(gpui_component::init);
+    let store = Arc::new(Store::new(fixture.path().join("state"))?);
+    let config = ConfigFile::load(Some(fixture.path().join("config.toml")));
+
+    for source in [
+        format!("![Example]({uri})\n"),
+        format!("<img src=\"{uri}\" width=\"96\" height=\"64\" alt=\"Example\">\n"),
+    ] {
+        fs::write(&path, source)?;
+        app.update(|cx| {
+            Workspace::open_standalone(store.clone(), config.clone(), path.clone(), None, cx)
+        })?;
+        let handle = *app.windows().last().unwrap();
+        let workspace = app.update_window(handle, |root, _, cx| {
+            root.downcast::<gpui_component::Root>()
+                .unwrap()
+                .read(cx)
+                .view()
+                .clone()
+                .downcast::<Workspace>()
+                .unwrap()
+        })?;
+        let mut visual = VisualTestContext::from_window(handle, &app);
+        visual.simulate_resize(size(px(530.), px(440.)));
+        for _ in 0..3 {
+            visual.run_until_parked();
+            visual.update(|window, cx| window.draw(cx).clear(cx));
+        }
+        visual.simulate_click(point(px(54.), px(60.)), Default::default());
+        visual.update(|_, cx| {
+            let preview = workspace
+                .read(cx)
+                .image_preview
+                .as_ref()
+                .expect("click should open the image preview");
+            let ImageSource::Image(original) = &preview.image else {
+                panic!("expected the original embedded image");
+            };
+            assert_eq!(original.format(), gpui::ImageFormat::Png);
+            assert_eq!(
+                image::load_from_memory(original.bytes()).unwrap().width(),
+                192
+            );
+        });
+        visual.simulate_keystrokes("escape");
+        visual.update(|window, cx| {
+            assert!(workspace.read(cx).image_preview.is_none());
+            window.remove_window();
+        });
+    }
+
+    Ok(())
+}

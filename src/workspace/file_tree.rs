@@ -1,0 +1,1512 @@
+use std::io::Write;
+
+use gpui_component::{
+    input::{Input, InputState},
+    menu::ContextMenuExt,
+};
+
+use super::*;
+use crate::repository::files::{CopyTarget, EntryVersion, FileOperation, valid_name};
+
+pub(super) struct TreeEdit {
+    path: PathBuf,
+    directory: bool,
+    version: Option<EntryVersion>,
+    input: Entity<InputState>,
+    return_focus: Option<FocusHandle>,
+    _subscription: Subscription,
+}
+
+impl TreeEdit {
+    pub(super) fn row(&self, rows: &[TreeRow]) -> Option<(usize, usize, bool)> {
+        if self.version.is_some() {
+            let index = rows.iter().position(|row| row.entry.path == self.path)?;
+            Some((index, rows[index].depth, true))
+        } else if self.path.as_os_str().is_empty() {
+            Some((0, 0, false))
+        } else {
+            let index = rows.iter().position(|row| row.entry.path == self.path)?;
+            Some((index + 1, rows[index].depth + 1, false))
+        }
+    }
+
+    pub(super) fn element(
+        &self,
+        depth: usize,
+        busy: bool,
+        workspace: WeakEntity<Workspace>,
+    ) -> AnyElement {
+        h_flex()
+            .h(px(28.))
+            .w_full()
+            .pl(px(15. + 14. * depth.min(16) as f32))
+            .pr_2()
+            .on_key_down(move |event, window, cx| {
+                if event.keystroke.key == "escape" && !busy {
+                    cx.stop_propagation();
+                    _ = workspace.update(cx, |this, cx| this.finish_tree_edit(window, cx));
+                }
+            })
+            .child(Input::new(&self.input).small().disabled(busy).w_full())
+            .into_any_element()
+    }
+}
+
+#[derive(Clone, Copy)]
+enum TreeAction {
+    Open(bool),
+    PreviewAudio,
+    SaveCopy,
+    Create(bool),
+    CopyPath(bool),
+    Rename,
+    Delete,
+    Refresh,
+    Collapse,
+}
+
+pub(super) fn tree_menu(
+    element: Stateful<Div>,
+    entry: Option<Entry>,
+    workspace: WeakEntity<Workspace>,
+) -> AnyElement {
+    element
+        .context_menu(move |mut menu, _, cx| {
+            let Some((repo, busy)) = workspace
+                .read_with(cx, |this, _| {
+                    this.repository
+                        .clone()
+                        .map(|repo| (repo, this.tree_busy || this.tree_edit.is_some()))
+                })
+                .ok()
+                .flatten()
+            else {
+                return menu;
+            };
+            let mutable = !busy
+                && repo
+                    .ssh
+                    .as_ref()
+                    .is_none_or(|ssh| ssh.supports_workspace_files());
+            if !busy && !mutable {
+                menu = menu
+                    .item(PopupMenuItem::new(t!("workspace.tree_requires_helper")).disabled(true))
+                    .separator();
+            }
+            let item = |action, label: SharedString, enabled: bool| {
+                let workspace = workspace.clone();
+                let repo = repo.clone();
+                let entry = entry.clone();
+                PopupMenuItem::new(label)
+                    .disabled(!enabled)
+                    .on_click(move |_, window, cx| {
+                        _ = workspace.update(cx, |this, cx| {
+                            if this.view == WorkspaceView::Editor
+                                && this
+                                    .repository
+                                    .as_ref()
+                                    .is_some_and(|current| Arc::ptr_eq(current, &repo))
+                            {
+                                this.tree_action(action, entry.clone(), window, cx);
+                            }
+                        });
+                    })
+            };
+            if entry.as_ref().is_none_or(|entry| entry.directory) {
+                menu = menu
+                    .item(item(
+                        TreeAction::Create(false),
+                        t!("workspace.tree_new_file").into(),
+                        mutable,
+                    ))
+                    .item(item(
+                        TreeAction::Create(true),
+                        t!("workspace.tree_new_directory").into(),
+                        mutable,
+                    ))
+                    .separator();
+            } else if entry.as_ref().is_some_and(|entry| !entry.symlink) {
+                if entry
+                    .as_ref()
+                    .is_some_and(|entry| audio_preview::is_audio(&entry.path))
+                {
+                    menu = menu.item(item(
+                        TreeAction::PreviewAudio,
+                        t!("audio.preview").into(),
+                        true,
+                    ));
+                } else {
+                    menu = menu
+                        .item(item(
+                            TreeAction::Open(true),
+                            t!("workspace.tree_open").into(),
+                            true,
+                        ))
+                        .item(item(
+                            TreeAction::Open(false),
+                            t!("workspace.tree_keep_open").into(),
+                            true,
+                        ));
+                }
+                menu = menu
+                    .item(item(
+                        TreeAction::SaveCopy,
+                        t!("workspace.tree_save_copy").into(),
+                        true,
+                    ))
+                    .separator();
+            }
+            if entry.is_some() {
+                menu.item(item(
+                    TreeAction::CopyPath(false),
+                    t!("tabs.copy_relative_path").into(),
+                    true,
+                ))
+                .item(item(
+                    TreeAction::CopyPath(true),
+                    t!("tabs.copy_absolute_path").into(),
+                    true,
+                ))
+                .separator()
+                .item(item(
+                    TreeAction::Rename,
+                    t!("workspace.tree_rename").into(),
+                    mutable,
+                ))
+                .item(item(
+                    TreeAction::Delete,
+                    t!("workspace.tree_delete").into(),
+                    mutable,
+                ))
+            } else {
+                menu.item(item(
+                    TreeAction::Refresh,
+                    t!("workspace.tree_refresh").into(),
+                    true,
+                ))
+                .item(item(
+                    TreeAction::Collapse,
+                    t!("workspace.collapse_all").into(),
+                    !busy,
+                ))
+            }
+        })
+        .shared_layer()
+        .into_any_element()
+}
+
+impl Workspace {
+    fn tree_action(
+        &mut self,
+        action: TreeAction,
+        entry: Option<Entry>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(repo) = self.repository.clone() else {
+            return;
+        };
+        let path = entry
+            .as_ref()
+            .map(|entry| entry.path.clone())
+            .unwrap_or_default();
+        match action {
+            TreeAction::Open(preview) => self.open_file(path, preview, window, cx),
+            TreeAction::PreviewAudio => self.preview_audio(path, window, cx),
+            TreeAction::SaveCopy => self.save_tree_copy(repo, path, window, cx),
+            TreeAction::CopyPath(absolute) => {
+                let path = if absolute { repo.root.join(path) } else { path };
+                cx.write_to_clipboard(ClipboardItem::new_string(paths::display(&path)));
+            }
+            TreeAction::Create(directory) => {
+                self.begin_tree_edit(path, directory, None, window, cx)
+            }
+            TreeAction::Rename | TreeAction::Delete => {
+                if self.tree_busy || self.tree_edit.is_some() {
+                    return;
+                }
+                self.tree_busy = true;
+                let lookup = repo.clone();
+                let source = path.clone();
+                let version = cx.background_spawn(async move { lookup.entry_version(&source) });
+                cx.spawn_in(window, async move |this, cx| {
+                    let version = version.await;
+                    _ = this.update_in(cx, |this, window, cx| {
+                        if !this
+                            .repository
+                            .as_ref()
+                            .is_some_and(|current| Arc::ptr_eq(current, &repo))
+                        {
+                            return;
+                        }
+                        this.tree_busy = false;
+                        cx.notify();
+                        if this.view != WorkspaceView::Editor {
+                            return;
+                        }
+                        match version {
+                            Ok(version) if matches!(action, TreeAction::Rename) => {
+                                this.begin_tree_edit(
+                                    path,
+                                    entry.unwrap().directory,
+                                    Some(version),
+                                    window,
+                                    cx,
+                                );
+                            }
+                            Ok(version) => this.confirm_tree_delete(path, version, window, cx),
+                            Err(error) => this.show_error(error, window, cx),
+                        }
+                    });
+                })
+                .detach();
+            }
+            TreeAction::Refresh => self.rescan_workspace(window, cx),
+            TreeAction::Collapse => {
+                self.tree_motion.get_mut().start();
+                self.expanded.clear();
+                self.tree_reveal = None;
+                self.rebuild_tree();
+                cx.notify();
+            }
+        }
+    }
+
+    fn begin_tree_edit(
+        &mut self,
+        path: PathBuf,
+        directory: bool,
+        version: Option<EntryVersion>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.tree_busy || self.tree_edit.is_some() {
+            return;
+        }
+        let value = if version.is_some() {
+            file_name(&path)
+        } else {
+            ""
+        };
+        let input = cx.new(|cx| InputState::new(window, cx).default_value(value.to_owned()));
+        let return_focus = window.focused(cx);
+        let subscription = cx.subscribe_in(&input, window, |this, _, event, window, cx| {
+            if matches!(event, InputEvent::PressEnter { .. }) {
+                this.submit_tree_edit(window, cx);
+            }
+        });
+        if version.is_none() && !path.as_os_str().is_empty() {
+            self.expanded.insert(path.clone());
+            self.load_tree_directory(path.clone(), window, cx);
+            self.rebuild_tree();
+        }
+        let edit = TreeEdit {
+            path,
+            directory,
+            version,
+            input,
+            return_focus,
+            _subscription: subscription,
+        };
+        if let Some((index, _, _)) = edit.row(&self.rows) {
+            self.tree_scroll.scroll_to_item(index, ScrollStrategy::Top);
+        }
+        edit.input.read(cx).focus_handle(cx).focus(window, cx);
+        edit.input
+            .update(cx, |state, cx| state.select_all(window, cx));
+        self.tree_edit = Some(edit);
+        cx.notify();
+    }
+
+    pub(super) fn finish_tree_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(edit) = self.tree_edit.take()
+            && let Some(focus) = edit.return_focus
+        {
+            focus.focus(window, cx);
+        }
+        self.resume_tree_reveal(window, cx);
+        cx.notify();
+    }
+
+    fn submit_tree_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(edit) = self.tree_edit.as_ref() else {
+            return;
+        };
+        let name = edit.input.read(cx).value().to_string();
+        if !valid_name(&name) {
+            toast::error(window, cx, t!("workspace.tree_invalid_name"));
+            return;
+        }
+        let (path, operation) = match &edit.version {
+            Some(version) => (
+                edit.path.clone(),
+                FileOperation::Rename {
+                    name,
+                    version: version.clone(),
+                },
+            ),
+            None => (
+                edit.path.join(name),
+                FileOperation::Create {
+                    directory: edit.directory,
+                },
+            ),
+        };
+        self.run_tree_operation(path, operation, window, cx);
+    }
+
+    fn affected_tree_files(&self, path: &Path) -> BTreeSet<PathBuf> {
+        self.repository_snapshot
+            .as_ref()
+            .or(self.repository.as_ref())
+            .into_iter()
+            .flat_map(|repo| repo.children.values().flatten())
+            .filter(|entry| !entry.directory && entry.path.starts_with(path))
+            .map(|entry| entry.path.clone())
+            .chain(
+                self.tabs
+                    .paths()
+                    .iter()
+                    .filter(|item| item.starts_with(path))
+                    .cloned(),
+            )
+            .chain(
+                self.files
+                    .keys()
+                    .filter(|item| item.starts_with(path))
+                    .cloned(),
+            )
+            .chain(
+                self.session
+                    .files
+                    .keys()
+                    .filter(|item| item.starts_with(path))
+                    .cloned(),
+            )
+            .collect()
+    }
+
+    fn confirm_tree_delete(
+        &self,
+        path: PathBuf,
+        version: EntryVersion,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let workspace = cx.weak_entity();
+        let repo = self.repository.clone().unwrap();
+        let drafts: Vec<_> = self
+            .affected_tree_files(&path)
+            .into_iter()
+            .filter(|path| self.tab_is_dirty(path))
+            .map(|path| paths::display(&path))
+            .collect();
+        window.open_dialog(cx, move |dialog, _, _| {
+            let workspace = workspace.clone();
+            let path = path.clone();
+            let version = version.clone();
+            let repo = repo.clone();
+            dialog
+                .centered()
+                .width(px(480.))
+                .title(t!("workspace.tree_delete_title"))
+                .child(div().child(paths::display(&path)))
+                .when(!drafts.is_empty(), |dialog| {
+                    dialog.child(
+                        div()
+                            .text_sm()
+                            .child(t!("workspace.tree_delete_drafts"))
+                            .children(
+                                drafts
+                                    .iter()
+                                    .take(6)
+                                    .cloned()
+                                    .map(|path| div().truncate().child(path)),
+                            )
+                            .when(drafts.len() > 6, |list| {
+                                list.child(t!(
+                                    "workspace.tree_more_drafts",
+                                    count = drafts.len() - 6
+                                ))
+                            }),
+                    )
+                })
+                .footer(
+                    h_flex()
+                        .justify_end()
+                        .gap_2()
+                        .child(
+                            action_button("cancel-file-delete")
+                                .secondary()
+                                .label(t!("common.cancel"))
+                                .on_click(|_, window, cx| window.close_dialog(cx)),
+                        )
+                        .child(
+                            action_button("confirm-file-delete")
+                                .danger()
+                                .label(t!("workspace.tree_delete"))
+                                .on_click(move |_, window, cx| {
+                                    window.close_dialog(cx);
+                                    _ = workspace.update(cx, |this, cx| {
+                                        if this
+                                            .repository
+                                            .as_ref()
+                                            .is_some_and(|current| Arc::ptr_eq(current, &repo))
+                                        {
+                                            this.run_tree_operation(
+                                                path.clone(),
+                                                FileOperation::Delete {
+                                                    version: version.clone(),
+                                                },
+                                                window,
+                                                cx,
+                                            );
+                                        }
+                                    });
+                                }),
+                        ),
+                )
+        });
+    }
+
+    fn run_tree_operation(
+        &mut self,
+        path: PathBuf,
+        operation: FileOperation,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.tree_busy {
+            return;
+        }
+        if self
+            .saving
+            .iter()
+            .chain(self.git_edit.iter())
+            .any(|item| item.starts_with(&path))
+        {
+            toast::error(window, cx, t!("workspace.tree_operation_busy"));
+            return;
+        }
+        let Some(repo) = self.repository.clone() else {
+            return;
+        };
+        let action = match &operation {
+            FileOperation::Rename { name, .. } => Some(Some(path.with_file_name(name))),
+            FileOperation::Delete { .. } => Some(None),
+            FileOperation::Create { .. } => None,
+        };
+        let open = matches!(operation, FileOperation::Create { directory: false });
+        let affected = action
+            .as_ref()
+            .map(|_| self.affected_tree_files(&path))
+            .unwrap_or_default();
+        self.cancel_file_open();
+        self.tree_busy = true;
+        let target = path.clone();
+        let working = repo.clone();
+        let task = cx.background_spawn(async move { working.operate(&target, operation) });
+        cx.spawn_in(window, async move |this, cx| {
+            let result = task.await;
+            _ = this.update_in(cx, |this, window, cx| {
+                if !this
+                    .repository
+                    .as_ref()
+                    .is_some_and(|current| Arc::ptr_eq(current, &repo))
+                {
+                    return;
+                }
+                this.tree_busy = false;
+                match result {
+                    Ok(()) => {
+                        this.finish_tree_edit(window, cx);
+                        if let Some(action) = action {
+                            if let Some(destination) = action {
+                                this.relocate_tree_path(
+                                    &repo,
+                                    &path,
+                                    &destination,
+                                    affected,
+                                    window,
+                                    cx,
+                                );
+                            } else {
+                                this.remove_tree_path(&repo, &path, affected, window, cx);
+                            }
+                        }
+                        this.refresh_tree_paths(
+                            [path.parent().unwrap_or(Path::new("")).to_owned()],
+                            window,
+                            cx,
+                        );
+                        if open && this.view == WorkspaceView::Editor {
+                            this.open_file(path, false, window, cx);
+                        }
+                    }
+                    Err(error) => {
+                        this.show_error(error, window, cx);
+                        this.rescan_workspace(window, cx);
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    pub(super) fn relocate_tree_path(
+        &mut self,
+        repo: &Repository,
+        from: &Path,
+        to: &Path,
+        paths: BTreeSet<PathBuf>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if from == to {
+            return;
+        }
+        let map = |path: &Path| {
+            path.strip_prefix(from).map_or_else(
+                |_| path.to_owned(),
+                |suffix| {
+                    if suffix.as_os_str().is_empty() {
+                        to.to_owned()
+                    } else {
+                        to.join(suffix)
+                    }
+                },
+            )
+        };
+        let active_moved = self
+            .tabs
+            .active()
+            .is_some_and(|path| path.starts_with(from));
+        self.capture_active_file_position(cx);
+        self.capture_document_position(cx);
+        for path in paths {
+            let target = map(&path);
+            if let Some(mut file) = self.files.remove(&path) {
+                if self.files.contains_key(&target) {
+                    self.files.insert(path, file);
+                    continue;
+                }
+                let state = file.draft_write.clone();
+                let mut pending = state.lock().unwrap();
+                let dirty = file.committed != file.saved;
+                let draft = self
+                    .store
+                    .write_draft(
+                        repo,
+                        &target,
+                        file.document.draft_baseline(),
+                        &file.committed.to_string(),
+                        dirty,
+                    )
+                    .and_then(|()| self.store.discard_draft(repo, &path));
+                if let Err(error) = draft {
+                    self.show_error(error, window, cx);
+                }
+                pending.revision = file.revision;
+                pending.result = None;
+                file.path = target.clone();
+                repo.language_resources().configure_editor(&target, cx);
+                file.editor.update(cx, |editor, cx| {
+                    let language = self.source_language(&target, editor.text());
+                    if editor.language_name() != language {
+                        editor.set_highlighter(language, cx);
+                        editor.prepare_language(window, cx);
+                    }
+                });
+                file.language_server = None;
+                file.server_project = ServerProject::for_file(repo, &target);
+                self.files.insert(target.clone(), file);
+                self.connect_file_to_language_service(&target, cx);
+            } else if let Err(error) = self.store.move_draft(repo, &path, &target) {
+                self.show_error(error, window, cx);
+            }
+            if let Some(position) = self.session.files.remove(&path) {
+                self.session.files.insert(target, position);
+            }
+        }
+        let images: Vec<_> = self
+            .images
+            .keys()
+            .filter(|path| path.starts_with(from))
+            .cloned()
+            .collect();
+        for path in images {
+            let target = map(&path);
+            if crate::image_viewer::is_image(&target) && !self.images.contains_key(&target) {
+                let image = self.images.remove(&path).unwrap();
+                self.images.insert(target.clone(), image);
+                self.load_image_tab(target, window, cx);
+            } else {
+                self.remove_image_tab(&path, window);
+            }
+        }
+        self.tabs.remap(&map);
+        self.expanded = self.expanded.iter().map(|path| map(path)).collect();
+        self.docs_expanded = self.docs_expanded.iter().map(|path| map(path)).collect();
+        self.session.documents = std::mem::take(&mut self.session.documents)
+            .into_iter()
+            .map(|(path, position)| (map(&path), position))
+            .collect();
+        if let Some(docs) = self.session.open_documents.as_mut() {
+            for doc in docs {
+                doc.path = map(&doc.path);
+            }
+        }
+        if let Some(doc) = self
+            .session
+            .document
+            .clone()
+            .filter(|path| path.starts_with(from))
+        {
+            let target = map(&doc);
+            self.session.document = Some(target.clone());
+            self.doc = None;
+            if self.view == WorkspaceView::Docs {
+                self.open_doc(target, None, window, cx);
+            }
+        }
+        if active_moved && self.view == WorkspaceView::Editor {
+            if self.active_file().is_none() && self.active_image_tab().is_none() {
+                self.restore_active_file(window, cx);
+            } else {
+                self.watch_editor_git(window, cx);
+            }
+        }
+        self.session_revision += 1;
+        self.rebuild_tree();
+    }
+
+    pub(super) fn files_for_external_rename(&self, source: &Path) -> BTreeSet<PathBuf> {
+        self.affected_tree_files(source)
+    }
+
+    fn remove_tree_path(
+        &mut self,
+        repo: &Repository,
+        target: &Path,
+        paths: BTreeSet<PathBuf>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let previous = self.tabs.active().map(Path::to_owned);
+        for path in paths {
+            if let Some(file) = self.files.remove(&path) {
+                let mut pending = file.draft_write.lock().unwrap();
+                pending.revision = file.revision;
+            }
+            self.remove_image_tab(&path, window);
+            self.tabs.close(&path);
+            self.session.files.remove(&path);
+            if let Err(error) = self.store.discard_draft(repo, &path) {
+                self.show_error(error, window, cx);
+            }
+        }
+        let removed: Vec<_> = self
+            .session
+            .open_documents
+            .iter()
+            .flatten()
+            .filter(|document| document.path.starts_with(target))
+            .map(|document| document.path.clone())
+            .collect();
+        for path in removed {
+            self.session.close_document(&path);
+            self.session.documents.remove(&path);
+        }
+        if self
+            .doc
+            .as_ref()
+            .is_some_and(|doc| doc.read(cx).path.starts_with(target))
+        {
+            self.doc = None;
+            if self.view == WorkspaceView::Docs
+                && let Some(path) = self.session.document.clone()
+            {
+                self.open_doc(path, None, window, cx);
+            }
+        }
+        self.expanded.retain(|path| !path.starts_with(target));
+        self.docs_expanded.retain(|path| !path.starts_with(target));
+        if previous.as_deref() != self.tabs.active() {
+            self.restore_active_file(window, cx);
+        }
+        self.session_revision += 1;
+    }
+
+    fn save_tree_copy(
+        &self,
+        repo: Arc<Repository>,
+        path: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let buffer = self.files.get(&path).and_then(|file| {
+            let text = file.editor.read(cx).text();
+            (text != &file.saved).then(|| file.document.encode_text(&text.to_string()))
+        });
+        let store = self.store.clone();
+        let initial = if repo.ssh.is_none() {
+            repo.root.join(path.parent().unwrap_or(Path::new("")))
+        } else {
+            dirs::home_dir().unwrap_or_else(env::temp_dir)
+        };
+        let selection =
+            cx.prompt_for_new_path(&initial, path.file_name().and_then(|name| name.to_str()));
+        cx.spawn_in(window, async move |this, cx| {
+            let result = async {
+                let Some(destination) = selection.await?? else {
+                    return Ok(());
+                };
+                let source = repo.ssh.is_none().then(|| repo.root.join(&path));
+                let target = cx
+                    .background_spawn(
+                        async move { CopyTarget::prepare(destination, source.as_deref()) },
+                    )
+                    .await?;
+                if target.exists() {
+                    let confirmation = this.update_in(cx, |_, window, cx| {
+                        window.prompt(
+                            PromptLevel::Warning,
+                            &t!("workspace.tree_replace_title"),
+                            Some(&paths::display(target.path())),
+                            &[
+                                PromptButton::new(t!("common.cancel")),
+                                PromptButton::new(t!("workspace.tree_replace")),
+                            ],
+                            cx,
+                        )
+                    })?;
+                    if confirmation.await? != 1 {
+                        return Ok(());
+                    }
+                }
+                cx.background_spawn(async move {
+                    target.write(|output| {
+                        if let Some(bytes) = buffer {
+                            output.write_all(&bytes)?;
+                            return Ok(());
+                        }
+                        if store.has_draft(&repo, &path) {
+                            let document = Document::open(&repo, &path, &store)?;
+                            if document.restored {
+                                output.write_all(&document.encode_text(&document.text))?;
+                                return Ok(());
+                            }
+                        }
+                        repo.copy_to(&path, output)
+                    })
+                })
+                .await
+            }
+            .await;
+            if let Err(error) = result {
+                _ = this.update_in(cx, |this, window, cx| this.show_error(error, window, cx));
+            }
+        })
+        .detach();
+    }
+}
+
+#[derive(Default, PartialEq)]
+pub(super) struct TreeStatus {
+    files: Arc<crate::git::WorktreeStatus>,
+    directories: HashMap<PathBuf, bool>,
+}
+
+impl TreeStatus {
+    pub(super) fn new(files: Arc<crate::git::WorktreeStatus>) -> Self {
+        let mut directories = HashMap::new();
+        for (path, status) in files.iter() {
+            for path in std::iter::once(path).chain(status.old_path.iter()) {
+                for directory in Path::new(path).ancestors().skip(1) {
+                    *directories.entry(directory.to_owned()).or_default() |= status.conflict;
+                }
+            }
+        }
+        Self { files, directories }
+    }
+
+    pub(super) fn decoration(
+        &self,
+        entry: &Entry,
+        colors: Palette,
+        cx: &App,
+    ) -> Option<(Hsla, SharedString)> {
+        let (color, label) = if entry.directory {
+            if *self.directories.get(&entry.path)? {
+                (
+                    cx.theme().danger,
+                    t!("workspace.tree_status_directory_conflict"),
+                )
+            } else {
+                (colors.warning, t!("workspace.tree_status_directory"))
+            }
+        } else {
+            let key = entry.path.to_str()?.replace(std::path::MAIN_SEPARATOR, "/");
+            let status = self.files.get(&key)?;
+            let code = if status.conflict { 'U' } else { status.code };
+            let label = match code {
+                '?' => t!("workspace.tree_status_untracked"),
+                'A' => t!("workspace.tree_status_added"),
+                'D' => t!("workspace.tree_status_deleted"),
+                'U' => t!("workspace.tree_status_conflict"),
+                'R' => t!("workspace.tree_status_renamed"),
+                'C' => t!("workspace.tree_status_copied"),
+                _ => t!("workspace.tree_status_modified"),
+            };
+            let mut color = super::git_panel::status_color(code, colors, cx);
+            if matches!(code, 'A' | '?') {
+                color.s *= 0.55;
+            }
+            (color, label)
+        };
+        Some((color, label.into()))
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+
+    fn test_repository_location(root: PathBuf) -> PathBuf {
+        match env::var("STROLL_TEST_WORKSPACE_SSH_AUTHORITY") {
+            Ok(authority) => PathBuf::from(format!("ssh://{authority}{}", root.display())),
+            Err(_) => root,
+        }
+    }
+
+    #[track_caller]
+    fn settle(
+        visual: &mut VisualTestContext,
+        workspace: &Entity<Workspace>,
+        ready: impl Fn(&Workspace) -> bool,
+    ) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            visual.executor().advance_clock(crate::git::watch::DEBOUNCE);
+            visual.run_until_parked();
+            let done = visual.update(|window, cx| {
+                window.simulate_next_frame(cx);
+                window.draw(cx).clear(cx);
+                ready(workspace.read(cx))
+            });
+            if done {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "workspace did not settle"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[::core::prelude::v1::test]
+    fn workspace_tree_opens_image_tabs_and_previews_audio_in_place() -> Result<()> {
+        let fixture = tempfile::tempdir()?;
+        let root = fixture.path().join("repo");
+        fs::create_dir(&root)?;
+        assert!(
+            std::process::Command::new("git")
+                .args(["init", "-qb", "main"])
+                .arg(&root)
+                .status()?
+                .success()
+        );
+        fs::write(root.join("notes.txt"), "Keep this buffer focused.\n")?;
+        fs::write(root.join("clip.wav"), b"Invalid audio fixture")?;
+        fs::write(root.join("broken.webp"), b"Invalid image fixture")?;
+        let image = image::RgbaImage::from_pixel(1600, 960, image::Rgba([93, 146, 223, 160]));
+        image.save(root.join("picture.png"))?;
+        fs::copy(root.join("picture.png"), root.join("second.png"))?;
+
+        let platform = gpui_platform::current_platform(true);
+        let mut cx = TestAppContext::build_with_text_system(
+            TestDispatcher::new(0),
+            None,
+            platform.text_system(),
+        );
+        cx.update(gpui_component::init);
+        let store = Arc::new(Store::new(fixture.path().join("state"))?);
+        let config = ConfigFile::load(Some(fixture.path().join("config.toml")));
+        let mut workspace = None;
+        let (_, visual) = cx.add_window_view(|window, cx| {
+            let view = cx
+                .new(|cx| Workspace::with_config(store, config, WorkspaceView::Editor, window, cx));
+            workspace = Some(view.clone());
+            gpui_component::Root::new(view, window, cx)
+        });
+        let workspace = workspace.unwrap();
+        visual.simulate_resize(size(px(900.), px(620.)));
+        let root = test_repository_location(root);
+        visual.update(|window, cx| {
+            window.activate_window();
+            workspace.update(cx, |this, cx| {
+                this.open_repository(
+                    Location {
+                        root,
+                        file: Some("notes.txt".into()),
+                    },
+                    window,
+                    cx,
+                );
+            });
+        });
+        let notes = Path::new("notes.txt");
+        let picture = Path::new("picture.png");
+        let broken = Path::new("broken.webp");
+        settle(visual, &workspace, |this| this.active_file().is_some());
+        visual.update(|window, cx| {
+            workspace.update(cx, |this, cx| {
+                this.keep_tab(notes, cx);
+                this.finish_tab_selection(Some(notes), window, cx);
+            })
+        });
+
+        let audio_row = visual
+            .debug_bounds("workspace-tree-row:clip.wav")
+            .unwrap()
+            .center();
+        let focused = visual.update(|window, cx| window.focused(cx));
+        assert!(focused.is_some());
+        visual.simulate_click(audio_row, Modifiers::default());
+        visual.simulate_event(MouseDownEvent {
+            button: MouseButton::Left,
+            position: audio_row,
+            click_count: 2,
+            ..Default::default()
+        });
+        visual.simulate_event(MouseUpEvent {
+            button: MouseButton::Left,
+            position: audio_row,
+            click_count: 2,
+            ..Default::default()
+        });
+        visual.update(|window, cx| {
+            assert_eq!(workspace.read(cx).tabs.paths(), [notes.to_owned()]);
+            assert_eq!(window.focused(cx), focused);
+        });
+
+        let image_row = visual
+            .debug_bounds("workspace-tree-row:picture.png")
+            .unwrap()
+            .center();
+        visual.simulate_click(image_row, Modifiers::default());
+        settle(visual, &workspace, |this| {
+            this.tabs.active() == Some(picture)
+        });
+        let viewport = visual.debug_bounds("workspace-image-viewport").unwrap();
+        let controls = visual.debug_bounds("workspace-image-controls").unwrap();
+        assert_eq!(viewport.top(), controls.top());
+        assert!(viewport.contains(&controls.center()));
+        visual.update(|_, cx| {
+            let this = workspace.read(cx);
+            assert!(this.tabs.is_preview(picture));
+            assert!(this.active_file().is_none());
+            assert!(!this.tab_is_dirty(picture));
+            assert!(this.image_preview.is_none());
+        });
+
+        let mut scroll = ScrollEvent {
+            position: viewport.center(),
+            delta: ScrollDelta::Pixels(point(px(0.), px(13.))),
+            modifiers: Modifiers {
+                control: true,
+                ..Default::default()
+            },
+            source: ScrollSource::Touchpad,
+            touch_phase: TouchPhase::Started,
+        };
+        let zoom = |visual: &mut VisualTestContext| {
+            visual.update(|_, cx| workspace.read(cx).active_image_tab().unwrap().1.zoom())
+        };
+        let tick = |visual: &mut VisualTestContext| {
+            visual.executor().advance_clock(Duration::from_millis(16));
+            visual.update(|window, cx| {
+                window.simulate_next_frame(cx);
+                window.draw(cx).clear(cx);
+            });
+        };
+        for _ in 0..3 {
+            visual.simulate_event(scroll.clone());
+            scroll.touch_phase = TouchPhase::Moved;
+            tick(visual);
+        }
+        assert_eq!(zoom(visual), None);
+        visual.simulate_event(scroll.clone());
+        for _ in 0..5 {
+            tick(visual);
+        }
+        assert_eq!(zoom(visual), Some(1.));
+        scroll.delta = ScrollDelta::Lines(point(0., 1.));
+        scroll.source = ScrollSource::Pointer;
+        visual.simulate_event(scroll);
+        assert_eq!(zoom(visual), Some(1.25));
+
+        let broken_row = visual
+            .debug_bounds("workspace-tree-row:broken.webp")
+            .unwrap()
+            .center();
+        visual.simulate_click(broken_row, Modifiers::default());
+        settle(visual, &workspace, |this| {
+            this.tabs.active() == Some(broken)
+        });
+        assert!(visual.debug_bounds("workspace-image-status").is_some());
+        visual.update(|_, cx| {
+            let this = workspace.read(cx);
+            assert!(!this.tabs.paths().iter().any(|path| path == picture));
+            assert!(!this.images.contains_key(picture));
+        });
+
+        visual.simulate_click(image_row, Modifiers::default());
+        settle(visual, &workspace, |this| {
+            this.tabs.active() == Some(picture)
+        });
+        visual.simulate_event(MouseDownEvent {
+            button: MouseButton::Left,
+            position: image_row,
+            click_count: 2,
+            ..Default::default()
+        });
+        visual.simulate_event(MouseUpEvent {
+            button: MouseButton::Left,
+            position: image_row,
+            click_count: 2,
+            ..Default::default()
+        });
+        settle(visual, &workspace, |this| !this.tabs.is_preview(picture));
+        visual.update(|_, cx| {
+            let (_, tab) = workspace.read(cx).active_image_tab().unwrap();
+            assert_eq!(tab.sampling(), ImageSampling::Linear);
+        });
+        let control = visual.debug_bounds("workspace-image-sampling").unwrap();
+        assert_eq!(control.size.height, px(26.));
+        visual.simulate_click(control.center(), Modifiers::default());
+        settle(visual, &workspace, |_| true);
+        visual.simulate_keystrokes("down down enter");
+        settle(visual, &workspace, |this| {
+            this.active_image_tab()
+                .is_some_and(|(_, tab)| tab.sampling() == ImageSampling::Nearest)
+        });
+
+        let second = Path::new("second.png");
+        let second_row = visual
+            .debug_bounds("workspace-tree-row:second.png")
+            .unwrap();
+        visual.simulate_click(second_row.center(), Modifiers::default());
+        settle(visual, &workspace, |this| {
+            this.tabs.active() == Some(second)
+        });
+        visual.update(|_, cx| {
+            let (_, tab) = workspace.read(cx).active_image_tab().unwrap();
+            assert_eq!(tab.sampling(), ImageSampling::Linear);
+        });
+        visual.simulate_click(image_row, Modifiers::default());
+        settle(visual, &workspace, |this| {
+            this.tabs.active() == Some(picture)
+        });
+        visual.update(|window, cx| {
+            workspace.update(cx, |this, cx| {
+                assert_eq!(
+                    this.active_image_tab().unwrap().1.sampling(),
+                    ImageSampling::Nearest
+                );
+                assert!(!this.tabs.is_preview(picture));
+                this.close_tabs(vec![second.to_owned(), picture.to_owned()], window, cx);
+                assert_eq!(this.tabs.active(), Some(notes));
+                assert!(!this.images.contains_key(picture));
+                assert!(this.request_window_close(window, cx));
+            });
+        });
+        Ok(())
+    }
+
+    #[::core::prelude::v1::test]
+    fn workspace_lazy_tree_loads_one_layer_and_reveals_active_tab() -> Result<()> {
+        let fixture = tempfile::tempdir()?;
+        let root = fixture.path().join("repo");
+        fs::create_dir(&root)?;
+        assert!(
+            std::process::Command::new("git")
+                .args(["init", "-q", "--"])
+                .arg(&root)
+                .status()?
+                .success()
+        );
+        fs::write(root.join(".gitignore"), "ignored/\n")?;
+        fs::write(root.join(".visible"), "")?;
+        fs::create_dir_all(root.join("ignored/deep"))?;
+        fs::create_dir_all(root.join("ignored/deep/unopened"))?;
+        fs::write(root.join("ignored/deep/unopened/untouched.txt"), "")?;
+        fs::write(root.join("ignored/deep/z-target.txt"), "target")?;
+        for index in 0..60 {
+            fs::write(root.join(format!("ignored/deep/file-{index:02}.txt")), "")?;
+        }
+        let large_fixture = env::var_os("STROLL_TEST_LARGE_IGNORED_TREE").is_some();
+        if large_fixture {
+            fs::create_dir(root.join("ignored/bulk"))?;
+            for dir in 0..2_000 {
+                let parent = root.join(format!("ignored/bulk/dir-{dir:04}"));
+                fs::create_dir(&parent)?;
+                for file in 0..50 {
+                    fs::write(parent.join(format!("file-{file:02}.txt")), "")?;
+                }
+            }
+        }
+
+        let mut cx = TestAppContext::single();
+        cx.update(gpui_component::init);
+        let store = Arc::new(Store::new(fixture.path().join("state"))?);
+        let config = ConfigFile::load(Some(fixture.path().join("config.toml")));
+        let mut workspace = None;
+        let (_, mut visual) = cx.add_window_view(|window, cx| {
+            let view = cx
+                .new(|cx| Workspace::with_config(store, config, WorkspaceView::Editor, window, cx));
+            workspace = Some(view.clone());
+            gpui_component::Root::new(view, window, cx)
+        });
+        let workspace = workspace.unwrap();
+        visual.simulate_resize(size(px(1024.), px(650.)));
+        let visual = &mut visual;
+        let location = test_repository_location(root);
+        let remote = location.to_string_lossy().starts_with("ssh://");
+        let start = std::time::Instant::now();
+        visual.update(|window, cx| {
+            window.activate_window();
+            workspace.update(cx, |this, cx| {
+                this.open_repository(
+                    Location {
+                        root: location,
+                        file: None,
+                    },
+                    window,
+                    cx,
+                );
+            });
+        });
+        settle(visual, &workspace, |this| {
+            this.rows
+                .iter()
+                .any(|row| row.entry.path == Path::new(".visible"))
+        });
+        assert!(visual.debug_bounds("workspace-tree-row:.visible").is_some());
+        let first_frame = start.elapsed();
+        visual.update(|_, cx| {
+            let this = workspace.read(cx);
+            let repo = this
+                .repository_snapshot
+                .as_ref()
+                .or(this.repository.as_ref())
+                .unwrap();
+            assert_eq!(
+                repo.children.keys().cloned().collect::<Vec<_>>(),
+                [PathBuf::new()]
+            );
+            assert!(
+                this.rows
+                    .iter()
+                    .any(|row| row.entry.path == Path::new("ignored") && row.dimmed)
+            );
+            assert!(
+                this.rows
+                    .iter()
+                    .any(|row| row.entry.path == Path::new(".visible") && !row.dimmed)
+            );
+        });
+        if large_fixture {
+            settle(visual, &workspace, |this| this.repository_watch_active);
+            let watch_ready = start.elapsed();
+            settle(visual, &workspace, |this| {
+                !this.workspace_refreshing && this.tree_status.files.contains_key(".visible")
+            });
+            eprintln!(
+                "workspace SSH={remote}, 100000 bulk files, first frame {:.1} ms, watch ready {:.1} ms, first refresh/status {:.1} ms",
+                first_frame.as_secs_f64() * 1_000.,
+                watch_ready.as_secs_f64() * 1_000.,
+                start.elapsed().as_secs_f64() * 1_000.
+            );
+        }
+
+        let ignored = visual.debug_bounds("workspace-tree-row:ignored").unwrap();
+        visual.simulate_click(ignored.center(), Modifiers::default());
+        settle(visual, &workspace, |this| {
+            this.rows
+                .iter()
+                .any(|row| row.entry.path == Path::new("ignored/deep"))
+        });
+        visual.update(|_, cx| {
+            let this = workspace.read(cx);
+            assert_eq!(this.repository_snapshot.as_ref().unwrap().children.len(), 2);
+            assert!(
+                this.rows
+                    .iter()
+                    .any(|row| row.entry.path == Path::new("ignored/deep") && !row.dimmed)
+            );
+        });
+        visual.simulate_click(ignored.center(), Modifiers::default());
+
+        let target = Path::new("ignored/deep/z-target.txt");
+        let dotfile = Path::new(".visible");
+        // Restoring a tab must discover its ancestor directories even when they
+        // were collapsed and the target was never reached by expanding the tree.
+        visual.update(|window, cx| {
+            workspace.update(cx, |this, cx| {
+                this.open_file(target.to_owned(), false, window, cx)
+            })
+        });
+        settle(visual, &workspace, |this| {
+            this.rows.iter().any(|row| row.entry.path == target)
+        });
+        settle(visual, &workspace, |_| true);
+        let target_bounds = visual
+            .debug_bounds("workspace-tree-row:ignored/deep/z-target.txt")
+            .unwrap();
+        assert!(target_bounds.bottom() <= px(650.));
+        visual.update(|window, cx| {
+            workspace.update(cx, |this, cx| {
+                let repo = this.repository_snapshot.as_ref().unwrap();
+                assert!(repo.children.contains_key(Path::new("ignored/deep")));
+                assert!(
+                    !repo
+                        .children
+                        .contains_key(Path::new("ignored/deep/unopened"))
+                );
+                assert!(!repo.children.contains_key(Path::new("ignored/bulk")));
+                this.open_file(dotfile.to_owned(), false, window, cx);
+            });
+        });
+        settle(visual, &workspace, |this| {
+            this.tabs.active() == Some(dotfile)
+        });
+        visual.update(|window, cx| {
+            workspace.update(cx, |this, cx| {
+                this.expanded.clear();
+                this.rebuild_tree();
+                this.activate_tab(target, window, cx);
+            });
+        });
+        settle(visual, &workspace, |this| {
+            this.tabs.active() == Some(target)
+        });
+        settle(visual, &workspace, |_| true);
+        assert!(
+            visual
+                .debug_bounds("workspace-tree-row:ignored/deep/z-target.txt")
+                .is_some()
+        );
+        visual.update(|window, cx| {
+            let this = workspace.read(cx);
+            assert!(
+                this.active_file()
+                    .unwrap()
+                    .editor
+                    .read(cx)
+                    .focus_handle(cx)
+                    .is_focused(window)
+            );
+        });
+        Ok(())
+    }
+
+    #[::core::prelude::v1::test]
+    fn workspace_file_tree_watcher_and_inline_edit() -> Result<()> {
+        let fixture = tempfile::tempdir()?;
+        let root = fixture.path().join("repo");
+        fs::create_dir(&root)?;
+        assert!(
+            std::process::Command::new("git")
+                .args(["init", "-qb", "main"])
+                .arg(&root)
+                .status()?
+                .success()
+        );
+        fs::write(root.join(".gitignore"), "ignored/\n*.log\n")?;
+        fs::write(root.join(".visible"), "dotfile\n")?;
+        fs::write(root.join(".ignored.log"), "ignored dotfile\n")?;
+        fs::write(root.join("original.txt"), "initial\n")?;
+        let platform = gpui_platform::current_platform(true);
+        let mut cx = TestAppContext::build_with_text_system(
+            TestDispatcher::new(0),
+            None,
+            platform.text_system(),
+        );
+        cx.update(gpui_component::init);
+        let store = Arc::new(Store::new(fixture.path().join("state"))?);
+        let config = ConfigFile::load(Some(fixture.path().join("config.toml")));
+        let mut workspace = None;
+        let (_, mut visual) = cx.add_window_view(|window, cx| {
+            let view = cx
+                .new(|cx| Workspace::with_config(store, config, WorkspaceView::Editor, window, cx));
+            workspace = Some(view.clone());
+            gpui_component::Root::new(view, window, cx)
+        });
+        let workspace = workspace.unwrap();
+        let visual = &mut visual;
+        visual.simulate_resize(size(px(1024.), px(700.)));
+        let open_root = test_repository_location(root.clone());
+        visual.update(|window, cx| {
+            window.activate_window();
+            workspace.update(cx, |this, cx| {
+                this.open_repository(
+                    Location {
+                        root: open_root,
+                        file: None,
+                    },
+                    window,
+                    cx,
+                );
+            });
+        });
+        settle(visual, &workspace, |this| this.repository_watch_active);
+        visual.update(|window, cx| {
+            workspace.update(cx, |this, cx| {
+                this.open_file("original.txt".into(), false, window, cx)
+            });
+        });
+        settle(visual, &workspace, |this| {
+            this.files.contains_key(Path::new("original.txt"))
+        });
+
+        fs::create_dir(root.join("ignored"))?;
+        settle(visual, &workspace, |this| {
+            this.rows
+                .iter()
+                .any(|row| row.entry.path == Path::new("ignored") && row.dimmed)
+        });
+        visual.update(|_, cx| {
+            let this = workspace.read(cx);
+            for name in [".gitignore", ".visible"] {
+                assert!(
+                    this.rows
+                        .iter()
+                        .any(|row| { row.entry.path == Path::new(name) && !row.dimmed })
+                );
+            }
+            assert!(
+                this.rows
+                    .iter()
+                    .any(|row| { row.entry.path == Path::new(".ignored.log") && row.dimmed })
+            );
+        });
+        let ignored = visual.debug_bounds("workspace-tree-row:ignored").unwrap();
+        visual.simulate_click(ignored.center(), Modifiers::default());
+        fs::write(root.join("ignored/notes.txt"), "ignored file\n")?;
+        settle(visual, &workspace, |this| {
+            this.rows.iter().any(|row| {
+                row.entry.path == Path::new("ignored/notes.txt") && row.entry.ignored && !row.dimmed
+            })
+        });
+        let notes = visual
+            .debug_bounds("workspace-tree-row:ignored/notes.txt")
+            .unwrap();
+        visual.simulate_click(notes.center(), Modifiers::default());
+        settle(visual, &workspace, |this| {
+            this.active_file()
+                .is_some_and(|file| file.saved == "ignored file\n")
+        });
+        fs::write(root.join("ignored/notes.txt"), "updated ignored file\n")?;
+        settle(visual, &workspace, |this| {
+            this.active_file()
+                .is_some_and(|file| file.saved == "updated ignored file\n")
+        });
+        fs::write(root.join(".gitignore"), "ignored/\n")?;
+        settle(visual, &workspace, |this| {
+            this.rows
+                .iter()
+                .any(|row| row.entry.path == Path::new(".ignored.log") && !row.dimmed)
+        });
+        visual.update(|window, cx| {
+            workspace.update(cx, |this, cx| {
+                this.open_file("original.txt".into(), false, window, cx)
+            });
+        });
+        fs::create_dir(root.join("empty"))?;
+        fs::write(root.join("original.txt"), "external edit\n")?;
+        settle(visual, &workspace, |this| {
+            this.rows
+                .iter()
+                .any(|row| row.entry.path == Path::new("empty"))
+                && this
+                    .active_file()
+                    .is_some_and(|file| file.saved == "external edit\n")
+        });
+        visual.update(|window, cx| {
+            workspace.update(cx, |this, cx| {
+                let editor = this.active_file().unwrap().editor.clone();
+                editor.update(cx, |editor, cx| {
+                    editor.set_value("my unsaved draft\n", window, cx)
+                });
+                this.editor_changed(editor, window, cx);
+            });
+        });
+
+        settle(visual, &workspace, |_| true);
+        let original = visual
+            .debug_bounds("workspace-tree-row:original.txt")
+            .unwrap();
+        visual.simulate_mouse_move(original.center(), None, Modifiers::default());
+        visual.simulate_mouse_down(original.center(), MouseButton::Right, Modifiers::default());
+        visual.simulate_mouse_up(original.center(), MouseButton::Right, Modifiers::default());
+        settle(visual, &workspace, |_| true);
+        visual.simulate_keystrokes("down down down enter");
+        assert!(
+            visual.did_prompt_for_new_path(),
+            "Save As must open the platform save dialog"
+        );
+        let copy = fixture.path().join("copy.txt");
+        visual.simulate_new_path_selection(|_| Some(copy.clone()));
+        settle(visual, &workspace, |this| {
+            assert_eq!(this.tabs.active(), Some(Path::new("original.txt")));
+            copy.is_file()
+        });
+        assert_eq!(fs::read_to_string(copy)?, "my unsaved draft\n");
+        assert_eq!(
+            fs::read_to_string(root.join("original.txt"))?,
+            "external edit\n"
+        );
+
+        fs::rename(root.join("original.txt"), root.join("renamed.txt"))?;
+        settle(visual, &workspace, |this| {
+            this.tabs.active() == Some(Path::new("renamed.txt"))
+                && this
+                    .active_file()
+                    .is_some_and(|file| file.committed == "my unsaved draft\n")
+                && this
+                    .repository
+                    .as_ref()
+                    .is_some_and(|repo| this.store.has_draft(repo, Path::new("renamed.txt")))
+        });
+        fs::remove_file(root.join("renamed.txt"))?;
+        settle(visual, &workspace, |this| {
+            this.active_file().is_some_and(|file| file.missing)
+        });
+        fs::write(root.join("renamed.txt"), "new external edit\n")?;
+        settle(visual, &workspace, |this| {
+            this.active_file().is_some_and(|file| {
+                !file.missing && file.document.conflict && file.committed == "my unsaved draft\n"
+            })
+        });
+
+        let folder = visual
+            .debug_bounds("workspace-tree-row:empty")
+            .expect("empty folder is visible");
+        visual.simulate_mouse_down(folder.center(), MouseButton::Right, Modifiers::default());
+        visual.simulate_mouse_up(folder.center(), MouseButton::Right, Modifiers::default());
+        settle(visual, &workspace, |_| true);
+        visual.simulate_keystrokes("down enter");
+        settle(visual, &workspace, |this| this.tree_edit.is_some());
+        visual.simulate_input("created.txt");
+        visual.simulate_keystrokes("enter");
+        settle(visual, &workspace, |this| {
+            this.tabs.active() == Some(Path::new("empty/created.txt"))
+        });
+        assert!(root.join("empty/created.txt").is_file());
+        Ok(())
+    }
+}

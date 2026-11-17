@@ -1,0 +1,19 @@
+{
+  "name": "example-grammar-fixture",
+  "private": true,
+  "contributes": {
+    "languages": [
+      {
+        "id": "example",
+        "extensions": [".example"]
+      }
+    ],
+    "grammars": [
+      {
+        "language": "example",
+        "scopeName": "source.example",
+        "path": "./example.tmLanguage.json"
+      }
+    ]
+  }
+}

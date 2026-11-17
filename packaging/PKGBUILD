@@ -1,0 +1,41 @@
+pkgname=stroll
+pkgver=0.1.0
+pkgrel=2
+pkgdesc='Read and edit local Git repositories and Markdown documents'
+arch=(x86_64)
+license=(custom)
+depends=(git openssh libxcb libxkbcommon libxkbcommon-x11 wayland fontconfig vulkan-icd-loader)
+makedepends=(cargo rust pkgconf)
+# C LTO flags break ring's pregenerated assembly at link time.
+options=(!lto !debug)
+source=("stroll-$pkgver.tar.gz"
+        "io.stroll.Stroll.desktop"
+        "io.stroll.Stroll.svg")
+sha256sums=('SKIP'
+            'SKIP'
+            'SKIP')
+
+build() {
+  cd "$pkgname-$pkgver"
+  # scripts/package-arch.sh stages a binary from a warm local build here, so
+  # iterating on the package does not repeat a full cargo build.
+  if [[ -f $startdir/prebuilt/stroll ]]; then
+    return 0
+  fi
+  # Keep temporary build paths out of panic locations and binary strings.
+  export RUSTFLAGS="${RUSTFLAGS:-} --remap-path-prefix=$srcdir=$pkgname-$pkgver"
+  cargo build --release --locked --bin stroll
+}
+
+package() {
+  cd "$pkgname-$pkgver"
+  local binary=target/release/stroll
+  if [[ -f $startdir/prebuilt/stroll ]]; then
+    binary=$startdir/prebuilt/stroll
+  fi
+  install -Dm755 "$binary" "$pkgdir/usr/bin/stroll"
+  install -Dm644 "$srcdir/io.stroll.Stroll.desktop" \
+    "$pkgdir/usr/share/applications/io.stroll.Stroll.desktop"
+  install -Dm644 "$srcdir/io.stroll.Stroll.svg" \
+    "$pkgdir/usr/share/icons/hicolor/scalable/apps/io.stroll.Stroll.svg"
+}

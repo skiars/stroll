@@ -1,0 +1,758 @@
+use rust_i18n::t;
+
+use std::{
+    env,
+    fs::{self, File, OpenOptions},
+    io::ErrorKind,
+    path::{Path, PathBuf},
+};
+
+use anyhow::{Context as _, Result, ensure};
+use gpui::TextRenderingPreference;
+use serde::{Deserialize, Serialize};
+use toml_edit::{DocumentMut, Item, Table, TableLike};
+
+use crate::{
+    language::parse_command_line, locale::Language, lsp::LanguageServer, repository::atomic_write,
+};
+
+const VERSION: u32 = 1;
+pub(crate) const FONT_SIZE_MIN: f64 = 10.;
+pub(crate) const FONT_SIZE_MAX: f64 = 32.;
+pub(crate) const UI_FONT_SIZE_MIN: f64 = 12.;
+pub(crate) const UI_FONT_SIZE_MAX: f64 = 14.;
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+#[serde(default)]
+pub(crate) struct Config {
+    pub appearance: Appearance,
+    pub docs: Docs,
+    pub editor: Editor,
+    pub git: Git,
+    pub terminal: Terminal,
+    pub lsp: Lsp,
+    pub ai: crate::ai::Settings,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(default)]
+pub(crate) struct Appearance {
+    pub theme: Theme,
+    pub code_theme: CodeTheme,
+    pub code_contrast: CodeContrast,
+    pub language: Language,
+    pub ui_font_family: String,
+    pub ui_font_size: f64,
+    pub fallback_font_family: String,
+    pub smooth_scroll: bool,
+    pub text_rendering: TextRenderingPreference,
+}
+
+impl Default for Appearance {
+    fn default() -> Self {
+        Self {
+            theme: Theme::System,
+            code_theme: CodeTheme::default(),
+            code_contrast: CodeContrast::Enhanced,
+            language: Language::System,
+            ui_font_family: String::new(),
+            ui_font_size: 13.,
+            fallback_font_family: String::new(),
+            smooth_scroll: true,
+            text_rendering: TextRenderingPreference::Auto,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum Theme {
+    #[default]
+    System,
+    Light,
+    Dark,
+}
+
+/// Code color scheme for editors and document previews.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum CodeTheme {
+    #[default]
+    #[serde(alias = "default")]
+    Prism,
+    Orchard,
+    Spectrum,
+    Neon,
+    Lilac,
+    LilacWhite,
+    Balanced,
+    Paper,
+}
+
+impl CodeTheme {
+    pub(crate) const ALL: [Self; 8] = [
+        Self::Prism,
+        Self::Orchard,
+        Self::Spectrum,
+        Self::Neon,
+        Self::Lilac,
+        Self::LilacWhite,
+        Self::Balanced,
+        Self::Paper,
+    ];
+
+    pub(crate) fn config_value(self) -> &'static str {
+        match self {
+            Self::Prism => "prism",
+            Self::Orchard => "orchard",
+            Self::Spectrum => "spectrum",
+            Self::Neon => "neon",
+            Self::Lilac => "lilac",
+            Self::LilacWhite => "lilac-white",
+            Self::Balanced => "balanced",
+            Self::Paper => "paper",
+        }
+    }
+
+    pub(crate) fn from_config(value: &str) -> Self {
+        Self::ALL
+            .into_iter()
+            .find(|theme| theme.config_value() == value)
+            .unwrap_or_default()
+    }
+}
+
+/// Contrast target for code text.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum CodeContrast {
+    Standard,
+    #[default]
+    Enhanced,
+    High,
+}
+
+impl CodeContrast {
+    pub(crate) const ALL: [Self; 3] = [Self::Standard, Self::Enhanced, Self::High];
+
+    pub(crate) fn config_value(self) -> &'static str {
+        match self {
+            Self::Standard => "standard",
+            Self::Enhanced => "enhanced",
+            Self::High => "high",
+        }
+    }
+
+    pub(crate) fn from_config(value: &str) -> Self {
+        Self::ALL
+            .into_iter()
+            .find(|contrast| contrast.config_value() == value)
+            .unwrap_or_default()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(default)]
+pub(crate) struct Docs {
+    pub body_font_size: f64,
+    pub code_block_font_size: f64,
+}
+
+impl Default for Docs {
+    fn default() -> Self {
+        Self {
+            body_font_size: 16.,
+            code_block_font_size: 13.5,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(default)]
+pub(crate) struct Editor {
+    pub font_family: String,
+    pub font_size: f64,
+    pub line_numbers: bool,
+    pub soft_wrap: bool,
+    pub inlay_hints: bool,
+}
+
+impl Default for Editor {
+    fn default() -> Self {
+        Self {
+            font_family: String::new(),
+            font_size: 13.5,
+            line_numbers: true,
+            soft_wrap: true,
+            inlay_hints: false,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(default)]
+pub(crate) struct Git {
+    pub diff_layout: DiffLayout,
+    pub soft_wrap: bool,
+    pub ignore_whitespace: bool,
+}
+
+impl Default for Git {
+    fn default() -> Self {
+        Self {
+            diff_layout: DiffLayout::Unified,
+            soft_wrap: true,
+            ignore_whitespace: false,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum DiffLayout {
+    #[default]
+    Unified,
+    Split,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+#[serde(default)]
+pub(crate) struct Terminal {
+    pub shell: String,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(default)]
+pub(crate) struct Lsp {
+    pub enabled: bool,
+    pub rust: Server,
+    pub clangd: Server,
+    pub typescript: Server,
+    pub python: Server,
+}
+
+impl Default for Lsp {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            rust: Server::default(),
+            clangd: Server::default(),
+            typescript: Server::default(),
+            python: Server::default(),
+        }
+    }
+}
+
+impl Lsp {
+    pub(crate) fn server(&self, server: LanguageServer) -> &Server {
+        match server {
+            LanguageServer::Rust => &self.rust,
+            LanguageServer::Clangd => &self.clangd,
+            LanguageServer::TypeScript => &self.typescript,
+            LanguageServer::Python => &self.python,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+#[serde(default)]
+pub(crate) struct Server {
+    pub command: String,
+}
+
+impl Config {
+    fn validate(&self) -> Result<()> {
+        for (key, size, min, max) in [
+            (
+                "appearance.ui_font_size",
+                self.appearance.ui_font_size,
+                UI_FONT_SIZE_MIN,
+                UI_FONT_SIZE_MAX,
+            ),
+            (
+                "docs.body_font_size",
+                self.docs.body_font_size,
+                FONT_SIZE_MIN,
+                FONT_SIZE_MAX,
+            ),
+            (
+                "docs.code_block_font_size",
+                self.docs.code_block_font_size,
+                FONT_SIZE_MIN,
+                FONT_SIZE_MAX,
+            ),
+            (
+                "editor.font_size",
+                self.editor.font_size,
+                FONT_SIZE_MIN,
+                FONT_SIZE_MAX,
+            ),
+        ] {
+            ensure!(
+                (min..=max).contains(&size),
+                t!("config.font_range", key = key, min = min, max = max)
+            );
+        }
+        for (key, family) in [
+            ("appearance.ui_font_family", &self.appearance.ui_font_family),
+            (
+                "appearance.fallback_font_family",
+                &self.appearance.fallback_font_family,
+            ),
+            ("editor.font_family", &self.editor.font_family),
+        ] {
+            ensure!(
+                !family.contains(char::is_control),
+                t!("config.control_characters", key = key)
+            );
+        }
+        let shell = &self.terminal.shell;
+        ensure!(
+            shell.is_empty()
+                || (Path::new(shell).is_absolute()
+                    && !shell.contains(char::is_control)
+                    && (!cfg!(windows) || !shell.contains('"'))),
+            t!("config.invalid_shell")
+        );
+        for (key, command) in [
+            ("lsp.rust.command", &self.lsp.rust.command),
+            ("lsp.clangd.command", &self.lsp.clangd.command),
+            ("lsp.typescript.command", &self.lsp.typescript.command),
+            ("lsp.python.command", &self.lsp.python.command),
+        ] {
+            ensure!(
+                command.is_empty() || parse_command_line(command).is_some(),
+                t!("config.invalid_lsp_command", key = key)
+            );
+        }
+        Ok(())
+    }
+}
+
+/// Owns the last successfully loaded configuration and the bytes it came from.
+#[derive(Clone)]
+pub struct ConfigFile {
+    path: Option<PathBuf>,
+    config: Config,
+    baseline: Option<Vec<u8>>,
+    pub(crate) load_error: Option<String>,
+}
+
+impl ConfigFile {
+    pub fn load_for_desktop() -> Self {
+        Language::System.activate();
+        let file = Self::from_environment();
+        file.config.appearance.language.activate();
+        file
+    }
+
+    pub fn from_environment() -> Self {
+        let path = env::var_os("STROLL_CONFIG")
+            .filter(|path| !path.is_empty())
+            .map(PathBuf::from)
+            .or_else(|| dirs::config_dir().map(|dir| dir.join("stroll/config.toml")));
+        Self::load(path)
+    }
+
+    pub fn load(path: Option<PathBuf>) -> Self {
+        let path = path.map(|path| std::path::absolute(&path).unwrap_or(path));
+        let mut file = Self {
+            path,
+            config: Config::default(),
+            baseline: None,
+            load_error: None,
+        };
+        _ = file.reload();
+        file
+    }
+
+    pub(crate) fn path(&self) -> Result<&Path> {
+        self.path.as_deref().context(t!("config.no_directory"))
+    }
+
+    pub(crate) fn current(&self) -> &Config {
+        &self.config
+    }
+
+    pub(crate) fn reload(&mut self) -> Result<()> {
+        let result = self.read();
+        self.load_error = result.as_ref().err().map(|error| format!("{error:#}"));
+        let (bytes, config) = result?;
+        self.baseline = bytes;
+        self.config = config;
+        Ok(())
+    }
+
+    fn read(&self) -> Result<(Option<Vec<u8>>, Config)> {
+        let path = self.path()?;
+        let bytes = read_file(path)?;
+        let config = match &bytes {
+            Some(bytes) => decode(bytes)
+                .with_context(|| t!("common.read_failed", path = path.display()).into_owned())?,
+            None => Config::default(),
+        };
+        Ok((bytes, config))
+    }
+
+    pub(crate) fn save(&mut self, config: Config) -> Result<()> {
+        config.validate()?;
+        let path = self.path()?;
+        let _lock = lock_config(path)?;
+        self.check_disk(path)?;
+        let mut document = match &self.baseline {
+            Some(bytes) => std::str::from_utf8(bytes)?.parse::<DocumentMut>()?,
+            None => new_document(),
+        };
+        if !document.contains_key("version") {
+            document.insert("version", toml_edit::value(i64::from(VERSION)));
+        }
+        migrate_text_rendering(&mut document);
+        let old = toml_edit::ser::to_document(&self.config)?;
+        let new = toml_edit::ser::to_document(&config)?;
+        patch_table(document.as_table_mut(), old.as_table(), new.as_table());
+        let bytes = document.to_string().into_bytes();
+        self.check_disk(path)?;
+        atomic_write(path, &bytes)
+            .with_context(|| t!("config.write_failed", path = path.display()).into_owned())?;
+        self.baseline = Some(bytes);
+        self.config = config;
+        Ok(())
+    }
+
+    fn check_disk(&self, path: &Path) -> Result<()> {
+        ensure!(
+            self.load_error.is_none() && read_file(path)? == self.baseline,
+            t!("config.modified", path = path.display())
+        );
+        Ok(())
+    }
+}
+
+fn read_file(path: &Path) -> Result<Option<Vec<u8>>> {
+    match fs::read(path) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
+        Err(error) => {
+            Err(error).with_context(|| t!("common.read_failed", path = path.display()).into_owned())
+        }
+    }
+}
+
+fn decode(bytes: &[u8]) -> Result<Config> {
+    #[derive(Deserialize)]
+    struct Version {
+        #[serde(default = "current_version")]
+        version: u32,
+    }
+    fn current_version() -> u32 {
+        VERSION
+    }
+
+    let source = std::str::from_utf8(bytes)?;
+    let version: Version = toml_edit::de::from_str(source)?;
+    ensure!(
+        version.version == VERSION,
+        t!("config.unsupported_version", version = version.version)
+    );
+    let mut document = source.parse::<DocumentMut>()?;
+    migrate_text_rendering(&mut document);
+    let config: Config = toml_edit::de::from_document(document)?;
+    config.validate()?;
+    Ok(config)
+}
+
+fn migrate_text_rendering(document: &mut DocumentMut) {
+    let Some(appearance) = document
+        .get_mut("appearance")
+        .and_then(Item::as_table_like_mut)
+    else {
+        return;
+    };
+    let Some(legacy) = appearance.remove("font_hinting") else {
+        return;
+    };
+    if !appearance.contains_key("text_rendering") {
+        let value = match legacy.as_str() {
+            Some("on") => "pixel_aligned",
+            Some("off") => "high_precision",
+            _ => {
+                appearance.insert("text_rendering", legacy);
+                return;
+            }
+        };
+        let mut replacement = toml_edit::Value::from(value);
+        if let Some(legacy) = legacy.as_value() {
+            *replacement.decor_mut() = legacy.decor().clone();
+        }
+        appearance.insert("text_rendering", Item::Value(replacement));
+    }
+}
+
+fn new_document() -> DocumentMut {
+    let mut document = DocumentMut::new();
+    document.insert("version", toml_edit::value(i64::from(VERSION)));
+    document
+}
+
+struct ConfigLock(File);
+
+impl Drop for ConfigLock {
+    fn drop(&mut self) {
+        // Release the lock even if a concurrent fork inherited the descriptor
+        // and has yet to close it on exec.
+        _ = self.0.unlock();
+    }
+}
+
+fn lock_config(path: &Path) -> Result<ConfigLock> {
+    let parent = path.parent().context(t!("config.missing_directory"))?;
+    fs::create_dir_all(parent)?;
+    let mut lock_path = path.as_os_str().to_os_string();
+    lock_path.push(".lock");
+    let lock = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(lock_path)?;
+    lock.try_lock()
+        .with_context(|| t!("config.locked", path = path.display()).into_owned())?;
+    Ok(ConfigLock(lock))
+}
+
+fn patch_table(target: &mut dyn TableLike, old: &dyn TableLike, new: &dyn TableLike) {
+    for (key, value) in new.iter() {
+        let old_value = old.get(key).expect("both tables use the same schema");
+        if let (Some(old), Some(new)) = (old_value.as_table_like(), value.as_table_like()) {
+            let mut empty = Table::new();
+            empty.set_implicit(true);
+            if let Some(table) = target.get_mut(key).and_then(Item::as_table_like_mut) {
+                patch_table(table, old, new);
+            } else {
+                patch_table(&mut empty, old, new);
+                if !empty.is_empty() {
+                    target.insert(key, Item::Table(empty));
+                }
+            }
+        } else if value.to_string() != old_value.to_string() {
+            let Some(mut replacement) = value.as_value().cloned() else {
+                unreachable!("settings are scalar values or tables");
+            };
+            if let Some(existing) = target.get_mut(key) {
+                if let Some(existing) = existing.as_value() {
+                    *replacement.decor_mut() = existing.decor().clone();
+                }
+                *existing = Item::Value(replacement);
+            } else {
+                target.insert(key, Item::Value(replacement));
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn migrates_legacy_hinting_when_loading_and_saving() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("config.toml");
+        for (old, preference, new) in [
+            ("auto", TextRenderingPreference::Auto, "auto"),
+            ("on", TextRenderingPreference::PixelAligned, "pixel_aligned"),
+            (
+                "off",
+                TextRenderingPreference::HighPrecision,
+                "high_precision",
+            ),
+        ] {
+            fs::write(
+                &path,
+                format!("[appearance]\nfont_hinting = \"{old}\" # preferred rendering\n"),
+            )?;
+            let mut file = ConfigFile::load(Some(path.clone()));
+            assert!(file.load_error.is_none());
+            let mut config = file.current().clone();
+            assert_eq!(config.appearance.text_rendering, preference);
+            config.appearance.smooth_scroll = false;
+            file.save(config.clone())?;
+            let saved = fs::read_to_string(&path)?;
+            assert!(saved.contains(&format!("text_rendering = \"{new}\" # preferred rendering")));
+            assert!(!saved.contains("font_hinting"));
+            assert_eq!(decode(saved.as_bytes())?, config);
+        }
+        let both = b"[appearance]\nfont_hinting = 'on'\ntext_rendering = 'high_precision'";
+        assert_eq!(
+            decode(both)?.appearance.text_rendering,
+            TextRenderingPreference::HighPrecision
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn code_theme_values_round_trip_through_the_config_file() -> Result<()> {
+        for (theme, contrast) in CodeTheme::ALL
+            .into_iter()
+            .flat_map(|theme| CodeContrast::ALL.map(|contrast| (theme, contrast)))
+        {
+            let source = format!(
+                "[appearance]\ncode_theme = \"{}\"\ncode_contrast = \"{}\"\n",
+                theme.config_value(),
+                contrast.config_value()
+            );
+            let config = decode(source.as_bytes())?;
+            assert_eq!(config.appearance.code_theme, theme, "{source}");
+            assert_eq!(config.appearance.code_contrast, contrast, "{source}");
+        }
+        assert_eq!(
+            decode(b"[appearance]\ncode_theme = \"default\"\n")?
+                .appearance
+                .code_theme,
+            CodeTheme::Prism,
+        );
+        assert!(decode(b"[appearance]\ncode_theme = \"unknown\"\n").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn edits_only_changed_values_and_round_trips_all_sections() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("config.toml");
+        fs::write(
+            &path,
+            "# User config\nversion = 1\n\n[docs]\nbody_font_size = 15.5 # prose\ncode_block_font_size = 12 # code blocks\n\n[editor]\nfont_size = 15 # pixels\nextra = true\n\n[lsp]\nrust = { command = 'rust-analyzer' }\n\n[unknown]\nkey = ['value']\n",
+        )?;
+        let mut file = ConfigFile::load(Some(path.clone()));
+        assert!(file.load_error.is_none(), "{:?}", file.load_error);
+        let mut config = file.current().clone();
+        assert_eq!(config.docs.body_font_size, 15.5);
+        assert_eq!(config.docs.code_block_font_size, 12.);
+        assert_eq!(config.editor.font_size, 15.);
+        assert_eq!(config.appearance.language, Language::System);
+        assert!(config.appearance.ui_font_family.is_empty());
+        assert_eq!(config.appearance.ui_font_size, 13.);
+        assert!(config.appearance.fallback_font_family.is_empty());
+        assert_eq!(
+            config.appearance.text_rendering,
+            TextRenderingPreference::Auto
+        );
+        config.appearance.theme = Theme::Dark;
+        config.appearance.code_theme = CodeTheme::Paper;
+        config.appearance.code_contrast = CodeContrast::High;
+        config.appearance.language = Language::Chinese;
+        config.appearance.ui_font_family = "Inter".into();
+        config.appearance.ui_font_size = 13.5;
+        config.appearance.fallback_font_family = "Noto Sans CJK SC".into();
+        config.appearance.text_rendering = TextRenderingPreference::HighPrecision;
+        config.docs.body_font_size = 17.;
+        config.docs.code_block_font_size = 14.;
+        config.editor.font_size = 18.;
+        assert!(!config.editor.inlay_hints);
+        config.editor.inlay_hints = true;
+        config.git.diff_layout = DiffLayout::Split;
+        config.terminal.shell = if cfg!(windows) {
+            r"C:\Windows\cmd.exe"
+        } else {
+            "/bin/sh"
+        }
+        .into();
+        config.lsp.rust.command = "custom-rust-analyzer".into();
+        config.lsp.python.command = "custom-pylsp --check-parent-process".into();
+        config.lsp.typescript.command = "tsc --lsp --stdio".into();
+        file.save(config.clone())?;
+
+        let saved = fs::read_to_string(&path)?;
+        for expected in [
+            "# User config",
+            "language = \"zh-CN\"",
+            "code_theme = \"paper\"",
+            "code_contrast = \"high\"",
+            "ui_font_family = \"Inter\"",
+            "ui_font_size = 13.5",
+            "fallback_font_family = \"Noto Sans CJK SC\"",
+            "text_rendering = \"high_precision\"",
+            "body_font_size = 17.0 # prose",
+            "code_block_font_size = 14.0 # code blocks",
+            "18.0 # pixels",
+            "inlay_hints = true",
+            "extra = true",
+            "tsc --lsp --stdio",
+            "[unknown]",
+            "key = ['value']",
+        ] {
+            assert!(saved.contains(expected), "{expected:?} absent from {saved}");
+        }
+        assert!(!saved.contains("line_numbers"));
+        let loaded = ConfigFile::load(Some(path));
+        assert!(
+            loaded.load_error.is_none(),
+            "{:?}\n{saved}",
+            loaded.load_error
+        );
+        assert_eq!(loaded.current(), &config);
+        Ok(())
+    }
+
+    #[test]
+    fn ui_font_size_is_validated_with_its_own_bounds() {
+        for (value, valid) in [
+            ("12", true),
+            ("14", true),
+            ("11.5", false),
+            ("14.5", false),
+            ("nan", false),
+        ] {
+            let config = format!("[appearance]\nui_font_size = {value}\n");
+            assert_eq!(decode(config.as_bytes()).is_ok(), valid, "{value}");
+        }
+    }
+
+    #[test]
+    fn malformed_files_and_external_edits_preserve_the_last_good_config() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("config.toml");
+        let mut file = ConfigFile::load(Some(path.clone()));
+        assert_eq!(file.current(), &Config::default());
+        assert!(!path.exists());
+        let mut config = file.current().clone();
+        config.appearance.smooth_scroll = false;
+        file.save(config.clone())?;
+        for invalid in [
+            "version = 2",
+            "[editor\n",
+            "[editor]\nfont_size = nan",
+            "[terminal]\nshell = 'relative'",
+            "[lsp.typescript]\ncommand = 'tsc \"--lsp --stdio'",
+        ] {
+            fs::write(&path, invalid)?;
+            assert!(file.save(Config::default()).is_err());
+            assert!(file.reload().is_err(), "{invalid}");
+            assert_eq!(file.current(), &config);
+            assert_eq!(fs::read_to_string(&path)?, invalid);
+        }
+        fs::remove_file(&path)?;
+        file.reload()?;
+        assert_eq!(file.current(), &Config::default());
+        file.save(config.clone())?;
+        assert_eq!(ConfigFile::load(Some(path)).current(), &config);
+        Ok(())
+    }
+
+    #[test]
+    fn second_instance_must_reload_before_saving() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("config.toml");
+        let mut first = ConfigFile::load(Some(path.clone()));
+        let mut second = ConfigFile::load(Some(path.clone()));
+        let mut config = Config::default();
+        config.git.ignore_whitespace = true;
+        first.save(config.clone())?;
+        assert!(second.save(Config::default()).is_err());
+        second.reload()?;
+        config.editor.line_numbers = false;
+        second.save(config.clone())?;
+        assert_eq!(ConfigFile::load(Some(path)).current(), &config);
+        Ok(())
+    }
+}

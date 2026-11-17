@@ -1,0 +1,491 @@
+#![cfg(any(target_os = "linux", target_os = "windows"))]
+
+use std::{cell::Cell, rc::Rc, time::Duration};
+
+use gpui::{
+    AppContext as _, Context, Entity, InteractiveElement as _, IntoElement, ListAlignment,
+    ListState, ParentElement as _, Pixels, Render, ScrollDelta, ScrollEvent, ScrollHandle,
+    StatefulInteractiveElement as _, Styled as _, TestAppContext, TestDispatcher,
+    UniformListScrollHandle, VisualTestContext, Window, div, list, point, px, uniform_list,
+};
+use gpui_component::{
+    Root,
+    diff::{Diff, DiffEvent, DiffFile, DiffLinePosition, DiffSide, DiffState},
+    input::{Editor, EditorState},
+    scroll::ScrollableMask,
+    text::{TextView, TextViewState},
+};
+
+struct ScrollViews {
+    outer: ScrollHandle,
+    uniform: UniformListScrollHandle,
+    rows: ListState,
+    horizontal: ScrollHandle,
+    editor: Entity<EditorState>,
+    diff: Entity<DiffState>,
+    document: Entity<TextViewState>,
+}
+
+impl Render for ScrollViews {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .id("outer")
+            .w(px(300.))
+            .h(px(500.))
+            .flex()
+            .flex_col()
+            .overflow_y_scroll()
+            .track_scroll(&self.outer)
+            .child(
+                uniform_list("uniform", 100, |range, _, _| {
+                    range.map(|_| div().h(px(20.))).collect::<Vec<_>>()
+                })
+                .h(px(80.))
+                .flex_none()
+                .track_scroll(&self.uniform),
+            )
+            .child(
+                list(self.rows.clone(), |_, _, _| {
+                    div().h(px(20.)).into_any_element()
+                })
+                .h(px(80.))
+                .flex_none(),
+            )
+            .child(
+                div()
+                    .relative()
+                    .h(px(80.))
+                    .flex_none()
+                    .child(
+                        div()
+                            .id("horizontal")
+                            .size_full()
+                            .overflow_x_scroll()
+                            .restrict_scroll_to_axis()
+                            .track_scroll(&self.horizontal)
+                            .child(div().w(px(900.)).h_full().flex_none()),
+                    )
+                    .child(ScrollableMask::vertical_wheel(&self.horizontal)),
+            )
+            .child(
+                div()
+                    .h(px(80.))
+                    .flex_none()
+                    .child(Editor::new(&self.editor).size_full()),
+            )
+            .child(
+                div()
+                    .h(px(80.))
+                    .flex_none()
+                    .child(Diff::new(&self.diff).render_preamble(|_, _| div().h(px(90.)))),
+            )
+            .child(
+                div().h(px(80.)).flex_none().child(
+                    TextView::new(&self.document)
+                        .scrollable(true)
+                        .wheel_line_height(px(30.))
+                        .size_full(),
+                ),
+            )
+            .child(div().h(px(700.)).flex_none())
+    }
+}
+
+fn draw(cx: &mut VisualTestContext) {
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+}
+
+fn advance_frame(cx: &mut VisualTestContext, milliseconds: u64) {
+    cx.executor()
+        .advance_clock(Duration::from_millis(milliseconds));
+    cx.update(|window, cx| {
+        window.simulate_next_frame(cx);
+        window.draw(cx).clear(cx);
+    });
+}
+
+#[gpui::test]
+fn editor_selection_autoscroll_stops_after_a_missing_mouse_up(cx: &mut TestAppContext) {
+    use gpui::MouseButton;
+
+    struct EditorView(Entity<EditorState>);
+    impl Render for EditorView {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            Editor::new(&self.0).size_full()
+        }
+    }
+
+    let mut editor = None;
+    let (_, cx) = cx.add_window_view(|window, cx| {
+        gpui_component::init(cx);
+        let state = cx.new(|cx| {
+            EditorState::new(window, cx).default_value("some text on each line\n".repeat(200))
+        });
+        editor = Some(state.clone());
+        let view = cx.new(|_| EditorView(state));
+        Root::new(view, window, cx)
+    });
+    let editor = editor.unwrap();
+    cx.simulate_resize(gpui::size(px(400.), px(200.)));
+    draw(cx);
+    let bounds = cx.update(|_, cx| editor.read(cx).input_bounds());
+    let start = point(bounds.left() + px(12.), bounds.top() + px(9.));
+    let edge = point(start.x, bounds.bottom() + px(20.));
+    cx.simulate_mouse_down(start, MouseButton::Left, Default::default());
+    cx.simulate_mouse_move(edge, MouseButton::Left, Default::default());
+    let snapshot = |cx: &mut VisualTestContext| {
+        cx.update(|_, cx| {
+            let editor = editor.read(cx);
+            (editor.selected_range(), editor.scroll_offset())
+        })
+    };
+    let before_scroll = snapshot(cx);
+    advance_frame(cx, 32);
+    let during_drag = snapshot(cx);
+    assert!(!during_drag.0.is_empty());
+    assert!(during_drag.1.y < before_scroll.1.y);
+
+    cx.simulate_mouse_move(start, None, Default::default());
+    advance_frame(cx, 64);
+    assert_eq!(snapshot(cx), during_drag);
+    cx.simulate_mouse_move(edge, MouseButton::Left, Default::default());
+    advance_frame(cx, 64);
+    assert_eq!(snapshot(cx), during_drag);
+}
+
+fn finish_scroll(cx: &mut VisualTestContext) {
+    for _ in 0..16 {
+        advance_frame(cx, 16);
+    }
+}
+
+fn scroll(cx: &mut VisualTestContext, y: Pixels, delta: ScrollDelta) {
+    cx.simulate_event(ScrollEvent {
+        position: point(px(100.), y),
+        delta,
+        ..ScrollEvent::default()
+    });
+}
+
+#[test]
+fn wheel_scrolling_animates_through_the_desktop_viewports() {
+    let platform = gpui_platform::current_platform(cfg!(target_os = "linux"));
+    let mut cx = TestAppContext::build_with_text_system(
+        TestDispatcher::new(0),
+        None,
+        platform.text_system(),
+    );
+    let outer = ScrollHandle::new();
+    let uniform = UniformListScrollHandle::new();
+    let rows = ListState::new(100, ListAlignment::Top, px(300.));
+    let horizontal = ScrollHandle::new();
+    let mut views = None;
+    let (_, cx) = cx.add_window_view(|window, cx| {
+        gpui_component::init(cx);
+        cx.set_reduce_motion(true);
+        cx.set_smooth_scrolling(true);
+        let editor = cx.new(|cx| {
+            EditorState::new(window, cx).default_value("some text\n".repeat(100))
+        });
+        let patch = format!(
+            "diff --git a/test.txt b/test.txt\n--- a/test.txt\n+++ b/test.txt\n@@ -1 +1,100 @@\n-old\n{}",
+            "+new\n".repeat(100)
+        );
+        let diff = cx.new(|cx| DiffState::new(DiffFile::parse(&patch).unwrap(), cx));
+        let document = cx.new(|cx| {
+            TextViewState::markdown(&"A document paragraph.\n\n".repeat(80), cx).scrollable(true)
+        });
+        let view = cx.new(|_| ScrollViews {
+            outer: outer.clone(),
+            uniform: uniform.clone(),
+            rows: rows.clone(),
+            horizontal: horizontal.clone(),
+            editor,
+            diff,
+            document,
+        });
+        views = Some(view.clone());
+        Root::new(view, window, cx)
+    });
+    draw(cx);
+    let views = views.unwrap();
+    let (editor, diff, document_rows) = cx.update(|_, cx| {
+        let views = views.read(cx);
+        (
+            views.editor.clone(),
+            views.diff.clone(),
+            views.document.read(cx).list_state().clone(),
+        )
+    });
+    let lines = |distance| ScrollDelta::Lines(point(0., distance));
+    let editor_y = px(280.);
+    let uniform_offset = || uniform.0.borrow().base_handle.offset().y;
+    let list_offset = || rows.scroll_px_offset_for_scrollbar().y;
+    let document_y = px(440.);
+    let document_offset = || document_rows.scroll_px_offset_for_scrollbar().y;
+
+    let viewports = [
+        (px(40.), &uniform_offset as &dyn Fn() -> Pixels, px(-60.)),
+        (px(120.), &list_offset, px(-60.)),
+        (px(200.), &|| horizontal.offset().x, px(-60.)),
+        (document_y, &document_offset, px(-90.)),
+    ];
+    for (y, offset, _) in viewports {
+        scroll(cx, y, lines(-3.));
+        assert_eq!(offset(), px(0.));
+    }
+    advance_frame(cx, 40);
+    let offsets = viewports.map(|(_, offset, _)| offset());
+    finish_scroll(cx);
+    for ((y, offset, target), intermediate) in viewports.into_iter().zip(offsets) {
+        assert!(intermediate < px(0.), "scroll area at {y:?}");
+        assert_eq!(offset(), target, "scroll area at {y:?}");
+        assert_eq!(outer.offset().y, px(0.));
+    }
+
+    scroll(cx, editor_y, lines(-3.));
+    let editor_offset =
+        |cx: &mut VisualTestContext| cx.update(|_, cx| editor.read(cx).scroll_offset().y);
+    assert_eq!(editor_offset(cx), px(0.));
+    advance_frame(cx, 40);
+    let intermediate = editor_offset(cx);
+    assert!(intermediate < px(0.));
+    finish_scroll(cx);
+    assert_eq!(editor_offset(cx), px(-60.));
+    assert_eq!(outer.offset().y, px(0.));
+
+    let diff_y = px(360.);
+    let diff_top_file =
+        |cx: &mut VisualTestContext| cx.update(|_, cx| diff.read(cx).top_file().cloned());
+    assert_eq!(diff_top_file(cx), None);
+    let diff_steps = Rc::new(Cell::new(0));
+    let _subscription = cx.update(|_, cx| {
+        let steps = diff_steps.clone();
+        cx.subscribe(&diff, move |_, event: &DiffEvent, _| {
+            if matches!(event, DiffEvent::Scrolled) {
+                steps.set(steps.get() + 1);
+            }
+        })
+    });
+    scroll(cx, diff_y, lines(-3.));
+    assert_eq!(diff_steps.get(), 0);
+    advance_frame(cx, 40);
+    assert_eq!(outer.offset().y, px(0.));
+    assert_eq!(diff_steps.get(), 1);
+    advance_frame(cx, 16);
+    assert_eq!(diff_steps.get(), 2);
+    finish_scroll(cx);
+    assert!(diff_top_file(cx).is_some());
+    // The 90 px preamble ends exactly one wheel notch from the top.
+    scroll(cx, diff_y, ScrollDelta::Pixels(point(px(0.), px(1.))));
+    assert_eq!(diff_top_file(cx), None);
+
+    let outer_y = px(490.);
+    scroll(cx, outer_y, lines(-2.));
+    scroll(cx, outer_y, lines(-2.));
+    assert_eq!(outer.offset().y, px(0.));
+    finish_scroll(cx);
+    let combined = outer.offset().y;
+    assert_eq!(combined, px(-80.));
+    outer.set_offset(point(px(0.), px(0.)));
+    draw(cx);
+    scroll(cx, outer_y, lines(-4.));
+    finish_scroll(cx);
+    assert_eq!(outer.offset().y, combined);
+
+    scroll(cx, outer_y, lines(-6.));
+    advance_frame(cx, 30);
+    let before_reverse = outer.offset().y;
+    scroll(cx, outer_y, lines(2.));
+    advance_frame(cx, 30);
+    assert!(outer.offset().y > before_reverse);
+
+    let before_pixels = outer.offset().y;
+    scroll(cx, outer_y, ScrollDelta::Pixels(point(px(0.), px(-13.))));
+    assert_eq!(outer.offset().y, before_pixels - px(13.));
+    advance_frame(cx, 140);
+    assert_eq!(outer.offset().y, before_pixels - px(13.));
+
+    cx.update(|_, cx| cx.set_smooth_scrolling(false));
+    outer.set_offset(point(px(0.), px(0.)));
+    draw(cx);
+    let before_document = document_offset();
+    scroll(cx, document_y, lines(-3.));
+    assert_eq!(document_offset(), before_document - px(90.));
+    draw(cx);
+    scroll(cx, document_y, ScrollDelta::Pixels(point(px(0.), px(-13.))));
+    assert_eq!(document_offset(), before_document - px(103.));
+
+    let before = outer.offset().y;
+    scroll(cx, outer_y, lines(-2.));
+    let after = outer.offset().y;
+    assert_eq!(after, before - px(40.));
+    advance_frame(cx, 140);
+    assert_eq!(outer.offset().y, after);
+}
+
+#[test]
+fn wheel_bursts_keep_advancing_and_a_delayed_frame_does_not_jump_to_the_target() {
+    struct ScrollViewport(ScrollHandle);
+
+    impl Render for ScrollViewport {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .id("scroll")
+                .size_full()
+                .overflow_y_scroll()
+                .track_scroll(&self.0)
+                .child(div().h(px(4000.)))
+        }
+    }
+
+    let mut cx = TestAppContext::build(TestDispatcher::new(0), None);
+    let handle = ScrollHandle::new();
+    let (_, cx) = cx.add_window_view(|_, cx| {
+        cx.set_smooth_scrolling(true);
+        ScrollViewport(handle.clone())
+    });
+    draw(cx);
+    let wheel = ScrollDelta::Lines(point(0., -3.));
+    scroll(cx, px(20.), wheel);
+    advance_frame(cx, 160);
+    let first = handle.offset().y;
+    assert!(first < px(0.) && first > px(-60.));
+    for _ in 0..4 {
+        let before = handle.offset().y;
+        cx.executor().advance_clock(Duration::from_millis(15));
+        scroll(cx, px(20.), wheel);
+        advance_frame(cx, 1);
+        assert!(before - handle.offset().y > px(10.));
+    }
+    finish_scroll(cx);
+    assert_eq!(handle.offset().y, px(-300.));
+}
+
+#[test]
+fn replacing_an_earlier_patch_keeps_the_current_source_in_view() {
+    let patch = |name: &str, lines: usize| {
+        DiffFile::parse(&format!(
+            "--- /dev/null\n+++ b/{name}\n@@ -0,0 +1,{lines} @@\n{}",
+            "+line\n".repeat(lines),
+        ))
+        .unwrap()
+        .remove(0)
+    };
+    let platform = gpui_platform::current_platform(cfg!(target_os = "linux"));
+    let mut cx = TestAppContext::build_with_text_system(
+        TestDispatcher::new(0),
+        None,
+        platform.text_system(),
+    );
+    let state = cx.new(|cx| DiffState::new([patch("first", 2), patch("second", 100)], cx));
+    state.update(&mut cx, |state, cx| {
+        state.scroll_to_line(DiffLinePosition::new("second", DiffSide::Modified, 8), cx);
+        assert_eq!(state.top_file().map(|path| path.as_str()), Some("second"));
+        state.replace_files([patch("first", 40)], cx);
+        assert_eq!(state.top_file().map(|path| path.as_str()), Some("second"));
+        state.next_change(cx);
+        assert_eq!(state.top_file().map(|path| path.as_str()), Some("first"));
+    });
+}
+
+#[test]
+fn split_diff_padding_keeps_the_source_line_at_the_same_viewport_position() {
+    struct Columns([Entity<EditorState>; 2]);
+
+    impl Render for Columns {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .flex()
+                .size_full()
+                .children(self.0.iter().map(|editor| {
+                    div()
+                        .w(px(300.))
+                        .h_full()
+                        .child(Editor::new(editor).size_full())
+                }))
+        }
+    }
+
+    let platform = gpui_platform::current_platform(cfg!(target_os = "linux"));
+    let mut cx = TestAppContext::build_with_text_system(
+        TestDispatcher::new(0),
+        None,
+        platform.text_system(),
+    );
+    cx.update(gpui_component::init);
+    let mut columns = None;
+    let (_, visual) = cx.add_window_view(|window, cx| {
+        let tail = "source line\n".repeat(99);
+        let short = format!("short line\n{tail}");
+        let long = format!("{}\n{tail}", "wrapped words ".repeat(20));
+        let rows = Rc::new((1..=100).map(|line| (Some(line), None)).collect::<Vec<_>>());
+        let columns = columns.insert([short, long].map(|text| {
+            cx.new(|cx| {
+                let mut editor = EditorState::new(window, cx)
+                    .soft_wrap(true)
+                    .default_value(text);
+                editor.set_projected_rows(rows.clone(), cx);
+                editor
+            })
+        }));
+        Root::new(cx.new(|_| Columns(columns.clone())), window, cx)
+    });
+    let columns = columns.unwrap();
+    visual.simulate_scale_factor_change(1.);
+    visual.simulate_resize(gpui::size(px(600.), px(360.)));
+    draw(visual);
+
+    let anchor = 35;
+    visual.update(|_, cx| {
+        for column in &columns {
+            column.update(cx, |editor, cx| {
+                editor.scroll_to_projected_line(anchor, px(-3.), cx);
+            });
+        }
+    });
+    draw(visual);
+    let viewport = |cx: &mut VisualTestContext| {
+        cx.update(|_, cx| {
+            columns.each_ref().map(|column| {
+                let editor = column.read(cx);
+                (
+                    editor.projected_top_line(),
+                    editor.projected_line_bounds(anchor).unwrap().top(),
+                )
+            })
+        })
+    };
+    let before = viewport(visual);
+    assert_eq!(before[0], before[1]);
+    let padding = visual.update(|_, cx| {
+        let [left, right] = columns.each_ref().map(|column| column.read(cx));
+        assert!(right.projected_wrap_rows(0) > left.projected_wrap_rows(0));
+        assert_ne!(left.scroll_offset().y, right.scroll_offset().y);
+        Rc::new(
+            left.projected_wrap_rows_snapshot()
+                .zip(right.projected_wrap_rows_snapshot())
+                .map(|(left, right)| left.max(right))
+                .collect::<Vec<_>>(),
+        )
+    });
+    let set_padding = |visual: &mut VisualTestContext, rows: Rc<Vec<usize>>| {
+        visual.update(|_, cx| {
+            for column in &columns {
+                column.update(cx, |editor, cx| {
+                    editor.set_projected_min_rows(rows.clone(), cx);
+                });
+            }
+        });
+        draw(visual);
+        assert_eq!(viewport(visual), before);
+    };
+    set_padding(visual, padding);
+    visual.update(|_, cx| {
+        assert_eq!(
+            columns[0].read(cx).scroll_offset().y,
+            columns[1].read(cx).scroll_offset().y
+        );
+    });
+    set_padding(visual, Rc::default());
+}
