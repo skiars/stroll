@@ -7,7 +7,7 @@ default-run = "stroll"
 
 [features]
 default = ["desktop"]
-desktop = ["dep:glob", "dep:alacritty_terminal", "dep:gpui", "dep:gpui_platform", "dep:gpui-component", "dep:gpui-kit-assets", "dep:toml_edit", "dep:markdown", "dep:merman", "dep:ratex-layout", "dep:ratex-parser", "dep:ratex-svg", "dep:percent-encoding", "dep:ratex-types", "dep:roxmltree", "dep:sys-locale", "dep:blocking", "dep:image", "dep:ureq", "dep:shlex", "dep:similar", "dep:chrono", "dep:keyring", "dep:giallo", "dep:jsonc-parser", "dep:tree-sitter"]
+desktop = ["dep:glob", "dep:alacritty_terminal", "dep:gpui", "dep:gpui_platform", "dep:gpui-component", "dep:gpui-kit-assets", "dep:toml_edit", "dep:markdown", "dep:merman", "dep:ratex-layout", "dep:ratex-parser", "dep:ratex-svg", "dep:percent-encoding", "dep:ratex-types", "dep:roxmltree", "dep:sys-locale", "dep:blocking", "dep:image", "dep:ureq", "dep:shlex", "dep:similar", "dep:chrono", "dep:keyring", "dep:giallo", "dep:jsonc-parser", "dep:tree-sitter", "dep:objc2", "dep:objc2-app-kit", "dep:objc2-foundation"]
 
 [[bin]]
 name = "stroll"
@@ -92,6 +92,11 @@ gpui_wgpu = { package = "gpui-pre-wgpu", version = "=0.3.12", features = ["test-
 
 [target.'cfg(windows)'.dev-dependencies]
 gpui_platform = { package = "gpui-pre-platform", version = "=0.3.12", features = ["test-support"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = { version = "0.6.5", default-features = false, optional = true }
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["NSPasteboard", "NSPasteboardItem"], optional = true }
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["NSArray", "NSString"], optional = true }
 
 [profile.dev.package.harfrust]
 opt-level = 3

@@ -17,6 +17,60 @@ use gpui::{ClipboardEntry, ClipboardItem, Image, ImageFormat, hash};
 pub(crate) const TEXT_MIME_TYPES: [&str; 3] =
     ["text/plain;charset=utf-8", "UTF8_STRING", "text/plain"];
 pub(crate) const FILE_LIST_MIME_TYPE: &str = "text/uri-list";
+pub(crate) const FILE_CLIPBOARD_MIME_TYPES: [&str; 3] = [
+    FILE_LIST_MIME_TYPE,
+    "application/x-kde-cutselection",
+    "x-special/gnome-copied-files",
+];
+
+fn decode_file_list(bytes: &[u8], gnome: bool, cut: bool) -> Option<ClipboardItem> {
+    let mut lines = std::str::from_utf8(bytes).ok()?.lines();
+    let cut = if gnome {
+        match lines.next()? {
+            "cut" => true,
+            "copy" => false,
+            _ => return None,
+        }
+    } else {
+        cut
+    };
+    let paths = lines
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .map(|line| url::Url::parse(line).ok()?.to_file_path().ok())
+        .collect::<Option<_>>()?;
+    let paths = gpui::ExternalPaths(paths);
+    (!paths.paths().is_empty()).then(|| ClipboardItem::new_file_list(paths, cut))
+}
+
+fn encode_file_list(item: &ClipboardItem, mime_type: &str) -> Option<Vec<u8>> {
+    let (paths, cut) = item.file_list()?;
+    let gnome = match mime_type {
+        "application/x-kde-cutselection" => return Some(if cut { vec![b'1'] } else { vec![b'0'] }),
+        "x-special/gnome-copied-files" => true,
+        FILE_LIST_MIME_TYPE => false,
+        _ => return None,
+    };
+    let mut list = if gnome {
+        if cut {
+            "cut".to_owned()
+        } else {
+            "copy".to_owned()
+        }
+    } else {
+        String::new()
+    };
+    for path in paths.paths() {
+        let uri = url::Url::from_file_path(path).ok()?;
+        if gnome {
+            list.push('\n');
+        }
+        list.push_str(uri.as_str());
+        if !gnome {
+            list.push_str("\r\n");
+        }
+    }
+    Some(list.into_bytes())
+}
 
 /// Text mime types that we'll accept from other programs.
 pub(crate) const ALLOWED_TEXT_MIME_TYPES: [&str; 2] = ["text/plain;charset=utf-8", "UTF8_STRING"];
@@ -133,6 +187,26 @@ impl<T: ReceiveData> DataOffer<T> {
         }
         None
     }
+
+    fn read_files(&self, connection: &Connection) -> Option<ClipboardItem> {
+        let [uris, kde_cut, gnome] = FILE_CLIPBOARD_MIME_TYPES;
+        if self.has_mime_type(gnome)
+            && let Some(item) = self
+                .read_bytes(connection, gnome)
+                .and_then(|bytes| decode_file_list(&bytes, true, false))
+        {
+            return Some(item);
+        }
+        if !self.has_mime_type(uris) {
+            return None;
+        }
+        let bytes = self.read_bytes(connection, uris)?;
+        let cut = self.has_mime_type(kde_cut)
+            && self
+                .read_bytes(connection, kde_cut)
+                .is_some_and(|bytes| bytes == b"1");
+        decode_file_list(&bytes, false, cut)
+    }
 }
 
 impl Clipboard {
@@ -174,9 +248,16 @@ impl Clipboard {
         self.self_mime.clone()
     }
 
-    pub fn send(&self, _mime_type: String, fd: OwnedFd) {
-        if let Some(text) = self.contents.as_ref().and_then(|contents| contents.text()) {
-            self.send_bytes(fd, text.as_bytes().to_owned());
+    pub fn send(&self, mime_type: String, fd: OwnedFd) {
+        if let Some(item) = &self.contents {
+            let bytes = if FILE_CLIPBOARD_MIME_TYPES.contains(&mime_type.as_str()) {
+                encode_file_list(item, &mime_type)
+            } else {
+                item.text().map(String::into_bytes)
+            };
+            if let Some(bytes) = bytes {
+                self.send_bytes(fd, bytes);
+            }
         }
     }
 
@@ -201,7 +282,8 @@ impl Clipboard {
         }
 
         let item = offer
-            .read_text(&self.connection)
+            .read_files(&self.connection)
+            .or_else(|| offer.read_text(&self.connection))
             .or_else(|| offer.read_image(&self.connection))?;
 
         self.cached_read = Some(item.clone());
@@ -253,5 +335,35 @@ impl Clipboard {
                 },
             )
             .unwrap();
+    }
+}
+
+#[cfg(test)]
+mod file_list_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    #[test]
+    fn file_clipboard_payload_preserves_paths_and_the_cut_action() {
+        let paths = gpui::ExternalPaths(
+            ["/tmp/with space", "/tmp/音#1\nnotes.txt"]
+                .into_iter()
+                .map(PathBuf::from)
+                .collect(),
+        );
+        let [uris, kde_cut, gnome] = FILE_CLIPBOARD_MIME_TYPES;
+        for cut in [false, true] {
+            let item = ClipboardItem::new_file_list(paths.clone(), cut);
+            let marker = encode_file_list(&item, kde_cut).unwrap();
+            let uri_list = encode_file_list(&item, uris).unwrap();
+            let gnome_list = encode_file_list(&item, gnome).unwrap();
+            assert_eq!(
+                decode_file_list(&uri_list, false, marker == b"1"),
+                Some(item.clone())
+            );
+            assert_eq!(decode_file_list(&gnome_list, true, false), Some(item));
+        }
+        assert!(decode_file_list(b"https://example.com", false, true).is_none());
+        assert!(decode_file_list(b"link\nfile:///tmp/file", true, false).is_none());
     }
 }

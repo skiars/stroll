@@ -19,9 +19,21 @@ pub(crate) struct EntryVersion(String);
 
 #[derive(Serialize, Deserialize)]
 pub(crate) enum FileOperation {
-    Create { directory: bool },
-    Rename { name: String, version: EntryVersion },
-    Delete { version: EntryVersion },
+    Create {
+        directory: bool,
+    },
+    Rename {
+        name: String,
+        version: EntryVersion,
+    },
+    Delete {
+        version: EntryVersion,
+    },
+    Transfer {
+        destination: crate::remote::RepoPath,
+        version: EntryVersion,
+        move_entry: bool,
+    },
 }
 
 fn entry_kind(path: &Path) -> Result<(fs::Metadata, EntryVersion)> {
@@ -96,8 +108,9 @@ fn operation_path(root: &Path, path: &Path) -> Result<PathBuf> {
     let mut parent = root.to_owned();
     for part in path.parent().into_iter().flat_map(Path::components) {
         parent.push(part);
+        let metadata = parent.symlink_metadata()?;
         ensure!(
-            parent.symlink_metadata()?.file_type().is_dir(),
+            metadata.is_dir() && !is_link(&metadata),
             t!("common.path_outside_repo")
         );
     }
@@ -172,8 +185,43 @@ impl Repository {
                     fs::remove_file(target)?;
                 }
             }
+            FileOperation::Transfer {
+                destination,
+                version,
+                move_entry,
+            } => {
+                let destination = operation_path(&self.root, destination.as_path())?;
+                transfer_entry(&target, &destination, &version, move_entry)?;
+            }
         }
         Ok(())
+    }
+
+    #[cfg(feature = "desktop")]
+    pub(crate) fn import_entry(
+        &self,
+        source: &Path,
+        destination: &Path,
+        move_entry: bool,
+    ) -> Result<Option<PathBuf>> {
+        ensure!(self.ssh.is_none(), t!("storage.no_local_path"));
+        ensure!(source.is_absolute(), t!("common.path_outside_repo"));
+        let parent = source
+            .parent()
+            .context(t!("storage.no_parent"))?
+            .canonicalize()?;
+        let name = source
+            .file_name()
+            .context(t!("workspace.tree_invalid_name"))?;
+        let source = parent.join(name);
+        let relative = source.strip_prefix(&self.root).ok();
+        if let Some(relative) = relative {
+            operation_path(&self.root, relative)?;
+        }
+        let destination = operation_path(&self.root, destination)?;
+        let version = entry_kind(&source)?.1;
+        transfer_entry(&source, &destination, &version, move_entry)?;
+        Ok(relative.map(Path::to_owned))
     }
 
     pub(crate) fn read_copy_chunk(
@@ -228,6 +276,91 @@ impl Repository {
         }
         Ok(())
     }
+}
+
+fn transfer_entry(
+    source: &Path,
+    destination: &Path,
+    version: &EntryVersion,
+    move_entry: bool,
+) -> Result<()> {
+    let (metadata, current) = entry_kind(source)?;
+    ensure!(&current == version, t!("workspace.tree_entry_changed"));
+    ensure!(
+        source != destination && !(metadata.is_dir() && destination.starts_with(source)),
+        t!("workspace.tree_invalid_destination")
+    );
+    match destination.symlink_metadata() {
+        Ok(_) => anyhow::bail!(t!("workspace.tree_destination_exists")),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    if move_entry {
+        return rename_no_replace(source, destination);
+    }
+
+    let staging = tempfile::tempdir_in(destination.parent().context(t!("storage.no_parent"))?)?;
+    let staged = staging.path().join("entry");
+    copy_entry(source, &staged)?;
+    ensure!(
+        &entry_kind(source)?.1 == version,
+        t!("workspace.tree_entry_changed")
+    );
+    rename_no_replace(&staged, destination)
+}
+
+fn copy_entry(source: &Path, destination: &Path) -> Result<()> {
+    let (metadata, version) = entry_kind(source)?;
+    ensure!(!is_link(&metadata), t!("workspace.tree_unsupported"));
+    if metadata.is_dir() {
+        ensure!(
+            source.canonicalize()? == source,
+            t!("common.path_outside_repo")
+        );
+        fs::create_dir(destination)?;
+        for entry in fs::read_dir(source)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            ensure!(
+                name.to_str().is_some_and(valid_name),
+                t!("workspace.tree_invalid_name")
+            );
+            copy_entry(&entry.path(), &destination.join(name))?;
+        }
+    } else {
+        ensure!(metadata.is_file(), t!("workspace.tree_unsupported"));
+        let mut options = OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        }
+        let mut input = options.open(source)?;
+        ensure!(
+            input.metadata()?.is_file(),
+            t!("workspace.tree_unsupported")
+        );
+        let mut output = File::create_new(destination)?;
+        std::io::copy(&mut input, &mut output)?;
+        output.set_permissions(metadata.permissions())?;
+    }
+    ensure!(
+        entry_kind(source)?.1 == version,
+        t!("workspace.tree_entry_changed")
+    );
+    Ok(())
+}
+
+fn is_link(metadata: &fs::Metadata) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt as _;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    }
+    #[cfg(not(windows))]
+    metadata.file_type().is_symlink()
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -716,6 +849,77 @@ impl CopyTarget {
             output.as_file().sync_all()?;
             output.persist_noclobber(&self.path)?;
         }
+        Ok(())
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod transfer_tests {
+    use std::process::Command;
+
+    use super::*;
+
+    #[test]
+    fn worktree_transfer_copies_and_moves_without_overwriting() -> Result<()> {
+        let fixture = tempfile::tempdir()?;
+        let root = fixture.path().canonicalize()?;
+        assert!(
+            Command::new("git")
+                .args(["init", "-q"])
+                .arg(&root)
+                .status()?
+                .success()
+        );
+        fs::create_dir_all(root.join("source/sub"))?;
+        fs::create_dir(root.join("destination"))?;
+        fs::write(root.join("source/sub/data.bin"), [0, 255])?;
+        let repo = Repository::open(&root)?;
+        let source = Path::new("source");
+        let operation = |destination: &str, move_entry| -> Result<FileOperation> {
+            Ok(FileOperation::Transfer {
+                destination: crate::remote::RepoPath::from_local(destination.as_ref())?,
+                version: repo.entry_version(source)?,
+                move_entry,
+            })
+        };
+        assert!(
+            repo.operate(source, operation("source/sub/self", false)?)
+                .is_err()
+        );
+        repo.operate(source, operation("destination/copied", false)?)?;
+        assert_eq!(
+            fs::read(root.join("destination/copied/sub/data.bin"))?,
+            [0, 255]
+        );
+        assert!(
+            repo.operate(source, operation("destination/copied", true)?)
+                .is_err()
+        );
+        assert!(root.join("source/sub/data.bin").is_file());
+
+        let pending = operation("destination/moved", true)?;
+        fs::write(root.join("source/updated"), "new content")?;
+        assert!(repo.operate(source, pending).is_err());
+        repo.operate(source, operation("destination/moved", true)?)?;
+        assert!(!root.join("source").exists());
+        assert!(root.join("destination/moved/updated").is_file());
+        Ok(())
+    }
+
+    #[test]
+    fn directory_copy_cleans_staging_if_an_entry_is_unsupported() -> Result<()> {
+        let fixture = tempfile::tempdir()?;
+        let root = fixture.path().canonicalize()?;
+        fs::create_dir(root.join("source"))?;
+        fs::create_dir(root.join("destination"))?;
+        fs::write(root.join("source/file.txt"), "contents")?;
+        std::os::unix::fs::symlink("/tmp", root.join("source/link"))?;
+        let source = root.join("source");
+        let destination = root.join("destination");
+        let version = entry_kind(&source)?.1;
+        assert!(transfer_entry(&source, &destination.join("copy"), &version, false).is_err());
+        assert_eq!(fs::read_dir(&destination)?.count(), 0);
+        assert_eq!(fs::read(root.join("source/file.txt"))?, b"contents");
         Ok(())
     }
 }

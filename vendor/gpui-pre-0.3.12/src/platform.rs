@@ -3159,6 +3159,40 @@ pub enum ClipboardEntry {
 }
 
 impl ClipboardItem {
+    /// Builds a system file clipboard item, with a text representation for editors.
+    pub fn new_file_list(paths: crate::ExternalPaths, cut: bool) -> Self {
+        let text = paths
+            .paths()
+            .iter()
+            .map(|path| path.to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("\n");
+        Self {
+            entries: vec![
+                ClipboardEntry::ExternalPaths(paths),
+                ClipboardEntry::String(ClipboardString {
+                    text,
+                    metadata: cut.then(|| "gpui:file-list:cut".to_owned()),
+                }),
+            ],
+        }
+    }
+
+    /// Returns file clipboard paths and whether the source requested a move.
+    pub fn file_list(&self) -> Option<(&crate::ExternalPaths, bool)> {
+        let paths = self.entries.iter().find_map(|entry| match entry {
+            ClipboardEntry::ExternalPaths(paths) if !paths.paths().is_empty() => Some(paths),
+            _ => None,
+        })?;
+        let cut = self.entries.iter().any(|entry| {
+            matches!(
+                entry, ClipboardEntry::String(text)
+                    if text.metadata.as_deref() == Some("gpui:file-list:cut")
+            )
+        });
+        Some((paths, cut))
+    }
+
     /// Create a new ClipboardItem::String with no associated metadata
     pub fn new_string(text: String) -> Self {
         Self {

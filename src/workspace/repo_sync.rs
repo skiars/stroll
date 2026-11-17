@@ -20,6 +20,8 @@ impl Workspace {
         self.tree_load_pending.clear();
         self.tree_reveal = None;
         self.tree_selected = None;
+        self.tree_keyboard_path.clear();
+        self.tree_clipboard = None;
         self.docs_tree = Rc::default();
         self.docs_tree_seeded = false;
         self.docs_tree_complete = false;

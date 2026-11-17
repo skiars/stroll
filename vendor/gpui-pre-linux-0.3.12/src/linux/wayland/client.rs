@@ -94,7 +94,9 @@ use crate::linux::{
     keystroke_from_xkb, keystroke_underlying_dead_key, modifiers_from_xkb, new_xkb_context,
     open_uri_internal, read_fd_with_timeout, reveal_path_internal,
     wayland::{
-        clipboard::{Clipboard, DataOffer, FILE_LIST_MIME_TYPE, TEXT_MIME_TYPES},
+        clipboard::{
+            Clipboard, DataOffer, FILE_CLIPBOARD_MIME_TYPES, FILE_LIST_MIME_TYPE, TEXT_MIME_TYPES,
+        },
         cursor::Cursor,
         serial::{ActivationContext, Serial, SerialKind, SerialTracker},
         to_shape,
@@ -1480,6 +1482,7 @@ impl WaylandConnection {
             return;
         };
         if state.mouse_focused_window.is_some() || state.keyboard_focused_window.is_some() {
+            let files = item.file_list().is_some();
             state.clipboard.set(item);
             let Some(serial) = state.serial_tracker.selection_serial() else {
                 log::warn!(
@@ -1491,6 +1494,11 @@ impl WaylandConnection {
                 .create_data_source(&state.globals.qh, DataSourceKind::Clipboard);
             for mime_type in TEXT_MIME_TYPES {
                 data_source.offer(mime_type.to_string());
+            }
+            if files {
+                for mime_type in FILE_CLIPBOARD_MIME_TYPES {
+                    data_source.offer(mime_type.to_string());
+                }
             }
             data_source.offer(state.clipboard.self_mime());
             data_device.set_selection(Some(&data_source), serial.as_raw());

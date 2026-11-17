@@ -45,6 +45,7 @@ pub(crate) const LAZY_TREE_VERSION: u32 = 16;
 pub(crate) const DOCUMENT_PATHS_VERSION: u32 = 17;
 pub(crate) const DOCUMENT_BATCH_VERSION: u32 = 18;
 pub(crate) const REVISION_COMPARISON_VERSION: u32 = 19;
+pub(crate) const WORKSPACE_TRANSFER_VERSION: u32 = 20;
 const MAX_FRAME: usize = 40 * 1024 * 1024;
 
 #[derive(Clone, Debug, Eq, PartialEq)]

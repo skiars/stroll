@@ -66,6 +66,7 @@ impl Server {
                             | super::DOCUMENT_PATHS_VERSION
                             | super::DOCUMENT_BATCH_VERSION
                             | super::REVISION_COMPARISON_VERSION
+                            | super::WORKSPACE_TRANSFER_VERSION
                     ),
                     "SSH workspace protocol version mismatch. Update the remote helper."
                 );

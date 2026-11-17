@@ -26,9 +26,11 @@ mod session;
 mod settings;
 mod source_history;
 mod standalone;
+mod system_files;
 mod terminal;
 mod toast;
 mod tree_motion;
+mod tree_transfer;
 mod window_bounds;
 
 pub use window_bounds::{repository_window_bounds, standalone_window_bounds};
@@ -584,6 +586,10 @@ pub struct Workspace {
     tree_status: Rc<file_tree::TreeStatus>,
     tree_edit: Option<file_tree::TreeEdit>,
     tree_busy: bool,
+    tree_focus: FocusHandle,
+    tree_keyboard_path: PathBuf,
+    tree_clipboard: Option<tree_transfer::TreeClipboard>,
+    system_files: system_files::SystemFiles,
     standalone: Option<PathBuf>,
     docs_tree_width: Pixels,
     editor_tree_width: Pixels,
@@ -696,6 +702,19 @@ impl Workspace {
         Self::bind_git_history_keys(cx);
         Self::bind_source_navigation_keys(cx);
         Self::bind_caret_hint_keys(cx);
+        Self::bind_tree_keys(cx);
+        #[cfg(target_os = "linux")]
+        if repository_mode && matches!(cx.compositor_name(), "Wayland" | "X11") {
+            let probe = cx.background_spawn(async { system_files::SystemFiles::load() });
+            cx.spawn(async move |workspace, cx| {
+                let actions = probe.await;
+                _ = workspace.update(cx, |workspace, cx| {
+                    workspace.system_files = actions;
+                    cx.notify();
+                });
+            })
+            .detach();
+        }
         let focus = cx.focus_handle();
         focus.focus(window, cx);
         cx.on_app_quit(|this, cx| {
@@ -752,6 +771,10 @@ impl Workspace {
             tree_status: Rc::default(),
             tree_edit: None,
             tree_busy: false,
+            tree_focus: cx.focus_handle(),
+            tree_keyboard_path: PathBuf::new(),
+            tree_clipboard: None,
+            system_files: Default::default(),
             standalone,
             docs_tree_width: px(240.),
             editor_tree_width: px(240.),
@@ -1396,6 +1419,15 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.view == WorkspaceView::Editor
+            && (entry.directory || entry.symlink || !audio_preview::is_audio(&entry.path))
+        {
+            if event.click_count() < 2 {
+                self.focus_tree(entry.path.clone(), window, cx);
+            } else if self.tree_focus.is_focused(window) {
+                self.focus.focus(window, cx);
+            }
+        }
         if entry.directory {
             self.tree_motion.get_mut().start();
             let expanded = if self.view == WorkspaceView::Docs {
@@ -2887,7 +2919,9 @@ impl Workspace {
         if self.view == WorkspaceView::Editor && !self.confirming_close {
             let keep_focus = self.locator.open
                 || self.repository_overlay_open()
-                || self.terminal_focused(window, cx);
+                || self.terminal_focused(window, cx)
+                || (self.tree_focus.is_focused(window)
+                    && active == Some(self.tree_keyboard_path.as_path()));
             if let Some(file) = active.and_then(|path| self.files.get_mut(path)) {
                 file.apply_wrap(self.wrap, window, cx);
                 if !keep_focus {
@@ -3290,6 +3324,9 @@ impl Workspace {
     ) -> impl IntoElement {
         let rows = self.rows.clone();
         let in_workspace = self.view == WorkspaceView::Editor;
+        let drag_repo = self
+            .tree_transfer_available()
+            .then(|| self.repository.as_ref().unwrap().clone());
         let status = self.tree_status.clone();
         let inline = self.tree_edit.as_ref().and_then(|edit| {
             let (index, depth, replace) = edit.row(&rows)?;
@@ -3298,6 +3335,8 @@ impl Workspace {
         let row_count = rows.len() + usize::from(inline.is_some_and(|(_, _, replace)| !replace));
         let active = if self.view == WorkspaceView::Docs {
             self.session.document.clone()
+        } else if self.tree_focus.is_focused(window) {
+            Some(self.tree_keyboard_path.clone())
         } else {
             self.tabs.active().map(Path::to_owned)
         };
@@ -3418,17 +3457,55 @@ impl Workspace {
                     })
                 });
                 Some(if in_workspace {
+                    let element =
+                        tree_transfer::tree_drag_source(element, &entry, drag_repo.as_ref());
+                    let element = if entry.directory {
+                        tree_transfer::tree_drop_target(
+                            element,
+                            entry.path.clone(),
+                            weak.clone(),
+                            colors,
+                        )
+                    } else {
+                        element
+                    };
                     file_tree::tree_menu(element, Some(entry), weak.clone())
                 } else {
-                    element.into_any_element()
+                    file_tree::document_tree_menu(element, Some(entry), weak.clone())
                 })
             },
         );
         v_flex()
+            .id("workspace-file-tree-pane")
             .relative()
             .w(width)
             .h_full()
             .flex_shrink_0()
+            .when(in_workspace, |pane| {
+                pane.track_focus(&self.tree_focus)
+                    .key_context("WorkspaceFileTree")
+                    .on_drop(|_: &ExternalPaths, _, _| {})
+                    .on_action(
+                        cx.listener(|this, _: &tree_transfer::CopyTreeEntry, window, cx| {
+                            this.tree_key_copy(false, window, cx);
+                        }),
+                    )
+                    .on_action(
+                        cx.listener(|this, _: &tree_transfer::CutTreeEntry, window, cx| {
+                            this.tree_key_copy(true, window, cx);
+                        }),
+                    )
+                    .on_action(cx.listener(
+                        |this, _: &tree_transfer::PasteTreeEntry, window, cx| {
+                            this.tree_key_paste(false, window, cx);
+                        },
+                    ))
+                    .on_action(cx.listener(
+                        |this, _: &tree_transfer::MoveTreeClipboard, window, cx| {
+                            this.tree_key_paste(true, window, cx);
+                        },
+                    ))
+            })
             .child({
                 let header = h_flex()
                     .id("workspace-tree-header")
@@ -3487,9 +3564,17 @@ impl Workspace {
                         })),
                     );
                 if in_workspace {
+                    let header = tree_transfer::tree_drop_target(
+                        header.on_click(cx.listener(|this, _, window, cx| {
+                            this.focus_tree(PathBuf::new(), window, cx);
+                        })),
+                        PathBuf::new(),
+                        root_menu.clone(),
+                        colors,
+                    );
                     file_tree::tree_menu(header, None, root_menu.clone())
                 } else {
-                    header.into_any_element()
+                    file_tree::document_tree_menu(header, None, root_menu.clone())
                 }
             })
             .child(

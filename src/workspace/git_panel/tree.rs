@@ -1,6 +1,6 @@
 use rust_i18n::t;
 
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, path::Path};
 
 use gpui_component::{
     checkbox::Checkbox,
@@ -317,6 +317,7 @@ impl GitPanel {
         let view = cx.weak_entity();
         let workspace = self.workspace.clone();
         let mode = detail.comparison.worktree_mode().unwrap_or(Mode::All);
+        let historical = detail.comparison.commit_target().is_some() || mode == Mode::Staged;
         let rows = frame.as_ref().map_or(rows, |frame| frame.rows.clone());
         let list = tree_motion::tree_list(
             cx.entity(),
@@ -427,6 +428,7 @@ impl GitPanel {
                         let menu_detail = detail.clone();
                         let files = files.clone();
                         let context_view = view.clone();
+                        let system_workspace = workspace.clone();
                         let file_name_size = file_name_font_size(cx);
                         tree_row(("folder", path.clone()), *depth, colors)
                             .child(icon(
@@ -466,8 +468,16 @@ impl GitPanel {
                                     }
                                 });
                             })
-                            .context_menu(move |mut menu, _, _| {
+                            .context_menu(move |mut menu, _, cx| {
                                 let path = directory.clone();
+                                menu = append_system_menu(
+                                    menu,
+                                    Path::new(&path),
+                                    true,
+                                    historical,
+                                    &system_workspace,
+                                    cx,
+                                );
                                 menu = menu.item(
                                     PopupMenuItem::new(t!("git.copy_directory")).on_click(
                                         move |_, _, cx| {
@@ -513,6 +523,7 @@ impl GitPanel {
                         let select_view = view.clone();
                         let select_path = path.clone();
                         let menu_view = view.clone();
+                        let system_workspace = workspace.clone();
                         let stage = stage_paths(&detail, &[ix], true, stage_allowed);
                         let unstage = stage_paths(&detail, &[ix], false, stage_allowed);
                         let file_name_size = file_name_font_size(cx);
@@ -586,6 +597,14 @@ impl GitPanel {
                                     );
                                 }
                                 let path = path.clone();
+                                menu = append_system_menu(
+                                    menu,
+                                    Path::new(&path),
+                                    false,
+                                    historical,
+                                    &system_workspace,
+                                    cx,
+                                );
                                 menu = menu.item(
                                     PopupMenuItem::new(t!("git.copy_file_path")).on_click(
                                         move |_, _, cx| {
@@ -930,6 +949,23 @@ impl GitPanel {
             }
             cx.notify();
         }
+    }
+}
+
+fn append_system_menu(
+    menu: gpui_component::menu::PopupMenu,
+    path: &Path,
+    directory: bool,
+    historical: bool,
+    workspace: &WeakEntity<Workspace>,
+    cx: &App,
+) -> gpui_component::menu::PopupMenu {
+    if let Some(workspace) = workspace.upgrade() {
+        workspace
+            .read(cx)
+            .system_tree_menu(menu, path, directory, true, historical)
+    } else {
+        menu
     }
 }
 

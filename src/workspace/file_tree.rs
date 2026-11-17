@@ -2,7 +2,7 @@ use std::io::Write;
 
 use gpui_component::{
     input::{Input, InputState},
-    menu::ContextMenuExt,
+    menu::{ContextMenuExt, PopupMenu},
 };
 
 use super::*;
@@ -60,6 +60,8 @@ enum TreeAction {
     SaveCopy,
     Create(bool),
     CopyPath(bool),
+    CopyEntry(bool),
+    PasteEntry,
     Rename,
     Delete,
     Refresh,
@@ -73,11 +75,16 @@ pub(super) fn tree_menu(
 ) -> AnyElement {
     element
         .context_menu(move |mut menu, _, cx| {
-            let Some((repo, busy)) = workspace
+            let Some((repo, busy, clipboard, paste)) = workspace
                 .read_with(cx, |this, _| {
-                    this.repository
-                        .clone()
-                        .map(|repo| (repo, this.tree_busy || this.tree_edit.is_some()))
+                    this.repository.clone().map(|repo| {
+                        (
+                            repo,
+                            this.tree_busy || this.tree_edit.is_some(),
+                            this.tree_clipboard_available(cx),
+                            this.tree_paste_available(cx),
+                        )
+                    })
                 })
                 .ok()
                 .flatten()
@@ -92,6 +99,18 @@ pub(super) fn tree_menu(
             if !busy && !mutable {
                 menu = menu
                     .item(PopupMenuItem::new(t!("workspace.tree_requires_helper")).disabled(true))
+                    .separator();
+            } else if !busy
+                && repo
+                    .ssh
+                    .as_ref()
+                    .is_some_and(|ssh| !ssh.supports_workspace_transfer())
+            {
+                menu = menu
+                    .item(
+                        PopupMenuItem::new(t!("workspace.tree_transfer_requires_helper"))
+                            .disabled(true),
+                    )
                     .separator();
             }
             let item = |action, label: SharedString, enabled: bool| {
@@ -163,6 +182,30 @@ pub(super) fn tree_menu(
                     ))
                     .separator();
             }
+            if repo.ssh.is_none() {
+                menu = system_menu_for_entry(menu, entry.as_ref(), &workspace, cx).separator();
+            }
+            if let Some(entry) = entry.as_ref() {
+                menu = menu
+                    .item(item(
+                        TreeAction::CopyEntry(false),
+                        t!("workspace.tree_copy_entry").into(),
+                        clipboard && !entry.symlink,
+                    ))
+                    .item(item(
+                        TreeAction::CopyEntry(true),
+                        t!("workspace.tree_cut_entry").into(),
+                        clipboard,
+                    ));
+            }
+            if entry.as_ref().is_none_or(|entry| entry.directory) {
+                menu = menu.item(item(
+                    TreeAction::PasteEntry,
+                    t!("workspace.tree_paste_entry").into(),
+                    paste,
+                ));
+            }
+            menu = menu.separator();
             if entry.is_some() {
                 menu.item(item(
                     TreeAction::CopyPath(false),
@@ -202,6 +245,36 @@ pub(super) fn tree_menu(
         .into_any_element()
 }
 
+pub(super) fn document_tree_menu(
+    element: Stateful<Div>,
+    entry: Option<Entry>,
+    workspace: WeakEntity<Workspace>,
+) -> AnyElement {
+    element
+        .context_menu(move |menu, _, cx| {
+            system_menu_for_entry(menu, entry.as_ref(), &workspace, cx)
+        })
+        .shared_layer()
+        .into_any_element()
+}
+
+fn system_menu_for_entry(
+    menu: PopupMenu,
+    entry: Option<&Entry>,
+    workspace: &WeakEntity<Workspace>,
+    cx: &App,
+) -> PopupMenu {
+    if let Some(workspace) = workspace.upgrade() {
+        let path = entry.map_or(Path::new(""), |entry| &entry.path);
+        let directory = entry.is_none_or(|entry| entry.directory);
+        workspace
+            .read(cx)
+            .system_tree_menu(menu, path, directory, false, false)
+    } else {
+        menu
+    }
+}
+
 impl Workspace {
     fn tree_action(
         &mut self,
@@ -226,6 +299,12 @@ impl Workspace {
                 let path = if absolute { repo.root.join(path) } else { path };
                 cx.write_to_clipboard(ClipboardItem::new_string(paths::display(&path)));
             }
+            TreeAction::CopyEntry(cut) => {
+                if let Some(entry) = entry.as_ref() {
+                    self.tree_copy(entry, cut, window, cx);
+                }
+            }
+            TreeAction::PasteEntry => self.tree_paste(path, false, window, cx),
             TreeAction::Create(directory) => {
                 self.begin_tree_edit(path, directory, None, window, cx)
             }
@@ -503,6 +582,9 @@ impl Workspace {
             FileOperation::Rename { name, .. } => Some(Some(path.with_file_name(name))),
             FileOperation::Delete { .. } => Some(None),
             FileOperation::Create { .. } => None,
+            FileOperation::Transfer { .. } => {
+                unreachable!("Transfers use the shared tree transfer flow")
+            }
         };
         let open = matches!(operation, FileOperation::Create { directory: false });
         let affected = action
@@ -658,6 +740,7 @@ impl Workspace {
         if let Some(history) = self.source_history_mut() {
             history.remap(&map);
         }
+        self.tree_keyboard_path = map(&self.tree_keyboard_path);
         self.expanded = self.expanded.iter().map(|path| map(path)).collect();
         self.docs_expanded = self.docs_expanded.iter().map(|path| map(path)).collect();
         self.session.documents = std::mem::take(&mut self.session.documents)
@@ -705,6 +788,9 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.tree_keyboard_path.starts_with(target) {
+            self.tree_keyboard_path = target.parent().unwrap_or(Path::new("")).to_owned();
+        }
         let previous = self.tabs.active().map(Path::to_owned);
         if matches!(
             self.loading_file,
@@ -1393,6 +1479,174 @@ mod tests {
                     .read(cx)
                     .focus_handle(cx)
                     .is_focused(window)
+            );
+        });
+        Ok(())
+    }
+
+    #[::core::prelude::v1::test]
+    fn workspace_tree_drag_moves_drafts_and_imports_external_entries() -> Result<()> {
+        let fixture = tempfile::tempdir()?;
+        let root = fixture.path().join("repo");
+        fs::create_dir(&root)?;
+        assert!(
+            std::process::Command::new("git")
+                .args(["init", "-q"])
+                .arg(&root)
+                .status()?
+                .success()
+        );
+        fs::create_dir(root.join("target"))?;
+        fs::write(root.join("source.txt"), "on disk")?;
+        let folder = fixture.path().join("folder from desktop");
+        fs::create_dir(&folder)?;
+        fs::write(folder.join("data.bin"), [0, 255])?;
+        let local_file = fixture.path().join("clipboard source.txt");
+        fs::write(&local_file, "from desktop")?;
+
+        let platform = gpui_platform::current_platform(true);
+        let mut cx = TestAppContext::build_with_text_system(
+            TestDispatcher::new(0),
+            None,
+            platform.text_system(),
+        );
+        cx.update(gpui_component::init);
+        let store = Arc::new(Store::new(fixture.path().join("state"))?);
+        let config = ConfigFile::load(Some(fixture.path().join("config.toml")));
+        let mut workspace = None;
+        let (_, mut visual) = cx.add_window_view(|window, cx| {
+            let view = cx
+                .new(|cx| Workspace::with_config(store, config, WorkspaceView::Editor, window, cx));
+            workspace = Some(view.clone());
+            gpui_component::Root::new(view, window, cx)
+        });
+        let workspace = workspace.unwrap();
+        visual.simulate_resize(size(px(1024.), px(700.)));
+        let open_root = test_repository_location(root.clone());
+        visual.update(|window, cx| {
+            workspace.update(cx, |this, cx| {
+                this.open_repository(
+                    Location {
+                        root: open_root,
+                        file: None,
+                    },
+                    window,
+                    cx,
+                );
+            });
+        });
+        settle(&mut visual, &workspace, |this| this.repository_watch_active);
+
+        let source = visual
+            .debug_bounds("workspace-tree-row:source.txt")
+            .unwrap()
+            .center();
+        let target = visual
+            .debug_bounds("workspace-tree-row:target")
+            .unwrap()
+            .center();
+        visual.simulate_click(source, Modifiers::default());
+        settle(&mut visual, &workspace, |this| {
+            this.tabs.active() == Some(Path::new("source.txt"))
+        });
+        visual.update(|window, cx| {
+            workspace.update(cx, |this, cx| {
+                assert!(this.tree_focus.is_focused(window));
+                let editor = this.active_file().unwrap().editor.clone();
+                editor.update(cx, |editor, cx| editor.set_value("unsaved", window, cx));
+                this.editor_changed(editor, window, cx);
+            })
+        });
+
+        let modifiers = Modifiers::default();
+        visual.simulate_mouse_move(source, None, modifiers);
+        visual.simulate_mouse_down(source, MouseButton::Left, modifiers);
+        visual.simulate_mouse_move(
+            source + point(px(30.), px(0.)),
+            MouseButton::Left,
+            modifiers,
+        );
+        settle(&mut visual, &workspace, |_| true);
+        visual.simulate_mouse_move(target, MouseButton::Left, modifiers);
+        visual.simulate_mouse_up(target, MouseButton::Left, modifiers);
+        settle(&mut visual, &workspace, |this| {
+            !this.tree_busy && this.tabs.active() == Some(Path::new("target/source.txt"))
+        });
+        assert!(!root.join("source.txt").exists());
+        assert_eq!(
+            fs::read_to_string(root.join("target/source.txt"))?,
+            "on disk"
+        );
+        visual.update(|_, cx| {
+            let this = workspace.read(cx);
+            assert_eq!(this.active_file().unwrap().committed.to_string(), "unsaved");
+        });
+
+        let remote = visual.update(|_, cx| {
+            workspace
+                .read(cx)
+                .repository
+                .as_ref()
+                .unwrap()
+                .ssh
+                .is_some()
+        });
+        if remote {
+            if !visual.update(|_, cx| workspace.read(cx).expanded.contains(Path::new("target"))) {
+                visual.simulate_click(target, modifiers);
+            }
+            settle(&mut visual, &workspace, |this| {
+                this.rows
+                    .iter()
+                    .any(|row| row.entry.path == Path::new("target/source.txt"))
+            });
+            let moved = visual
+                .debug_bounds("workspace-tree-row:target/source.txt")
+                .unwrap()
+                .center();
+            visual.simulate_click(moved, modifiers);
+            settle(&mut visual, &workspace, |_| true);
+            visual.simulate_keystrokes("ctrl-c");
+            visual.update(|window, cx| {
+                workspace.update(cx, |this, cx| {
+                    this.focus_tree(PathBuf::new(), window, cx);
+                })
+            });
+            settle(&mut visual, &workspace, |_| true);
+            visual.simulate_keystrokes("ctrl-v");
+            settle(&mut visual, &workspace, |_| {
+                root.join("source.txt").is_file()
+            });
+            assert_eq!(fs::read_to_string(root.join("source.txt"))?, "on disk");
+            return Ok(());
+        }
+
+        let target = visual
+            .debug_bounds("workspace-tree-row:target")
+            .unwrap()
+            .center();
+        visual.simulate_event(FileDropEvent::Entered {
+            position: target,
+            paths: ExternalPaths([folder.clone(), local_file.clone()].into_iter().collect()),
+        });
+        visual.simulate_event(FileDropEvent::Submit { position: target });
+        settle(&mut visual, &workspace, |_| {
+            root.join("target/clipboard source.txt").is_file()
+        });
+        assert_eq!(
+            fs::read(root.join("target/folder from desktop/data.bin"))?,
+            [0, 255]
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("target/clipboard source.txt"))?,
+            "from desktop"
+        );
+        assert!(folder.is_dir());
+        assert!(local_file.is_file());
+        visual.update(|_, cx| {
+            assert_eq!(
+                workspace.read(cx).tabs.paths(),
+                [PathBuf::from("target/source.txt")]
             );
         });
         Ok(())

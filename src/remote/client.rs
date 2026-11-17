@@ -84,6 +84,8 @@ struct Connection {
     #[cfg(feature = "desktop")]
     workspace_files: AtomicBool,
     #[cfg(feature = "desktop")]
+    workspace_transfer: AtomicBool,
+    #[cfg(feature = "desktop")]
     lsp_edits: AtomicBool,
     failure: Arc<Mutex<Option<String>>>,
 }
@@ -222,6 +224,11 @@ impl SshSession {
     #[cfg(feature = "desktop")]
     pub(crate) fn supports_workspace_files(&self) -> bool {
         self.0.workspace_files.load(Ordering::Relaxed)
+    }
+
+    #[cfg(feature = "desktop")]
+    pub(crate) fn supports_workspace_transfer(&self) -> bool {
+        self.0.workspace_transfer.load(Ordering::Relaxed)
     }
 
     #[cfg(feature = "desktop")]
@@ -368,6 +375,8 @@ impl Connection {
             #[cfg(feature = "desktop")]
             workspace_files: AtomicBool::new(false),
             #[cfg(feature = "desktop")]
+            workspace_transfer: AtomicBool::new(false),
+            #[cfg(feature = "desktop")]
             lsp_edits: AtomicBool::new(false),
             #[cfg(feature = "desktop")]
             review: AtomicBool::new(false),
@@ -500,6 +509,14 @@ impl Connection {
                     .is_ok_and(|reply| reply == version);
                 connection
                     .workspace_files
+                    .store(supported, Ordering::Relaxed);
+                let version = super::WORKSPACE_TRANSFER_VERSION;
+                let supported = supported
+                    && connection
+                        .call::<u32>(Request::Hello(version))
+                        .is_ok_and(|reply| reply == version);
+                connection
+                    .workspace_transfer
                     .store(supported, Ordering::Relaxed);
                 let version = super::LSP_EDITS_VERSION;
                 let supported = connection

@@ -17,7 +17,9 @@ impl GitPanel {
         self.staging
             || self
                 .workspace
-                .read_with(cx, |workspace, _| !workspace.git_edit.is_empty())
+                .read_with(cx, |workspace, _| {
+                    workspace.tree_busy || !workspace.git_edit.is_empty()
+                })
                 .unwrap_or(true)
     }
 

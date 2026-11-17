@@ -4,7 +4,7 @@ use anyhow::Result;
 use collections::FxHashMap;
 use itertools::Itertools;
 use windows::Win32::{
-    Foundation::{HANDLE, HGLOBAL},
+    Foundation::{HANDLE, HGLOBAL, HWND},
     System::{
         DataExchange::{
             CloseClipboard, CountClipboardFormats, EmptyClipboard, EnumClipboardFormats,
@@ -36,6 +36,8 @@ static CLIPBOARD_PNG_FORMAT: LazyLock<u32> =
     LazyLock::new(|| register_clipboard_format(windows::core::w!("PNG")));
 static CLIPBOARD_JPG_FORMAT: LazyLock<u32> =
     LazyLock::new(|| register_clipboard_format(windows::core::w!("JFIF")));
+static CLIPBOARD_DROP_EFFECT: LazyLock<u32> =
+    LazyLock::new(|| register_clipboard_format(windows::core::w!("Preferred DropEffect")));
 
 static IMAGE_FORMATS_MAP: LazyLock<FxHashMap<u32, ImageFormat>> = LazyLock::new(|| {
     let mut map = FxHashMap::default();
@@ -67,13 +69,16 @@ fn get_clipboard_data(format: u32) -> Option<LockedGlobal> {
     LockedGlobal::lock(global)
 }
 
-pub(crate) fn write_to_clipboard(item: ClipboardItem) {
-    let Some(_clip) = ClipboardGuard::open() else {
+pub(crate) fn write_to_clipboard(item: ClipboardItem, owner: Option<HWND>) {
+    let Some(_clip) = ClipboardGuard::open(owner) else {
         return;
     };
 
     let result: Result<()> = (|| {
         unsafe { EmptyClipboard()? };
+        if let Some((paths, cut)) = item.file_list() {
+            write_files(paths, cut)?;
+        }
         for entry in item.entries() {
             match entry {
                 ClipboardEntry::String(string) => write_string(string)?,
@@ -90,12 +95,12 @@ pub(crate) fn write_to_clipboard(item: ClipboardItem) {
 }
 
 pub(crate) fn read_from_clipboard() -> Option<ClipboardItem> {
-    let _clip = ClipboardGuard::open()?;
+    let _clip = ClipboardGuard::open(None)?;
 
     let mut entries = Vec::new();
     let mut have_text = false;
     let mut have_image = false;
-    let mut have_files = false;
+    let mut files = None;
 
     let count = unsafe { CountClipboardFormats() };
     let mut format = 0;
@@ -112,11 +117,25 @@ pub(crate) fn read_from_clipboard() -> Option<ClipboardItem> {
                 entries.push(entry);
                 have_image = true;
             }
-        } else if !have_files && format == CF_HDROP.0 as u32 {
-            if let Some(entry) = read_files() {
-                entries.push(entry);
-                have_files = true;
+        } else if files.is_none() && format == CF_HDROP.0 as u32 {
+            files = read_files();
+        }
+    }
+
+    if let Some((paths, cut)) = files {
+        if cut {
+            let mut file_entries = ClipboardItem::new_file_list(paths, true).entries;
+            if let Some(index) = entries
+                .iter()
+                .position(|entry| matches!(entry, ClipboardEntry::String(_)))
+                && let ClipboardEntry::String(existing) = entries.remove(index)
+                && let ClipboardEntry::String(text) = &mut file_entries[1]
+            {
+                text.text = existing.text;
             }
+            entries.splice(0..0, file_entries);
+        } else {
+            entries.insert(0, ClipboardEntry::ExternalPaths(paths));
         }
     }
 
@@ -264,14 +283,39 @@ fn read_image(format: u32) -> Option<ClipboardEntry> {
     }))
 }
 
-fn read_files() -> Option<ClipboardEntry> {
+fn file_drop_bytes(paths: &ExternalPaths) -> Vec<u8> {
+    use std::os::windows::ffi::OsStrExt as _;
+
+    // DROPFILES with a wide, double-NUL-terminated path list.
+    let mut data = vec![0; 20];
+    data[0] = 20;
+    data[16] = 1;
+    for path in paths.paths() {
+        for unit in path.as_os_str().encode_wide().chain(Some(0)) {
+            data.extend_from_slice(&unit.to_le_bytes());
+        }
+    }
+    data.extend_from_slice(&[0, 0]);
+    data
+}
+
+fn write_files(paths: &ExternalPaths, cut: bool) -> Result<()> {
+    set_clipboard_bytes(&file_drop_bytes(paths), CF_HDROP.0 as u32)?;
+    set_clipboard_bytes(&[if cut { 2_u32 } else { 1_u32 }], *CLIPBOARD_DROP_EFFECT)
+}
+
+fn read_files() -> Option<(ExternalPaths, bool)> {
     let locked = get_clipboard_data(CF_HDROP.0 as u32)?;
     let hdrop = HDROP(locked.ptr as *mut _);
     let mut filenames = Vec::new();
     with_file_names(hdrop, |name| filenames.push(std::path::PathBuf::from(name)));
-    Some(ClipboardEntry::ExternalPaths(ExternalPaths(
-        filenames.into(),
-    )))
+    if filenames.is_empty() {
+        return None;
+    }
+    let paths = ExternalPaths(filenames.into());
+    let cut = get_clipboard_data(*CLIPBOARD_DROP_EFFECT)
+        .is_some_and(|locked| locked.as_bytes().get(..4) == Some(&2_u32.to_le_bytes()));
+    Some((paths, cut))
 }
 
 /// DIB is BMP without the 14-byte BITMAPFILEHEADER. Prepend one.
@@ -343,8 +387,8 @@ fn gpui_to_image_format(value: ImageFormat) -> Option<image::ImageFormat> {
 struct ClipboardGuard;
 
 impl ClipboardGuard {
-    fn open() -> Option<Self> {
-        match unsafe { OpenClipboard(None) } {
+    fn open(owner: Option<HWND>) -> Option<Self> {
+        match unsafe { OpenClipboard(owner) } {
             Ok(()) => Some(Self),
             Err(e) => {
                 log::error!("Failed to open clipboard: {e}");
@@ -390,5 +434,31 @@ impl LockedGlobal {
 impl Drop for LockedGlobal {
     fn drop(&mut self) {
         unsafe { GlobalUnlock(self.global).ok() };
+    }
+}
+
+#[cfg(test)]
+mod file_list_tests {
+    use super::*;
+
+    #[test]
+    fn wide_file_drop_list_has_a_header_and_two_terminators() {
+        let paths = ExternalPaths(
+            [r"C:\My Folder", r"C:\My Folder\音.txt"]
+                .into_iter()
+                .map(std::path::PathBuf::from)
+                .collect(),
+        );
+        let bytes = file_drop_bytes(&paths);
+        assert_eq!(&bytes[..4], &20_u32.to_le_bytes());
+        assert_eq!(&bytes[16..20], &1_u32.to_le_bytes());
+        let words = bytes[20..]
+            .chunks_exact(2)
+            .map(|word| u16::from_le_bytes(word.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            String::from_utf16(&words).unwrap(),
+            "C:\\My Folder\0C:\\My Folder\\音.txt\0\0"
+        );
     }
 }
