@@ -842,6 +842,15 @@ impl Workspace {
             window_write: Task::ready(()),
         };
         workspace.apply_appearance(window, cx);
+        let mut mode = cx.theme().mode;
+        cx.observe_global::<Theme>(move |workspace, cx| {
+            let next = cx.theme().mode;
+            if mode != next {
+                mode = next;
+                workspace.refresh_expanded_editor_hunks(cx);
+            }
+        })
+        .detach();
         workspace.start_session_writer(cx);
         workspace.observe_window_geometry(window, cx);
         workspace

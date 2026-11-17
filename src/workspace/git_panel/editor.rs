@@ -1,7 +1,7 @@
 use super::*;
 use crate::workspace::{
-    DiffSource, OpenFile, WorkspaceView, editor_git::hunk_toolbar_row, inlay_hints::InlayHints,
-    line_alignment::LineAlignment,
+    DiffSource, OpenFile, WorkspaceView, code_theme::HunkPalette, editor_git::hunk_toolbar_row,
+    inlay_hints::InlayHints, line_alignment::LineAlignment,
 };
 use gpui_component::{
     diff::{DiffEditorRow, DiffSide},
@@ -1104,6 +1104,7 @@ impl ReviewEditor {
         // Install only when the patch projection changed. Normal cursor and
         // scroll notifications never replace the editor document.
         let theme = cx.theme().mode;
+        let hunk = HunkPalette::for_mode(theme);
         let changed = panel.editor.row_revision != Some(revision)
             || panel.editor.theme != Some(theme)
             || panel.editor.split != split
@@ -1113,8 +1114,6 @@ impl ReviewEditor {
                 return;
             }
             let rows = panel.diff.read(cx).editor_rows().collect::<Vec<_>>();
-            let success = cx.theme().success.opacity(0.13);
-            let danger = cx.theme().danger.opacity(0.13);
             let muted = cx.theme().muted.opacity(0.30);
             let surface = Palette::for_mode(cx.theme().mode).soft;
             let workspace = panel.workspace.upgrade();
@@ -1194,7 +1193,7 @@ impl ReviewEditor {
                                     if original.is_none() {
                                         Some(muted)
                                     } else {
-                                        changed.then_some(danger)
+                                        changed.then_some(hunk.removed_row)
                                     },
                                 )
                             } else if split {
@@ -1203,16 +1202,16 @@ impl ReviewEditor {
                                     if modified.is_none() {
                                         Some(muted)
                                     } else {
-                                        changed.then_some(success)
+                                        changed.then_some(hunk.added_row)
                                     },
                                 )
                             } else {
                                 (
                                     modified.as_ref().or(original.as_ref()),
                                     changed.then_some(if modified.is_some() {
-                                        success
+                                        hunk.added_row
                                     } else {
-                                        danger
+                                        hunk.removed_row
                                     }),
                                 )
                             }
@@ -1363,7 +1362,6 @@ impl ReviewEditor {
             for column in [&panel.editor.original, &panel.editor.modified] {
                 let projection = column.projection.borrow();
                 let diff = panel.diff.read(cx);
-                let theme = cx.theme();
                 let highlights = projection
                     .lines
                     .iter()
@@ -1376,10 +1374,9 @@ impl ReviewEditor {
                     })
                     .flat_map(|(offset, position)| {
                         let color = match position.side() {
-                            DiffSide::Original => theme.danger,
-                            DiffSide::Modified => theme.success,
-                        }
-                        .opacity(0.25);
+                            DiffSide::Original => hunk.removed_inline,
+                            DiffSide::Modified => hunk.added_inline,
+                        };
                         diff.editor_highlights(position, color).into_iter().map(
                             move |(range, style)| {
                                 TextDecoration::new(

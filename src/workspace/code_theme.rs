@@ -15,6 +15,7 @@ use serde_json::{Map, Value, json};
 use crate::config::{CodeContrast, CodeTheme};
 
 const ACTIVE_LINE_ALPHA: u8 = 0x0f;
+const MIN_ADDED_CODE_CONTRAST: f64 = 4.5;
 const SEMANTIC_UNDERLINE_CONTRAST: f64 = 3.;
 
 /// Contrast targets for the code text presets.
@@ -558,14 +559,26 @@ pub(crate) fn highlight_theme(
     if clear {
         backgrounds.push(hsla_hex(focus));
     }
-    let mut colors = colors(theme, contrast, mode, &backgrounds);
+    // Code runs share their syntax colors across ordinary and tinted rows.
+    // The inline fill is the more demanding of the two added backgrounds.
+    let added_inline = Some(luminance(&hsla_hex(
+        HunkPalette::for_mode(mode).added_inline,
+    )));
+    let mut colors = colors(theme, contrast, mode, &backgrounds, added_inline);
     if !clear {
         backgrounds.push(hsla_hex(focus));
         let luminances = backgrounds
             .iter()
             .map(|color| luminance(color))
             .collect::<Vec<_>>();
-        colors.comment = comment_color(mode.is_dark(), contrast_target(contrast), &luminances);
+        colors.comment = comment_color(
+            mode.is_dark(),
+            ContrastTargets {
+                backgrounds: &luminances,
+                target: contrast_target(contrast),
+                added_inline,
+            },
+        );
     }
     build_highlight_theme(theme, mode, &colors)
 }
@@ -604,9 +617,9 @@ fn colors(
     contrast: CodeContrast,
     mode: ThemeMode,
     backgrounds: &[String],
+    added_inline: Option<f64>,
 ) -> Colors {
     let palette = palette(theme, mode);
-    let target = contrast_target(contrast);
     let dark = mode == ThemeMode::Dark;
     let surface = palette.surface.to_string();
     let block_surface = palette.block_surface.to_string();
@@ -617,6 +630,11 @@ fn colors(
         backgrounds.to_vec()
     };
     let luminances: Vec<f64> = on.iter().map(|color| luminance(color)).collect();
+    let targets = ContrastTargets {
+        backgrounds: &luminances,
+        target: contrast_target(contrast),
+        added_inline,
+    };
     // Light prism and spectrum retain higher chroma. Reduce chroma to fit the gamut before conversion.
     let clear = !dark && matches!(theme, CodeTheme::Prism | CodeTheme::Spectrum);
     let chroma = if clear { 1.07 } else { 1.15 };
@@ -630,7 +648,7 @@ fn colors(
         if let Some(color) = memo.get(value) {
             return color.clone();
         }
-        let color = readable(value, &luminances, target, dark, chroma, fit);
+        let color = readable(value, targets, dark, chroma, fit);
         memo.insert(value.to_string(), color.clone());
         color
     };
@@ -657,7 +675,7 @@ fn colors(
         number: color(palette.number),
         macro_fg: color(palette.macro_fg),
         preprocessor: color(palette.preprocessor.unwrap_or(palette.macro_fg)),
-        comment: comment_color(dark, target, &luminances),
+        comment: comment_color(dark, targets),
         surface,
         block_surface,
     }
@@ -818,7 +836,30 @@ fn syntax_style(colors: &Colors, semantics: bool) -> Value {
     Value::Object(syntax)
 }
 
-/// Use the Web diff accents with a softer added-row fill on the active code surface.
+pub(super) struct HunkPalette {
+    pub added_row: Hsla,
+    pub added_inline: Hsla,
+    pub removed_row: Hsla,
+    pub removed_inline: Hsla,
+}
+
+impl HunkPalette {
+    pub fn for_mode(mode: ThemeMode) -> Self {
+        let [added_row, added_inline, removed_row, removed_inline] = match mode {
+            ThemeMode::Light => ["#eaf4ed", "#caebd5", "#f8e1df", "#f1c1bd"],
+            ThemeMode::Dark => ["#222d28", "#284837", "#3a272a", "#593638"],
+        }
+        .map(hsla);
+        Self {
+            added_row,
+            added_inline,
+            removed_row,
+            removed_inline,
+        }
+    }
+}
+
+/// Fit the syntax colors for the shared diff palettes.
 pub(crate) fn apply_diff_contrast(
     highlight: &mut HighlightTheme,
     theme: CodeTheme,
@@ -827,24 +868,19 @@ pub(crate) fn apply_diff_contrast(
 ) {
     use gpui_component::highlighter::TintedSyntax;
 
-    let [removed, added] = match mode {
-        ThemeMode::Light => [["#fcebe9", "#f6cdc7"], ["#f5faf6", "#dfefe3"]],
-        ThemeMode::Dark => [["#2c1c1c", "#552b26"], ["#1b211e", "#294132"]],
-    };
-    let surface = hsla(palette(theme, mode).surface);
-    let added_row = hsla_hex(surface.blend(hsla(added[0]).opacity(0.6)));
-    let styles = |backgrounds: [&str; 2]| {
+    let hunk = HunkPalette::for_mode(mode);
+    let styles = |backgrounds: [Hsla; 2]| {
         let [row, inline] = backgrounds.map(|background| {
-            let colors = colors(theme, contrast, mode, &[background.into()]);
+            let colors = colors(theme, contrast, mode, &[hsla_hex(background)], None);
             TintedSyntax {
-                background: hsla(background),
+                background,
                 syntax: serde_json::from_value(syntax_style(&colors, false)).expect("diff syntax"),
             }
         });
         (row, inline)
     };
-    highlight.style.diff_removed = Some(styles(removed));
-    highlight.style.diff_added = Some(styles([&added_row, added[1]]));
+    highlight.style.diff_removed = Some(styles([hunk.removed_row, hunk.removed_inline]));
+    highlight.style.diff_added = Some(styles([hunk.added_row, hunk.added_inline]));
 }
 
 fn style(colors: &Colors, mode: ThemeMode) -> Value {
@@ -1060,23 +1096,32 @@ fn fit_chroma(lightness: f64, a: f64, b: f64) -> String {
     hex(from_oklab(lightness, a * low, b * low))
 }
 
+#[derive(Clone, Copy)]
+struct ContrastTargets<'a> {
+    backgrounds: &'a [f64],
+    target: f64,
+    added_inline: Option<f64>,
+}
+
 /// Adjust foreground lightness until contrast against every background reaches the target.
 ///
 /// If even white or black falls short (for example, at high contrast on a midtone background),
 /// use the highest achievable contrast.
 fn readable(
     color: &str,
-    backgrounds: &[f64],
-    target: f64,
+    targets: ContrastTargets<'_>,
     dark: bool,
     chroma: f64,
     fit: fn(f64, f64, f64) -> String,
 ) -> String {
     let end = if dark { "#ffffff" } else { "#000000" };
     let end_luminance = luminance(end);
-    let floor = backgrounds.iter().fold(target, |floor, background| {
-        floor.min(contrast_ratio(end_luminance, *background))
-    });
+    let floor = targets
+        .backgrounds
+        .iter()
+        .fold(targets.target, |floor, background| {
+            floor.min(contrast_ratio(end_luminance, *background))
+        });
     let [lightness, a, b] = oklab(color);
     let finish = if dark { 1. } else { 0. };
     for step in 0..=300 {
@@ -1086,9 +1131,13 @@ fn readable(
             b * chroma,
         );
         let candidate_luminance = luminance(&candidate);
-        if backgrounds
+        if targets
+            .backgrounds
             .iter()
             .all(|background| contrast_ratio(candidate_luminance, *background) + 1e-9 >= floor)
+            && targets.added_inline.is_none_or(|background| {
+                contrast_ratio(candidate_luminance, background) >= MIN_ADDED_CODE_CONTRAST
+            })
         {
             return candidate;
         }
@@ -1096,9 +1145,9 @@ fn readable(
     end.to_string()
 }
 
-fn comment_color(dark: bool, target: f64, backgrounds: &[f64]) -> String {
+fn comment_color(dark: bool, targets: ContrastTargets<'_>) -> String {
     let gray = if dark { "#c5c5c5" } else { "#919191" };
-    readable(gray, backgrounds, target, dark, 1., in_gamut)
+    readable(gray, targets, dark, 1., in_gamut)
 }
 
 #[cfg(test)]
@@ -1164,7 +1213,7 @@ mod tests {
             (CodeTheme::Spectrum, ThemeMode::Light, preview.as_slice()),
             (CodeTheme::Spectrum, ThemeMode::Dark, &[][..]),
         ] {
-            let colors = colors(theme, CodeContrast::Enhanced, mode, backgrounds);
+            let colors = colors(theme, CodeContrast::Enhanced, mode, backgrounds, None);
             let expected: [&str; 5] = match (theme, mode) {
                 (CodeTheme::Prism, ThemeMode::Light) => {
                     ["#b40033", "#0050ca", "#924200", "#7500e0", "#66500a"]
@@ -1195,6 +1244,7 @@ mod tests {
             CodeContrast::Enhanced,
             ThemeMode::Light,
             &preview,
+            None,
         );
         assert_eq!(prism.macro_fg, "#7500e0");
         assert_eq!(prism.preprocessor, "#005b64");
@@ -1212,7 +1262,7 @@ mod tests {
                     CodeContrast::High,
                 ] {
                     let backgrounds = ordinary(theme, mode);
-                    let colors = colors(theme, contrast, mode, &backgrounds);
+                    let colors = colors(theme, contrast, mode, &backgrounds, None);
                     let target = contrast_target(contrast);
                     let end_luminance = luminance(if mode == ThemeMode::Dark {
                         "#ffffff"
@@ -1270,6 +1320,45 @@ mod tests {
                             assert!(
                                 (3. ..=3.8).contains(&ratio),
                                 "{theme:?} {mode:?} {contrast:?}: {capture} has {ratio:.2}:1 contrast"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn added_hunk_text_keeps_readable_contrast() {
+        for mode in [ThemeMode::Light, ThemeMode::Dark] {
+            let hunk = HunkPalette::for_mode(mode);
+            let fills = [hunk.added_row, hunk.added_inline].map(hsla_hex);
+            let app = app_backgrounds(mode)
+                .iter()
+                .map(|background| hsla(background))
+                .collect::<Vec<_>>();
+            for theme in CodeTheme::ALL {
+                for contrast in CodeContrast::ALL {
+                    let highlight = highlight_theme(theme, contrast, mode, &app);
+                    for capture in [
+                        "primary",
+                        "comment",
+                        "keyword",
+                        "type",
+                        "function",
+                        "string",
+                        "number",
+                        "property",
+                        "namespace",
+                        "variable",
+                    ] {
+                        let foreground = hsla_hex(highlight.style(capture).unwrap().color.unwrap());
+                        for background in &fills {
+                            let ratio =
+                                contrast_ratio(luminance(&foreground), luminance(background));
+                            assert!(
+                                ratio >= MIN_ADDED_CODE_CONTRAST,
+                                "{theme:?} {mode:?} {contrast:?} {capture}: {foreground} on {background} is {ratio:.2}:1"
                             );
                         }
                     }

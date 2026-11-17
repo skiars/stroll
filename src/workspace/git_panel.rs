@@ -3042,7 +3042,10 @@ mod tests {
                             cx,
                         )
                         .unwrap();
-                    let color = Background::from(cx.theme().success.opacity(0.13));
+                    let color = Background::from(
+                        crate::workspace::code_theme::HunkPalette::for_mode(cx.theme().mode)
+                            .added_row,
+                    );
                     let scale = window.scale_factor();
                     let device_pixel = px(1. / scale);
                     assert!(window.painted_quads().iter().any(|quad| {

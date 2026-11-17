@@ -456,3 +456,142 @@ fn workspace_disclosures_animate_offscreen() -> Result<()> {
     })?;
     Ok(())
 }
+
+#[::core::prelude::v1::test]
+fn hunk_colors_match_in_the_editor_and_git_diff_offscreen() -> Result<()> {
+    use crate::workspace::code_theme::HunkPalette;
+    use gpui::Hsla;
+
+    let fixture = tempfile::tempdir()?;
+    let root = fixture.path().join("repo");
+    fs::create_dir(&root)?;
+    git(&root, &["init", "-qb", "main"]);
+    let path = PathBuf::from("cache.rs");
+    let source =
+        |variant| format!("fn cache_ttl() -> Ttl {{\n    let ttl = Ttl::{variant};\n    ttl\n}}\n");
+    fs::write(root.join(&path), source("Short"))?;
+    git(&root, &["add", "."]);
+    git(
+        &root,
+        &[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.com",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-qm",
+            "Initial",
+        ],
+    );
+    fs::write(root.join(&path), source("Medium"))?;
+
+    let platform = gpui_platform::current_platform(true);
+    let mut cx = HeadlessAppContext::with_platform(
+        platform.text_system(),
+        Arc::new(gpui_kit_assets::AllAssets),
+        || Ok(Some(Box::new(WgpuHeadlessRenderer::new()?))),
+    );
+    cx.update(gpui_component::init);
+    let store = Arc::new(Store::new(fixture.path().join("state"))?);
+    let config = crate::config::ConfigFile::load(Some(fixture.path().join("config.toml")));
+    let mut workspace = None;
+    let handle = cx
+        .open_window(VIEWPORT, |window, cx| {
+            let view = cx
+                .new(|cx| Workspace::with_config(store, config, WorkspaceView::Editor, window, cx));
+            workspace = Some(view.clone());
+            cx.new(|cx| Root::new(view, window, cx))
+        })?
+        .into();
+    let workspace = workspace.unwrap();
+    cx.update_window(handle, |_, window, cx| {
+        workspace.update(cx, |workspace, cx| {
+            workspace.open_repository(
+                Location {
+                    root,
+                    file: Some(path.clone()),
+                },
+                window,
+                cx,
+            );
+        });
+    })?;
+    let assert_colors = |cx: &mut HeadlessAppContext, view, label, colors: &[Hsla]| -> Result<()> {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            draw(cx, handle)?;
+            let image = cx.capture_screenshot(handle)?;
+            let has_color = |color: Hsla| {
+                let gpui::Rgba { r, g, b, a } = color.into();
+                let expected = [r, g, b, a].map(|channel: f32| (channel * 255.).round() as u8);
+                image
+                    .pixels()
+                    .filter(|pixel| pixel.0 == expected)
+                    .take(16)
+                    .count()
+                    == 16
+            };
+            let missing = colors
+                .iter()
+                .copied()
+                .filter(|&color| !has_color(color))
+                .collect::<Vec<_>>();
+            if missing.is_empty() {
+                record(cx, handle, view, label)?;
+                return Ok(());
+            }
+            anyhow::ensure!(
+                std::time::Instant::now() < deadline,
+                "{view} {label} is missing hunk colors {missing:?}"
+            );
+            std::thread::yield_now();
+        }
+    };
+
+    // Let the repository watcher load the file changes before expanding the hunk.
+    draw(&mut cx, handle)?;
+    cx.update_window(handle, |_, _, cx| {
+        workspace.update(cx, |workspace, cx| {
+            workspace.toggle_editor_git(&path, 0, cx)
+        });
+    })?;
+    for (mode, label) in [(ThemeMode::Light, "light"), (ThemeMode::Dark, "dark")] {
+        cx.update(|cx| crate::workspace::apply_theme(mode, cx));
+        let hunk = HunkPalette::for_mode(mode);
+        assert_colors(
+            &mut cx,
+            "hunk-editor",
+            label,
+            &[hunk.added_row, hunk.removed_row],
+        )?;
+    }
+    cx.update_window(handle, |_, window, cx| {
+        workspace.update(cx, |workspace, cx| {
+            workspace.switch_view(WorkspaceView::Git, window, cx)
+        });
+        let panel = workspace.read(cx).git.clone().unwrap();
+        panel.update(cx, |panel, cx| {
+            panel.split = false;
+            panel.show_history = false;
+            panel.load_review(Selection::Worktree(Mode::All), false, window, cx);
+        });
+    })?;
+    for (mode, label) in [(ThemeMode::Light, "light"), (ThemeMode::Dark, "dark")] {
+        cx.update(|cx| crate::workspace::apply_theme(mode, cx));
+        let hunk = HunkPalette::for_mode(mode);
+        assert_colors(
+            &mut cx,
+            "hunk-diff",
+            label,
+            &[
+                hunk.added_row,
+                hunk.removed_row,
+                hunk.added_inline,
+                hunk.removed_inline,
+            ],
+        )?;
+    }
+    Ok(())
+}

@@ -811,6 +811,17 @@ impl Workspace {
         cx.notify();
     }
 
+    pub(super) fn refresh_expanded_editor_hunks(&mut self, cx: &mut Context<Self>) {
+        let expanded = self
+            .files
+            .iter()
+            .filter_map(|(path, file)| Some((path.clone(), file.git.selected?)))
+            .collect::<Vec<_>>();
+        for (path, action) in expanded {
+            self.expand_editor_git(&path, action, cx);
+        }
+    }
+
     fn expand_editor_git(&mut self, path: &Path, action: usize, cx: &mut Context<Self>) {
         let Some(file) = self.files.get_mut(path) else {
             return;
@@ -824,6 +835,7 @@ impl Workspace {
         let Some(mut deleted) = patch.deleted_lines(block).map(Vec::into_iter) else {
             return;
         };
+        let hunk = code_theme::HunkPalette::for_mode(cx.theme().mode);
         let sections: Vec<_> = block
             .changes
             .iter()
@@ -832,8 +844,8 @@ impl Workspace {
                 line: lines.start,
                 deleted: deleted.by_ref().take(change.removed).collect(),
                 added: lines.end.saturating_sub(lines.start),
-                deleted_background: cx.theme().danger.opacity(0.13),
-                added_background: cx.theme().success.opacity(0.08),
+                deleted_background: hunk.removed_row,
+                added_background: hunk.added_row,
             })
             .collect();
         let Some(first) = block.changes.first() else {
@@ -1444,6 +1456,23 @@ mod tests {
                 workspace.toggle_editor_git(&path, 0, cx);
             });
         });
+        for mode in [ThemeMode::Dark, ThemeMode::Light] {
+            visual.update(|_, cx| apply_theme(mode, cx));
+            visual.update(|window, cx| {
+                window.draw(cx).clear(cx);
+                assert_eq!(workspace.read(cx).files[&path].git.selected, Some(0));
+                let hunk = code_theme::HunkPalette::for_mode(mode);
+                let quads = window.painted_quads();
+                for fill in [hunk.added_row, hunk.removed_row] {
+                    assert!(
+                        quads
+                            .iter()
+                            .any(|quad| quad.background == Background::from(fill)),
+                        "{mode:?}: the expanded hunk must adopt the current theme"
+                    );
+                }
+            });
+        }
         let hover = visual.update(|window, cx| {
             window.draw(cx).clear(cx);
             let viewport = workspace.read(cx).files[&path]
@@ -1451,7 +1480,8 @@ mod tests {
                 .read(cx)
                 .input_bounds();
             let scale = window.scale_factor();
-            let color = Background::from(cx.theme().danger.opacity(0.13));
+            let color =
+                Background::from(code_theme::HunkPalette::for_mode(cx.theme().mode).removed_row);
             let row = window
                 .painted_quads()
                 .into_iter()
@@ -1491,7 +1521,8 @@ mod tests {
             let viewport = editor.input_bounds();
             let line_height = editor.line_height().unwrap();
             let scale = window.scale_factor();
-            let color = Background::from(cx.theme().danger.opacity(0.13));
+            let color =
+                Background::from(code_theme::HunkPalette::for_mode(cx.theme().mode).removed_row);
             let target_top = window
                 .painted_quads()
                 .into_iter()
@@ -1666,9 +1697,9 @@ mod tests {
                 window.draw(cx).clear(cx);
                 let scale = window.scale_factor();
                 let background = if deleted_rows == 0 {
-                    cx.theme().success.opacity(0.08)
+                    code_theme::HunkPalette::for_mode(cx.theme().mode).added_row
                 } else {
-                    cx.theme().danger.opacity(0.13)
+                    code_theme::HunkPalette::for_mode(cx.theme().mode).removed_row
                 };
                 let editor = workspace.read(cx).files[&path].editor.read(cx);
                 let viewport = editor.input_bounds();
@@ -1759,7 +1790,9 @@ mod tests {
                 window.draw(cx).clear(cx);
                 let input = editor.read(cx).input_bounds();
                 let scale = window.scale_factor();
-                let tint = Background::from(cx.theme().danger.opacity(0.13));
+                let tint = Background::from(
+                    code_theme::HunkPalette::for_mode(cx.theme().mode).removed_row,
+                );
                 let top = window
                     .painted_quads()
                     .into_iter()
@@ -1882,7 +1915,9 @@ mod tests {
                     let scale = window.scale_factor();
                     let file = &workspace.read(cx).files[&path];
                     let viewport = file.editor.read(cx).input_bounds();
-                    let color = Background::from(cx.theme().danger.opacity(0.13));
+                    let color = Background::from(
+                        code_theme::HunkPalette::for_mode(cx.theme().mode).removed_row,
+                    );
                     let row = window
                         .painted_quads()
                         .into_iter()
