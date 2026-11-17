@@ -21,9 +21,12 @@ def expect(method):
     return message
 
 
-def diagnostic(message):
+def diagnostic(message, end_column=4):
     return {
-        "range": {"start": {"line": 0, "character": 3}, "end": {"line": 0, "character": 4}},
+        "range": {
+            "start": {"line": 0, "character": 3},
+            "end": {"line": 0, "character": end_column},
+        },
         "severity": 1,
         "message": message,
     }
@@ -54,16 +57,17 @@ else:
     publish(document["version"], diagnostic("initial"))
 
 current = expect("textDocument/didChange")["params"]["textDocument"]
+current_diagnostic = diagnostic("current", end_column=5)
 if mode == "pull":
     send(id=first["id"], result={"kind": "full", "items": [diagnostic("outdated")]})
     second = expect("textDocument/diagnostic")
-    send(id=second["id"], result={"kind": "full", "items": [diagnostic("current")]})
+    send(id=second["id"], result={"kind": "full", "items": [current_diagnostic]})
     send(id="refresh", method="workspace/diagnostic/refresh")
     assert receive() == {"jsonrpc": "2.0", "id": "refresh", "result": None}
     third = expect("textDocument/diagnostic")
     send(id=third["id"], result={"kind": "full", "items": []})
 else:
-    publish(current["version"], diagnostic("current"))
+    publish(current["version"], current_diagnostic)
     publish(document["version"], diagnostic("outdated"))
     send(id=expect("textDocument/hover")["id"], result=None)
     next_version = expect("textDocument/didChange")["params"]["textDocument"]["version"]

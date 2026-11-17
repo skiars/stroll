@@ -27,6 +27,9 @@ dialogs in a Wayland window after changes to paint order or focus handling.
   heights are respected, and fixed-height input groups fit the inner field inside
   the group's border. The popup and Git integration tests check control geometry.
 - The shared editor search and replace fields use the default input height.
+- CMake uses the shared Tree-sitter highlighter with a query that uses Rust
+  Tree-sitter predicates. Run `cargo test --release --locked --test cmake_highlighting`
+  to check highlighting in the source editor, Git diff, and Markdown code fences.
 - Select dropdowns in dialogs use the owning dialog's paint priority so their
   search field and rows stay visible over the dialog. The Git version comparison
   integration test checks the paint order for both selectors.

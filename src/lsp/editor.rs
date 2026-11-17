@@ -485,6 +485,11 @@ pub(crate) fn editor_diagnostics(
     let mut diagnostics = diagnostics
         .into_iter()
         .filter_map(|mut diagnostic| {
+            // Clamp columns to the line end. Pyflakes includes the newline in its end column.
+            for position in [&mut diagnostic.range.start, &mut diagnostic.range.end] {
+                let line = text.slice_line(position.line as usize);
+                position.character = (position.character as usize).min(line.len_utf16()) as u32;
+            }
             // A point diagnostic can still mark the following character on its line.
             if diagnostic.range.start == diagnostic.range.end {
                 let start = editor_position(text, diagnostic.range.start)?;

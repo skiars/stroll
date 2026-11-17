@@ -4,6 +4,9 @@ Bash highlighting is built in. It recognizes `.sh`, `.bash`, common Bash
 startup files, and extensionless scripts with a Bash shebang. The Markdown
 fence names `bash` and `sh` use the same grammar.
 
+CMake highlighting is built in for `CMakeLists.txt`, `*.cmake` files, and
+Markdown fences labeled `cmake`.
+
 ## TextMate extensions
 
 Add a `.stroll.json` file to the worktree:
@@ -68,6 +71,20 @@ optional `server.workspaceSettings` object for the server's workspace settings.
 For SSH, install the updated remote helper and register the same server ID
 in the helper user's `lsp.json` with the command for that host. The client
 routes by ID and the helper resolves the executable from its own configuration.
+
+### Python with pylsp
+
+Stroll uses `pylsp` for `.py` and `.pyi` files in a repository. Install
+`python-lsp-server` on the machine running the language server and verify that
+`pylsp --version` works. For SSH repositories, use the remote machine's login
+shell `PATH`. For a local repository, set `[lsp.python].command` in the app
+configuration to use an absolute path to `pylsp` if needed.
+
+To resolve dependencies from a project virtual environment, install and run
+`pylsp` in that environment. Install `python-lsp-server[pyflakes]` there for
+diagnostics such as undefined names. The editor uses the nearest parent with
+`pyproject.toml` or `setup.py` inside the repository as the language server
+root, falling back to the repository root.
 
 ### Markdown with Marksman
 

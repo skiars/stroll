@@ -1,7 +1,9 @@
 use std::{
+    cell::RefCell,
     fs,
     path::Path,
     process::Command,
+    rc::Rc,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -340,6 +342,105 @@ fn workspace_completion_keeps_the_selected_candidate_across_a_refresh() -> Resul
             wait(visual, "the selected method is accepted", |visual| {
                 visual.update(|_, cx| {
                     editor.read(cx).text().to_string() == source.replace("object", "object.method")
+                })
+            })
+        },
+    )
+}
+
+#[test]
+#[ignore = "requires pylsp with Pyflakes on PATH"]
+fn workspace_python_with_pylsp() -> Result<()> {
+    let fixture = tempfile::tempdir()?;
+    let package = fixture.path().join("repository/packages/app");
+    fs::create_dir_all(&package)?;
+    fs::write(package.join("pyproject.toml"), "[project]\nname = 'app'\n")?;
+    fs::write(
+        package.join("helper.py"),
+        "def greeting():\n    \"\"\"A greeting from the project.\"\"\"\n    return 'hello'\n",
+    )?;
+    let source = "from helper import greet\nprint(greeting())\nunknown_name\nfrom pyflakes.api import checkP\n";
+    let caret = source.find('\n').unwrap();
+    with_workspace_editor(
+        fixture.path(),
+        "packages/app/main.py",
+        "",
+        source,
+        caret,
+        |visual, workspace, editor| {
+            visual.update(|_, cx| {
+                let file = workspace.read(cx).active_file().unwrap();
+                assert_eq!(file.server_project.as_ref().unwrap().key.root, package);
+            });
+            wait(visual, "Pyflakes diagnostic", |visual| {
+                visual.update(|_, cx| {
+                    editor.read(cx).diagnostics().is_some_and(|diagnostics| {
+                        diagnostics
+                            .iter()
+                            .any(|item| item.message.contains("unknown_name"))
+                    })
+                })
+            })?;
+
+            visual.simulate_keystrokes("ctrl-space");
+            wait(visual, "Python import completion", |visual| {
+                labels(visual, editor)
+                    .first()
+                    .is_some_and(|label| label.starts_with("greeting"))
+            })?;
+            visual.simulate_keystrokes("enter");
+            wait(visual, "Python completion insertion", |visual| {
+                visual.update(|_, cx| {
+                    editor
+                        .read(cx)
+                        .text()
+                        .to_string()
+                        .starts_with("from helper import greeting\n")
+                })
+            })?;
+
+            visual.update(|_, cx| {
+                editor.update(cx, |state, cx| {
+                    let end = state.text().to_string().rfind('\n').unwrap();
+                    state.set_selected_range(end..end, cx);
+                })
+            });
+            visual.simulate_keystrokes("ctrl-space");
+            wait(visual, "completion from the pylsp environment", |visual| {
+                labels(visual, editor)
+                    .iter()
+                    .any(|label| label.starts_with("checkPath"))
+            })?;
+            visual.simulate_keystrokes("escape");
+
+            let hover_result = Rc::new(RefCell::new(None));
+            visual.update(|window, cx| {
+                let state = editor.read(cx);
+                let text = state.text().clone();
+                let offset = text.to_string().rfind("greeting").unwrap() + 1;
+                let provider = state.lsp().hover_provider.clone().unwrap();
+                let hover = provider.hover(&text, offset, window, cx);
+                let result = hover_result.clone();
+                cx.spawn(async move |_| {
+                    *result.borrow_mut() = Some(hover.await);
+                })
+                .detach();
+                editor.update(cx, |state, cx| state.set_selected_range(offset..offset, cx));
+            });
+            wait(visual, "Python hover", |_| hover_result.borrow().is_some())?;
+            let hover = hover_result.borrow_mut().take().unwrap()?.unwrap();
+            let lsp_types::HoverContents::Markup(contents) = hover.contents else {
+                anyhow::bail!("Expected Python hover documentation");
+            };
+            assert!(contents.value.contains("A greeting from the project."));
+
+            visual.simulate_keystrokes("f12");
+            wait(visual, "Python cross-file definition", |visual| {
+                visual.update(|_, cx| {
+                    workspace
+                        .read(cx)
+                        .active_file()
+                        .is_some_and(|file| file.path == Path::new("packages/app/helper.py"))
                 })
             })
         },

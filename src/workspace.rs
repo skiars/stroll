@@ -4456,7 +4456,11 @@ fn language_for(path: &Path) -> &'static str {
     if gpui_component::highlighter::is_bash_source(file_name(path), None) {
         return "bash";
     }
+    if file_name(path).eq_ignore_ascii_case("CMakeLists.txt") {
+        return "cmake";
+    }
     match path.extension().and_then(|ext| ext.to_str()) {
+        Some(ext) if ext.eq_ignore_ascii_case("cmake") => "cmake",
         Some("rs") => "rust",
         Some("ts" | "mts" | "cts") => "typescript",
         Some("tsx") => "tsx",
@@ -4584,6 +4588,24 @@ mod tests {
                 Some(gpui::rgb(0xffffff).into())
             );
         });
+    }
+
+    #[test]
+    fn detects_cmake_source_files() {
+        for filename in [
+            "build/CMakeLists.txt",
+            "cmake/Compiler.cmake",
+            "Compiler.CMAKE",
+        ] {
+            assert_eq!(
+                language_for_source(
+                    Path::new(filename),
+                    &Rope::from("message(STATUS \"Hello\")")
+                ),
+                "cmake"
+            );
+        }
+        assert_eq!(language_for(Path::new("CMakeLists.txt.bak")), "text");
     }
 
     #[test]

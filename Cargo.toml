@@ -33,6 +33,7 @@ gpui_platform = { package = "gpui-pre-platform", version = "=0.3.12", features =
 gpui-component = { version = "=0.9.1", features = [
     "tree-sitter-bash",
     "tree-sitter-c",
+    "tree-sitter-cmake",
     "tree-sitter-cpp",
     "tree-sitter-css",
     "tree-sitter-html",
