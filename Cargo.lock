@@ -7362,6 +7362,7 @@ dependencies = [
  "cc",
  "chrono",
  "dirs 6.0.0",
+ "embed-resource",
  "fancy-regex 0.14.0",
  "futures-channel",
  "futures-lite",

@@ -1,0 +1,2 @@
+// GPUI loads the window icon from resource 1.
+1 ICON "stroll.ico"

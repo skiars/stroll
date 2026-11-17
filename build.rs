@@ -8,5 +8,17 @@ fn main() {
             .flag_if_supported(if msvc { "/std:c11" } else { "-std=c11" })
             .compile("stroll_conpty");
         println!("cargo:rustc-link-lib=kernel32");
+        if std::env::var_os("CARGO_FEATURE_DESKTOP").is_some() {
+            let resources = "packaging/windows";
+            println!("cargo:rerun-if-changed={resources}/stroll.rc");
+            println!("cargo:rerun-if-changed={resources}/stroll.ico");
+            embed_resource::compile_for(
+                format!("{resources}/stroll.rc"),
+                ["stroll"],
+                embed_resource::ParamsIncludeDirs([resources]),
+            )
+            .manifest_required()
+            .expect("Could not embed the Stroll application icon");
+        }
     }
 }
