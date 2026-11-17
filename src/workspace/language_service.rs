@@ -437,7 +437,7 @@ impl Workspace {
                             break;
                         };
                         if inlay_refresh {
-                            cx.update(|cx| inlay_hints.invalidate(cx));
+                            cx.update(|cx| inlay_hints.refresh(cx));
                             if let Ok(Some(panel)) =
                                 workspace.read_with(cx, |workspace, _| workspace.git.clone())
                             {

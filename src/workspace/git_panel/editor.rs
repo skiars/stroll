@@ -97,13 +97,13 @@ fn projected_inlay_hints(
     text: &Rope,
     ranges: &[Range<usize>],
     cx: &App,
-) -> Task<Vec<InlayHint>> {
+) -> Task<Result<Vec<InlayHint>>> {
     let Some(workspace) = panel.workspace.upgrade() else {
-        return Task::ready(Vec::new());
+        return Task::ready(Ok(Vec::new()));
     };
     let owner = workspace.read(cx);
     if &projection.text != text {
-        return Task::ready(Vec::new());
+        return Task::ready(Ok(Vec::new()));
     }
     let mut sources: HashMap<&Path, BTreeMap<usize, Vec<usize>>> = HashMap::new();
     let mut verified_snapshots = HashMap::new();
@@ -183,9 +183,9 @@ fn projected_inlay_hints(
     cx.spawn(async move |cx| {
         let mut results = Vec::new();
         for (path, document, text, version, rows, request) in requests {
-            results.push((path, document, text, version, rows, request.await));
+            results.push((path, document, text, version, rows, request.await?));
         }
-        workspace
+        Ok(workspace
             .read_with(cx, |owner, cx| {
                 let mut projected = Vec::new();
                 for (path, document, text, version, rows, hints) in results {
@@ -214,7 +214,7 @@ fn projected_inlay_hints(
                 }
                 projected
             })
-            .unwrap_or_default()
+            .unwrap_or_default())
     })
 }
 
@@ -624,7 +624,7 @@ impl Column {
         snapshots: Rc<SnapshotEditors>,
         window: &mut Window,
         cx: &mut App,
-    ) {
+    ) -> bool {
         let mut projection = self.projection.borrow_mut();
         let range = projection.text.line_start_offset(old_rows.start)
             ..projection.text.line_start_offset(old_rows.end);
@@ -639,6 +639,27 @@ impl Column {
             .slice(range.clone())
             .chars()
             .eq(text.chars());
+        // A text replacement remaps hints in untouched rows itself. Without
+        // a replacement, keep them only while the projected origins match.
+        let same_origins = changed
+            || (old_rows.len() == lines.len()
+                && projection.lines[old_rows.clone()]
+                    .iter()
+                    .zip(&lines)
+                    .all(|(old, new)| match (old, new) {
+                        (None, None) => true,
+                        (Some(old), Some(new)) => {
+                            old.position == new.position
+                                && old.source == new.source
+                                && projection
+                                    .snapshot(&old.position)
+                                    .map(|old| old.editor.entity_id())
+                                    == snapshots
+                                        .get(&(new.position.path().clone(), new.position.side()))
+                                        .map(|new| new.editor.entity_id())
+                        }
+                        _ => false,
+                    }));
 
         projection.lines.splice(old_rows.clone(), lines);
         if changed {
@@ -669,6 +690,7 @@ impl Column {
             }
             editor.set_projected_rows(rows, cx);
         });
+        same_origins
     }
 }
 
@@ -751,7 +773,7 @@ impl ReviewEditor {
                         .read_with(cx, |panel, cx| {
                             projected_inlay_hints(panel, &inlay_projection.borrow(), text, rows, cx)
                         })
-                        .unwrap_or_else(|_| Task::ready(Vec::new()))
+                        .unwrap_or_else(|_| Task::ready(Ok(Vec::new())))
                 })),
                 cx,
             );
@@ -886,6 +908,15 @@ impl ReviewEditor {
 
     pub(super) fn invalidate(&mut self) {
         self.row_revision = None;
+        self.reset_viewport();
+    }
+
+    pub(super) fn invalidate_live_source(&mut self, path: PathBuf) {
+        self.invalidate_source(path);
+        self.reset_viewport();
+    }
+
+    fn reset_viewport(&mut self) {
         self.navigation_source = None;
         self.viewport.set((usize::MAX, 0, 0, px(0.)));
     }
@@ -909,7 +940,7 @@ impl ReviewEditor {
         );
         for column in [&self.original, &self.modified] {
             column.projection.borrow_mut().snapshots = snapshots.clone();
-            column.inlay_hints.invalidate(cx);
+            column.inlay_hints.refresh(cx);
         }
     }
 
@@ -1144,6 +1175,7 @@ impl ReviewEditor {
                 (&panel.editor.original, true),
             ] {
                 if left && !split {
+                    column.inlay_hints.invalidate(cx);
                     continue;
                 }
                 let mut text = String::new();
@@ -1211,7 +1243,7 @@ impl ReviewEditor {
                     text.push('\n');
                 }
                 let old_len = column.projection.borrow().lines.len();
-                column.install(
+                let same_origins = column.install(
                     prefix..old_len - suffix,
                     lines,
                     text,
@@ -1220,9 +1252,11 @@ impl ReviewEditor {
                     window,
                     cx,
                 );
-            }
-            for column in [&panel.editor.original, &panel.editor.modified] {
-                column.inlay_hints.invalidate(cx);
+                if same_origins {
+                    column.inlay_hints.refresh(cx);
+                } else {
+                    column.inlay_hints.invalidate(cx);
+                }
             }
             panel.editor.dirty_sources.clear();
             panel.editor.headers = Rc::new(
@@ -2177,22 +2211,53 @@ impl GitPanel {
     }
 
     pub(in crate::workspace) fn invalidate_source_inlay_hints(&self, path: &Path, cx: &mut App) {
+        self.reset_source_inlay_hints(path, None, cx);
+    }
+
+    pub(in crate::workspace) fn refresh_edited_source_inlay_hints(
+        &self,
+        path: &Path,
+        text: &Rope,
+        cx: &mut App,
+    ) {
+        self.reset_source_inlay_hints(path, Some(text), cx);
+    }
+
+    fn reset_source_inlay_hints(&self, path: &Path, edited_text: Option<&Rope>, cx: &mut App) {
         for column in [&self.editor.original, &self.editor.modified] {
             let hints = &column.inlay_hints;
+            let mut should_clear = edited_text.is_none();
             if hints.covers(|ranges| {
                 let projection = column.projection.borrow();
-                ranges.iter().any(|range| {
+                let mut tracks_source = false;
+                for range in ranges {
                     let end = range.end.min(projection.lines.len());
-                    projection
-                        .lines
-                        .get(range.start..end)
-                        .into_iter()
-                        .flatten()
-                        .flatten()
-                        .any(|line| projection.hint_path(self, &line.position) == Some(path))
-                })
+                    for view_row in range.start..end {
+                        let Some(line) = projection.lines[view_row].as_ref() else {
+                            continue;
+                        };
+                        if projection.hint_path(self, &line.position) != Some(path) {
+                            continue;
+                        }
+                        tracks_source = true;
+                        if edited_text.is_some_and(|text| {
+                            let source_row = line.position.line() - 1;
+                            line.source.as_deref() != Some(path)
+                                || source_row >= text.lines_len()
+                                || text.slice_line(source_row)
+                                    != projection.text.slice_line(view_row)
+                        }) {
+                            should_clear = true;
+                        }
+                    }
+                }
+                tracks_source
             }) {
-                hints.invalidate(cx);
+                if should_clear {
+                    hints.invalidate(cx);
+                } else {
+                    hints.refresh(cx);
+                }
             }
         }
     }

@@ -47,7 +47,7 @@ fn check_worktree_diff_inlay_hints(arbitrary: bool) {
     git(&root, &["commit", "-qm", "Initial"]);
     fs::write(root.join(&source), "// staged anchor\n").unwrap();
     git(&root, &["add", "."]);
-    let working_text = "// 😺 worktree anchor\n";
+    let working_text = "// 😺 worktree anchor\n// stable anchor\n";
     fs::write(root.join(&source), working_text).unwrap();
     let config_path = fixture.path().join("config.toml");
     let server = fixture.path().join("server.py");
@@ -116,6 +116,14 @@ fn check_worktree_diff_inlay_hints(arbitrary: bool) {
         });
         panel
     });
+    let stable_hint_width = |editor: &EditorState| {
+        let source = editor.text().to_string();
+        let start = source.find("// stable ")?;
+        let anchor = start + "// stable ".len();
+        let width = editor.range_to_bounds(&(start..anchor))?.size.width;
+        let before = editor.range_to_bounds(&(start..anchor - 1))?.size.width;
+        Some(width - before)
+    };
     let check_diff = |split, window: &mut Window, cx: &mut App| {
         let panel = panel.read(cx);
         let mode = if split {
@@ -175,6 +183,28 @@ fn check_worktree_diff_inlay_hints(arbitrary: bool) {
         "working tree hints and row alignment in split diff",
         |window, cx| check_diff(true, window, cx),
     );
+    let projection = visual.update(|window, cx| {
+        let editor = panel.read(cx).editor.focused_column(window, cx).clone();
+        editor.update(cx, |editor, cx| {
+            let text = editor.text().to_string();
+            let offset = text.find("worktree anchor").unwrap();
+            editor.apply_editor_edits(&[(offset..offset, "!".into())], false, window, cx);
+        });
+        editor
+    });
+    wait_for(visual, "unchanged hint after a projected edit", |_, cx| {
+        let state = projection.read(cx);
+        assert!(stable_hint_width(state).is_some_and(|width| width > px(18.)));
+        state.text().to_string().contains("!worktree anchor")
+    });
+    visual.simulate_keystrokes(if cfg!(target_os = "macos") {
+        "cmd-z"
+    } else {
+        "ctrl-z"
+    });
+    wait_for(visual, "projected undo", |_, cx| {
+        workspace.read(cx).files[&source].committed.to_string() == working_text
+    });
     visual.update(|window, cx| {
         workspace.update(cx, |workspace, cx| {
             workspace.switch_view(WorkspaceView::Editor, window, cx);
@@ -210,7 +240,10 @@ fn check_worktree_diff_inlay_hints(arbitrary: bool) {
             editor.set_selected_range(0..working_text.len(), cx);
             assert_eq!(editor.selected_text().to_string(), working_text);
             editor.apply_editor_edits(
-                &[(0..working_text.len(), "// waiting anchor\n".into())],
+                &[(
+                    0..working_text.find('\n').unwrap(),
+                    "// waiting anchor".into(),
+                )],
                 false,
                 window,
                 cx,
@@ -220,12 +253,20 @@ fn check_worktree_diff_inlay_hints(arbitrary: bool) {
     wait_for(
         visual,
         "pending response for the intermediate edit",
-        |_, cx| root.join("held-inlay").exists() && editor.read(cx).projected_wrap_rows(0) == 1,
+        |_, cx| {
+            let state = editor.read(cx);
+            root.join("held-inlay").exists()
+                && state.projected_wrap_rows(0) == 1
+                && stable_hint_width(state).is_some_and(|width| width > px(18.))
+        },
     );
     visual.update(|window, cx| {
         editor.update(cx, |editor, cx| {
             editor.apply_editor_edits(
-                &[(0..editor.text().len(), "// edited anchor\n".into())],
+                &[(
+                    0..editor.text().line_end_offset(0),
+                    "// edited anchor".into(),
+                )],
                 false,
                 window,
                 cx,
@@ -245,6 +286,7 @@ fn check_worktree_diff_inlay_hints(arbitrary: bool) {
         |_, cx| {
             editor.read(cx).projected_wrap_rows(0) == 1
                 && anchor_advance(cx).is_some_and(|width| width > px(18.))
+                && stable_hint_width(editor.read(cx)).is_some_and(|width| width > px(18.))
                 && root.join("late-inlay-sent").exists()
         },
     );

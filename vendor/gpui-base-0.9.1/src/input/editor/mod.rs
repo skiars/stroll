@@ -38,6 +38,7 @@ impl InputModeKind for EditorMode {
     fn reset_annotations(state: &mut InputBaseState<Self>) {
         state.extras.hover_popover = None;
         state.extras.lsp._hover_task = gpui::Task::ready(Ok(()));
+        state.extras.lsp.reset_semantic_tokens();
         state.extras.decorations.clear();
         state.extras.range_decorations.clear();
         state.extras.gutter_decorations.clear();
@@ -56,6 +57,10 @@ impl InputModeKind for EditorMode {
     ) {
         state.extras.hover_popover = None;
         state.extras.lsp._hover_task = gpui::Task::ready(Ok(()));
+        state
+            .extras
+            .lsp
+            .adjust_semantic_tokens(state.document_revision, range, new_len);
         state.extras.decorations.adjust_for_edit(range, new_len);
         state
             .extras

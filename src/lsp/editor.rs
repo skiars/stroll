@@ -162,7 +162,7 @@ pub(crate) fn editor_inlay_hints(
     text: &Rope,
     ranges: &[ByteRange<usize>],
     cx: &App,
-) -> Task<Vec<InlayHint>> {
+) -> Task<Result<Vec<InlayHint>>> {
     let requests = ranges
         .iter()
         .map(|rows| {
@@ -174,13 +174,13 @@ pub(crate) fn editor_inlay_hints(
     cx.background_spawn(async move {
         let mut hints = Vec::new();
         for (rows, request) in requests {
-            hints.extend(request.await.into_iter().filter_map(|hint| {
+            hints.extend(request.await?.into_iter().filter_map(|hint| {
                 rows.contains(&(hint.position.line as usize))
                     .then(|| editor_inlay_hint(&text, hint))
                     .flatten()
             }));
         }
-        hints
+        Ok(hints)
     })
 }
 
@@ -335,12 +335,12 @@ impl DocumentRangeSemanticTokensProvider for EditorLsp {
         _: &mut Window,
         cx: &mut App,
     ) -> Task<Result<SemanticTokens>> {
-        let document = self.document.clone();
         let text = text.clone();
+        let request = self.document.semantic_tokens(text.clone());
         cx.background_spawn(async move {
-            Ok(match document.semantic_tokens(text.clone()).await {
-                Ok(Some((tokens, legend))) => translate_tokens(&text, tokens, &legend),
-                _ => SemanticTokens::default(),
+            Ok(match request.await? {
+                Some((tokens, legend)) => translate_tokens(&text, tokens, &legend),
+                None => SemanticTokens::default(),
             })
         })
     }

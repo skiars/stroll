@@ -5756,7 +5756,6 @@ impl<M: InputModeKind> EntityInputHandler for InputBaseState<M> {
         );
 
         self.update_fold_candidates_incremental(&range, new_text);
-        M::refresh_language_features(self, window, cx);
         if new_text.is_empty() {
             // Cancel selection, when cancel IME input.
             self.set_cursor_to(range.start);
@@ -5794,6 +5793,7 @@ impl<M: InputModeKind> EntityInputHandler for InputBaseState<M> {
         if new_text.is_empty() {
             self.undo_manager.commit_transaction();
         }
+        M::refresh_language_features(self, window, cx);
         self.reveal_after_interactive_edit(revision);
         cx.notify();
     }

@@ -450,23 +450,24 @@ impl Document {
             .value)
     }
 
-    pub async fn semantic_tokens(
+    pub fn semantic_tokens(
         &self,
         text: Rope,
-    ) -> Result<Option<(SemanticTokens, SemanticTokensLegend)>> {
+    ) -> impl Future<Output = Result<Option<(SemanticTokens, SemanticTokensLegend)>>> + use<> {
         let end = lsp_position(&text, text.len());
-        let response = self
-            .request(Query::Tokens(Range::new(Position::default(), end)), text)
-            .await?;
-        let tokens: Option<SemanticTokens> = serde_json::from_value(response.value)?;
-        Ok(tokens.zip(response.legend))
+        let request = self.begin_request(Query::Tokens(Range::new(Position::default(), end)), text);
+        async move {
+            let response = request?.await.context("The LSP session is closed")??;
+            let tokens: Option<SemanticTokens> = serde_json::from_value(response.value)?;
+            Ok(tokens.zip(response.legend))
+        }
     }
 
     pub(crate) fn inlay_hints(
         &self,
         text: &Rope,
         offsets: std::ops::Range<usize>,
-    ) -> impl Future<Output = Vec<lsp_types::InlayHint>> + use<> {
+    ) -> impl Future<Output = Result<Vec<lsp_types::InlayHint>>> + use<> {
         let range = Range::new(
             lsp_position(text, offsets.start),
             lsp_position(text, offsets.end),
@@ -474,16 +475,9 @@ impl Document {
         // Enqueue against the snapshot captured by the UI before yielding to later edits.
         let request = self.begin_request(Query::InlayHints(range), text.clone());
         async move {
-            let Ok(request) = request else {
-                return Vec::new();
-            };
-            let Ok(Ok(response)) = request.await else {
-                return Vec::new();
-            };
-            serde_json::from_value::<Option<Vec<lsp_types::InlayHint>>>(response.value)
-                .ok()
-                .flatten()
-                .unwrap_or_default()
+            let response = request?.await.context("The LSP session is closed")??;
+            let hints: Option<Vec<lsp_types::InlayHint>> = serde_json::from_value(response.value)?;
+            Ok(hints.unwrap_or_default())
         }
     }
 
@@ -956,6 +950,9 @@ impl Session {
             && (reply.is_canceled() || self.capabilities.completion_provider.is_none())
         {
             _ = reply.send(Ok(Response::default()));
+            return Ok(());
+        }
+        if matches!(query, Query::Tokens(_) | Query::InlayHints(_)) && reply.is_canceled() {
             return Ok(());
         }
         let supports_newline = match &query {

@@ -887,7 +887,9 @@ fn semantic_style(role: &str, flags: u32, foreground: &str) -> (String, Value) {
         "font_weight": weight,
         "font_style": if italic { "italic" } else { "normal" },
     });
-    if role != "keyword" {
+    // Clangd also marks the punctuation of overloaded operator names as
+    // operators. Keep the more specific grammar color for the whole name.
+    if role != "keyword" && !(role == "operator" && declaration) {
         style["color"] = json!(foreground);
     }
     if deprecated {
@@ -1227,6 +1229,249 @@ mod tests {
         assert_eq!(surface(CodeTheme::Neon, ThemeMode::Dark), hsla("#081629"));
         assert_eq!(surface(CodeTheme::Paper, ThemeMode::Light), hsla("#fbf7ef"));
     }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+#[test]
+fn cpp_highlights_survive_delayed_semantic_responses() -> anyhow::Result<()> {
+    use std::{cell::RefCell, rc::Rc, time::Duration};
+
+    use futures_channel::oneshot;
+    use gpui::{
+        AppContext as _, Bounds, DevicePixels, Entity, HeadlessAppContext, Hsla, PlatformAtlas,
+        PlatformHeadlessRenderer, Render, ScaledPixels, Scene, Size, Styled as _, Task, Window, px,
+        size,
+    };
+    use gpui_component::{
+        ActiveTheme as _, Root,
+        input::{DocumentRangeSemanticTokensProvider, Editor, EditorState, Rope},
+    };
+    use gpui_wgpu::WgpuHeadlessRenderer;
+    use lsp_types::{SemanticToken, SemanticTokens, SemanticTokensLegend};
+
+    const SOURCE: &str = concat!(
+        "class VectorPath {\n",
+        "    GX_NODISCARD bool isEmpty() const;\n",
+        "    GX_NODISCARD constexpr const Vertex &operator[](unsigned i) const;\n",
+        "    bool operator==(const VectorPath &other) const;\n",
+        "};\n",
+    );
+    type Reply = oneshot::Sender<SemanticTokens>;
+    #[derive(Default)]
+    struct Tokens(RefCell<Vec<(String, Reply)>>);
+    impl DocumentRangeSemanticTokensProvider for Tokens {
+        fn legend(&self) -> SemanticTokensLegend {
+            SemanticTokensLegend {
+                token_types: ["property.lsp.0", "operator.lsp.1", "constant.lsp.0"]
+                    .map(Into::into)
+                    .to_vec(),
+                ..Default::default()
+            }
+        }
+
+        fn semantic_tokens(
+            &self,
+            text: &Rope,
+            _: std::ops::Range<usize>,
+            _: &mut Window,
+            cx: &mut gpui::App,
+        ) -> Task<anyhow::Result<SemanticTokens>> {
+            let (reply, response) = oneshot::channel();
+            self.0.borrow_mut().push((text.to_string(), reply));
+            cx.background_spawn(async move { Ok(response.await?) })
+        }
+    }
+
+    struct Probe(Entity<EditorState>);
+    impl Render for Probe {
+        fn render(
+            &mut self,
+            _: &mut Window,
+            _: &mut gpui::Context<Self>,
+        ) -> impl gpui::IntoElement {
+            Editor::new(&self.0).text_size(px(17.)).size_full()
+        }
+    }
+
+    type Glyphs = Rc<RefCell<Vec<(Bounds<ScaledPixels>, Hsla)>>>;
+    struct Renderer(WgpuHeadlessRenderer, Glyphs);
+    impl PlatformHeadlessRenderer for Renderer {
+        fn render_scene(
+            &mut self,
+            scene: &Scene,
+            viewport: Size<DevicePixels>,
+        ) -> anyhow::Result<()> {
+            self.0.render_scene(scene, viewport)
+        }
+
+        fn render_scene_to_image(
+            &mut self,
+            scene: &Scene,
+            viewport: Size<DevicePixels>,
+        ) -> anyhow::Result<image::RgbaImage> {
+            self.1.replace(
+                scene
+                    .monochrome_sprites
+                    .iter()
+                    .map(|glyph| (glyph.bounds, glyph.color))
+                    .chain(
+                        scene
+                            .subpixel_sprites
+                            .iter()
+                            .map(|glyph| (glyph.bounds, glyph.color)),
+                    )
+                    .collect(),
+            );
+            self.0.render_scene_to_image(scene, viewport)
+        }
+
+        fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {
+            self.0.sprite_atlas()
+        }
+    }
+
+    let glyphs = Glyphs::default();
+    let mut cx = HeadlessAppContext::with_platform(
+        gpui_platform::current_platform(true).text_system(),
+        Arc::new(gpui_kit_assets::Assets),
+        {
+            let glyphs = glyphs.clone();
+            move || {
+                Ok(Some(Box::new(Renderer(
+                    WgpuHeadlessRenderer::new()?,
+                    glyphs.clone(),
+                ))))
+            }
+        },
+    );
+    cx.update(|cx| {
+        gpui_component::init(cx);
+        super::apply_theme(ThemeMode::Light, cx);
+    });
+    let mut opened = None;
+    let window = cx.open_window(size(px(930.), px(230.)), |window, cx| {
+        let editor = cx.new(|cx| {
+            EditorState::new(window, cx)
+                .language("cpp")
+                .default_value(SOURCE)
+        });
+        opened = Some(editor.clone());
+        let probe = cx.new(|_| Probe(editor));
+        cx.new(|cx| Root::new(probe, window, cx))
+    })?;
+    let editor = opened.unwrap();
+    let assert_color =
+        |cx: &mut HeadlessAppContext, needle: &str, color: &str| -> anyhow::Result<()> {
+            let (bounds, expected) = cx.update_window(window.into(), |_, window, cx| {
+                window.draw(cx).clear(cx);
+                let state = editor.read(cx);
+                let start = state.text().to_string().find(needle).unwrap();
+                (
+                    state
+                        .range_to_bounds(&(start..start + needle.len()))
+                        .unwrap()
+                        .scale(window.scale_factor()),
+                    cx.theme()
+                        .highlight_theme
+                        .style(color)
+                        .unwrap()
+                        .color
+                        .unwrap(),
+                )
+            })?;
+            let _ = cx.capture_screenshot(window.into())?;
+            let colors = glyphs.borrow();
+            let actual = colors
+                .iter()
+                .filter(|(glyph, _)| bounds.contains(&glyph.center()))
+                .map(|(_, color)| *color)
+                .collect::<Vec<_>>();
+            assert!(!actual.is_empty(), "{needle:?} has no painted glyphs");
+            assert!(
+                actual.iter().all(|color| *color == expected),
+                "{needle:?} {color}: {actual:?}"
+            );
+            Ok(())
+        };
+    let frame = |cx: &mut HeadlessAppContext| -> anyhow::Result<()> {
+        cx.update_window(window.into(), |_, window, cx| window.draw(cx).clear(cx))?;
+        cx.run_until_parked();
+        cx.advance_clock(Duration::from_millis(150));
+        cx.run_until_parked();
+        Ok(())
+    };
+    let response = |line, kind| SemanticTokens {
+        data: [
+            SemanticToken {
+                delta_line: line,
+                delta_start: SOURCE.lines().nth(1).unwrap().find("isEmpty").unwrap() as u32,
+                length: 7,
+                token_type: kind,
+                token_modifiers_bitset: 0,
+            },
+            SemanticToken {
+                delta_line: 1,
+                delta_start: SOURCE.lines().nth(2).unwrap().find('[').unwrap() as u32,
+                length: 1,
+                token_type: 1,
+                token_modifiers_bitset: 0,
+            },
+            SemanticToken {
+                delta_line: 0,
+                delta_start: 1,
+                length: 1,
+                token_type: 1,
+                token_modifiers_bitset: 0,
+            },
+        ]
+        .into(),
+        ..Default::default()
+    };
+
+    frame(&mut cx)?;
+    assert_color(&mut cx, "bool", "type")?;
+    assert_color(&mut cx, "operator[]", "function")?;
+    assert_color(&mut cx, "operator==", "function")?;
+    let provider = Rc::new(Tokens::default());
+    cx.update(|cx| {
+        editor.update(cx, |editor, cx| {
+            editor.lsp_mut().semantic_tokens_provider = Some(provider.clone());
+            editor.refresh(cx);
+        })
+    });
+    frame(&mut cx)?;
+    let (snapshot, request) = provider.0.borrow_mut().pop().unwrap();
+    assert_eq!(snapshot, SOURCE);
+    request.send(response(1, 0)).unwrap();
+    cx.run_until_parked();
+    assert_color(&mut cx, "isEmpty", "property.lsp.0")?;
+    assert_color(&mut cx, "operator[]", "function")?;
+    assert_color(&mut cx, "[]", "function")?;
+
+    cx.update_window(window.into(), |_, window, cx| {
+        editor.update(cx, |editor, cx| {
+            editor.apply_editor_edits(&[(0..0, "\n".into())], false, window, cx);
+        })
+    })?;
+    frame(&mut cx)?;
+    let (snapshot, delayed) = provider.0.borrow_mut().pop().unwrap();
+    assert_eq!(snapshot, format!("\n{SOURCE}"));
+    assert_color(&mut cx, "isEmpty", "property.lsp.0")?;
+
+    cx.update_window(window.into(), |_, window, cx| {
+        editor.update(cx, |editor, cx| {
+            editor.replay_text_history(true, window, cx);
+        })
+    })?;
+    _ = delayed.send(response(2, 2));
+    frame(&mut cx)?;
+    let (snapshot, current) = provider.0.borrow_mut().pop().unwrap();
+    assert_eq!(snapshot, SOURCE);
+    assert_color(&mut cx, "isEmpty", "property.lsp.0")?;
+    current.send(response(1, 2)).unwrap();
+    cx.run_until_parked();
+    assert_color(&mut cx, "isEmpty", "constant.lsp.0")?;
+    Ok(())
 }
 
 #[cfg(all(test, target_os = "linux"))]

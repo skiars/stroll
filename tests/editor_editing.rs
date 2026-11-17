@@ -6,7 +6,7 @@ use gpui::{
 };
 use gpui_component::{
     Root,
-    input::{Editor, EditorState, Position, RopeExt as _},
+    input::{Editor, EditorState, InlayHint, Position, RopeExt as _},
 };
 
 struct EditorView {
@@ -85,6 +85,46 @@ fn select(
 ) {
     visual.update(|_, cx| editor.update(cx, |editor, cx| editor.set_selected_range(range, cx)));
     draw(visual);
+}
+
+#[test]
+fn inlay_hints_keep_their_wrap_rows_after_line_insertion_and_undo() {
+    let source = "before\nstable line\nafter";
+    let row_start = source.find("stable").unwrap();
+    let offset = source.find("line").unwrap();
+    with_editor(source, true, false, false, |visual, editor| {
+        visual.update(|_, cx| {
+            editor.update(cx, |editor, cx| {
+                editor.set_inlay_hints(
+                    vec![InlayHint {
+                        offset,
+                        label: "long_type ".repeat(30).into(),
+                    }],
+                    cx,
+                );
+            })
+        });
+        select(visual, editor, row_start..row_start);
+        let wrapped = visual.update(|_, cx| editor.read(cx).projected_wrap_rows(1));
+        assert!(wrapped > 1);
+
+        visual.simulate_keystrokes("enter");
+        draw(visual);
+        visual.update(|_, cx| {
+            let state = editor.read(cx);
+            assert_eq!(state.text().to_string(), "before\n\nstable line\nafter");
+            assert_eq!(state.projected_wrap_rows(1), 1);
+            assert_eq!(state.projected_wrap_rows(2), wrapped);
+        });
+
+        visual.simulate_keystrokes("ctrl-z");
+        draw(visual);
+        visual.update(|_, cx| {
+            let state = editor.read(cx);
+            assert_eq!(state.text().to_string(), source);
+            assert_eq!(state.projected_wrap_rows(1), wrapped);
+        });
+    });
 }
 
 #[test]

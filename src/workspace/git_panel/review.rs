@@ -2956,7 +2956,7 @@ impl GitPanel {
                     .upgrade()
                     .and_then(|workspace| workspace.read(cx).document_repository());
                 doc = scope_diff_document(doc, repo.as_deref());
-                this.editor.invalidate();
+                this.editor.invalidate_live_source(edit_path.clone());
                 if let Some(base) = &live.base {
                     let sources = review.sources.entry(ix).or_default();
                     let key = (doc.path().clone(), DiffSide::Original);

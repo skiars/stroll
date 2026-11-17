@@ -2454,7 +2454,7 @@ impl Workspace {
             let text = file.committed.clone();
             let saved = text == file.saved;
             panel.update(cx, |panel, cx| {
-                panel.invalidate_source_inlay_hints(path, cx);
+                panel.refresh_edited_source_inlay_hints(path, &text, cx);
                 if saved {
                     panel.schedule_snapshot_alignment(cx);
                 }

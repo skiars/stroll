@@ -432,7 +432,8 @@ impl Language {
             Self::Cpp => {
                 // The C++ query only defines captures specific to C++.
                 cpp_highlights = format!(
-                    "{}\n{}",
+                    "{}\n{}\n{}",
+                    include_str!("languages/cpp/highlights.scm"),
                     tree_sitter_c::HIGHLIGHT_QUERY,
                     tree_sitter_cpp::HIGHLIGHT_QUERY,
                 );

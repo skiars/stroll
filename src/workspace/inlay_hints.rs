@@ -8,7 +8,8 @@ use std::{
 use gpui::{App, Entity, Task, WeakEntity};
 use gpui_component::input::{EditorState, InlayHint, Rope, RopeExt};
 
-pub(super) type Provider = Rc<dyn Fn(&Rope, &[Range<usize>], &App) -> Task<Vec<InlayHint>>>;
+pub(super) type Provider =
+    Rc<dyn Fn(&Rope, &[Range<usize>], &App) -> Task<anyhow::Result<Vec<InlayHint>>>>;
 
 const PAGE_LINES: usize = 64;
 
@@ -24,7 +25,7 @@ struct Requests {
     provider: Option<Provider>,
     requested: Option<Rc<Request>>,
     pending: Option<Task<()>>,
-    cached: Option<(u64, Vec<InlayHint>)>,
+    cached: Option<(Rc<Request>, Vec<InlayHint>)>,
 }
 
 #[derive(Clone)]
@@ -68,27 +69,44 @@ impl InlayHints {
     }
 
     pub(super) fn invalidate(&self, cx: &mut App) {
+        self.reset_request(true, cx);
+    }
+
+    pub(super) fn refresh(&self, cx: &mut App) {
+        self.reset_request(false, cx);
+    }
+
+    fn reset_request(&self, clear_labels: bool, cx: &mut App) {
         let mut requests = self.requests.borrow_mut();
         let requested = requests.requested.take().is_some();
-        if !requests.enabled && !requested {
+        if !requests.enabled && !requested && requests.cached.is_none() {
             return;
         }
         requests.pending = None;
-        requests.cached = None;
+        if clear_labels {
+            requests.cached = None;
+        }
         drop(requests);
 
         _ = self.editor.update(cx, |editor, cx| {
-            editor.set_inlay_hints(Vec::new(), cx);
+            if clear_labels {
+                editor.set_inlay_hints(Vec::new(), cx);
+            }
             cx.notify();
         });
     }
 
-    pub(super) fn covers(&self, contains: impl FnOnce(&[Range<usize>]) -> bool) -> bool {
-        self.requests
-            .borrow()
+    pub(super) fn covers(&self, mut contains: impl FnMut(&[Range<usize>]) -> bool) -> bool {
+        let requests = self.requests.borrow();
+        let requested = requests
             .requested
             .as_ref()
-            .is_some_and(|request| contains(&request.ranges))
+            .is_some_and(|request| contains(&request.ranges));
+        let painted = requests
+            .cached
+            .as_ref()
+            .is_some_and(|(request, _)| contains(&request.ranges));
+        requested || painted
     }
 
     fn request(
@@ -146,7 +164,9 @@ impl InlayHints {
                 return;
             };
 
-            let hints = task.await;
+            let Ok(hints) = task.await else {
+                return;
+            };
             if !is_current(&requests, &request) {
                 return;
             }
@@ -157,7 +177,7 @@ impl InlayHints {
                 if editor.document_revision() != revision {
                     return;
                 }
-                let response = (revision, hints);
+                let response = (request, hints);
                 let mut state = requests.borrow_mut();
                 if state.cached.as_ref() != Some(&response) {
                     editor.set_inlay_hints(response.1.clone(), cx);

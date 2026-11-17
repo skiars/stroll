@@ -65,11 +65,10 @@ pub struct Lsp {
     completion_highlighter: Rc<CompletionHighlighter>,
 
     pub(crate) document_colors: Vec<(lsp_types::Range, Hsla)>,
-    /// Cached semantic tokens as absolute position ranges + theme token-type
-    /// names. Color is resolved from the name at paint time so theme switches
-    /// take effect without a refetch.
+    /// Semantic tokens mapped to byte ranges in the current editor revision.
+    /// The active theme resolves their names at paint time.
     pub(crate) semantic_revision: Option<u64>,
-    pub(crate) semantic_tokens: Vec<(lsp_types::Range, SharedString)>,
+    pub(crate) semantic_tokens: Vec<(std::ops::Range<usize>, SharedString)>,
     pub(crate) code_action_probe: CodeActionProbe,
     pub(crate) _hover_task: Task<Result<()>>,
     pub(crate) _definition_task: Task<Result<()>>,
@@ -136,11 +135,15 @@ impl Lsp {
     pub(crate) fn reset(&mut self) {
         self.document_colors.clear();
         self.code_action_probe = CodeActionProbe::default();
-        self.semantic_revision = None;
-        self.semantic_tokens.clear();
+        self.reset_semantic_tokens();
         self._hover_task = Task::ready(Ok(()));
         self._definition_task = Task::ready(Ok(()));
         self._document_color_task = Task::ready(());
+    }
+
+    pub(crate) fn reset_semantic_tokens(&mut self) {
+        self.semantic_revision = None;
+        self.semantic_tokens.clear();
         self._semantic_tokens_task = Task::ready(());
     }
 }

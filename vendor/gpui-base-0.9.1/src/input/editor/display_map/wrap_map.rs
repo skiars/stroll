@@ -121,8 +121,47 @@ impl WrapMap {
         new_text: &Rope,
         cx: &mut App,
     ) {
-        self.clear_inlays(cx);
-        self.update_wrapper(changed_text, range, new_text, cx);
+        let Some(source) = self.source.take() else {
+            self.update_wrapper(changed_text, range, new_text, cx);
+            return;
+        };
+        if range.is_empty() && new_text.len() == 0 {
+            self.source = Some(source);
+            return;
+        }
+
+        let start = source.offset_to_point(range.start);
+        let end = source.offset_to_point(range.end);
+        let inserted_end = changed_text.offset_to_point(range.start + new_text.len());
+        // When both ends are at the start of a row, the suffix row has
+        // intact source text and still owns its original hints.
+        let first_unchanged = end.row + usize::from(end.column != 0 || inserted_end.column != 0);
+        let touched: Vec<_> = self
+            .inlays
+            .range(start.row..first_unchanged)
+            .map(|(&row, _)| row)
+            .collect();
+        for row in touched {
+            self.inlays.remove(&row);
+            self.replace_inlay_row(row, &source, cx);
+        }
+
+        let mut display = self.wrapper.text().clone();
+        let display_range = display.line_start_offset(start.row) + start.column
+            ..display.line_start_offset(end.row) + end.column;
+        display.replace(display_range.clone(), &new_text.to_string());
+        self.update_wrapper(&display, &display_range, new_text, cx);
+
+        if inserted_end.row != end.row {
+            let delta = inserted_end.row as isize - end.row as isize;
+            let suffix = self.inlays.split_off(&first_unchanged);
+            self.inlays.extend(
+                suffix
+                    .into_iter()
+                    .map(|(row, hints)| (row.saturating_add_signed(delta), hints)),
+            );
+        }
+        self.source = (!self.inlays.is_empty()).then(|| changed_text.clone());
     }
 
     fn update_wrapper(

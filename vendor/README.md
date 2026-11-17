@@ -166,3 +166,10 @@ dialogs in a Wayland window after changes to paint order or focus handling.
   fixture and `cargo test --release --locked --test popups completion_popup`
   for offscreen geometry and selection coverage. Set
   `STROLL_COMPLETION_SCREENSHOTS` to save the popup screenshots.
+
+- C++ overload names use function captures, and primitive type captures
+  recover after declaration macros. The editor maps unaffected semantic token
+  ranges and inlay rows through edits while refreshes are pending. Run
+  `cargo test --release --locked cpp_highlights_survive_delayed_semantic_responses`
+  and `cargo test --release --locked inlay_hints` to verify paint, wrapping,
+  projected diff hints, and stale language-service responses.
