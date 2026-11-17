@@ -840,7 +840,7 @@ impl Workspace {
             return;
         };
         let marker = marker_color(first, cx);
-        let staged = patch.layer == Layer::Staged;
+        let outlined = patch.layer == Layer::Staged;
         file.git.selected = Some(action);
         let weak = cx.weak_entity();
         let path = path.to_owned();
@@ -849,7 +849,7 @@ impl Workspace {
                 action,
                 sections,
                 marker,
-                staged,
+                outlined,
                 move |_, cx| {
                     weak.read_with(cx, |workspace, cx| {
                         workspace.editor_git_toolbar(&path, weak.clone(), cx)

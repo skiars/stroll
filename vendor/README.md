@@ -65,7 +65,12 @@ dialogs in a Wayland window after changes to paint order or focus handling.
 - The workspace editor opts into a 16 px Git gutter, including its gap before the line numbers.
   Actionable marks use the entire strip for hit testing and animate their painted width from
   5 px to 12 px with a fixed 1 px stroke for outlines. Line numbers and text keep their positions.
+  Stroll selects outlined marks for staged hunks, including expanded hunks.
   Run `cargo test --release --locked --test scrollbars interactive_editor_gutter` for coverage.
+- The Git review generates draft worktree patches in `src/git/changes.rs` and
+  passes them to the shared diff parser. Run
+  `cargo test --release --locked --lib custom_workspace_diff_edits` to verify
+  drafts, undo, and save against a selected comparison base.
 - To verify presentation feedback in a native Wayland session, set
   `STROLL_FRAME_TIMINGS=1` and check `wayland_submit`,
   `wayland_present_return`, `wayland_callback`, and the compositor's

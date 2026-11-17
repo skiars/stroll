@@ -2922,7 +2922,7 @@ impl GitPanel {
                         }
                         None => backend.index_text(&name, &version)?.map(Arc::<str>::from),
                     };
-                    let mut doc = DiffFile::from_worktree_text(
+                    let mut doc = git::worktree_buffer_diff(
                         &name,
                         base.as_deref(),
                         &text.to_string(),

@@ -1921,7 +1921,7 @@ impl<M: InputModeKind> TextElement<M> {
                 hunk.render.clone(),
                 gutter_width,
                 hunk.action,
-                hunk.staged,
+                hunk.outlined,
                 hunk.marker_color,
                 state.mode.tab_size().tab_size,
             )

@@ -765,6 +765,27 @@ pub(crate) fn placeholder(file: &ChangedFile, message: &str) -> Result<DiffFile>
 }
 
 #[cfg(feature = "desktop")]
+pub(crate) fn worktree_buffer_diff(
+    path: &str,
+    base: Option<&str>,
+    text: &str,
+    context: usize,
+) -> Result<DiffFile> {
+    if base == Some(text) {
+        return Ok(DiffFile::unchanged(path.to_owned(), text));
+    }
+    let old = base.map_or_else(|| "/dev/null".to_owned(), |_| quote(&format!("a/{path}")));
+    let new = quote(&format!("b/{path}"));
+    let mut patch = format!("--- {old}\n+++ {new}\n");
+    let diff = similar::TextDiff::from_lines(base.unwrap_or_default(), text);
+    patch.push_str(&diff.unified_diff().context_radius(context).to_string());
+    parse_patch(&patch, false)?
+        .into_iter()
+        .next()
+        .context(t!("git.build_diff_failed"))
+}
+
+#[cfg(feature = "desktop")]
 fn parse_patch(patch: &str, truncated: bool) -> Result<Vec<DiffFile>> {
     DiffFile::parse_with(patch, DiffParseOptions::new().truncated_hunks(truncated))
         .map_err(|error| anyhow::anyhow!(t!("git.invalid_diff", error = error)))
@@ -944,4 +965,44 @@ pub(super) fn complete_lines(bytes: &[u8]) -> &[u8] {
         .iter()
         .rposition(|&byte| byte == b'\n')
         .map_or(0, |ix| ix + 1)]
+}
+
+#[cfg(all(test, feature = "desktop"))]
+mod tests {
+    use gpui_component::diff::{DiffFileStatus, DiffSide};
+
+    use super::*;
+
+    #[test]
+    fn worktree_buffer_diff_preserves_paths_and_file_status() -> Result<()> {
+        let path = "src/a file\twith \"quotes\" and \\ 漢.txt";
+        let modified = worktree_buffer_diff(path, Some("old"), "new", 3)?;
+        assert_eq!(modified.path().as_str(), path);
+        assert_eq!(
+            modified.original_path().map(|path| path.as_str()),
+            Some(path)
+        );
+        assert_eq!(
+            modified.modified_path().map(|path| path.as_str()),
+            Some(path)
+        );
+        assert_eq!(modified.status(), DiffFileStatus::Modified);
+        assert_eq!(
+            modified.patch_source_lines().collect::<Vec<_>>(),
+            [
+                (DiffSide::Original, 1, "old"),
+                (DiffSide::Modified, 1, "new")
+            ]
+        );
+
+        let added = worktree_buffer_diff(path, None, "", 3)?;
+        assert_eq!(added.path().as_str(), path);
+        assert_eq!(added.status(), DiffFileStatus::Added);
+        assert!(added.original_path().is_none());
+
+        let unchanged = worktree_buffer_diff(path, Some("same"), "same", 3)?;
+        assert_eq!(unchanged.path().as_str(), path);
+        assert_eq!(unchanged.status(), DiffFileStatus::Unchanged);
+        Ok(())
+    }
 }

@@ -417,35 +417,6 @@ pub struct DiffFile {
 }
 
 impl DiffFile {
-    /// Compare a working buffer with its index snapshot.
-    pub fn from_worktree_text(
-        path: &str,
-        base: Option<&str>,
-        text: &str,
-        context: usize,
-    ) -> Result<Self, DiffParseError> {
-        if base == Some(text) {
-            return Ok(Self::unchanged(path.to_owned(), text));
-        }
-        let diff = similar::TextDiff::from_lines(base.unwrap_or_default(), text);
-        let old = if base.is_some() {
-            "a/worktree"
-        } else {
-            "/dev/null"
-        };
-        let mut patch = format!("diff --git a/worktree b/worktree\n--- {old}\n+++ b/worktree\n");
-        patch.push_str(&diff.unified_diff().context_radius(context).to_string());
-        let mut document = Self::parse(&patch)?
-            .into_iter()
-            .next()
-            .ok_or_else(|| DiffParseError::new(1, "missing worktree diff"))?;
-        let inner = Arc::get_mut(&mut document.inner).expect("new diff document");
-        inner.path = path.to_owned().into();
-        inner.original.path = base.map(|_| path.to_owned().into());
-        inner.modified.path = Some(path.to_owned().into());
-        Ok(document)
-    }
-
     pub(crate) fn same_document(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.inner, &other.inner)
             && self.language == other.language

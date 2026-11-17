@@ -102,7 +102,7 @@ pub struct GutterHunk {
     pub(crate) action: usize,
     pub(crate) sections: Vec<GutterHunkSection>,
     pub(crate) marker_color: Hsla,
-    pub(crate) staged: bool,
+    pub(crate) outlined: bool,
     pub(crate) render: std::rc::Rc<dyn Fn(&mut gpui::Window, &mut App) -> gpui::AnyElement>,
 }
 
@@ -1083,13 +1083,13 @@ impl InputBaseState<EditorMode> {
         }
     }
 
-    /// Expand the hunk in the editor at its working-line boundaries.
+    /// Expand the hunk at its working-line boundaries and style its gutter marks.
     pub fn set_gutter_hunk(
         &mut self,
         action: usize,
         sections: Vec<GutterHunkSection>,
         marker_color: Hsla,
-        staged: bool,
+        outlined: bool,
         render: impl Fn(&mut gpui::Window, &mut App) -> gpui::AnyElement + 'static,
         cx: &mut Context<Self>,
     ) {
@@ -1097,7 +1097,7 @@ impl InputBaseState<EditorMode> {
             action,
             sections,
             marker_color,
-            staged,
+            outlined,
             render: std::rc::Rc::new(render),
         });
         cx.notify();
