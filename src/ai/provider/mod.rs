@@ -150,6 +150,12 @@ pub(super) struct Provider {
     key: String,
 }
 
+pub(super) enum Thinking {
+    Default,
+    /// Disable thinking when the provider supports an override.
+    Disable,
+}
+
 impl Provider {
     pub(super) fn open(settings: &Settings, scope: &Path) -> Result<Self, Failure> {
         let base = endpoint(&settings.base_url).ok_or(Failure::Credential)?;
@@ -199,14 +205,13 @@ impl Provider {
         Ok(value)
     }
 
-    pub(super) fn complete(
+    fn completion_body(
         &self,
         prompt: &str,
         input: &str,
         tokens: u32,
-        timeout: Duration,
-        max_response: usize,
-    ) -> Result<String, Failure> {
+        thinking: Thinking,
+    ) -> serde_json::Value {
         let host = Url::parse(&self.base).ok();
         let host = host.as_ref().and_then(Url::host_str);
         let limit_param = if host == Some("api.openai.com") {
@@ -224,9 +229,24 @@ impl Provider {
             "stream": false,
         });
         if host == Some("api.deepseek.com") {
-            body["thinking"] = json!({"type": "disabled"});
             body["temperature"] = json!(0);
+            if matches!(thinking, Thinking::Disable) {
+                body["thinking"] = json!({"type": "disabled"});
+            }
         }
+        body
+    }
+
+    pub(super) fn complete(
+        &self,
+        prompt: &str,
+        input: &str,
+        tokens: u32,
+        timeout: Duration,
+        max_response: usize,
+        thinking: Thinking,
+    ) -> Result<String, Failure> {
+        let body = self.completion_body(prompt, input, tokens, thinking);
         let response = agent(timeout)
             .post(format!("{}/chat/completions", self.base))
             .header("authorization", self.authorization()?)
@@ -509,6 +529,29 @@ pub(crate) mod tests {
     ) -> (String, JoinHandle<RequestLog>) {
         let (provider, worker) = mock_provider("model", replies);
         (provider.base, worker)
+    }
+
+    #[test]
+    fn thinking_overrides_are_provider_specific() {
+        let mut provider = Provider {
+            base: "https://api.deepseek.com/v1".into(),
+            model: "deepseek".into(),
+            key: "mock-key".into(),
+        };
+        let body = provider.completion_body("prompt", "input", 1024, Thinking::Default);
+        assert!(body.get("thinking").is_none());
+        assert!(body.get("reasoning_effort").is_none());
+
+        let body = provider.completion_body("prompt", "input", 1024, Thinking::Disable);
+        assert_eq!(body["thinking"], json!({"type": "disabled"}));
+        assert_eq!(body["temperature"], json!(0));
+
+        for base in ["https://api.openai.com/v1", "https://example.com/v1"] {
+            provider.base = base.into();
+            let body = provider.completion_body("prompt", "input", 1024, Thinking::Disable);
+            assert!(body.get("thinking").is_none());
+            assert!(body.get("reasoning_effort").is_none());
+        }
     }
 
     #[test]

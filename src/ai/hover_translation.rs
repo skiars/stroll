@@ -16,7 +16,7 @@ use sha2::{Digest, Sha256};
 
 use super::{
     Cancellation, Snapshot,
-    provider::{Failure, Provider},
+    provider::{Failure, Provider, Thinking},
 };
 use crate::repository::Repository;
 
@@ -647,7 +647,14 @@ fn request(texts: &[&str], provider: &Provider) -> Result<Vec<String>, Failure> 
             work.requests.push_back(now);
         }
         match provider
-            .complete(PROMPT, &input, 8192, ATTEMPT_TIMEOUT, 256 * 1024)
+            .complete(
+                PROMPT,
+                &input,
+                8192,
+                ATTEMPT_TIMEOUT,
+                256 * 1024,
+                Thinking::Disable,
+            )
             .and_then(|text| parse_response(&text, texts.len()))
         {
             Ok(output) => return Ok(output),

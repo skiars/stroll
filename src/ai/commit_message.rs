@@ -5,7 +5,7 @@ use rust_i18n::t;
 
 use super::{
     Cancellation, Snapshot,
-    provider::{Failure, Provider},
+    provider::{Failure, Provider, Thinking},
 };
 use crate::git::{Backend, CommitState, StagedCommitContext};
 
@@ -31,7 +31,14 @@ impl Snapshot {
                 .map_err(|failure| anyhow::anyhow!(failure.localized()))?;
             ensure!(live(), t!("ai.request_changed"));
             let message = provider
-                .complete(PROMPT, &context, 1024, Duration::from_secs(30), 64 * 1024)
+                .complete(
+                    PROMPT,
+                    &context,
+                    1024,
+                    Duration::from_secs(30),
+                    64 * 1024,
+                    Thinking::Default,
+                )
                 .and_then(|message| validate_message(&message))
                 .map_err(|failure| anyhow::anyhow!(failure.localized()))?;
             ensure!(live(), t!("ai.request_changed"));
