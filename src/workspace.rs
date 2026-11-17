@@ -407,6 +407,14 @@ enum FileOpen {
 enum SourcePosition {
     Lsp(lsp_types::Position),
     MarkdownFragment(String),
+    Diff(Option<DiffSource>),
+}
+
+struct DiffSource {
+    editor: EntityId,
+    revision: u64,
+    text: Rope,
+    offset: usize,
 }
 
 fn reveal_editor_range(
@@ -1763,6 +1771,16 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.open_document_source_at(path, None, window, cx);
+    }
+
+    fn open_document_source_at(
+        &mut self,
+        path: PathBuf,
+        position: Option<SourcePosition>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.standalone.as_ref() == Some(&path) {
             self.switch_view(WorkspaceView::Editor, window, cx);
             if self.view == WorkspaceView::Editor && self.tabs.active().is_none() {
@@ -1772,7 +1790,19 @@ impl Workspace {
         }
         self.switch_view(WorkspaceView::Editor, window, cx);
         if self.view == WorkspaceView::Editor {
-            self.open_file(path, true, window, cx);
+            if position.is_some() {
+                self.request_file(
+                    path,
+                    FileOpen::Select {
+                        preview: true,
+                        position,
+                    },
+                    window,
+                    cx,
+                );
+            } else {
+                self.open_file(path, true, window, cx);
+            }
             cx.notify();
         }
     }
@@ -1944,6 +1974,14 @@ impl Workspace {
                     }
                     offset
                 }
+                SourcePosition::Diff(Some(source)) => {
+                    self.reveal_diff_source(path.clone(), source, window, cx);
+                    None
+                }
+                SourcePosition::Diff(None) => {
+                    toast::info(window, cx, t!("git.editor_location_unavailable"));
+                    None
+                }
             };
             if let Some(offset) = offset {
                 let file = self.files.get_mut(&path).unwrap();
@@ -1971,6 +2009,70 @@ impl Workspace {
             }
         }
         self.locator_visit(&path);
+    }
+
+    fn reveal_diff_source(
+        &mut self,
+        path: PathBuf,
+        source: DiffSource,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        use gpui_component::input::RopeExt as _;
+
+        let file = self.files.get_mut(&path).unwrap();
+        let editor = file.editor.clone();
+        let current = editor.read(cx);
+        let revision = current.document_revision();
+        if source.editor == editor.entity_id() && source.revision == revision {
+            file.restore_position = None;
+            editor.update(cx, |editor, cx| {
+                let offset = source.offset;
+                reveal_editor_range(editor, offset..offset, None, window, cx);
+            });
+            return;
+        }
+        let selection = current.selected_range();
+        let current = current.text().clone();
+        let mapping = cx.background_spawn(async move {
+            let point = source.text.offset_to_point(source.offset);
+            let row = line_alignment::LineAlignment::between(&source.text, &current)?
+                .current_row(point.row)?;
+            let offset = current.line_start_offset(row) + point.column;
+            (row < current.lines_len()
+                && point.column <= current.line_len(row)
+                && current.is_char_boundary(offset))
+            .then_some(offset)
+        });
+        self.file_task = cx.spawn_in(window, async move |this, cx| {
+            let offset = mapping.await;
+            _ = this.update_in(cx, |this, window, cx| {
+                if this.view != WorkspaceView::Editor || this.tabs.active() != Some(path.as_path())
+                {
+                    return;
+                }
+                let Some(file) = this
+                    .files
+                    .get_mut(&path)
+                    .filter(|file| file.editor == editor)
+                else {
+                    return;
+                };
+                let state = editor.read(cx);
+                if state.selected_range() != selection || !state.focus_handle(cx).is_focused(window)
+                {
+                    return;
+                }
+                if let Some(offset) = offset.filter(|_| state.document_revision() == revision) {
+                    file.restore_position = None;
+                    editor.update(cx, |editor, cx| {
+                        reveal_editor_range(editor, offset..offset, None, window, cx);
+                    });
+                } else {
+                    toast::info(window, cx, t!("git.editor_location_unavailable"));
+                }
+            });
+        });
     }
 
     fn select_file_tab(

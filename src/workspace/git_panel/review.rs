@@ -251,6 +251,43 @@ fn batchable(backend: &git::Backend, detail: &Changes, file: &git::ChangedFile) 
     (!file.submodule() && !file.conflict()).then_some(mode)
 }
 
+pub(super) fn has_live_target(comparison: &Comparison) -> bool {
+    matches!(comparison.worktree_mode(), Some(Mode::All | Mode::Unstaged))
+}
+
+pub(super) fn is_custom_worktree(comparison: &Comparison) -> bool {
+    has_live_target(comparison)
+        && matches!(
+            comparison,
+            Comparison::Versions { .. } | Comparison::Worktree { base: Some(_), .. }
+        )
+}
+
+pub(super) fn aligns_historical_snapshots(comparison: &Comparison) -> bool {
+    matches!(
+        comparison,
+        Comparison::Commit { .. }
+            | Comparison::Versions { .. }
+            | Comparison::Worktree { base: Some(_), .. }
+    )
+}
+
+fn snapshot_worktree_path(
+    comparison: &Comparison,
+    file: &git::ChangedFile,
+    side: DiffSide,
+) -> Option<PathBuf> {
+    (aligns_historical_snapshots(comparison)
+        && (side == DiffSide::Original || comparison.commit_target().is_some()))
+    .then(|| {
+        PathBuf::from(if side == DiffSide::Original {
+            file.old_path.as_deref().unwrap_or(&file.path)
+        } else {
+            &file.path
+        })
+    })
+}
+
 #[derive(Clone)]
 pub(super) struct PatchAssets {
     version: Option<git::FileVersion>,
@@ -445,7 +482,18 @@ fn review_patch(
             },
         ));
     }
+    // Custom workspace comparisons have no layer operations, but the displayed
+    // patch still needs to identify the exact working file it was read from.
+    let version = (is_custom_worktree(&detail.comparison) && !file.binary)
+        .then(|| backend.file_version(&file.path).ok())
+        .flatten()
+        .filter(|version| version.status.as_ref() == file.worktree.as_ref());
     let patch = backend.patch(detail, file, context, whitespace)?;
+    let version = version.filter(|version| {
+        !patch.truncated
+            && !patch.document.is_binary()
+            && backend.file_version(&file.path).ok().as_ref() == Some(version)
+    });
     let layers = if mode.is_some() {
         Vec::new()
     } else {
@@ -455,7 +503,7 @@ fn review_patch(
         patch,
         None,
         PatchAssets {
-            version: None,
+            version,
             operations: None,
             layers,
         },
@@ -1414,6 +1462,20 @@ impl GitPanel {
         if restore {
             self.editor.restore_viewport();
         }
+        let draft = self.review.as_ref().and_then(|review| {
+            if !is_custom_worktree(&review.detail.comparison)
+                || !matches!(review.patches[ix], PatchState::Ready)
+            {
+                return None;
+            }
+            let path = PathBuf::from(&review.detail.files[ix].path);
+            let owner = self.workspace.upgrade()?;
+            let file = owner.read(cx).files.get(&path)?;
+            (file.committed != file.saved).then(|| (path, file.committed.clone()))
+        });
+        if let Some((path, draft)) = draft {
+            self.buffer_changed(&path, draft, false, window, cx);
+        }
         self.preload_working_buffers(window, cx);
         self.start_patch_assets(window, cx);
         App::notify(cx, self.review_pane.entity_id());
@@ -1490,15 +1552,7 @@ impl GitPanel {
                         for (key, text, language) in sources {
                             let file = &review.detail.files[ix];
                             let worktree_path =
-                                matches!(review.detail.comparison, Comparison::Commit { .. }).then(
-                                    || {
-                                        PathBuf::from(if key.1 == DiffSide::Original {
-                                            file.old_path.as_deref().unwrap_or(&file.path)
-                                        } else {
-                                            &file.path
-                                        })
-                                    },
-                                );
+                                snapshot_worktree_path(&review.detail.comparison, file, key.1);
                             let document = if review.documents[ix].path() == &key.0 {
                                 Some(&mut review.documents[ix])
                             } else {
@@ -1531,7 +1585,7 @@ impl GitPanel {
                             });
                         }
                         this.editor.sync_snapshots(review, cx);
-                        if matches!(review.detail.comparison, Comparison::Commit { .. }) {
+                        if aligns_historical_snapshots(&review.detail.comparison) {
                             this.preload_working_buffers(window, cx);
                         }
                         App::notify(cx, this.review_pane.entity_id());
@@ -2669,15 +2723,7 @@ impl GitPanel {
         let Some(&ix) = review.by_path.get(name) else {
             return;
         };
-        if self.detail_loading
-            || !matches!(
-                review.detail.comparison,
-                Comparison::Worktree {
-                    mode: Mode::All | Mode::Unstaged,
-                    base: None
-                }
-            )
-        {
+        if self.detail_loading || !has_live_target(&review.detail.comparison) {
             return;
         }
         if saved {
@@ -2691,12 +2737,7 @@ impl GitPanel {
             );
             return;
         }
-        let version = review
-            .operations
-            .get(&ix)
-            .map(|ops| &ops.version)
-            .or_else(|| review.pending_assets.get(&ix)?.version.as_ref());
-        let Some(version) = version.cloned() else {
+        let Some(version) = review.versions.get(&ix).cloned() else {
             return;
         };
         let base = review
@@ -2705,6 +2746,8 @@ impl GitPanel {
             .filter(|live| live.version == version)
             .map(|live| live.base.clone());
         let detail = review.detail.clone();
+        let patch_detail = detail.clone();
+        let patch_version = version.clone();
         let backend = self.backend.clone();
         let path = path.to_owned();
         let edit_path = path.clone();
@@ -2723,6 +2766,24 @@ impl GitPanel {
                 .spawn(async move {
                     let base = match base {
                         Some(base) => base,
+                        None if is_custom_worktree(&patch_detail.comparison) => {
+                            let file = &patch_detail.files[ix];
+                            let base = match backend.snapshot(&patch_detail, file, Side::Old)? {
+                                git::Snapshot::Text {
+                                    text,
+                                    truncated: false,
+                                } => Some(Arc::<str>::from(
+                                    text.trim_start_matches('\u{feff}').replace("\r\n", "\n"),
+                                )),
+                                git::Snapshot::Missing => None,
+                                _ => anyhow::bail!(t!("git.cannot_edit")),
+                            };
+                            anyhow::ensure!(
+                                backend.file_version(&name)? == version,
+                                t!("git.worktree_changed")
+                            );
+                            base
+                        }
                         None => backend.index_text(&name, &version)?.map(Arc::<str>::from),
                     };
                     let mut doc = DiffFile::from_worktree_text(
@@ -2738,11 +2799,11 @@ impl GitPanel {
                 })
                 .await;
             _ = this.update_in(cx, |this, window, cx| {
-                let Some(review) = this
-                    .review
-                    .as_mut()
-                    .filter(|review| Arc::ptr_eq(&review.detail, &detail))
-                else {
+                let Some(review) = this.review.as_mut().filter(|review| {
+                    Arc::ptr_eq(&review.detail, &detail)
+                        && review.versions.get(&ix) == Some(&patch_version)
+                        && review.contexts.get(&ix).copied().unwrap_or(3) == context
+                }) else {
                     return;
                 };
                 let (mut doc, live) = match result {
@@ -2766,10 +2827,18 @@ impl GitPanel {
                     if !sources.contains_key(&key) {
                         sources.insert(key, {
                             let source = Rope::from(base.as_ref());
-                            let language = super::super::language_for_source(&edit_path, &source);
+                            let worktree_path = snapshot_worktree_path(
+                                &detail.comparison,
+                                &detail.files[ix],
+                                DiffSide::Original,
+                            );
+                            let language = super::super::language_for_source(
+                                worktree_path.as_deref().unwrap_or(&edit_path),
+                                &source,
+                            );
                             super::editor::SnapshotEditor::new(
                                 super::editor::snapshot_editor(source, language, window, cx),
-                                None,
+                                worktree_path,
                             )
                         });
                     }
@@ -2995,6 +3064,12 @@ impl GitPanel {
                         let root = panel.root.clone();
                         let workspace = panel.workspace.clone();
                         let path = PathBuf::from(editor_path.as_str());
+                        let position = panel.editor.file_source_position(
+                            editor_path.as_str(),
+                            &workspace,
+                            window,
+                            cx,
+                        );
                         // Switching views reads this panel to save its session.
                         _ = workspace.update(cx, |workspace, cx| {
                             if workspace
@@ -3002,7 +3077,7 @@ impl GitPanel {
                                 .as_ref()
                                 .is_some_and(|repo| repo.root == root)
                             {
-                                workspace.open_document_source(path, window, cx);
+                                workspace.open_document_source_at(path, position, window, cx);
                             }
                         });
                     }),

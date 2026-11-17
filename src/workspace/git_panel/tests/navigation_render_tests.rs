@@ -17,6 +17,155 @@ fn settle(visual: &mut VisualTestContext) {
 }
 
 #[::core::prelude::v1::test]
+fn diff_open_in_editor_reveals_the_selected_source_column() {
+    use gpui_component::{Root, WindowExt as _, input::RopeExt as _};
+
+    let fixture = tempfile::tempdir().unwrap();
+    let root = fixture.path().join("repo");
+    fs::create_dir(&root).unwrap();
+    git(&root, &["init", "-qb", "main"]);
+    git(&root, &["config", "user.name", "Reviewer"]);
+    git(&root, &["config", "user.email", "reviewer@example.invalid"]);
+    git(&root, &["config", "commit.gpgsign", "false"]);
+    let original = (0..82)
+        .map(|row| match row {
+            31 => "😀 shared marker\n".to_owned(),
+            32 => "historical line\n".to_owned(),
+            _ => format!("row {row}\n"),
+        })
+        .collect::<String>();
+    let path = "new.txt";
+    fs::write(root.join("old.txt"), &original).unwrap();
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-qm", "Initial"]);
+    git(&root, &["mv", "old.txt", path]);
+    let renamed = original.replace("historical line", "committed line");
+    fs::write(root.join(path), &renamed).unwrap();
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-qm", "Rename"]);
+    let current = renamed
+        .replace("row 29\n", "row 29\ninserted working line\n")
+        .replace("committed line", "😀 working marker");
+    fs::write(root.join(path), &current).unwrap();
+
+    let mut app = TestAppContext::build_with_text_system(
+        TestDispatcher::new(0),
+        None,
+        gpui_platform::current_platform(true).text_system(),
+    );
+    app.update(gpui_component::init);
+    let store = Arc::new(Store::new(fixture.path().join("state")).unwrap());
+    let config = crate::config::ConfigFile::load(Some(fixture.path().join("config.toml")));
+    let mut workspace = None;
+    let (_, visual) = app.add_window_view(|window, cx| {
+        let view =
+            cx.new(|cx| Workspace::with_config(store, config, WorkspaceView::Git, window, cx));
+        workspace = Some(view.clone());
+        Root::new(view, window, cx)
+    });
+    let workspace = workspace.unwrap();
+    visual.simulate_resize(size(px(1200.), px(780.)));
+    visual.update(|window, cx| {
+        workspace.update(cx, |workspace, cx| {
+            workspace.open_repository(Location { root, file: None }, window, cx);
+        });
+    });
+    settle(visual);
+    let (panel, commit) = visual.update(|_, cx| {
+        let panel = workspace.read(cx).git.clone().unwrap();
+        let oid = panel.read(cx).commits[0].oid.to_string();
+        (panel, Selection::Commit(oid, None))
+    });
+    for (split, history, text, column, expected, unavailable) in [
+        (
+            false,
+            false,
+            "😀 working marker",
+            "😀 ".len(),
+            (33, 2),
+            false,
+        ),
+        (
+            true,
+            false,
+            "😀 working marker",
+            "😀 ".len(),
+            (33, 2),
+            false,
+        ),
+        (true, true, "😀 shared marker", "😀 ".len(), (32, 2), false),
+        (true, true, "historical line", 3, (32, 2), true),
+    ] {
+        visual.update(|window, cx| {
+            workspace.update(cx, |workspace, cx| {
+                workspace.switch_view(WorkspaceView::Git, window, cx);
+            });
+            panel.update(cx, |panel, cx| {
+                panel.show_history = false;
+                panel.split = split;
+                let selection = if history {
+                    commit.clone()
+                } else {
+                    Selection::Worktree(Mode::All)
+                };
+                panel.load_review(selection, false, window, cx);
+                cx.notify();
+            });
+        });
+        settle(visual);
+        visual.update(|window, cx| {
+            if !history {
+                panel.update(cx, |panel, cx| panel.editor.focus(window, cx));
+            }
+            let panel = panel.read(cx);
+            assert_eq!(
+                panel.diff.read(cx).mode(),
+                if split {
+                    DiffMode::Split
+                } else {
+                    DiffMode::Unified
+                },
+            );
+            if history {
+                assert_eq!(
+                    panel.review.as_ref().unwrap().detail.files[0]
+                        .old_path
+                        .as_deref(),
+                    Some("old.txt")
+                );
+            }
+            let editor = if history {
+                panel.editor.original_state().clone()
+            } else {
+                panel.editor.focused_column(window, cx).clone()
+            };
+            editor.update(cx, |editor, cx| {
+                let offset = editor.text().to_string().find(text).unwrap() + column;
+                editor.set_selected_range(offset..offset, cx);
+                editor.focus(window, cx);
+            });
+        });
+        settle(visual);
+        let button = visual.debug_bounds("git-open-file-in-editor").unwrap();
+        visual.simulate_click(button.center(), Modifiers::default());
+        settle(visual);
+        visual.update(|window, cx| {
+            let owner = workspace.read(cx);
+            assert_eq!(owner.view, WorkspaceView::Editor);
+            assert_eq!(owner.tabs.active(), Some(Path::new(path)));
+            let editor = owner.files[Path::new(path)].editor.read(cx);
+            assert_eq!(editor.text(), current.as_str());
+            let offset = editor.cursor();
+            let position = editor.text().offset_to_position(offset);
+            assert_eq!((position.line, position.character), expected);
+            let caret = editor.range_to_bounds(&(offset..offset)).unwrap();
+            assert!(editor.input_bounds().contains(&caret.center()));
+            assert_eq!(!window.notifications(cx).is_empty(), unavailable);
+        });
+    }
+}
+
+#[::core::prelude::v1::test]
 fn commit_drafts_survive_worktree_switch_and_restart_until_committed() {
     let fixture = tempfile::tempdir().unwrap();
     let root = fixture.path().join("repo");

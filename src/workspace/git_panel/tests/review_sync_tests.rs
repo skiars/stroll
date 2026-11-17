@@ -604,6 +604,149 @@ fn changed_worktree_status_keeps_both_diff_layers_readable_without_edit_targets(
 }
 
 #[::core::prelude::v1::test]
+fn custom_workspace_diff_edits_undoes_and_saves_against_the_selected_base() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("repo");
+    fs::create_dir(&root).unwrap();
+    setup(&root);
+    let name = "text.txt";
+    let path = Path::new(name);
+    fs::write(root.join(path), "comparison base\nshared\n").unwrap();
+    command(&root, &["add", name]);
+    command(&root, &["commit", "-qm", "Comparison base"]);
+    command(&root, &["branch", "comparison-base"]);
+    fs::write(root.join(path), "ordinary index\nshared\n").unwrap();
+    command(&root, &["commit", "-qam", "Ordinary index"]);
+    fs::write(root.join(path), "working content\nshared\n").unwrap();
+
+    let mut cx = test_context();
+    let (panel, visual) = open(&mut cx, temp.path(), &root);
+    let branch = "refs/heads/comparison-base";
+    let focus_line = |visual: &mut VisualTestContext, expected: &str| {
+        visual.update(|window, cx| {
+            let editor = panel.read(cx).editor.focused_column(window, cx).clone();
+            editor.update(cx, |editor, cx| {
+                let offset = editor.text().to_string().find(expected).unwrap();
+                editor.set_selected_range(offset..offset, cx);
+                editor.focus(window, cx);
+            });
+            window.draw(cx).clear(cx);
+            assert_eq!(
+                panel.read(cx).editing_path(window, cx).as_deref(),
+                Some(path)
+            );
+        });
+    };
+    let wait_for_patch = |visual: &mut VisualTestContext, expected: &str| {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            visual.executor().advance_clock(Duration::from_millis(100));
+            settle(visual);
+            let ready = visual.update(|window, cx| {
+                let panel = panel.read(cx);
+                let Some(review) = &panel.review else {
+                    return false;
+                };
+                let Some(&ix) = review.by_path.get(name) else {
+                    return false;
+                };
+                let workspace = panel.workspace.upgrade().unwrap();
+                let editable = !panel.detail_loading
+                    && review.openable[ix]
+                    && review.versions.contains_key(&ix)
+                    && matches!(review.patches[ix], PatchState::Ready)
+                    && workspace.read(cx).files.contains_key(path);
+                if !editable {
+                    return false;
+                }
+                let mut source = review.documents[ix].patch_source_lines();
+                let has_base = source.any(|(_, _, text)| text == "comparison base");
+                let has_edited_row = source.any(|(_, _, text)| text == expected);
+                assert!(review.operations.is_empty());
+                has_base
+                    && has_edited_row
+                    && panel
+                        .editor
+                        .focused_column(window, cx)
+                        .read(cx)
+                        .text()
+                        .to_string()
+                        .contains(expected)
+            });
+            if ready {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "Waiting for custom diff text {expected}"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    };
+    for (arbitrary, start, prefix) in [
+        (true, "working content", "arbitrary "),
+        (false, "arbitrary working content", "branch "),
+    ] {
+        visual.update(|window, cx| {
+            panel.update(cx, |panel, cx| {
+                if arbitrary {
+                    let base = panel
+                        .history
+                        .as_ref()
+                        .unwrap()
+                        .branches
+                        .iter()
+                        .find(|item| item.reference == branch)
+                        .unwrap()
+                        .oid
+                        .clone();
+                    panel.load_review(
+                        Selection::Compare {
+                            base: Some(base),
+                            target: None,
+                            previous: Box::new(Selection::Worktree(Mode::All)),
+                        },
+                        false,
+                        window,
+                        cx,
+                    );
+                } else {
+                    panel.select_branch(branch.to_owned(), window, cx);
+                }
+                panel.editor.focus(window, cx);
+            });
+        });
+        wait_for_patch(visual, start);
+        focus_line(visual, start);
+        visual.simulate_input(prefix);
+        let edited = format!("{prefix}{start}");
+        wait_for_patch(visual, &edited);
+        assert_eq!(
+            fs::read_to_string(root.join(path)).unwrap(),
+            format!("{start}\nshared\n")
+        );
+        focus_line(visual, &edited);
+        visual
+            .update(|window, cx| window.dispatch_action(Box::new(gpui_component::input::Undo), cx));
+        wait_for_patch(visual, start);
+        focus_line(visual, start);
+        visual
+            .update(|window, cx| window.dispatch_action(Box::new(gpui_component::input::Redo), cx));
+        wait_for_patch(visual, &edited);
+        focus_line(visual, &edited);
+        visual.update(|window, cx| {
+            window.dispatch_action(Box::new(crate::workspace::SaveFile), cx);
+        });
+        settle(visual);
+        assert_eq!(
+            fs::read_to_string(root.join(path)).unwrap(),
+            format!("{edited}\nshared\n")
+        );
+        wait_for_patch(visual, &edited);
+    }
+}
+
+#[::core::prelude::v1::test]
 #[ignore = "manual release-mode timing probe for cold diffs"]
 fn cold_bottom_probe() {
     let tmp = tempfile::tempdir().unwrap();

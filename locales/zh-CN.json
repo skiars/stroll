@@ -142,6 +142,7 @@
   "git.detached_head": "游离 HEAD",
   "git.diff_search": "搜索本次比较中的 diff",
   "git.editor_history_conflict": "请先撤销受影响文件中较新的编辑。",
+  "git.editor_location_unavailable": "无法在当前文件中确定所选差异行的位置",
   "git.empty_branch": "当前分支尚无提交",
   "git.empty_snapshot": "文件为空",
   "git.empty_subject": "（无标题提交）",

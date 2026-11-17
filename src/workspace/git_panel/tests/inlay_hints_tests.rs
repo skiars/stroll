@@ -25,6 +25,15 @@ fn wait_for(
 
 #[::core::prelude::v1::test]
 fn renders_inlay_hints_in_the_workspace_and_worktree_diff_layouts() {
+    check_worktree_diff_inlay_hints(false);
+}
+
+#[::core::prelude::v1::test]
+fn arbitrary_comparison_with_workspace_target_reuses_live_lsp() {
+    check_worktree_diff_inlay_hints(true);
+}
+
+fn check_worktree_diff_inlay_hints(arbitrary: bool) {
     let fixture = tempfile::tempdir().unwrap();
     let root = fixture.path().join("repo");
     fs::create_dir(&root).unwrap();
@@ -81,14 +90,28 @@ fn renders_inlay_hints_in_the_workspace_and_worktree_diff_layouts() {
             );
         });
     });
-    wait_for(visual, "git panel", |_, cx| {
-        workspace.read(cx).git.is_some()
+    wait_for(visual, "git history", |_, cx| {
+        workspace
+            .read(cx)
+            .git
+            .as_ref()
+            .is_some_and(|panel| panel.read(cx).history.is_some())
     });
     let panel = visual.update(|window, cx| {
         let panel = workspace.read(cx).git.clone().unwrap();
         panel.update(cx, |panel, cx| {
             panel.show_history = false;
-            panel.load_review(Selection::Worktree(Mode::All), false, window, cx);
+            let selection = Selection::Worktree(Mode::All);
+            let selection = if arbitrary {
+                Selection::Compare {
+                    base: panel.history.as_ref().unwrap().head.clone(),
+                    target: None,
+                    previous: Box::new(selection),
+                }
+            } else {
+                selection
+            };
+            panel.load_review(selection, false, window, cx);
             cx.notify();
         });
         panel
@@ -236,6 +259,15 @@ fn renders_inlay_hints_in_the_workspace_and_worktree_diff_layouts() {
 
 #[::core::prelude::v1::test]
 fn commit_diff_reuses_lsp_for_unambiguous_worktree_lines() {
+    check_historical_diff_lsp(false);
+}
+
+#[::core::prelude::v1::test]
+fn arbitrary_historical_comparison_reuses_verified_lsp_and_remains_read_only() {
+    check_historical_diff_lsp(true);
+}
+
+fn check_historical_diff_lsp(arbitrary: bool) {
     let fixture = tempfile::tempdir().unwrap();
     let root = fixture.path().join("repo");
     fs::create_dir(&root).unwrap();
@@ -349,7 +381,17 @@ fn commit_diff_reuses_lsp_for_unambiguous_worktree_lines() {
         panel.update(cx, |panel, cx| {
             panel.show_history = false;
             panel.split = false;
-            panel.load_review(Selection::Commit(oid, None), false, window, cx);
+            let selection = if arbitrary {
+                let commit = panel.backend.commit(&oid).unwrap();
+                Selection::Compare {
+                    base: commit.parents.first().cloned(),
+                    target: Some(oid),
+                    previous: Box::new(Selection::Worktree(Mode::All)),
+                }
+            } else {
+                Selection::Commit(oid, None)
+            };
+            panel.load_review(selection, false, window, cx);
             panel.editor.focus(window, cx);
             cx.notify();
         });
@@ -478,6 +520,24 @@ fn commit_diff_reuses_lsp_for_unambiguous_worktree_lines() {
                 assert!(links.is_empty());
             }
         }
+    }
+    if arbitrary {
+        let (editor, before) = visual.update(|window, cx| {
+            let editor = panel.read(cx).editor.focused_column(window, cx).clone();
+            let text = editor.read(cx).text().clone();
+            let caret = text.to_string().find(cases[1].2).unwrap();
+            editor.update(cx, |editor, cx| {
+                editor.set_selected_range(caret..caret, cx);
+                editor.focus(window, cx);
+            });
+            (editor, text)
+        });
+        visual.simulate_input("blocked");
+        visual.update(|_, cx| {
+            assert_eq!(editor.read(cx).text(), &before);
+            let file = &workspace.read(cx).files[Path::new(cases[1].0)];
+            assert_eq!(file.committed, file.saved);
+        });
     }
     // A draft invalidates the mapping until the LSP document matches the worktree again.
     visual.update(|window, cx| {

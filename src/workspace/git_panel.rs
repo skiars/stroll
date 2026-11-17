@@ -673,21 +673,20 @@ impl GitPanel {
         let mut paths = check.paths.into_iter().collect::<HashSet<_>>();
         if (verify_visible || check.rescan)
             && let Some(review) = &self.review
-            && matches!(
-                review.detail.comparison,
-                Comparison::Versions { target: None, .. }
-            )
+            && review::is_custom_worktree(&review.detail.comparison)
         {
-            // A custom comparison does not collect editable file versions. When
-            // the watcher cannot identify changed paths, recheck its loaded diffs.
+            // Recheck loaded custom diffs that lack a verified file version.
             paths.extend(
                 review
                     .detail
                     .files
                     .iter()
                     .zip(&review.patches)
-                    .filter(|(_, patch)| !matches!(patch, PatchState::Pending))
-                    .map(|(file, _)| file.path.clone()),
+                    .enumerate()
+                    .filter(|(ix, (_, patch))| {
+                        !matches!(patch, PatchState::Pending) && !review.versions.contains_key(ix)
+                    })
+                    .map(|(_, (file, _))| file.path.clone()),
             );
         }
         let versions = self

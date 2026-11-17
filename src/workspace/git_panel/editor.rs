@@ -1,7 +1,7 @@
 use super::*;
 use crate::workspace::{
-    OpenFile, WorkspaceView, editor_git::hunk_toolbar_row, inlay_hints::InlayHints,
-    line_alignment::LineAlignment,
+    DiffSource, OpenFile, SourcePosition, WorkspaceView, editor_git::hunk_toolbar_row,
+    inlay_hints::InlayHints, line_alignment::LineAlignment,
 };
 use gpui_component::{
     diff::{DiffEditorRow, DiffSide},
@@ -152,10 +152,9 @@ fn projected_inlay_hints(
             .or_default()
             .push(text.line_start_offset(view_row));
     }
-    let commit = panel
-        .review
-        .as_ref()
-        .is_some_and(|review| matches!(review.detail.comparison, Comparison::Commit { .. }));
+    let aligned = panel.review.as_ref().is_some_and(|review| {
+        super::review::aligns_historical_snapshots(&review.detail.comparison)
+    });
     let mut requests = Vec::new();
     for (path, rows) in sources {
         let file = &owner.files[path];
@@ -171,7 +170,7 @@ fn projected_inlay_hints(
             }
         }
         let text = file.committed.clone();
-        let version = commit.then(|| WorktreeVersion::of(file, cx)).flatten();
+        let version = aligned.then(|| WorktreeVersion::of(file, cx)).flatten();
         let document = server.document.clone();
         let task = crate::lsp::editor_inlay_hints(&document, &text, &ranges, cx);
         requests.push((path.to_owned(), document, text, version, rows, task));
@@ -297,6 +296,16 @@ impl Projection {
             }
             return Some((editor, line.bytes.start + point.column));
         }
+        self.snapshot_source(point.row, point.column, cx)
+    }
+
+    fn snapshot_source(
+        &self,
+        view_row: usize,
+        column: usize,
+        cx: &App,
+    ) -> Option<(Entity<EditorState>, usize)> {
+        let line = self.lines.get(view_row)?.as_ref()?;
         let editor = &self.snapshot(&line.position)?.editor;
         let text = editor.read(cx).text();
         let row = line.position.line().checked_sub(1)?;
@@ -304,11 +313,11 @@ impl Projection {
             || !text
                 .slice_line(row)
                 .chars()
-                .eq(self.text.slice_line(point.row).chars())
+                .eq(self.text.slice_line(view_row).chars())
         {
             return None;
         }
-        let offset = text.line_start_offset(row) + point.column;
+        let offset = text.line_start_offset(row) + column;
         Some((editor.clone(), offset))
     }
 
@@ -966,6 +975,46 @@ impl ReviewEditor {
         } else {
             &self.modified.editor
         }
+    }
+
+    pub(super) fn file_source_position(
+        &self,
+        path: &str,
+        workspace: &WeakEntity<Workspace>,
+        window: &Window,
+        cx: &App,
+    ) -> Option<SourcePosition> {
+        let focused = self.focused_column(window, cx);
+        let editor = focused.read(cx);
+        if !editor.focus_handle(cx).is_focused(window) {
+            return None;
+        }
+        let column = if focused == &self.original.editor {
+            &self.original
+        } else {
+            &self.modified
+        };
+        let projection = column.projection.borrow();
+        let offset = editor.cursor();
+        let point = projection.text.offset_to_point(offset);
+        let line = projection.lines.get(point.row)?.as_ref()?;
+        // The staged and unstaged projections can share a single file header.
+        if line.position.path().as_str().trim_start_matches('\0') != path {
+            return None;
+        }
+        let source = projection
+            .language_source(offset, workspace, cx)
+            .or_else(|| {
+                line.source.as_ref()?;
+                projection.snapshot_source(point.row, point.column, cx)
+            })
+            .map(|(source, offset)| DiffSource {
+                editor: source.entity_id(),
+                revision: source.read(cx).document_revision(),
+                text: source.read(cx).text().clone(),
+                offset,
+            });
+        Some(SourcePosition::Diff(source))
     }
 
     pub(super) fn focus(&self, window: &mut Window, cx: &mut App) {
@@ -1954,7 +2003,9 @@ fn render_header(
 
 impl GitPanel {
     pub(in crate::workspace) fn schedule_snapshot_alignment(&self, cx: &mut Context<Self>) {
-        if !matches!(self.selection, Some(Selection::Commit(..))) {
+        if !self.review.as_ref().is_some_and(|review| {
+            super::review::aligns_historical_snapshots(&review.detail.comparison)
+        }) {
             return;
         }
         let panel = cx.weak_entity();
@@ -1968,7 +2019,7 @@ impl GitPanel {
             return;
         }
         let Some(review) = &self.review else { return };
-        if !matches!(review.detail.comparison, Comparison::Commit { .. }) {
+        if !super::review::aligns_historical_snapshots(&review.detail.comparison) {
             return;
         }
         let Some(workspace) = self.workspace.upgrade() else {
@@ -2090,40 +2141,32 @@ impl GitPanel {
 
     fn working_path(&self, position: &DiffLinePosition) -> Option<PathBuf> {
         let (review, ix, file) = self.worktree_source_file(position)?;
-        (matches!(
-            review.detail.comparison,
-            Comparison::Worktree {
-                mode: Mode::All | Mode::Unstaged,
-                base: None
-            }
-        ) && (self.document_layer(ix, position.path()) != Some(git::Layer::Staged)
-            || file
-                .worktree
-                .as_ref()
-                .is_some_and(|status| !status.unstaged && !status.untracked)
-                && !review.secondary.contains_key(&ix)))
+        (super::review::has_live_target(&review.detail.comparison)
+            && (!super::review::is_custom_worktree(&review.detail.comparison)
+                || review.versions.contains_key(&ix))
+            && (self.document_layer(ix, position.path()) != Some(git::Layer::Staged)
+                || file
+                    .worktree
+                    .as_ref()
+                    .is_some_and(|status| !status.unstaged && !status.untracked)
+                    && !review.secondary.contains_key(&ix)))
         .then(|| PathBuf::from(&file.path))
     }
 
     fn worktree_hint_path(&self, position: &DiffLinePosition) -> Option<&str> {
         let (review, ix, file) = self.worktree_source_file(position)?;
-        let Comparison::Worktree {
-            mode: Mode::All | Mode::Unstaged,
-            base,
-        } = &review.detail.comparison
-        else {
+        if !super::review::has_live_target(&review.detail.comparison) {
             return None;
-        };
+        }
         let layer = self.document_layer(ix, position.path());
         let staged = layer == Some(git::Layer::Staged)
             || (layer.is_none()
-                && base.is_none()
                 && self.backend.supports_git_edit()
                 && matches!(
                     review.detail.comparison,
                     Comparison::Worktree {
                         mode: Mode::All,
-                        ..
+                        base: None
                     }
                 )
                 && file
