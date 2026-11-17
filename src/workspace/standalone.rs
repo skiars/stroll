@@ -195,6 +195,43 @@ impl Workspace {
         colors: Palette,
     ) -> impl IntoElement {
         let editing = self.view == WorkspaceView::Editor;
+        let actions = titlebar_actions()
+            // Keep Win32 hit testing from reaching the draggable title bar behind the buttons.
+            .when(cfg!(target_os = "windows"), |actions| actions.occlude())
+            .flex_shrink_0()
+            .gap_2()
+            .when(!editing, |bar| {
+                bar.when_some(self.doc.as_ref(), |bar, doc| {
+                    bar.child(doc.read(cx).toolbar_actions(doc, window))
+                })
+            })
+            .when(editing, |bar| {
+                bar.child(
+                    icon_button("standalone-find", IconName::Search, t!("common.find"))
+                        .on_click(cx.listener(|this, _, window, cx| this.find(window, cx))),
+                )
+                .child(
+                    icon_button("standalone-save", IconName::Save, t!("common.save"))
+                        .disabled(!self.tab_is_dirty(path) || self.saving.contains(path))
+                        .on_click(
+                            cx.listener(|this, _, window, cx| this.save(&SaveFile, window, cx)),
+                        ),
+                )
+                .when(docs::is_markdown(path), |bar| {
+                    bar.child(
+                        icon_button(
+                            "standalone-read",
+                            Icon::default().path("icons/book-open.svg"),
+                            t!("docs.read_markdown"),
+                        )
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.switch_view(WorkspaceView::Docs, window, cx);
+                        })),
+                    )
+                })
+                .child(self.workspace_actions(cx))
+            })
+            .child(self.theme_button(cx));
         TitleBar::new()
             .h(px(36.))
             .bg(colors.bg)
@@ -221,40 +258,7 @@ impl Workspace {
                     .when(self.tab_is_dirty(path), |bar| {
                         bar.child(div().size(px(6.)).rounded_full().bg(colors.warning))
                     })
-                    .when(!editing, |bar| {
-                        bar.when_some(self.doc.as_ref(), |bar, doc| {
-                            bar.child(doc.read(cx).toolbar_actions(doc, window))
-                        })
-                    })
-                    .when(editing, |bar| {
-                        bar.child(
-                            icon_button("standalone-find", IconName::Search, t!("common.find"))
-                                .on_click(cx.listener(|this, _, window, cx| this.find(window, cx))),
-                        )
-                        .child(
-                            icon_button("standalone-save", IconName::Save, t!("common.save"))
-                                .disabled(!self.tab_is_dirty(path) || self.saving.contains(path))
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.save(&SaveFile, window, cx)
-                                })),
-                        )
-                        .when(docs::is_markdown(path), |bar| {
-                            bar.child(
-                                icon_button(
-                                    "standalone-read",
-                                    Icon::default().path("icons/book-open.svg"),
-                                    t!("docs.read_markdown"),
-                                )
-                                .on_click(cx.listener(
-                                    |this, _, window, cx| {
-                                        this.switch_view(WorkspaceView::Docs, window, cx);
-                                    },
-                                )),
-                            )
-                        })
-                        .child(self.workspace_actions(cx))
-                    })
-                    .child(self.theme_button(cx)),
+                    .child(actions),
             )
     }
 }

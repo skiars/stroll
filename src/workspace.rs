@@ -3235,9 +3235,8 @@ impl Workspace {
                     .when(self.repository.is_some(), |bar| bar.child(nav))
                     .child(div().flex_1())
                     .child(
-                        h_flex()
+                        titlebar_actions()
                             .gap(px(4.))
-                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                             .when(self.repository.is_some(), |tools| {
                                 tools
                                     .child(
@@ -4388,6 +4387,11 @@ pub(crate) fn action_button(id: impl Into<ElementId>) -> Button {
 
 fn quiet_button(id: impl Into<ElementId>) -> Button {
     action_button(id).ghost()
+}
+
+fn titlebar_actions() -> Div {
+    // Keep the title bar from handling button presses as window drags.
+    h_flex().on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
 }
 
 pub(crate) fn icon_button(
