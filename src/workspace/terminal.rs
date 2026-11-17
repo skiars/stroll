@@ -18,7 +18,10 @@ use gpui_kit_assets::IconName;
 
 use crate::{repository::Store, terminal::Process};
 
-use super::{Palette, ToggleTerminal, Workspace, WorkspaceView, compact_icon_button, icon_button};
+use super::{
+    NextTab, Palette, PreviousTab, ToggleTerminal, Workspace, WorkspaceView, compact_icon_button,
+    icon_button,
+};
 use surface::{Session, SessionEvent, Status};
 
 const DEFAULT_HEIGHT: f32 = 300.;
@@ -86,6 +89,8 @@ impl Workspace {
         cx.bind_keys([
             KeyBinding::new("tab", NoAction, Some("TerminalInput")),
             KeyBinding::new("shift-tab", NoAction, Some("TerminalInput")),
+            KeyBinding::new("ctrl-tab", NextTab, Some("TerminalInput")),
+            KeyBinding::new("ctrl-shift-tab", PreviousTab, Some("TerminalInput")),
             KeyBinding::new("ctrl-c", NoAction, Some("TerminalInput")),
             KeyBinding::new("ctrl-v", NoAction, Some("TerminalInput")),
             KeyBinding::new("shift-insert", NoAction, Some("TerminalInput")),
@@ -366,6 +371,19 @@ impl Workspace {
         }
     }
 
+    fn cycle_terminal_tabs(&mut self, forward: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(panel) = self.current_terminal().filter(|panel| panel.tabs.len() > 1) else {
+            return;
+        };
+        let count = panel.tabs.len();
+        let next = if forward {
+            (panel.active + 1) % count
+        } else {
+            (panel.active + count - 1) % count
+        };
+        self.select_terminal(next, true, window, cx);
+    }
+
     fn set_terminal_height(
         &mut self,
         value: Pixels,
@@ -572,6 +590,12 @@ impl Workspace {
                 .min_w_0()
                 .track_focus(&panel.focus)
                 .key_context("Terminal")
+                .on_action(cx.listener(|this, _: &NextTab, window, cx| {
+                    this.cycle_terminal_tabs(true, window, cx);
+                }))
+                .on_action(cx.listener(|this, _: &PreviousTab, window, cx| {
+                    this.cycle_terminal_tabs(false, window, cx);
+                }))
                 .role(Role::Group)
                 .aria_label(t!("common.terminal"))
                 .bg(background)

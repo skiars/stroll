@@ -1513,9 +1513,14 @@ impl Workspace {
         self.open_doc_at(path, fragment, None, None, window, cx);
     }
 
-    /// Opens a Markdown tab in the document view without requiring it to be
+    /// Opens a Markdown file in the document view without requiring it to be
     /// listed in the repository's document tree.
-    fn open_doc_from_tab(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+    fn open_markdown_in_docs(
+        &mut self,
+        path: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if !docs::is_markdown(&path) {
             return;
         }

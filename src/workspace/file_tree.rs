@@ -55,6 +55,7 @@ impl TreeEdit {
 #[derive(Clone, Copy)]
 enum TreeAction {
     Open(bool),
+    OpenInDocs,
     PreviewAudio,
     SaveCopy,
     Create(bool),
@@ -125,11 +126,10 @@ pub(super) fn tree_menu(
                         mutable,
                     ))
                     .separator();
-            } else if entry.as_ref().is_some_and(|entry| !entry.symlink) {
-                if entry
-                    .as_ref()
-                    .is_some_and(|entry| audio_preview::is_audio(&entry.path))
-                {
+            } else if let Some(entry) = &entry
+                && !entry.symlink
+            {
+                if audio_preview::is_audio(&entry.path) {
                     menu = menu.item(item(
                         TreeAction::PreviewAudio,
                         t!("audio.preview").into(),
@@ -147,6 +147,13 @@ pub(super) fn tree_menu(
                             t!("workspace.tree_keep_open").into(),
                             true,
                         ));
+                    if docs::is_markdown(&entry.path) {
+                        menu = menu.item(item(
+                            TreeAction::OpenInDocs,
+                            t!("tabs.open_in_docs").into(),
+                            true,
+                        ));
+                    }
                 }
                 menu = menu
                     .item(item(
@@ -212,6 +219,7 @@ impl Workspace {
             .unwrap_or_default();
         match action {
             TreeAction::Open(preview) => self.open_file(path, preview, window, cx),
+            TreeAction::OpenInDocs => self.open_markdown_in_docs(path, window, cx),
             TreeAction::PreviewAudio => self.preview_audio(path, window, cx),
             TreeAction::SaveCopy => self.save_tree_copy(repo, path, window, cx),
             TreeAction::CopyPath(absolute) => {
@@ -905,6 +913,70 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    #[::core::prelude::v1::test]
+    fn workspace_tree_context_menu_opens_markdown_in_docs() -> Result<()> {
+        let fixture = tempfile::tempdir()?;
+        let root = fixture.path().join("repo");
+        fs::create_dir(&root)?;
+        assert!(
+            std::process::Command::new("git")
+                .args(["init", "-qb", "main"])
+                .arg(&root)
+                .status()?
+                .success()
+        );
+        let path = Path::new("guide.md");
+        fs::write(root.join(path), "# Project guide\n")?;
+
+        let platform = gpui_platform::current_platform(true);
+        let mut cx = TestAppContext::build_with_text_system(
+            TestDispatcher::new(0),
+            None,
+            platform.text_system(),
+        );
+        cx.update(gpui_component::init);
+        let store = Arc::new(Store::new(fixture.path().join("state"))?);
+        let config = ConfigFile::load(Some(fixture.path().join("config.toml")));
+        let mut workspace = None;
+        let (_, visual) = cx.add_window_view(|window, cx| {
+            let view = cx
+                .new(|cx| Workspace::with_config(store, config, WorkspaceView::Editor, window, cx));
+            workspace = Some(view.clone());
+            gpui_component::Root::new(view, window, cx)
+        });
+        let workspace = workspace.unwrap();
+        visual.simulate_resize(size(px(900.), px(620.)));
+        visual.update(|window, cx| {
+            window.activate_window();
+            workspace.update(cx, |this, cx| {
+                this.open_repository(Location { root, file: None }, window, cx);
+            });
+        });
+        settle(visual, &workspace, |this| {
+            this.rows.iter().any(|row| row.entry.path == path)
+        });
+
+        let position = visual
+            .debug_bounds("workspace-tree-row:guide.md")
+            .unwrap()
+            .center();
+        visual.simulate_mouse_down(position, MouseButton::Right, Modifiers::default());
+        visual.simulate_mouse_up(position, MouseButton::Right, Modifiers::default());
+        settle(visual, &workspace, |_| true);
+        // The first two items open the file as a preview or a regular tab.
+        visual.simulate_keystrokes("down down down enter");
+        settle(visual, &workspace, |this| {
+            this.view == WorkspaceView::Docs && this.doc.is_some()
+        });
+        visual.update(|_, cx| {
+            let this = workspace.read(cx);
+            assert_eq!(this.doc.as_ref().unwrap().read(cx).path, path);
+            assert_eq!(this.session.document.as_deref(), Some(path));
+            assert!(!this.tabs.paths().iter().any(|tab| tab == path));
+        });
+        Ok(())
     }
 
     #[::core::prelude::v1::test]

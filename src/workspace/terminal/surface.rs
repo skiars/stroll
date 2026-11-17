@@ -1139,20 +1139,26 @@ fn modifier_bits(mods: Modifiers) -> u16 {
 #[cfg(test)]
 mod tests {
     use std::{
+        fs,
         path::Path,
-        sync::mpsc,
+        sync::{Arc, mpsc},
         time::{Duration, Instant},
     };
 
     use gpui::{
         AppContext as _, ClipboardItem, Context, Entity, EntityInputHandler as _, FocusHandle,
-        Hsla, InteractiveElement as _, IntoElement, Modifiers, MouseButton, ParentElement as _,
-        Render, Styled, TestAppContext, VisualTestContext, Window, div, point, px, rgb, size,
+        Hsla, InteractiveElement as _, IntoElement, KeyBinding, Modifiers, MouseButton,
+        ParentElement as _, Render, Styled, TestAppContext, TestDispatcher, VisualTestContext,
+        Window, div, point, px, rgb, size,
     };
     use gpui_component::{ActiveTheme as _, Root, Theme};
 
     use super::{Command, Emulator, Event, Fade, PtySize, Session};
-    use crate::workspace::Workspace;
+    use crate::{
+        config::ConfigFile,
+        repository::{Repository, Store},
+        workspace::{NextTab, PreviousTab, Workspace, WorkspaceView},
+    };
 
     #[test]
     fn scrollbar_fade_reaches_both_targets() {
@@ -1258,6 +1264,162 @@ mod tests {
             assert_eq!(writes.next().as_deref(), Some(expected), "{key}");
             assert_eq!(writes.next(), None, "{key}");
         }
+    }
+
+    #[test]
+    fn ctrl_tab_cycles_only_the_focused_terminal_tabs() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().join("repo");
+        assert!(
+            std::process::Command::new("git")
+                .args(["init", "-q"])
+                .arg(&root)
+                .status()?
+                .success()
+        );
+        let first = Path::new("first.txt");
+        let second = Path::new("second.txt");
+        fs::write(root.join(first), "first\n")?;
+        fs::write(root.join(second), "second\n")?;
+        let repo = Repository::open(&root)?;
+        let store = Arc::new(Store::new(temp.path().join("state"))?);
+        let config = ConfigFile::load(Some(temp.path().join("config.toml")));
+        let mut app = TestAppContext::build_with_text_system(
+            TestDispatcher::new(0),
+            None,
+            gpui_platform::current_platform(true).text_system(),
+        );
+        app.update(|cx| {
+            gpui_component::init(cx);
+            Workspace::bind_terminal_keys(cx);
+            cx.bind_keys([
+                KeyBinding::new(
+                    "ctrl-tab",
+                    NextTab,
+                    Some("WorkspaceEditor && !Terminal && !Locator"),
+                ),
+                KeyBinding::new(
+                    "ctrl-shift-tab",
+                    PreviousTab,
+                    Some("WorkspaceEditor && !Terminal && !Locator"),
+                ),
+            ]);
+        });
+        let mut workspace = None;
+        let (_, visual) = app.add_window_view(|window, cx| {
+            let view = cx
+                .new(|cx| Workspace::with_config(store, config, WorkspaceView::Editor, window, cx));
+            view.update(cx, |view, cx| {
+                view.apply_repository(repo, Default::default(), None, None, window, cx);
+            });
+            workspace = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        let workspace = workspace.unwrap();
+        visual.simulate_resize(size(px(1000.), px(760.)));
+        for path in [first, second] {
+            visual.update(|window, cx| {
+                workspace.update(cx, |view, cx| {
+                    view.open_file(path.to_owned(), false, window, cx);
+                });
+            });
+            visual.run_until_parked();
+        }
+        let add_terminal = |visual: &mut VisualTestContext| {
+            visual.update(|window, cx| {
+                workspace.update(cx, |view, cx| {
+                    if view.current_terminal().is_some() {
+                        view.create_terminal(window, cx);
+                    } else {
+                        view.show_terminal(window, cx);
+                    }
+                    let panel = view.current_terminal().unwrap();
+                    panel.tabs[panel.active].session.update(cx, |session, _| {
+                        let (commands, input) = mpsc::channel();
+                        session.pending = None;
+                        session.emulator = Some(Emulator::new(
+                            PtySize {
+                                cols: 80,
+                                rows: 24,
+                                cell_width: 8,
+                                cell_height: 16,
+                            },
+                            commands.clone(),
+                        ));
+                        session.commands = commands;
+                        input
+                    })
+                })
+            })
+        };
+        let assert_terminal_focus = |visual: &mut VisualTestContext, expected: usize| {
+            visual.update(|window, cx| {
+                let view = workspace.read(cx);
+                let panel = view.current_terminal().unwrap();
+                assert_eq!(panel.active, expected);
+                assert!(
+                    panel.tabs[expected]
+                        .session
+                        .read(cx)
+                        .focus
+                        .is_focused(window)
+                );
+                assert_eq!(view.tabs.active(), Some(second));
+            });
+        };
+
+        let single = add_terminal(visual);
+        visual.simulate_keystrokes("ctrl-tab ctrl-shift-tab");
+        assert_terminal_focus(visual, 0);
+        assert!(
+            !single
+                .try_iter()
+                .any(|cmd| matches!(cmd, Command::Input(_)))
+        );
+
+        let second_terminal = add_terminal(visual);
+        let third_terminal = add_terminal(visual);
+        assert_terminal_focus(visual, 2);
+        for (keys, expected) in [
+            ("ctrl-tab", 0),
+            ("ctrl-tab", 1),
+            ("ctrl-shift-tab", 0),
+            ("ctrl-shift-tab", 2),
+        ] {
+            visual.simulate_keystrokes(keys);
+            assert_terminal_focus(visual, expected);
+        }
+        visual.simulate_keystrokes("tab shift-tab");
+        let writes = third_terminal
+            .try_iter()
+            .filter_map(|cmd| match cmd {
+                Command::Input(bytes) => Some(bytes),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(writes, [b"\t".to_vec(), b"\x1b[Z".to_vec()]);
+        for input in [single, second_terminal] {
+            assert!(!input.try_iter().any(|cmd| matches!(cmd, Command::Input(_))));
+        }
+
+        visual.update(|window, cx| {
+            workspace
+                .read(cx)
+                .active_file()
+                .unwrap()
+                .editor
+                .clone()
+                .update(cx, |editor, cx| editor.focus(window, cx));
+        });
+        for (keys, expected) in [("ctrl-tab", first), ("ctrl-shift-tab", second)] {
+            visual.simulate_keystrokes(keys);
+            visual.update(|_, cx| {
+                let view = workspace.read(cx);
+                assert_eq!(view.tabs.active(), Some(expected));
+                assert_eq!(view.current_terminal().unwrap().active, 2);
+            });
+        }
+        Ok(())
     }
 
     fn terminal_fixture<'a>(

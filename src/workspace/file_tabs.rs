@@ -432,7 +432,7 @@ impl Workspace {
                     menu = menu.item(PopupMenuItem::new(t!("tabs.open_in_docs")).on_click(
                         move |_, window, cx| {
                             _ = workspace.update(cx, |this, cx| {
-                                this.open_doc_from_tab(target.clone(), window, cx)
+                                this.open_markdown_in_docs(target.clone(), window, cx)
                             });
                         },
                     ));

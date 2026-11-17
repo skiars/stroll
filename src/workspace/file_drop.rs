@@ -97,7 +97,7 @@ impl Workspace {
                     }
                     this.finish_tab_selection(previous.as_deref(), window, cx);
                     this.locator_visit(&active);
-                    this.open_doc_from_tab(active, window, cx);
+                    this.open_markdown_in_docs(active, window, cx);
                 }
                 if !errors.is_empty() {
                     window.push_notification(

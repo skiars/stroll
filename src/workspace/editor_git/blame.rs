@@ -2,7 +2,7 @@ use super::*;
 use crate::workspace::line_alignment::equal_line_ranges;
 use gpui_component::{
     ThemeStyled as _,
-    input::InputEditsEvent,
+    input::{InputEditsEvent, RopeExt as _},
     tooltip::{ManagedTooltipExt as _, Positioner, TooltipRequest},
 };
 use similar::DiffableStr;
@@ -443,6 +443,29 @@ pub(in crate::workspace) fn hint(
                         strikethrough: None,
                     }];
                     let text_system = window.text_system();
+                    let midpoint = bounds.size.height / 2.;
+                    let baseline = if baseline == bounds.top() + midpoint
+                        && editor
+                            .text()
+                            .slice_line(row)
+                            .chars()
+                            .all(char::is_whitespace)
+                    {
+                        // The empty shaped row has no glyph metrics. Use the
+                        // configured editor font for the annotation on that row.
+                        let space = text_system.layout_line(
+                            " ",
+                            font_size,
+                            &[TextRun {
+                                len: 1,
+                                ..run[0].clone()
+                            }],
+                            None,
+                        );
+                        bounds.top() + midpoint + (space.ascent - space.descent) / 2.
+                    } else {
+                        baseline
+                    };
                     let line = text_system.shape_line(label.clone(), size, &run, None);
                     let line = if line.width() <= width {
                         line
@@ -677,12 +700,11 @@ mod tests {
         run_git(&["config", "commit.gpgsign", "false"]);
         let path = PathBuf::from("source.txt");
         let source = (0..80)
-            .map(|line| {
-                if line == 12 {
-                    format!("{}tail\n", "long ".repeat(40))
-                } else {
-                    format!("line {line}\n")
-                }
+            .map(|line| match line {
+                10 => "\n".into(),
+                11 => "   \n".into(),
+                12 => format!("{}tail\n", "long ".repeat(40)),
+                _ => format!("line {line}\n"),
             })
             .collect::<String>();
         fs::write(root.join(&path), &source).unwrap();
@@ -839,13 +861,28 @@ mod tests {
         });
         assert!(visual.debug_bounds("editor-blame").is_some());
 
-        visual.update(|window, cx| {
-            editor.update(cx, |editor, cx| {
-                editor.set_cursor_position(lsp_types::Position::new(12, 0), window, cx)
+        let baseline_offset = |line, visual: &mut VisualTestContext| {
+            visual.update(|window, cx| {
+                editor.update(cx, |editor, cx| {
+                    editor.set_cursor_position(lsp_types::Position::new(line, 0), window, cx)
+                });
             });
-        });
-        visual.run_until_parked();
-        draw(visual);
+            visual.run_until_parked();
+            PAINTED_BASELINE.set(None);
+            draw(visual);
+            let hint = visual
+                .debug_bounds("editor-blame")
+                .expect("blame is visible");
+            PAINTED_BASELINE.get().expect("hint painted in this frame") - hint.top()
+        };
+        let text_baseline = baseline_offset(9, visual);
+        for line in [10, 11, 12] {
+            assert!(
+                (baseline_offset(line, visual) - text_baseline).abs() < px(0.05),
+                "blame on line {line} uses the same baseline offset as the ordinary text row",
+            );
+        }
+
         let wrapped = visual.update(|_, cx| editor.read(cx).projected_wrap_rows(12));
         assert!(wrapped > 1);
         let assert_frame = |visual: &mut VisualTestContext| {
