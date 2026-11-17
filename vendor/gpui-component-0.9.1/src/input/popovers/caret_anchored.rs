@@ -38,14 +38,14 @@ pub(crate) fn caret_popup_anchor(geometry: PrepaintCaretGeometry) -> Point<Pixel
 /// `deferred()` so the prepaint runs after the input's prepaint.
 pub(crate) struct CaretAnchoredPopup {
     editor: WeakEntity<EditorState>,
-    build: Box<dyn Fn(Point<Pixels>, Pixels, &mut Window, &mut App) -> AnyElement>,
+    build: Box<dyn Fn(Point<Pixels>, Pixels, Pixels, &mut Window, &mut App) -> AnyElement>,
     content: Option<AnyElement>,
 }
 
 impl CaretAnchoredPopup {
     pub(crate) fn new(
         editor: WeakEntity<EditorState>,
-        build: impl Fn(Point<Pixels>, Pixels, &mut Window, &mut App) -> AnyElement + 'static,
+        build: impl Fn(Point<Pixels>, Pixels, Pixels, &mut Window, &mut App) -> AnyElement + 'static,
     ) -> Self {
         Self {
             editor,
@@ -100,7 +100,13 @@ impl Element for CaretAnchoredPopup {
         let above_anchor = anchor.y - geometry.line_height() - px(8.);
         let above = above_anchor - margin;
         let below = viewport.height - anchor.y - margin;
-        let mut content = (self.build)(anchor, above.max(below).max(px(0.)), window, cx);
+        let mut content = (self.build)(
+            anchor,
+            above.max(below).max(px(0.)),
+            geometry.text_size(),
+            window,
+            cx,
+        );
         let size = content.layout_as_root(
             Size {
                 width: AvailableSpace::Definite(viewport.width),

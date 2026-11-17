@@ -403,6 +403,7 @@ struct PasteTarget {
 pub struct PrepaintCaretGeometry {
     cursor_bounds: Bounds<Pixels>,
     line_height: Pixels,
+    text_size: Pixels,
     input_bounds: Bounds<Pixels>,
     scroll_offset: Point<Pixels>,
     /// A resize owns visibility while its requested repaint settles.
@@ -413,12 +414,14 @@ impl PrepaintCaretGeometry {
     pub(super) fn new(
         cursor_bounds: Bounds<Pixels>,
         line_height: Pixels,
+        text_size: Pixels,
         input_bounds: Bounds<Pixels>,
         scroll_offset: Point<Pixels>,
     ) -> Self {
         Self {
             cursor_bounds,
             line_height,
+            text_size,
             input_bounds,
             scroll_offset,
             resize_reveal_owned: false,
@@ -428,6 +431,11 @@ impl PrepaintCaretGeometry {
     /// The active caret's bounds from the fresh prepaint layout.
     pub fn cursor_bounds(&self) -> Bounds<Pixels> {
         self.cursor_bounds
+    }
+
+    /// Font size used to paint the editor text.
+    pub fn text_size(&self) -> Pixels {
+        self.text_size
     }
 
     /// Line height from the fresh prepaint layout.

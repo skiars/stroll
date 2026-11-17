@@ -4577,8 +4577,13 @@ impl<M: InputModeKind> Element for TextElement<M> {
                 input_bounds.size.width,
                 last_layout.text_align,
             );
-            let mut geometry =
-                PrepaintCaretGeometry::new(cursor_bounds, line_height, input_bounds, scroll_offset);
+            let mut geometry = PrepaintCaretGeometry::new(
+                cursor_bounds,
+                line_height,
+                text_size,
+                input_bounds,
+                scroll_offset,
+            );
             geometry.resize_reveal_owned = resize_reveal_owned;
             geometry
         });

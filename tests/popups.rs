@@ -1594,10 +1594,10 @@ fn completion_popup_stays_in_view_and_tab_accepts_the_selected_row() -> anyhow::
     use gpui_wgpu::WgpuHeadlessRenderer;
     use lsp_types::{CompletionItem, CompletionItemKind, Documentation, MarkupContent, MarkupKind};
 
-    struct Probe(Entity<EditorState>);
+    struct Probe(Entity<EditorState>, f32);
     impl Render for Probe {
         fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl gpui::IntoElement {
-            Editor::new(&self.0).size_full()
+            Editor::new(&self.0).text_size(px(self.1)).size_full()
         }
     }
 
@@ -1671,10 +1671,11 @@ fn completion_popup_stays_in_view_and_tab_accepts_the_selected_row() -> anyhow::
         cx.set_reduce_motion(true);
     });
 
-    for (mode, width, height, stacked, name) in [
-        (ThemeMode::Light, 950., 420., false, "light"),
-        (ThemeMode::Dark, 950., 420., false, "dark"),
-        (ThemeMode::Dark, 344., 300., true, "narrow-dark"),
+    let mut previous_list_height: Option<f32> = None;
+    for (mode, width, height, font_size, stacked, name) in [
+        (ThemeMode::Light, 950., 420., 15., false, "light"),
+        (ThemeMode::Dark, 950., 420., 17., false, "dark"),
+        (ThemeMode::Dark, 344., 300., 15., true, "narrow-dark"),
     ] {
         cx.update(|cx| stroll::workspace::apply_theme(mode, cx));
         let mut editor = None;
@@ -1685,7 +1686,7 @@ fn completion_popup_stays_in_view_and_tab_accepts_the_selected_row() -> anyhow::
                     .default_value(SOURCE)
             });
             editor = Some(state.clone());
-            let view = cx.new(|_| Probe(state));
+            let view = cx.new(|_| Probe(state, font_size));
             cx.new(|cx| Root::new(view, window, cx))
         })?;
         let window = window.into();
@@ -1726,6 +1727,16 @@ fn completion_popup_stays_in_view_and_tab_accepts_the_selected_row() -> anyhow::
                 assert!(shell.bottom().0 <= (height - 7.) * scale);
             }
             let (list, docs) = (shells[0], shells[1]);
+            if !stacked {
+                let height = list.size.height.0 / scale;
+                if let Some(previous) = previous_list_height {
+                    assert!(
+                        (height - previous - 8.0_f32).abs() < 1.,
+                        "four rows should grow by 2px each"
+                    );
+                }
+                previous_list_height = Some(height);
+            }
             if stacked {
                 assert_eq!(list.left(), docs.left());
                 assert!(list.bottom() < docs.top());

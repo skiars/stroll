@@ -4,7 +4,7 @@ use gpui::{
     Action, AnyElement, App, AppContext, Context, DismissEvent, Empty, Entity, EventEmitter,
     FontWeight, HighlightStyle, InteractiveElement as _, IntoElement, ParentElement, Pixels,
     Render, RenderOnce, SharedString, Styled, StyledText, Subscription, WeakEntity, Window,
-    deferred, div, prelude::FluentBuilder, px, relative, rems,
+    deferred, div, prelude::FluentBuilder, px, relative,
 };
 use gpui_base::TestSupportExt as _;
 use gpui_base::input::CompletionHighlighter;
@@ -151,8 +151,9 @@ impl ParentElement for CompletionMenuItem {
     }
 }
 impl RenderOnce for CompletionMenuItem {
-    fn render(self, _: &mut Window, cx: &mut App) -> impl IntoElement {
+    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
         let item = self.item;
+        let text_size = window.text_style().font_size.to_pixels(window.rem_size());
 
         let deprecated = item.deprecated.unwrap_or(false)
             || item
@@ -180,10 +181,10 @@ impl RenderOnce for CompletionMenuItem {
             .aria_label(item.label.clone())
             .selected(self.selected)
             .w_full()
-            .text_size(rems(0.8125))
+            .text_size(text_size)
             .py_0()
             .px_2()
-            .h(rems(26. / 16.))
+            .h(text_size + px(11.))
             .rounded(cx.theme().radius)
             .child(
                 h_flex()
@@ -192,7 +193,7 @@ impl RenderOnce for CompletionMenuItem {
                     .gap_2()
                     .child(
                         Icon::new(kind_icon(item.kind))
-                            .size(rems(0.875))
+                            .size(text_size)
                             .text_color(cx.theme().muted_foreground),
                     )
                     .child(
@@ -491,7 +492,7 @@ impl Render for CompletionMenu {
 
         deferred(CaretAnchoredPopup::new(
             self.editor.clone(),
-            move |anchor, available_height, window, cx| {
+            move |anchor, available_height, code_font_size, window, cx| {
                 let viewport_width = window.viewport_size().width;
                 let menu_width =
                     configured_max.min((viewport_width - CARET_POPUP_MARGIN * 2.).max(px(0.)));
@@ -540,6 +541,7 @@ impl Render for CompletionMenu {
                             .debug_selector(|| "completion-menu".into())
                             .test_support()
                             .font_family(code_font)
+                            .text_size((code_font_size - px(0.5)).max(px(1.)))
                             .w(menu_width)
                             .child(List::new(&list).popup_scrollbar().max_h(list_height)),
                     )

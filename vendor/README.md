@@ -166,6 +166,7 @@ dialogs in a Wayland window after changes to paint order or focus handling.
   fixture and `cargo test --release --locked --test popups completion_popup`
   for offscreen geometry and selection coverage. Set
   `STROLL_COMPLETION_SCREENSHOTS` to save the popup screenshots.
+  Candidate text and kind icons use the current editor font size minus 0.5 px.
 
 - C++ overload names use function captures, and primitive type captures
   recover after declaration macros. The editor maps unaffected semantic token
