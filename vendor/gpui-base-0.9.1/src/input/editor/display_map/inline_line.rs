@@ -42,6 +42,16 @@ impl InputLine {
             content: Content::Inline(fragments),
         }
     }
+    /// Baseline used by the last shaped text run in this visual row.
+    pub(crate) fn baseline_offset(&self, height: Pixels) -> Pixels {
+        let line = match &self.content {
+            Content::Text(line) => Some(line),
+            Content::Inline(fragments) => fragments.iter().rev().find_map(|f| f.text.as_ref()),
+        };
+        line.map_or(height / 2., |line| {
+            (height - line.ascent - line.descent) / 2. + line.ascent
+        })
+    }
     pub(crate) fn x_for_index(&self, ix: usize) -> Pixels {
         match &self.content {
             Content::Text(line) => line.x_for_index(ix),

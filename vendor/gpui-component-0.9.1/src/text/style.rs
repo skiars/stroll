@@ -13,6 +13,19 @@ use crate::highlighter::HighlightTheme;
 pub struct TextViewStyle {
     /// Gap of each paragraphs, default is 0.75 rem.
     pub paragraph_gap: Rems,
+    /// Optional spacing around a Markdown horizontal rule.
+    pub rule_spacing: Option<Pixels>,
+    /// Total space above a heading, pinned when `Some`.
+    ///
+    /// Without it the space above a heading follows the heading metrics and
+    /// the previous block. A pinned value is measured from the previous block,
+    /// so the previous block's own gap is subtracted from it. The first block
+    /// of a container still starts flush.
+    pub heading_top_gap: Option<Pixels>,
+    /// Gap below a heading, pinned when `Some`.
+    ///
+    /// Without it the space below a heading follows its section gap.
+    pub heading_bottom_gap: Option<Pixels>,
     /// Base font size for headings, default is 14px.
     ///
     /// Left at the default together with [`Self::heading_font_size`], headings
@@ -62,6 +75,9 @@ impl Default for TextViewStyle {
     fn default() -> Self {
         Self {
             paragraph_gap: rems(0.75),
+            rule_spacing: None,
+            heading_top_gap: None,
+            heading_bottom_gap: None,
             heading_base_font_size: px(14.),
             heading_font_size: None,
             highlight_theme: HighlightTheme::default_light().clone(),
@@ -78,6 +94,9 @@ impl Default for TextViewStyle {
 impl PartialEq for TextViewStyle {
     fn eq(&self, other: &Self) -> bool {
         self.paragraph_gap == other.paragraph_gap
+            && self.rule_spacing == other.rule_spacing
+            && self.heading_top_gap == other.heading_top_gap
+            && self.heading_bottom_gap == other.heading_bottom_gap
             && self.heading_base_font_size == other.heading_base_font_size
             && match (&self.heading_font_size, &other.heading_font_size) {
                 (Some(left), Some(right)) => (1..=6).all(|level| {
@@ -116,6 +135,23 @@ impl TextViewStyle {
     ///
     /// Set `overflow.y` to `Overflow::Scroll` with a max height on the
     /// refinement to scroll long code inside the block instead of growing it.
+    pub fn rule_spacing(mut self, spacing: Pixels) -> Self {
+        self.rule_spacing = Some(spacing);
+        self
+    }
+
+    /// Pin the total gap above every heading, measured from the previous block.
+    pub fn heading_top_gap(mut self, gap: Pixels) -> Self {
+        self.heading_top_gap = Some(gap);
+        self
+    }
+
+    /// Pin the gap below every heading, in place of its section gap.
+    pub fn heading_bottom_gap(mut self, gap: Pixels) -> Self {
+        self.heading_bottom_gap = Some(gap);
+        self
+    }
+
     pub fn code_block(mut self, style: StyleRefinement) -> Self {
         self.code_block = style;
         self

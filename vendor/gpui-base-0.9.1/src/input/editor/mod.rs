@@ -37,9 +37,11 @@ impl InputModeKind for EditorMode {
 
     fn reset_annotations(state: &mut InputBaseState<Self>) {
         state.extras.hover_popover = None;
+        state.extras.lsp._hover_task = gpui::Task::ready(Ok(()));
         state.extras.decorations.clear();
         state.extras.range_decorations.clear();
         state.extras.gutter_decorations.clear();
+        state.extras.gutter_hunk = None;
         state.extras.overview_ruler_decorations.clear();
     }
 
@@ -52,6 +54,8 @@ impl InputModeKind for EditorMode {
         range: &std::ops::Range<usize>,
         new_len: usize,
     ) {
+        state.extras.hover_popover = None;
+        state.extras.lsp._hover_task = gpui::Task::ready(Ok(()));
         state.extras.decorations.adjust_for_edit(range, new_len);
         state
             .extras
@@ -73,7 +77,10 @@ impl InputModeKind for EditorMode {
         cx: &mut gpui::Context<InputBaseState<Self>>,
     ) {
         let text = state.text().clone();
-        state.extras.lsp.update(&text, window, cx);
+        state
+            .extras
+            .lsp
+            .update(&text, state.document_revision, window, cx);
     }
 
     fn accept_inline_completion(
@@ -105,6 +112,14 @@ impl InputModeKind for EditorMode {
         state.clear_hover_state(cx);
     }
 
+    fn validate_hover_anchor(
+        state: &mut InputBaseState<Self>,
+        clip: gpui::Bounds<gpui::Pixels>,
+        cx: &mut gpui::Context<InputBaseState<Self>>,
+    ) {
+        state.validate_language_hover(clip, cx);
+    }
+
     fn on_text_typed(
         state: &mut InputBaseState<Self>,
         range: &std::ops::Range<usize>,
@@ -127,6 +142,13 @@ impl InputModeKind for EditorMode {
         cx: &mut gpui::Context<InputBaseState<Self>>,
     ) {
         state.hide_context_menu(cx);
+    }
+
+    fn hide_context_menu_for_edit(
+        state: &mut InputBaseState<Self>,
+        cx: &mut gpui::Context<InputBaseState<Self>>,
+    ) {
+        state.hide_context_menu_for_edit(cx);
     }
 
     fn is_context_menu_open(state: &InputBaseState<Self>, cx: &App) -> bool {
@@ -198,6 +220,7 @@ impl InputModeKind for EditorMode {
         element
             .key_context("Input mode=editor")
             .on_action(window.listener_for(entity, InputBaseState::on_action_toggle_code_actions))
+            .on_action(window.listener_for(entity, InputBaseState::on_action_rename_symbol))
             .on_action(window.listener_for(entity, InputBaseState::on_action_show_completions))
             .on_action(window.listener_for(entity, InputBaseState::on_action_go_to_definition))
     }
@@ -217,8 +240,28 @@ impl EditorState {
         &mut self.extras.lsp
     }
 
+    pub(crate) fn file_highlight_styles(
+        &self,
+        range: &std::ops::Range<usize>,
+        resolver: &dyn super::HighlightStyleResolver,
+    ) -> Vec<(std::ops::Range<usize>, gpui::HighlightStyle)> {
+        let syntax = self
+            .mode
+            .highlighter()
+            .and_then(|highlighter| Some(highlighter.borrow().as_ref()?.styles(range, resolver)))
+            .unwrap_or_default();
+        let semantics = self.lsp().semantic_tokens_for_range(
+            self.text(),
+            self.document_revision,
+            range,
+            resolver,
+        );
+        super::element::combine_highlights(syntax, semantics)
+    }
+
     /// Syntax context at `offset`, or `Code` when the language has no provider.
-    pub(crate) fn syntax_context_at(&self, offset: usize) -> super::SyntaxContext {
+    #[doc(hidden)]
+    pub fn syntax_context_at(&self, offset: usize) -> super::SyntaxContext {
         self.mode.syntax_context_at(&self.text, offset)
     }
 }
@@ -259,6 +302,14 @@ impl crate::input::InputExtras for super::EditorExtras {
             .then_some(self.gutter_decorations_width)
     }
 
+    fn interactive_gutter(&self) -> bool {
+        self.interactive_gutter
+    }
+
+    fn gutter_hunk(&self) -> Option<&super::GutterHunk> {
+        self.gutter_hunk.as_ref()
+    }
+
     fn gutter_decorations(&self, range: std::ops::Range<usize>) -> Vec<&super::GutterDecoration> {
         self.gutter_decorations.intersecting(&[range])
     }
@@ -271,13 +322,24 @@ impl crate::input::InputExtras for super::EditorExtras {
         self.overview_ruler_decorations.revision()
     }
 
+    fn overview_ruler_gutter_revision(&self) -> Option<u64> {
+        self.navigable_overview_ruler
+            .then(|| self.gutter_decorations.revision())
+    }
+
+    fn overview_ruler_gutter(&self) -> Vec<&super::GutterDecoration> {
+        self.gutter_decorations.iter().flatten().collect()
+    }
+
     fn semantic_token_styles(
         &self,
         text: &ropey::Rope,
+        revision: u64,
         range: &std::ops::Range<usize>,
         resolver: &dyn crate::input::HighlightStyleResolver,
     ) -> Vec<(std::ops::Range<usize>, gpui::HighlightStyle)> {
-        self.lsp.semantic_tokens_for_range(text, range, resolver)
+        self.lsp
+            .semantic_tokens_for_range(text, revision, range, resolver)
     }
 
     fn document_color_swatches(
@@ -291,6 +353,7 @@ impl crate::input::InputExtras for super::EditorExtras {
     fn hover_symbol_range(&self) -> Option<std::ops::Range<usize>> {
         self.hover_popover
             .as_ref()
+            .filter(|session| session.hover.is_some() && session.diagnostics.is_empty())
             .map(|session| session.symbol_range.clone())
     }
 
@@ -298,10 +361,17 @@ impl crate::input::InputExtras for super::EditorExtras {
         self.inline_completion.item.as_ref()
     }
 
-    fn context_menu_capabilities(&self) -> (bool, bool) {
+    fn context_menu_capabilities(&self) -> (bool, bool, bool) {
         (
             self.lsp.definition_provider.is_some(),
-            !self.lsp.code_action_providers.is_empty(),
+            self.lsp
+                .code_action_providers
+                .iter()
+                .any(|provider| provider.supports_code_actions()),
+            self.lsp
+                .code_action_providers
+                .iter()
+                .any(|provider| provider.supports_rename()),
         )
     }
 }

@@ -5,7 +5,7 @@ use std::ops::Range;
 use gpui::{
     App, AppContext as _, Context, Empty, Entity, FocusHandle, Focusable, Half,
     InteractiveElement as _, IntoElement, ParentElement as _, Pixels, Render, Styled, Subscription,
-    WeakEntity, Window, actions, div, prelude::FluentBuilder as _,
+    WeakEntity, Window, actions, div, prelude::FluentBuilder as _, px,
 };
 
 use crate::{
@@ -307,6 +307,20 @@ impl<M: crate::input::overlay::OverlayMode> SearchPanel<M> {
     }
 }
 
+impl<M: crate::input::overlay::OverlayMode> SearchPanel<M> {
+    pub(super) fn has_focus(&self, window: &Window, cx: &App) -> bool {
+        self.search_input
+            .read(cx)
+            .focus_handle(cx)
+            .contains_focused(window, cx)
+            || self
+                .replace_input
+                .read(cx)
+                .focus_handle(cx)
+                .contains_focused(window, cx)
+    }
+}
+
 impl<M: crate::input::overlay::OverlayMode> Focusable for SearchPanel<M> {
     fn focus_handle(&self, cx: &App) -> FocusHandle {
         self.search_input.read(cx).focus_handle(cx)
@@ -359,11 +373,12 @@ impl<M: crate::input::overlay::OverlayMode> Render for SearchPanel<M> {
                                     .focus_bordered(false)
                                     .suffix(
                                         Button::new("case-insensitive")
+                                            .rounded(px(5.))
                                             .selected(!self.session.case_insensitive)
                                             .toggled(!self.session.case_insensitive)
                                             .xsmall()
                                             .compact()
-                                            .text()
+                                            .ghost()
                                             .icon(IconName::CaseSensitive)
                                             .on_click(cx.listener(|this, _, _, cx| {
                                                 this.session.case_insensitive =
@@ -372,7 +387,6 @@ impl<M: crate::input::overlay::OverlayMode> Render for SearchPanel<M> {
                                                 cx.notify();
                                             })),
                                     )
-                                    .small()
                                     .w_full()
                                     .shadow_none(),
                             )
@@ -386,6 +400,7 @@ impl<M: crate::input::overlay::OverlayMode> Render for SearchPanel<M> {
                     .when(allow_replace, |this| {
                         this.child(
                             Button::new("replace-mode")
+                                .rounded(px(5.))
                                 .xsmall()
                                 .ghost()
                                 .icon(IconName::Replace)
@@ -398,6 +413,7 @@ impl<M: crate::input::overlay::OverlayMode> Render for SearchPanel<M> {
                     })
                     .child(
                         Button::new("prev")
+                            .rounded(px(5.))
                             .xsmall()
                             .ghost()
                             .icon(IconName::ChevronLeft)
@@ -408,6 +424,7 @@ impl<M: crate::input::overlay::OverlayMode> Render for SearchPanel<M> {
                     )
                     .child(
                         Button::new("next")
+                            .rounded(px(5.))
                             .xsmall()
                             .ghost()
                             .icon(IconName::ChevronRight)
@@ -427,6 +444,7 @@ impl<M: crate::input::overlay::OverlayMode> Render for SearchPanel<M> {
                     .child(div().w_7())
                     .child(
                         Button::new("close")
+                            .rounded(px(5.))
                             .xsmall()
                             .ghost()
                             .icon(IconName::Close)
@@ -443,13 +461,14 @@ impl<M: crate::input::overlay::OverlayMode> Render for SearchPanel<M> {
                         .child(
                             Input::new(&self.replace_input)
                                 .focus_bordered(false)
-                                .small()
                                 .w(self.input_width)
                                 .shadow_none(),
                         )
                         .child(
                             Button::new("replace-one")
+                                .rounded(px(5.))
                                 .small()
+                                .secondary()
                                 .label(t!("Input.Replace"))
                                 .disabled(!has_matches)
                                 .on_click(cx.listener(|this, _, window, cx| {
@@ -458,7 +477,9 @@ impl<M: crate::input::overlay::OverlayMode> Render for SearchPanel<M> {
                         )
                         .child(
                             Button::new("replace-all")
+                                .rounded(px(5.))
                                 .small()
+                                .secondary()
                                 .label(t!("Input.Replace All"))
                                 .disabled(!has_matches)
                                 .on_click(cx.listener(|this, _, window, cx| {

@@ -382,10 +382,26 @@ struct DocumentInner {
     binary: bool,
     /// Width of the widest line number, in digits.
     line_number_digits: usize,
+    wide_lines: Vec<(usize, SharedString)>,
     /// The patch body in order; each side's lines map back into it.
     patch_lines: Vec<PatchLine>,
     patch_ixs: [Vec<usize>; 2],
     conflicts: Vec<DiffConflict>,
+}
+
+/// A bounded shortlist for precise glyph measurement with the current font.
+pub(crate) fn insert_wide_line(
+    lines: &mut Vec<(usize, SharedString)>,
+    cells: usize,
+    text: &SharedString,
+) {
+    const LIMIT: usize = 8;
+    if lines.len() == LIMIT && lines.last().is_some_and(|(width, _)| *width >= cells) {
+        return;
+    }
+    let ix = lines.partition_point(|(width, _)| *width >= cells);
+    lines.insert(ix, (cells, text.clone()));
+    lines.truncate(LIMIT);
 }
 
 /// One changed file parsed from a unified or Git diff.
@@ -396,9 +412,47 @@ struct DocumentInner {
 pub struct DiffFile {
     inner: Arc<DocumentInner>,
     language: Option<SharedString>,
+    side_languages: [Option<SharedString>; 2],
+    view_path: Option<SharedString>,
 }
 
 impl DiffFile {
+    /// Compare a working buffer with its index snapshot.
+    pub fn from_worktree_text(
+        path: &str,
+        base: Option<&str>,
+        text: &str,
+        context: usize,
+    ) -> Result<Self, DiffParseError> {
+        if base == Some(text) {
+            return Ok(Self::unchanged(path.to_owned(), text));
+        }
+        let diff = similar::TextDiff::from_lines(base.unwrap_or_default(), text);
+        let old = if base.is_some() {
+            "a/worktree"
+        } else {
+            "/dev/null"
+        };
+        let mut patch = format!("diff --git a/worktree b/worktree\n--- {old}\n+++ b/worktree\n");
+        patch.push_str(&diff.unified_diff().context_radius(context).to_string());
+        let mut document = Self::parse(&patch)?
+            .into_iter()
+            .next()
+            .ok_or_else(|| DiffParseError::new(1, "missing worktree diff"))?;
+        let inner = Arc::get_mut(&mut document.inner).expect("new diff document");
+        inner.path = path.to_owned().into();
+        inner.original.path = base.map(|_| path.to_owned().into());
+        inner.modified.path = Some(path.to_owned().into());
+        Ok(document)
+    }
+
+    pub(crate) fn same_document(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+            && self.language == other.language
+            && self.side_languages == other.side_languages
+            && self.view_path == other.view_path
+    }
+
     /// Parses every file in a unified or Git diff, in patch order, without
     /// computing differences. Syntax emphasis is prepared later by
     /// [`super::DiffState`] on a background thread.
@@ -447,6 +501,11 @@ impl DiffFile {
             .clone()
             .or_else(|| original.path.clone())
             .unwrap_or_default();
+        let mut wide_lines = Vec::new();
+        for line in original.lines.iter().chain(&modified.lines) {
+            let cells = unicode_width::UnicodeWidthStr::width(line.display().as_str());
+            insert_wide_line(&mut wide_lines, cells, line.display());
+        }
         let (patch_lines, patch_ixs) = patch_order(&pairs, &hunks, &original, &modified);
         Self {
             inner: Arc::new(DocumentInner {
@@ -461,11 +520,14 @@ impl DiffFile {
                 extended_headers,
                 binary,
                 line_number_digits: widest.max(1).ilog10() as usize + 1,
+                wide_lines,
                 patch_lines,
                 patch_ixs,
                 conflicts: Vec::new(),
             }),
             language: None,
+            side_languages: Default::default(),
+            view_path: None,
         }
     }
 
@@ -479,10 +541,18 @@ impl DiffFile {
     pub fn language(&self) -> SharedString {
         self.language
             .clone()
-            .unwrap_or_else(|| super::presentation::detected_language(self.path()))
+            .unwrap_or_else(|| super::presentation::detected_language(&self.inner.path))
     }
-    pub(crate) fn language_override(&self) -> Option<&SharedString> {
-        self.language.as_ref()
+    /// Select a language for one side, for example when a file was renamed.
+    pub fn with_side_language(mut self, side: DiffSide, language: SharedString) -> Self {
+        self.side_languages[side as usize] = Some(language);
+        self
+    }
+
+    pub(crate) fn language_override(&self, side: DiffSide) -> Option<&SharedString> {
+        self.side_languages[side as usize]
+            .as_ref()
+            .or(self.language.as_ref())
     }
     /// How the file changed.
     pub fn status(&self) -> DiffFileStatus {
@@ -492,7 +562,13 @@ impl DiffFile {
     /// The path to show for this file: the modified path, or the original path
     /// of a deleted file.
     pub fn path(&self) -> &SharedString {
-        &self.inner.path
+        self.view_path.as_ref().unwrap_or(&self.inner.path)
+    }
+
+    /// Give a second comparison of the same file its own identity in the view.
+    pub fn with_view_path(mut self, path: impl Into<SharedString>) -> Self {
+        self.view_path = Some(path.into());
+        self
     }
     /// The original path, or `None` for an added file.
     pub fn original_path(&self) -> Option<&SharedString> {
@@ -507,6 +583,39 @@ impl DiffFile {
     pub fn extended_headers(&self) -> &[SharedString] {
         &self.inner.extended_headers
     }
+    /// Labels and first available source positions for navigation within the patch.
+    pub fn hunk_locations(&self) -> impl Iterator<Item = (SharedString, DiffLinePosition)> + '_ {
+        self.hunks().iter().filter_map(|hunk| {
+            [DiffSide::Modified, DiffSide::Original]
+                .into_iter()
+                .find_map(|side| {
+                    let range = hunk.lines(side);
+                    if range.is_empty() {
+                        return None;
+                    }
+                    let line = self.line_number(side, range.start);
+                    Some((
+                        hunk.label().clone(),
+                        DiffLinePosition::new(self.path().clone(), side, line),
+                    ))
+                })
+        })
+    }
+
+    /// Source text in patch order. Context lines appear once with their
+    /// modified-side position.
+    pub fn patch_source_lines(&self) -> impl Iterator<Item = (DiffSide, usize, &str)> {
+        self.inner.patch_lines.iter().filter_map(|line| {
+            let (side, ix) = match (line.original, line.modified) {
+                (_, Some(ix)) => (DiffSide::Modified, ix),
+                (Some(ix), None) => (DiffSide::Original, ix),
+                _ => return None,
+            };
+            let line = self.lines(side).get(ix)?;
+            Some((side, line.line_number(), line.text().as_str()))
+        })
+    }
+
     /// Whether the patch reports binary contents rather than textual hunks.
     pub fn is_binary(&self) -> bool {
         self.inner.binary
@@ -588,6 +697,10 @@ impl DiffFile {
     /// Width of the widest supplied line number, in digits.
     pub(crate) fn line_number_digits(&self) -> usize {
         self.inner.line_number_digits
+    }
+
+    pub(crate) fn wide_lines(&self) -> &[(usize, SharedString)] {
+        &self.inner.wide_lines
     }
 
     pub(crate) fn patch_lines(&self) -> &[PatchLine] {

@@ -1,4 +1,4 @@
-use gpui::{Edges, Pixels, Styled, px};
+use gpui::{AbsoluteLength, Edges, Pixels, Styled, px, rems};
 use serde::{Deserialize, Serialize};
 
 /// A size for elements.
@@ -154,14 +154,33 @@ impl Size {
         }
     }
 
+    /// Returns the outer height of a single-line field or dropdown.
+    pub(crate) fn control_height(&self) -> AbsoluteLength {
+        match self {
+            Self::XSmall => px(24.).into(),
+            Self::Small => px(28.).into(),
+            Self::Medium => rems(2.).into(),
+            Self::Large => px(40.).into(),
+            Self::Size(height) => (*height).into(),
+        }
+    }
+
+    pub(crate) fn control_padding_y(&self) -> Pixels {
+        match self {
+            Self::Large => px(8.),
+            Self::Medium | Self::Small => px(3.),
+            Self::XSmall | Self::Size(_) => px(2.),
+        }
+    }
+
     /// Returns the vertical input padding.
     pub fn input_py(&self) -> Pixels {
         match self {
-            Size::Large => px(10.),
-            Size::Medium => px(8.),
-            Size::Small => px(2.),
-            Size::XSmall => px(0.),
-            _ => px(2.),
+            Self::Large => px(10.),
+            Self::Medium => px(8.),
+            Self::Small => px(2.),
+            Self::XSmall => px(0.),
+            Self::Size(_) => px(2.),
         }
     }
 
@@ -254,7 +273,7 @@ impl<T: Styled> StyleSized<T> for T {
 
     #[inline]
     fn input_size(self, size: Size) -> Self {
-        self.input_px(size).input_py(size).input_h(size)
+        self.input_px(size).py(size.control_padding_y()).input_h(size)
     }
 
     #[inline]
@@ -279,13 +298,7 @@ impl<T: Styled> StyleSized<T> for T {
 
     #[inline]
     fn input_h(self, size: Size) -> Self {
-        match size {
-            Size::Large => self.h_11(),
-            Size::Medium => self.h_8(),
-            Size::Small => self.h_6(),
-            Size::XSmall => self.h_5(),
-            _ => self.h_6(),
-        }
+        self.h(size.control_height())
     }
 
     #[inline]

@@ -569,6 +569,7 @@ fn paint_line(
         let mut prev_glyph_position = Point::default();
         let mut max_glyph_size = size(px(0.), px(0.));
         let mut first_glyph_x = origin.x;
+        let clip = window.content_mask().bounds;
         for (run_ix, run) in layout.runs.iter().enumerate() {
             max_glyph_size = text_system.bounding_box(run.font_id, layout.font_size).size;
 
@@ -663,6 +664,7 @@ fn paint_line(
                                     color: Some(run_underline.color.unwrap_or(style_run.color)),
                                     thickness: run_underline.thickness,
                                     wavy: run_underline.wavy,
+                                    pattern: run_underline.pattern,
                                 },
                                 style_run_start..style_run_start + style_run.len as usize,
                             ));
@@ -728,8 +730,7 @@ fn paint_line(
                     size: max_glyph_size,
                 };
 
-                let content_mask = window.content_mask();
-                if max_glyph_bounds.intersects(&content_mask.bounds) {
+                if max_glyph_bounds.intersects(&clip) {
                     let vertical_offset = point(px(0.0), glyph.position.y);
                     if glyph.is_emoji {
                         window.paint_emoji(
@@ -799,6 +800,12 @@ fn paint_line_background(
     window: &mut Window,
     cx: &mut App,
 ) -> Result<()> {
+    if !decoration_runs
+        .iter()
+        .any(|run| run.background_color.is_some())
+    {
+        return Ok(());
+    }
     let line_bounds = line_paint_bounds(
         origin,
         layout,
@@ -1119,6 +1126,7 @@ mod tests {
                 thickness: px(1.),
                 color: Some(hsla(0., 1., 0.5, 1.)),
                 wavy: true,
+                pattern: Default::default(),
             };
             let last_style = UnderlineStyle {
                 color: Some(hsla(0.5, 1., 0.5, 1.)),
@@ -1267,6 +1275,7 @@ mod tests {
                 thickness: px(1.),
                 color: Some(black()),
                 wavy: true,
+                pattern: Default::default(),
             };
             let last_style = UnderlineStyle {
                 wavy: false,
@@ -1346,6 +1355,7 @@ mod tests {
                 thickness: px(1.),
                 color: Some(black()),
                 wavy: true,
+                pattern: Default::default(),
             };
             for zero_advance in [false, true] {
                 let line = underline_test_line(

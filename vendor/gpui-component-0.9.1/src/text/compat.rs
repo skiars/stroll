@@ -42,6 +42,7 @@ pub struct TextView {
     inner: gpui_base::TextView,
     text_style: Option<TextViewStyle>,
     motion: Option<TextViewMotion>,
+    code_languages: Option<super::CodeLanguages>,
     /// `None` leaves the state's own policy alone; `Some(false)` turns a
     /// fade off that an earlier frame turned on.
     stream_fade: Option<bool>,
@@ -54,6 +55,12 @@ impl Styled for TextView {
 }
 
 impl TextView {
+    /// Resolves code fence languages using this view's workspace resources.
+    pub fn code_languages(mut self, languages: Option<super::CodeLanguages>) -> Self {
+        self.code_languages = languages;
+        self
+    }
+
     /// Creates a text view rendering an existing [`TextViewState`].
     pub fn new(state: &Entity<TextViewState>) -> Self {
         Self {
@@ -62,6 +69,7 @@ impl TextView {
             text_style: None,
             motion: None,
             stream_fade: None,
+            code_languages: None,
         }
     }
     /// Creates a text view that parses `text` as Markdown.
@@ -73,6 +81,7 @@ impl TextView {
             text_style: None,
             motion: None,
             stream_fade: None,
+            code_languages: None,
         }
     }
     /// Creates a text view that parses `text` as HTML.
@@ -84,6 +93,7 @@ impl TextView {
             text_style: None,
             motion: None,
             stream_fade: None,
+            code_languages: None,
         }
     }
     /// Overrides the source of every document image, including embedded data URLs.
@@ -138,6 +148,11 @@ impl TextView {
         self.inner = self.inner.scrollable(value);
         self
     }
+    /// Sets the displacement per mouse wheel line when this view scrolls.
+    pub fn wheel_line_height(mut self, height: Pixels) -> Self {
+        self.inner = self.inner.wheel_line_height(height);
+        self
+    }
     /// Fades streamed text in the way Claude reveals a reply: the words a `set_text` or
     /// `push_str` adds start transparent and light up one after another, each reaching full
     /// color over 280 ms. A chunk far larger than one keystroke burst -- a backfill, a replay --
@@ -183,6 +198,14 @@ impl TextView {
         F: Fn(&SharedString, &ClickEvent, &mut Window, &mut App) + Send + Sync + 'static,
     {
         self.inner = self.inner.on_link_click(f);
+        self
+    }
+    /// Handles clicks on rendered images instead of following an image link.
+    pub fn on_image_click<F>(mut self, f: F) -> Self
+    where
+        F: Fn(&SharedString, &ClickEvent, &mut Window, &mut App) + Send + Sync + 'static,
+    {
+        self.inner = self.inner.on_image_click(f);
         self
     }
     /// Shows an application-supplied tooltip beside the pointer over a link.
@@ -311,6 +334,23 @@ impl Element for TextView {
                 style,
             ));
         }
+        #[cfg(feature = "tree-sitter")]
+        if let Some(languages) = &self.code_languages {
+            let theme = self
+                .text_style
+                .as_ref()
+                .map(|style| &style.highlight_theme)
+                .filter(|theme| {
+                    !std::sync::Arc::ptr_eq(
+                        theme,
+                        &crate::highlighter::HighlightTheme::default_light(),
+                    )
+                })
+                .unwrap_or(&crate::ActiveTheme::theme(cx).highlight_theme);
+            inner = inner.shared_code_block_highlighter(super::scoped_code_block_highlighter(
+                theme, languages,
+            ));
+        }
         let motion = self.motion.clone().or_else(|| {
             self.stream_fade.map(|fade| {
                 if !fade {
@@ -393,6 +433,18 @@ pub(super) fn resolve_component_style(
     // resolver pins them to pixels.
     let pins_heading_size = heading_font_size.is_some()
         || heading_base_font_size != TextViewStyle::default().heading_base_font_size;
+    let themed = match legacy.rule_spacing {
+        Some(spacing) => themed.with_rule_spacing(spacing),
+        None => themed,
+    };
+    let themed = match legacy.heading_top_gap {
+        Some(gap) => themed.with_heading_top_gap(gap),
+        None => themed,
+    };
+    let themed = match legacy.heading_bottom_gap {
+        Some(gap) => themed.with_heading_bottom_gap(gap),
+        None => themed,
+    };
     let style = themed
         .with_paragraph_gap(legacy.paragraph_gap)
         .with_heading(move |level| {

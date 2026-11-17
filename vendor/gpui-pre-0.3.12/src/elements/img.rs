@@ -1,3 +1,4 @@
+use super::ImageThumbnails;
 use crate::{
     AnyElement, AnyImageCache, App, Asset, AssetLogger, Bounds, DefiniteLength, Element, ElementId,
     Entity, GlobalElementId, Hitbox, Image, ImageCache, InspectorElementId, InteractiveElement,
@@ -44,6 +45,8 @@ pub enum ImageSource {
     Image(Arc<Image>),
     /// A custom loading function to use
     Custom(Arc<dyn Fn(&mut Window, &mut App) -> Option<Result<Arc<RenderImage>, ImageCacheError>>>),
+    /// 保留原始布局尺寸，按实际绘制尺寸生成缩略图。
+    Fit(Arc<ImageSource>, Entity<ImageThumbnails>),
 }
 
 fn is_uri(uri: &str) -> bool {
@@ -121,10 +124,21 @@ where
     }
 }
 
+/// How an image is sampled when its displayed size differs from its pixel size.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ImageSampling {
+    /// Interpolate between neighboring texels.
+    #[default]
+    Linear,
+    /// Read the closest texel directly.
+    Nearest,
+}
+
 /// The style of an image element.
 pub struct ImageStyle {
     grayscale: bool,
     object_fit: ObjectFit,
+    sampling: ImageSampling,
     loading: Option<Box<dyn Fn() -> AnyElement>>,
     fallback: Option<Box<dyn Fn() -> AnyElement>>,
 }
@@ -134,6 +148,7 @@ impl Default for ImageStyle {
         Self {
             grayscale: false,
             object_fit: ObjectFit::Contain,
+            sampling: ImageSampling::default(),
             loading: None,
             fallback: None,
         }
@@ -154,6 +169,12 @@ pub trait StyledImage: Sized {
     /// Set the object fit for the image.
     fn object_fit(mut self, object_fit: ObjectFit) -> Self {
         self.image_style().object_fit = object_fit;
+        self
+    }
+
+    /// Set the sampling mode used to scale the image.
+    fn image_sampling(mut self, sampling: ImageSampling) -> Self {
+        self.image_style().sampling = sampling;
         self
     }
 
@@ -473,6 +494,9 @@ impl Element for Img {
             window,
             cx,
             |style, window, cx| {
+                if bounds.intersect(&window.content_mask().bounds).is_empty() {
+                    return;
+                }
                 if let Some(Ok(data)) = source.use_data(
                     self.image_cache
                         .clone()
@@ -483,19 +507,34 @@ impl Element for Img {
                     if data.frame_count() == 0 {
                         return;
                     }
+                    let frame_index = layout_state.frame_index.min(data.frame_count() - 1);
                     let new_bounds = self
                         .style
                         .object_fit
-                        .get_bounds(bounds, data.size(layout_state.frame_index));
+                        .get_bounds(bounds, data.size(frame_index));
+                    let (data, frame_index) = match &source {
+                        ImageSource::Fit(_, thumbnails)
+                            if data.frame_count() == 1 && self.style.sampling == ImageSampling::Linear =>
+                        {
+                            let Some(image) = ImageThumbnails::for_bounds(
+                                thumbnails, data, new_bounds, window, cx,
+                            ) else {
+                                return;
+                            };
+                            (image, 0)
+                        }
+                        _ => (data, frame_index),
+                    };
                     let corner_radii = style.corner_radii.to_pixels(window.rem_size());
                     window
-                        .paint_image(
+                        .paint_image_with_sampling(
                             bounds,
                             new_bounds,
                             corner_radii,
                             data,
-                            layout_state.frame_index,
+                            frame_index,
                             self.style.grayscale,
+                            self.style.sampling,
                         )
                         .log_err();
                 } else if let Some(replacement) = &mut layout_state.replacement {
@@ -529,6 +568,11 @@ impl IntoElement for Img {
 impl StatefulInteractiveElement for Img {}
 
 impl ImageSource {
+    /// 按绘制区域和屏幕缩放生成缩略图，原图仍可用于独立的预览。
+    pub fn fit_to_display(self, thumbnails: &Entity<ImageThumbnails>) -> Self {
+        Self::Fit(Arc::new(self), thumbnails.clone())
+    }
+
     pub(crate) fn use_data(
         &self,
         cache: Option<AnyImageCache>,
@@ -546,6 +590,7 @@ impl ImageSource {
             ImageSource::Custom(loading_fn) => loading_fn(window, cx),
             ImageSource::Render(data) => Some(Ok(data.to_owned())),
             ImageSource::Image(data) => window.use_asset::<AssetLogger<ImageDecoder>>(data, cx),
+            ImageSource::Fit(source, _) => source.use_data(cache, window, cx),
         }
     }
 
@@ -566,6 +611,7 @@ impl ImageSource {
             ImageSource::Custom(loading_fn) => loading_fn(window, cx),
             ImageSource::Render(data) => Some(Ok(data.to_owned())),
             ImageSource::Image(data) => window.get_asset::<AssetLogger<ImageDecoder>>(data, cx),
+            ImageSource::Fit(source, _) => source.get_data(cache, window, cx),
         }
     }
 
@@ -577,6 +623,7 @@ impl ImageSource {
             }
             ImageSource::Custom(_) | ImageSource::Render(_) => {}
             ImageSource::Image(data) => cx.remove_asset::<AssetLogger<ImageDecoder>>(data),
+            ImageSource::Fit(source, _) => source.remove_asset(cx),
         }
     }
 
@@ -588,6 +635,7 @@ impl ImageSource {
             ImageSource::Resource(resource) => cx.has_asset::<ImgResourceLoader>(resource),
             ImageSource::Custom(_) | ImageSource::Render(_) => false,
             ImageSource::Image(data) => cx.has_asset::<AssetLogger<ImageDecoder>>(data),
+            ImageSource::Fit(source, _) => source.is_asset_cached(cx),
         }
     }
 }

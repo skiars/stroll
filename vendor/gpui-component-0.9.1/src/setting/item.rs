@@ -1,11 +1,15 @@
 use gpui::{
     AnyElement, App, Axis, Div, InteractiveElement as _, IntoElement, ParentElement, SharedString,
-    Stateful, Styled, Window, div, prelude::FluentBuilder as _,
+    Stateful, Styled, Window, div, prelude::FluentBuilder as _, px,
 };
 use std::{any::TypeId, ops::Deref, rc::Rc};
 
+use super::{CONTROL_LINE_HEIGHT, DESCRIPTION_FONT_SIZE, DESCRIPTION_LINE_HEIGHT};
+
 use crate::{
-    ActiveTheme as _, AxisExt, StyledExt as _,
+    ActiveTheme as _, AxisExt, IconName, Sizable as _, StyledExt as _,
+    button::{Button, ButtonVariants},
+    h_flex,
     label::Label,
     setting::{
         AnySettingField, ElementField, RenderOptions,
@@ -27,6 +31,7 @@ pub enum SettingItem {
         keywords: Vec<SharedString>,
         layout: Axis,
         disabled: bool,
+        reset_label: Option<SharedString>,
         field: Rc<dyn AnySettingField>,
     },
     /// A full custom element to render.
@@ -53,8 +58,17 @@ impl SettingItem {
             layout: Axis::Horizontal,
             disabled: false,
             keywords: Vec::new(),
+            reset_label: None,
             field: Rc::new(field),
         }
+    }
+
+    /// Show a reset button next to a field when it differs from its default.
+    pub fn reset_button(mut self, label: impl Into<SharedString>) -> Self {
+        if let Self::Item { reset_label, .. } = &mut self {
+            *reset_label = Some(label.into());
+        }
+        self
     }
 
     /// Create a new custom element setting item with a render closure.
@@ -264,6 +278,7 @@ impl SettingItem {
                     description,
                     layout,
                     disabled,
+                    reset_label,
                     field,
                     ..
                 } => {
@@ -271,6 +286,43 @@ impl SettingItem {
                         Axis::Vertical
                     } else {
                         layout
+                    };
+                    let control = div().id("field").child(Self::render_field(
+                        title.clone(),
+                        field.clone(),
+                        options.with_layout(layout).with_disabled(disabled),
+                        window,
+                        cx,
+                    ));
+                    let control = if let Some(label) = reset_label {
+                        h_flex()
+                            .gap_2()
+                            .when(layout.is_horizontal(), |row| row.flex_shrink_0())
+                            .when(layout.is_vertical(), |row| row.w_full())
+                            .child(
+                                control
+                                    .when(layout.is_vertical(), |field| field.flex_1().min_w_0()),
+                            )
+                            .child(div().w(px(26.)).flex_shrink_0().when(
+                                !disabled && field.is_resettable(cx),
+                                |slot| {
+                                    slot.child(
+                                        Button::new("reset-field")
+                                            .rounded(gpui::px(5.))
+                                            .icon(IconName::Undo2)
+                                            .ghost()
+                                            .small()
+                                            .tooltip(label.clone())
+                                            .accessibility_label(format!("{label} · {title}"))
+                                            .on_click(move |_, window, cx| field.reset(window, cx)),
+                                    )
+                                },
+                            ))
+                            .into_any_element()
+                    } else {
+                        control
+                            .when(layout.is_horizontal(), |field| field.flex_shrink_0())
+                            .into_any_element()
                     };
 
                     div()
@@ -286,6 +338,7 @@ impl SettingItem {
                         .gap_3()
                         .child(
                             v_flex()
+                                .min_w_0()
                                 .map(|this| {
                                     if layout.is_horizontal() {
                                         this.flex_1().max_w_3_5()
@@ -293,24 +346,23 @@ impl SettingItem {
                                         this.w_full()
                                     }
                                 })
-                                .child(Label::new(title.clone()).text_sm())
+                                .child(
+                                    Label::new(title.clone())
+                                        .text_size(options.font_size())
+                                        .line_height(CONTROL_LINE_HEIGHT),
+                                )
                                 .when_some(description, |this, description| {
                                     this.child(
                                         div()
-                                            .size_full()
-                                            .text_sm()
+                                            .w_full()
+                                            .text_size(DESCRIPTION_FONT_SIZE)
+                                            .line_height(DESCRIPTION_LINE_HEIGHT)
                                             .text_color(cx.theme().muted_foreground)
                                             .child(description),
                                     )
                                 }),
                         )
-                        .child(div().id("field").child(Self::render_field(
-                            title,
-                            field,
-                            options.with_layout(layout).with_disabled(disabled),
-                            window,
-                            cx,
-                        )))
+                        .child(control)
                         .into_any_element()
                 }
                 SettingItem::Element {

@@ -1,3 +1,4 @@
+use crate::ThemeStyled as _;
 use crate::root::WindowState;
 use std::{
     cell::RefCell,
@@ -6,21 +7,15 @@ use std::{
 };
 
 use gpui::{
-    Action, AnyElement, AnyView, App, AppContext, Bounds, Context, ElementId, GlobalElementId,
-    IntoElement, MouseButton, ParentElement, Pixels, Render, SharedString,
+    Action, AnyElement, AnyView, App, AppContext, Bounds, Context, GlobalElementId,
+    HoverListenerMode, IntoElement, MouseButton, ParentElement, Pixels, Render, SharedString,
     StatefulInteractiveElement, StyleRefinement, Styled, Window, div, prelude::FluentBuilder, px,
 };
-pub use gpui_base::TooltipDefaults;
-use gpui_base::{
-    Tooltip as BaseTooltip, TooltipOverlay as BaseTooltipOverlay,
-    TooltipRequest as BaseTooltipRequest, TooltipTransition as BaseTooltipTransition,
-};
+pub use gpui_base::{Positioner, TooltipDefaults, TooltipRequest};
+use gpui_base::{Tooltip as BaseTooltip, TooltipOverlay as BaseTooltipOverlay};
 
 use crate::{
-    ActiveTheme, Placement, StyledExt,
-    animation::{EffectTransition, ease_in_out_cubic, ease_out_cubic},
-    kbd::Kbd,
-    text::Text,
+    ActiveTheme, Placement, StyledExt, kbd::Kbd, scroll::ScrollableElement as _, text::Text,
 };
 
 pub(crate) fn init(_cx: &mut App) {
@@ -116,25 +111,24 @@ impl Render for Tooltip {
                 .h_flex()
                 .font_family(cx.theme().font_family.clone())
                 .m_3()
-                .bg(cx.theme().tokens.popover)
-                .text_color(cx.theme().popover_foreground)
-                .bg(cx.theme().tokens.popover)
-                .border_1()
-                .border_color(cx.theme().border)
-                .shadow_md()
-                .rounded(cx.theme().radius)
+                .popover_style(cx)
                 .justify_between()
                 .py_0p5()
                 .px_2()
                 .text_sm()
                 .gap_3()
                 .refine_style(&self.style)
-                .map(|this| {
-                    this.child(div().map(|this| match self.content {
-                        TooltipContext::Text(ref text) => this.child(text.clone()),
-                        TooltipContext::Element(ref builder) => this.child(builder(window, cx)),
-                    }))
-                })
+                .child(
+                    div()
+                        .min_w_0()
+                        .max_w((window.viewport_size().width * 0.65).min(px(500.)))
+                        .max_h(window.viewport_size().height * 0.5)
+                        .map(|this| match self.content {
+                            TooltipContext::Text(ref text) => this.child(text.clone()),
+                            TooltipContext::Element(ref builder) => this.child(builder(window, cx)),
+                        })
+                        .overflow_y_popup_scrollbar(),
+                )
                 .when_some(key_binding, |this, kbd| {
                     this.child(
                         div()
@@ -146,50 +140,6 @@ impl Render for Tooltip {
                 }),
         )
     }
-}
-
-// ── Managed tooltip system ──────────────────────────────────────────────────
-
-/// Duration of the slide-down enter animation.
-const ENTER_DURATION: Duration = Duration::from_millis(150);
-/// Duration of the position-slide animation when switching tooltips.
-const SLIDE_DURATION: Duration = Duration::from_millis(200);
-pub(crate) fn render_tooltip(
-    content_view: AnyView,
-    transition: BaseTooltipTransition,
-    _: &mut Window,
-    _: &mut App,
-) -> AnyElement {
-    div().child(content_view).map(|element| match transition {
-        BaseTooltipTransition::Switch {
-            epoch,
-            previous,
-            current,
-        } => {
-            let same_row = (current.origin.y - previous.origin.y).abs() < px(10.);
-            if !same_row {
-                return element.into_any_element();
-            }
-            let dx = current.center().x - previous.center().x;
-            EffectTransition::new(SLIDE_DURATION)
-                .ease(ease_in_out_cubic)
-                .slide_x(-dx, px(0.))
-                .apply(
-                    element,
-                    ElementId::NamedInteger("tooltip-slide".into(), epoch as u64),
-                )
-                .into_any_element()
-        }
-        BaseTooltipTransition::Enter { epoch } => EffectTransition::new(ENTER_DURATION)
-            .ease(ease_out_cubic)
-            .slide_y(px(4.), px(0.))
-            .fade(0.0, 1.0)
-            .apply(
-                element,
-                ElementId::NamedInteger("tooltip-enter".into(), epoch as u64),
-            )
-            .into_any_element(),
-    })
 }
 
 // ── Extension trait for managed tooltips ─────────────────────────────────────
@@ -234,7 +184,10 @@ impl ComponentTooltip {
 // ── Internal managed tooltip trait ──────────────────────────────────────────
 
 #[derive(Default)]
-struct TooltipLifetime(Rc<()>);
+struct TooltipLifetime {
+    lifetime: Rc<()>,
+    bounds: Option<Bounds<Pixels>>,
+}
 
 #[derive(Default)]
 struct TooltipTrigger {
@@ -243,9 +196,8 @@ struct TooltipTrigger {
     bounds: Bounds<Pixels>,
 }
 
-pub(crate) trait ManagedTooltipExt:
-    StatefulInteractiveElement + crate::ElementExt + Sized
-{
+/// Attach a tooltip to the window’s shared popup layer.
+pub trait ManagedTooltipExt: StatefulInteractiveElement + crate::ElementExt + Sized {
     fn managed_tooltip(
         self,
         build_tooltip: impl Fn(&mut Window, &mut App) -> AnyView + 'static,
@@ -258,7 +210,17 @@ pub(crate) trait ManagedTooltipExt:
         placement: Placement,
         build_tooltip: impl Fn(&mut Window, &mut App) -> AnyView + 'static,
     ) -> Self {
-        self.managed_tooltip_with(Some(placement), None, build_tooltip)
+        self.managed_tooltip_with_options(Some(placement), None, false, build_tooltip)
+    }
+
+    /// Like [`Self::managed_tooltip_at`], but every entry pays the full show
+    /// delay instead of switching immediately from a visible tooltip.
+    fn managed_tooltip_restarting_at(
+        self,
+        placement: Placement,
+        build_tooltip: impl Fn(&mut Window, &mut App) -> AnyView + 'static,
+    ) -> Self {
+        self.managed_tooltip_with_options(Some(placement), None, true, build_tooltip)
     }
 
     fn managed_tooltip_with(
@@ -267,32 +229,134 @@ pub(crate) trait ManagedTooltipExt:
         show_delay: Option<Duration>,
         build_tooltip: impl Fn(&mut Window, &mut App) -> AnyView + 'static,
     ) -> Self {
+        self.managed_tooltip_with_options(preferred_placement, show_delay, false, build_tooltip)
+    }
+
+    fn managed_tooltip_with_options(
+        self,
+        preferred_placement: Option<Placement>,
+        show_delay: Option<Duration>,
+        restart_delay: bool,
+        build_tooltip: impl Fn(&mut Window, &mut App) -> AnyView + 'static,
+    ) -> Self {
         let build_tooltip = Rc::new(build_tooltip);
+        self.managed_tooltip_request(false, move |bounds, _, _| {
+            let build = build_tooltip.clone();
+            let request = TooltipRequest::new(bounds, move |window, cx| build(window, cx));
+            let request = match preferred_placement {
+                Some(placement) => request.with_placement(placement),
+                None => request,
+            };
+            let request = match show_delay {
+                Some(delay) => request.with_show_delay(delay),
+                None => request,
+            };
+            Some(request.with_restart_delay(restart_delay))
+        })
+    }
+
+    /// Attach a window-managed tooltip with custom positioning or presentation.
+    ///
+    /// With `hide_on_leave`, leaving the trigger starts the fade immediately.
+    fn managed_tooltip_request(
+        self,
+        hide_on_leave: bool,
+        request: impl Fn(Bounds<Pixels>, &mut Window, &mut App) -> Option<TooltipRequest> + 'static,
+    ) -> Self {
+        self.managed_tooltip_trigger(hide_on_leave, false, request)
+    }
+
+    /// Open an interactive popup after its trigger's pointer-idle delay.
+    fn managed_interactive_tooltip(
+        self,
+        request: impl Fn(Bounds<Pixels>, &mut Window, &mut App) -> Option<TooltipRequest> + 'static,
+    ) -> Self {
+        self.managed_tooltip_trigger(false, true, move |bounds, window, cx| {
+            request(bounds, window, cx).map(TooltipRequest::interactive)
+        })
+    }
+
+    #[doc(hidden)]
+    fn managed_tooltip_trigger(
+        self,
+        hide_on_leave: bool,
+        interactive: bool,
+        request: impl Fn(Bounds<Pixels>, &mut Window, &mut App) -> Option<TooltipRequest> + 'static,
+    ) -> Self {
         let trigger = Rc::new(RefCell::new(TooltipTrigger::default()));
         let trigger_writer = trigger.clone();
+        let trigger_motion = trigger.clone();
+        let request = Rc::new(request);
+        let update_request = request.clone();
 
-        self.on_prepaint(move |bounds, window, _| {
+        let element = self.on_prepaint(move |bounds, window, cx| {
             let id = window.with_global_id("managed-tooltip-trigger".into(), |id, _| id.clone());
             // GPUI retains keyed element state for cached subtrees too, and
             // drops it after a frame that no longer contains the trigger.
-            let lifetime = window.with_element_state(&id, |state: Option<TooltipLifetime>, _| {
-                let state = state.unwrap_or_default();
-                (Rc::downgrade(&state.0), state)
-            });
+            let (lifetime, moved) =
+                window.with_element_state(&id, |state: Option<TooltipLifetime>, _| {
+                    let mut state = state.unwrap_or_default();
+                    let moved = state
+                        .bounds
+                        .replace(bounds)
+                        .is_some_and(|old| old != bounds);
+                    ((Rc::downgrade(&state.lifetime), moved), state)
+                });
+            if moved
+                && (interactive || (bounds.contains(&window.mouse_position())
+                    && window.content_mask().bounds.contains(&window.mouse_position())))
+                && WindowState::active_tooltip_for_trigger(&id, window, cx).is_some()
+            {
+                let request = update_request.clone();
+                let id = id.clone();
+                window.defer(cx, move |window, cx| {
+                    if let Some(overlay) = WindowState::active_tooltip_for_trigger(&id, window, cx)
+                    {
+                        let request = request(bounds, window, cx);
+                        overlay.update(cx, |overlay, cx| match request {
+                            Some(request) => overlay.refresh_trigger(request, cx),
+                            None => overlay.hide(cx),
+                        });
+                    }
+                });
+            }
             *trigger_writer.borrow_mut() = TooltipTrigger {
                 id: Some(id),
                 lifetime,
                 bounds,
             };
         })
+        .hover_listener_mode(HoverListenerMode::PointerTriggered)
         .on_hover({
             let trigger = trigger.clone();
-            let build_tooltip = build_tooltip.clone();
             move |hovered, window, cx| {
                 let trigger = trigger.borrow();
                 let Some(id) = trigger.id.as_ref() else {
                     return;
                 };
+                if interactive && !*hovered {
+                    if let Some(overlay) = WindowState::active_tooltip_for_trigger(id, window, cx) {
+                        overlay.update(cx, |overlay, cx| overlay.request_hide(window, cx));
+                    }
+                    return;
+                }
+                if !*hovered && (hide_on_leave || !window.is_pointer_motion()) {
+                    // Give the other hover listeners for this event a chance
+                    // to hand off the tooltip before dismissing the old one.
+                    let id = id.clone();
+                    window.defer(cx, move |window, cx| {
+                        if let Some(overlay) = WindowState::tooltip_overlay_for_trigger(
+                            &id,
+                            Weak::new(),
+                            false,
+                            window,
+                            cx,
+                        ) {
+                            overlay.update(cx, |overlay, cx| overlay.hide(cx));
+                        }
+                    });
+                    return;
+                }
                 let bounds = trigger.bounds;
                 // A press keeps the tooltip dismissed until the pointer leaves
                 // the trigger. This also drops the hover-enter that a click
@@ -300,6 +364,20 @@ pub(crate) trait ManagedTooltipExt:
                 if *hovered && WindowState::is_tooltip_trigger_pressed(bounds, window, cx) {
                     return;
                 }
+                if interactive && *hovered
+                    && let Some(overlay) = WindowState::active_tooltip_for_trigger(id, window, cx)
+                    && overlay.update(cx, |overlay, _| overlay.resume_interactive())
+                {
+                    return;
+                }
+                let request = if *hovered {
+                    let Some(request) = request(bounds, window, cx) else {
+                        return;
+                    };
+                    Some(request)
+                } else {
+                    None
+                };
                 if let Some(overlay) = WindowState::tooltip_overlay_for_trigger(
                     id,
                     trigger.lifetime.clone(),
@@ -307,27 +385,13 @@ pub(crate) trait ManagedTooltipExt:
                     window,
                     cx,
                 ) {
-                    if *hovered {
-                        overlay.update(cx, |o: &mut BaseTooltipOverlay, cx| {
-                            let build = build_tooltip.clone();
-                            let request = BaseTooltipRequest::new(bounds, move |window, cx| {
-                                build(window, cx)
-                            });
-                            let request = match preferred_placement {
-                                Some(placement) => request.with_placement(placement),
-                                None => request,
-                            };
-                            let request = match show_delay {
-                                Some(delay) => request.with_show_delay(delay),
-                                None => request,
-                            };
-                            o.request_show(request, window, cx);
-                        });
-                    } else {
-                        overlay.update(cx, |o: &mut BaseTooltipOverlay, cx| {
-                            o.request_hide(window, cx);
-                        });
-                    }
+                    overlay.update(cx, |overlay: &mut BaseTooltipOverlay, cx| {
+                        if let Some(request) = request {
+                            overlay.request_show(request, window, cx);
+                        } else {
+                            overlay.request_hide(window, cx);
+                        }
+                    });
                 }
             }
         })
@@ -338,7 +402,20 @@ pub(crate) trait ManagedTooltipExt:
                     overlay.hide(cx);
                 });
             }
-        })
+        });
+
+        if interactive {
+            element.on_mouse_move(move |_, window, cx| {
+                let trigger = trigger_motion.borrow();
+                if let Some(id) = &trigger.id
+                    && let Some(overlay) = WindowState::active_tooltip_for_trigger(id, window, cx)
+                {
+                    overlay.update(cx, |overlay, cx| overlay.restart_pending(window, cx));
+                }
+            })
+        } else {
+            element
+        }
     }
 }
 
@@ -460,35 +537,43 @@ mod tests {
         draw(cx);
     }
 
-    struct AdjacentTriggers;
+    struct AdjacentTriggers {
+        restart: bool,
+    }
 
     impl Render for AdjacentTriggers {
         fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
             div().size_full().children((0..2).map(|index| {
-                div()
+                let trigger = div()
                     .id(("trigger", index))
                     .absolute()
                     .left(px(10. + index as f32 * 100.))
                     .top(px(10.))
                     .w(px(100.))
-                    .h(px(30.))
-                    .managed_tooltip(move |_, cx| {
-                        cx.new(|_| super::Tooltip::new("tip").bg(gpui::rgb(TOOLTIP_COLORS[index])))
-                            .into()
-                    })
+                    .h(px(30.));
+                let build = move |_: &mut Window, cx: &mut gpui::App| {
+                    cx.new(|_| super::Tooltip::new("tip").bg(gpui::rgb(TOOLTIP_COLORS[index])))
+                        .into()
+                };
+                if self.restart {
+                    trigger.managed_tooltip_restarting_at(Placement::Bottom, build)
+                } else {
+                    trigger.managed_tooltip(build)
+                }
             }))
         }
     }
 
     fn open_adjacent_triggers(
         cx: &mut TestAppContext,
+        restart: bool,
     ) -> (VisualTestContext, Entity<AdjacentTriggers>) {
         cx.update(|cx| {
             crate::init(cx);
             // These tests cover tooltip lifetime, not intermediate fade frames.
             cx.set_reduce_motion(true);
         });
-        let probe = cx.new(|_| AdjacentTriggers);
+        let probe = cx.new(|_| AdjacentTriggers { restart });
         let window = cx.update(|cx| {
             cx.open_window(Default::default(), |window, cx| {
                 cx.new(|cx| Root::new(probe.clone(), window, cx))
@@ -507,7 +592,7 @@ mod tests {
 
     #[gpui::test]
     fn tooltips_switch_in_both_directions(cx: &mut TestAppContext) {
-        let (mut cx, probe) = open_adjacent_triggers(cx);
+        let (mut cx, probe) = open_adjacent_triggers(cx, false);
         for (step, index) in [0, 1, 0].into_iter().enumerate() {
             let at = point(px(50. + index as f32 * 100.), px(25.));
             cx.simulate_mouse_move(at, None, Default::default());
@@ -528,9 +613,35 @@ mod tests {
     }
 
     #[gpui::test]
+    fn restart_tooltips_pay_the_delay_on_every_entry(cx: &mut TestAppContext) {
+        let (mut cx, _) = open_adjacent_triggers(cx, true);
+        let first = point(px(50.), px(25.));
+        let second = point(px(150.), px(25.));
+
+        cx.simulate_mouse_move(first, None, Default::default());
+        wait(&mut cx);
+        assert_tooltip_shown(&mut cx, 0);
+
+        // Entering the neighbor dismisses the visible tooltip and waits its
+        // own delay instead of switching immediately.
+        cx.simulate_mouse_move(second, None, Default::default());
+        draw(&mut cx);
+        assert_tooltip_painted(&mut cx, 0, false);
+        assert_tooltip_painted(&mut cx, 1, false);
+
+        cx.executor().advance_clock(Duration::from_millis(100));
+        cx.run_until_parked();
+        draw(&mut cx);
+        assert_tooltip_painted(&mut cx, 1, false);
+
+        wait(&mut cx);
+        assert_tooltip_shown(&mut cx, 1);
+    }
+
+    #[gpui::test]
     fn leaving_a_trigger_does_not_cancel_the_next_tooltip_delay(cx: &mut TestAppContext) {
         for (source, destination) in [(0, 1), (1, 0)] {
-            let (mut cx, _) = open_adjacent_triggers(cx);
+            let (mut cx, _) = open_adjacent_triggers(cx, false);
             cx.simulate_mouse_move(
                 point(px(50. + source as f32 * 100.), px(25.)),
                 None,
@@ -726,14 +837,13 @@ mod tests {
             super::WindowState::tooltip_overlay(window, cx)
                 .unwrap()
                 .update(cx, |overlay, _| {
-                    *overlay =
-                        std::mem::take(overlay).render_with(move |view, transition, window, cx| {
-                            builds.set(builds.get() + 1);
-                            div()
-                                .bg(gpui::rgb(TOOLTIP_COLORS[0]))
-                                .child(super::render_tooltip(view, transition, window, cx))
-                                .into_any_element()
-                        });
+                    *overlay = std::mem::take(overlay).render_with(move |view, _, _, _| {
+                        builds.set(builds.get() + 1);
+                        div()
+                            .bg(gpui::rgb(TOOLTIP_COLORS[0]))
+                            .child(view)
+                            .into_any_element()
+                    });
                 });
         });
         (cx, buttons, builds)

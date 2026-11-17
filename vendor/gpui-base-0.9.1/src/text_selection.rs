@@ -1150,7 +1150,7 @@ impl TextSelectionHandle {
                     window.prevent_default();
                     cx.stop_propagation();
                     state.update(cx, |state, cx| {
-                        state.begin_edge_drag(edge, event.position, window, cx)
+                        state.begin_edge_drag(edge, event.position, false, window, cx)
                     });
                     WindowSelectionState::resolve_content_keys(&state, cx);
                 }
@@ -1171,7 +1171,7 @@ impl TextSelectionHandle {
                     };
                     cx.stop_propagation();
                     state.update(cx, |state, cx| {
-                        state.begin_edge_drag(edge, event.position, window, cx)
+                        state.begin_edge_drag(edge, event.position, true, window, cx)
                     });
                     WindowSelectionState::resolve_content_keys(&state, cx);
                 }
@@ -1281,6 +1281,7 @@ struct TouchSelection {
     active: bool,
     menu_open: bool,
     drag: Option<EdgeDrag>,
+    mouse_drag: bool,
     /// Where the menu was painted this frame, and the frame before: a press
     /// arrives between frames, and the surfaces may have moved in the one
     /// that has not painted yet.
@@ -1326,6 +1327,7 @@ impl TouchSelection {
         self.active = false;
         self.menu_open = false;
         self.drag = None;
+        self.mouse_drag = false;
         self.last_edges.set(None);
         had
     }
@@ -1736,6 +1738,7 @@ impl WindowSelectionState {
 
     /// Ends the current gesture and keeps its selection visible.
     pub fn end(&mut self, cx: &mut App) {
+        self.mouse_down_prepared = false;
         self.pending_extension_anchor = None;
         if !self.is_selecting {
             return;
@@ -2005,6 +2008,7 @@ impl WindowSelectionState {
         self.touch.active = self.snapshot().is_some();
         self.touch.menu_open = self.touch.active;
         self.touch.drag = None;
+        self.touch.mouse_drag = false;
         self.touch_changed(cx);
     }
 
@@ -2126,6 +2130,7 @@ impl WindowSelectionState {
         &mut self,
         edge: SelectionEdge,
         finger: Point<Pixels>,
+        mouse_drag: bool,
         window: &mut Window,
         cx: &mut App,
     ) {
@@ -2152,6 +2157,7 @@ impl WindowSelectionState {
         self.touch.active = true;
         self.touch.menu_open = false;
         self.touch.drag = Some(drag);
+        self.touch.mouse_drag = mouse_drag;
         self.publish_snapshots(cx);
         self.touch_changed(cx);
     }
@@ -2195,6 +2201,14 @@ impl WindowSelectionState {
         }
         self.end(cx);
         self.keep_touch_selection(cx);
+    }
+
+    fn end_mouse_selection(&mut self, cx: &mut App) {
+        if self.touch.drag.is_none() {
+            self.end(cx);
+        } else if self.touch.mouse_drag {
+            self.end_edge_drag(cx);
+        }
     }
 
     fn begin_in_window(
@@ -2953,7 +2967,7 @@ impl TextSelection {
     ) {
         if let Some(state) = live_text_selection_state(window, cx) {
             state.update(cx, |state, cx| {
-                state.begin_edge_drag(edge, finger, window, cx)
+                state.begin_edge_drag(edge, finger, false, window, cx)
             });
             WindowSelectionState::resolve_content_keys(&state, cx);
         }
@@ -3162,8 +3176,20 @@ fn retain_text_selection_state(
     let window_id = window.window_handle().window_id();
     let state = window.with_element_state::<Entity<WindowSelectionState>, _>(
         global_id.expect("TextSelection has a stable element id"),
-        |retained, _| {
-            let state = retained.unwrap_or_else(|| WindowSelectionState::acquire(window_id, cx));
+        |retained, window| {
+            let state = retained.unwrap_or_else(|| {
+                let state = WindowSelectionState::acquire(window_id, cx);
+                state.update(cx, |_, cx| {
+                    cx.observe_window_activation(window, |state, window, cx| {
+                        if !window.is_window_active() {
+                            state.end_edge_drag(cx);
+                            state.end(cx);
+                        }
+                    })
+                    .detach();
+                });
+                state
+            });
             (state.clone(), state)
         },
     );
@@ -3406,6 +3432,7 @@ fn paint_text_selection(state: &Entity<WindowSelectionState>, window: &mut Windo
             && event.pressed_button == Some(MouseButton::Left)
             && let Some(state) = drag_state.upgrade()
             && state.read(cx).touch.drag.is_some()
+            && state.read(cx).touch.mouse_drag
         {
             state.update(cx, |state, cx| {
                 state.update_edge_drag(event.position, window, cx)
@@ -3413,29 +3440,24 @@ fn paint_text_selection(state: &Entity<WindowSelectionState>, window: &mut Windo
             WindowSelectionState::resolve_content_keys(&state, cx);
         }
     });
-    let drag_state = state.downgrade();
-    window.on_mouse_event(move |event: &MouseUpEvent, phase, _, cx| {
-        if phase.bubble()
-            && event.button == MouseButton::Left
-            && let Some(state) = drag_state.upgrade()
-        {
-            state.update(cx, |state, cx| state.end_edge_drag(cx));
-        }
-    });
-
     let mouse_move_state = state.downgrade();
     window.on_mouse_event(move |event: &MouseMoveEvent, phase, window, cx| {
-        if phase.bubble()
-            && let Some(state) = mouse_move_state.upgrade()
-            // Moving the pointer only moves a selection being made.
+        let Some(state) = mouse_move_state.upgrade() else {
+            return;
+        };
+        if !event.dragging() {
+            // Recover a lost release before any hover handler consumes the move.
+            if phase.capture()
+                && !window.has_long_press_capture(&state)
+                && (state.read(cx).is_selecting || state.read(cx).mouse_down_prepared)
+            {
+                state.update(cx, |state, cx| state.end_mouse_selection(cx));
+            }
+        } else if phase.bubble()
             && state.read(cx).is_selecting
+            && state.read(cx).touch.drag.is_none()
         {
             state.update(cx, |state, cx| {
-                // A handle drag maps the pointer through the handle's offset;
-                // the raw pointer must not fight it.
-                if state.touch.drag.is_some() {
-                    return;
-                }
                 state.update_in_window(event.position, window, cx)
             });
             WindowSelectionState::resolve_content_keys(&state, cx);
@@ -3443,14 +3465,13 @@ fn paint_text_selection(state: &Entity<WindowSelectionState>, window: &mut Windo
     });
 
     let mouse_up_state = state.downgrade();
-    window.on_mouse_event(move |_: &MouseUpEvent, phase, _, cx| {
-        if phase.bubble()
+    window.on_mouse_event(move |event: &MouseUpEvent, phase, window, cx| {
+        if phase.capture()
+            && event.button == MouseButton::Left
             && let Some(state) = mouse_up_state.upgrade()
+            && !window.has_long_press_capture(&state)
         {
-            state.update(cx, |state, cx| {
-                state.mouse_down_prepared = false;
-                state.end(cx)
-            });
+            state.update(cx, |state, cx| state.end_mouse_selection(cx));
         }
     });
 

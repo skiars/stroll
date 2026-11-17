@@ -278,6 +278,11 @@ pub struct Style {
     /// The fill color of this element
     pub background: Option<Fill>,
 
+    /// Gaussian standard deviation of the backdrop blur in logical pixels.
+    pub backdrop_blur: Option<Pixels>,
+    /// Backdrop saturation multiplier. One keeps the original saturation.
+    pub backdrop_saturation: Option<f32>,
+
     /// The border color of this element
     pub border_color: Option<Hsla>,
 
@@ -708,7 +713,20 @@ impl Style {
             .to_pixels(rem_size)
             .clamp_radii_for_quad_size(bounds.size);
 
-        window.paint_drop_shadows(bounds, corner_radii, &self.box_shadow);
+        if let Some(radius) = self.backdrop_blur {
+            window.paint_backdrop_blur(
+                bounds,
+                corner_radii,
+                radius,
+                self.backdrop_saturation.unwrap_or(1.),
+            );
+        }
+        window.paint_drop_shadows_with_clip(
+            bounds,
+            corner_radii,
+            &self.box_shadow,
+            self.backdrop_blur.is_some(),
+        );
 
         let background_color = self.background.as_ref().and_then(Fill::color);
         if background_color.is_some_and(|color| !color.is_transparent()) {
@@ -802,6 +820,8 @@ impl Default for Style {
             flex_shrink: 1.0,
             flex_basis: Length::Auto,
             background: None,
+            backdrop_blur: None,
+            backdrop_saturation: None,
             border_color: None,
             border_style: BorderStyle::default(),
             corner_radii: Corners::default(),
@@ -821,6 +841,19 @@ impl Default for Style {
     }
 }
 
+/// A repeating pattern for a straight underline.
+#[derive(Copy, Clone, Default, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum UnderlinePattern {
+    /// A continuous stroke.
+    #[default]
+    Solid,
+    /// Short strokes separated by gaps.
+    Dashed,
+    /// Single-stroke-width marks separated by gaps.
+    Dotted,
+}
+
 /// The properties that can be applied to an underline.
 #[derive(
     Refineable, Copy, Clone, Default, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema,
@@ -834,6 +867,10 @@ pub struct UnderlineStyle {
 
     /// Whether the underline should be wavy, like in a spell checker.
     pub wavy: bool,
+
+    /// The pattern used for a straight underline.
+    #[serde(default)]
+    pub pattern: UnderlinePattern,
 }
 
 /// The properties that can be applied to a strikethrough.
@@ -1361,6 +1398,7 @@ mod tests {
                 thickness: px(2.),
                 color: Some(red()),
                 wavy: true,
+                pattern: Default::default(),
             }),
         };
         let expected_style = style_b;
@@ -1393,6 +1431,7 @@ mod tests {
                 thickness: px(4.),
                 color: None,
                 wavy: false,
+                pattern: Default::default(),
             }),
         };
 
@@ -1411,6 +1450,7 @@ mod tests {
                 thickness: px(4.),
                 color: None,
                 wavy: false,
+                pattern: Default::default(),
             }),
         };
 

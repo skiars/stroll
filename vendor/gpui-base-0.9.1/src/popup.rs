@@ -7,6 +7,7 @@ use gpui::{
 };
 
 use crate::{Positioner, ResolvedPosition, StyledExt as _};
+use gpui::prelude::FluentBuilder as _;
 
 /// Distance kept between a popup and the window edge.
 const WINDOW_MARGIN: Pixels = px(8.);
@@ -32,6 +33,8 @@ pub struct Popup {
     style: StyleRefinement,
     anchor: Anchor,
     offset: Pixels,
+    travel: Pixels,
+    occlude: bool,
     on_position: Option<Box<dyn Fn(ResolvedPosition, Bounds<Pixels>)>>,
     trigger: AnyElement,
     content: Option<AnyElement>,
@@ -46,6 +49,8 @@ impl Popup {
             style: StyleRefinement::default(),
             anchor: Anchor::TopLeft,
             offset: px(0.),
+            travel: px(0.),
+            occlude: true,
             on_position: None,
             trigger: trigger.into_any_element(),
             content: None,
@@ -60,6 +65,16 @@ impl Popup {
     /// Gap from the trigger along the anchor's outward direction, zero by default.
     pub fn offset(mut self, offset: Pixels) -> Self {
         self.offset = offset;
+        self
+    }
+
+    pub(crate) fn travel(mut self, travel: Pixels) -> Self {
+        self.travel = travel;
+        self
+    }
+
+    pub(crate) fn occlude(mut self, occlude: bool) -> Self {
+        self.occlude = occlude;
         self
     }
 
@@ -195,7 +210,8 @@ impl RenderOnce for Popup {
                     .margin(WINDOW_MARGIN)
                     // The host blocks the mouse, so no caller has to remember:
                     // what a popup covers belongs to the popup.
-                    .occlude()
+                    .when(self.occlude, Positioner::occlude)
+                    .travel(self.travel)
                     .child(content),
             )
             .with_priority(POPUP_PRIORITY),

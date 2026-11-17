@@ -369,6 +369,8 @@ impl Language {
     ///
     /// (language, query, injection, locals)
     pub(super) fn config(&self) -> GrammarConfig {
+        #[cfg(feature = "tree-sitter-cpp")]
+        let cpp_highlights;
         let (language, query, injection, locals) = match self {
             Self::Plain => return GrammarConfig::plain(self.name()),
             Self::Json => (
@@ -427,12 +429,15 @@ impl Language {
                 "",
             ),
             #[cfg(feature = "tree-sitter-cpp")]
-            Self::Cpp => (
-                tree_sitter_cpp::LANGUAGE,
-                tree_sitter_cpp::HIGHLIGHT_QUERY,
-                "",
-                "",
-            ),
+            Self::Cpp => {
+                // The C++ query only defines captures specific to C++.
+                cpp_highlights = format!(
+                    "{}\n{}",
+                    tree_sitter_c::HIGHLIGHT_QUERY,
+                    tree_sitter_cpp::HIGHLIGHT_QUERY,
+                );
+                (tree_sitter_cpp::LANGUAGE, cpp_highlights.as_str(), "", "")
+            }
             #[cfg(feature = "tree-sitter-javascript")]
             Self::JavaScript => (
                 tree_sitter_javascript::LANGUAGE,

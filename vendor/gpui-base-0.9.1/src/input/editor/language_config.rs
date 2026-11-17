@@ -1,4 +1,4 @@
-//! Language-specific bracket pairing and indentation rules.
+//! Language-specific bracket pairing, indentation and line comment rules.
 
 use gpui::SharedString;
 use regex::Regex;
@@ -83,6 +83,7 @@ pub struct LanguageConfig {
     /// Automatic insertion is allowed before these characters, whitespace, or EOF.
     pub auto_close_before: SharedString,
     pub indentation_rules: Option<IndentationRules>,
+    pub(crate) line_comment: Option<SharedString>,
 }
 
 impl Default for LanguageConfig {
@@ -112,6 +113,7 @@ impl Default for LanguageConfig {
             auto_closing_pairs: Some(pairs),
             auto_close_before: ";:.,=}])>".into(),
             indentation_rules: None,
+            line_comment: None,
         }
     }
 }
@@ -131,6 +133,16 @@ impl LanguageConfig {
     }
     pub fn indentation_rules(mut self, rules: IndentationRules) -> Self {
         self.indentation_rules = Some(rules);
+        self
+    }
+
+    /// Set the token that opens a line comment. An invalid token disables line commenting.
+    pub fn line_comment(mut self, marker: impl Into<SharedString>) -> Self {
+        let marker = marker.into();
+        self.line_comment = (!marker.is_empty()
+            && !marker.contains(['\r', '\n'])
+            && marker.trim() == marker.as_ref())
+        .then_some(marker);
         self
     }
 

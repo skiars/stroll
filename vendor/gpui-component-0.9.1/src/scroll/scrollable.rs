@@ -1,8 +1,11 @@
-use std::{panic::Location, rc::Rc};
+use std::panic::Location;
 
 use crate::{InteractiveElementExt as _, StyledExt};
 
-use super::{ScrollableMask, Scrollbar, ScrollbarAxis, ScrollbarHandle};
+use super::{
+    ScrollableMask, Scrollbar, ScrollbarAxis, ScrollbarHandle, content_scrollbar, popup_scrollbar,
+    thin_scrollbar,
+};
 use gpui::{
     App, Div, Element, ElementId, InteractiveElement, IntoElement, Overflow, ParentElement,
     PointRefinement, RenderOnce, ScrollHandle, Stateful, StatefulInteractiveElement,
@@ -20,23 +23,28 @@ pub trait ScrollableElement: InteractiveElement + Styled + ParentElement + Eleme
         self,
         scroll_handle: &H,
         axis: impl Into<ScrollbarAxis>,
-    ) -> Self {
-        self.child(ScrollbarLayer {
-            id: caller_id(),
-            axis: axis.into(),
-            scroll_handle: Rc::new(scroll_handle.clone()),
-        })
+    ) -> Self
+    where
+        Self: ScrollbarViewport,
+    {
+        self.scrollbar_overlay(thin_scrollbar(scroll_handle).axis(axis))
     }
 
     /// Adds a vertical scrollbar to the element.
     #[track_caller]
-    fn vertical_scrollbar<H: ScrollbarHandle + Clone>(self, scroll_handle: &H) -> Self {
+    fn vertical_scrollbar<H: ScrollbarHandle + Clone>(self, scroll_handle: &H) -> Self
+    where
+        Self: ScrollbarViewport,
+    {
         self.scrollbar(scroll_handle, ScrollbarAxis::Vertical)
     }
 
     /// Adds a horizontal scrollbar to the element.
     #[track_caller]
-    fn horizontal_scrollbar<H: ScrollbarHandle + Clone>(self, scroll_handle: &H) -> Self {
+    fn horizontal_scrollbar<H: ScrollbarHandle + Clone>(self, scroll_handle: &H) -> Self
+    where
+        Self: ScrollbarViewport,
+    {
         self.scrollbar(scroll_handle, ScrollbarAxis::Horizontal)
     }
 
@@ -60,6 +68,45 @@ pub trait ScrollableElement: InteractiveElement + Styled + ParentElement + Eleme
     fn overflow_y_scrollbar(self) -> Scrollable<Self> {
         Scrollable::new(self, ScrollbarAxis::Vertical)
     }
+
+    /// Makes a popup body vertically scrollable with a narrow overlay scrollbar.
+    #[track_caller]
+    fn overflow_y_popup_scrollbar(self) -> Scrollable<Self> {
+        Scrollable::new(self, ScrollbarAxis::Vertical)
+    }
+
+    /// Makes a content reader horizontally scrollable with a persistent
+    /// standard-width scrollbar.
+    #[track_caller]
+    fn overflow_x_content_scrollbar(self) -> Scrollable<Self> {
+        let mut scrollable = Scrollable::new(self, ScrollbarAxis::Horizontal);
+        scrollable.persistent = true;
+        scrollable
+    }
+}
+
+/// Install a scrollbar outside a div's scrolled contents.
+pub trait ScrollbarViewport: Sized {
+    /// Add a compact overlay scrollbar to a popup's viewport.
+    #[track_caller]
+    fn vertical_popup_scrollbar<H: ScrollbarHandle + Clone>(self, handle: &H) -> Self {
+        self.scrollbar_overlay(popup_scrollbar(handle))
+    }
+
+    #[doc(hidden)]
+    fn scrollbar_overlay(self, scrollbar: Scrollbar) -> Self;
+}
+
+impl ScrollbarViewport for Div {
+    fn scrollbar_overlay(self, scrollbar: Scrollbar) -> Self {
+        self.viewport_overlay(ScrollbarLayer(scrollbar))
+    }
+}
+
+impl ScrollbarViewport for Stateful<Div> {
+    fn scrollbar_overlay(self, scrollbar: Scrollbar) -> Self {
+        self.viewport_overlay(ScrollbarLayer(scrollbar))
+    }
 }
 
 /// A scrollable element wrapper that renders the original element as the scroll area and overlays scrollbars.
@@ -69,6 +116,9 @@ pub struct Scrollable<E: InteractiveElement + Styled + ParentElement + Element> 
     element: E,
     axis: ScrollbarAxis,
     scroll_bounce: Option<bool>,
+    /// Cached content uses a persistent standard scrollbar; every other surface
+    /// uses the thin overlay geometry.
+    persistent: bool,
 }
 
 impl<E> Scrollable<E>
@@ -82,6 +132,7 @@ where
             element,
             axis: axis.into(),
             scroll_bounce: None,
+            persistent: false,
         }
     }
 
@@ -149,6 +200,11 @@ where
         let area_id = (self.id.clone(), "area");
         let content_id = (self.id.clone(), "content");
         let scrollbar_id = (self.id.clone(), "scrollbar");
+        let scrollbar = if self.persistent {
+            content_scrollbar(&scroll_handle).axis(self.axis)
+        } else {
+            thin_scrollbar(&scroll_handle).axis(self.axis)
+        };
 
         let mut content = self
             .element
@@ -218,13 +274,7 @@ where
             .when(self.axis == ScrollbarAxis::Horizontal, |this| {
                 this.child(ScrollableMask::vertical_wheel(&scroll_handle))
             })
-            .child(render_scrollbar(
-                scrollbar_id,
-                &scroll_handle,
-                self.axis,
-                window,
-                cx,
-            ))
+            .child(render_scrollbar(scrollbar.id(scrollbar_id), window, cx))
     }
 }
 
@@ -237,18 +287,13 @@ where
 }
 
 #[derive(IntoElement)]
-struct ScrollbarLayer<H: ScrollbarHandle + Clone> {
-    id: ElementId,
-    axis: ScrollbarAxis,
-    scroll_handle: Rc<H>,
-}
+struct ScrollbarLayer(Scrollbar);
 
-impl<H> RenderOnce for ScrollbarLayer<H>
-where
-    H: ScrollbarHandle + Clone + 'static,
-{
+impl RenderOnce for ScrollbarLayer {
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
-        render_scrollbar(self.id, self.scroll_handle.as_ref(), self.axis, window, cx)
+        div().when(!window.is_inspector_picking(cx), |layer| {
+            layer.child(self.0)
+        })
     }
 }
 
@@ -305,13 +350,7 @@ where
 }
 
 #[inline]
-fn render_scrollbar<H: ScrollbarHandle + Clone>(
-    id: impl Into<ElementId>,
-    scroll_handle: &H,
-    axis: ScrollbarAxis,
-    window: &mut Window,
-    cx: &mut App,
-) -> Div {
+fn render_scrollbar(scrollbar: Scrollbar, window: &mut Window, cx: &mut App) -> Div {
     // Do not render scrollbar when inspector is picking elements,
     // to allow us to pick the background elements.
     let is_inspector_picking = window.is_inspector_picking(cx);
@@ -323,12 +362,7 @@ fn render_scrollbar<H: ScrollbarHandle + Clone>(
         .absolute()
         .inset_0()
         .debug_selector(|| "scrollbar-overlay".to_string())
-        .child(
-            Scrollbar::new(scroll_handle)
-                .id(id)
-                .axis(axis)
-                .viewport_from_layout(),
-        )
+        .child(scrollbar.viewport_from_layout())
 }
 
 #[cfg(feature = "test-support")]

@@ -21,12 +21,13 @@ use crate::{
     SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, Shadow, SharedString, Size,
     StrikethroughStyle, Style, SubpixelSprite, Subscription, SystemWindowTab,
     SystemWindowTabController, TabStopMap, Task, TextInputConfiguration, TextInputStateChange,
-    TextRenderingMode, TextStyle, TextStyleRefinement, ThermalState, TransformationMatrix,
-    Underline, UnderlineStyle, WindowAppearance, WindowBackgroundAppearance, WindowBounds,
-    WindowControls, WindowDecorations, WindowInsets, WindowOptions, WindowParams, WindowTextSystem,
-    WindowVisibility, point, prelude::*, px, rems, size, transparent_black,
+    TextRenderingMode, TextRenderingPreference, TextStyle, TextStyleRefinement, ThermalState,
+    TransformationMatrix, Underline, UnderlinePattern, UnderlineStyle, WindowAppearance, WindowBackgroundAppearance,
+    WindowBounds, WindowControls, WindowDecorations, WindowInsets, WindowOptions, WindowParams,
+    WindowTextSystem, WindowVisibility, point, prelude::*, px, rems, size, transparent_black,
 };
 
+use crate::ImageSampling;
 use crate::gestures::{GestureTuning, RecognizedTouchGesture, TouchGestureRecognizer};
 use crate::interactive::TouchEvent;
 use anyhow::{Context as _, Result, anyhow};
@@ -1033,6 +1034,7 @@ pub(crate) struct DeferredDraw {
     absolute_offset: Point<Pixels>,
     prepaint_range: Range<PrepaintStateIndex>,
     paint_range: Range<PaintIndex>,
+    paint_only: bool,
     /// The entities the deferred element accessed while it was last drawn, in
     /// any phase, restored when its prepaint is reused.
     accessed_entities: FxHashSet<EntityId>,
@@ -1227,8 +1229,10 @@ pub struct Window {
     is_resizable: bool,
     is_minimizable: bool,
     sprite_atlas: Arc<dyn PlatformAtlas>,
+    frame_glyphs: FxHashMap<RenderGlyphParams, Option<(AtlasTile, Point<ScaledPixels>)>>,
     text_system: Rc<WindowTextSystem>,
     text_rendering_mode: Rc<Cell<TextRenderingMode>>,
+    text_rendering_preference: Rc<Cell<TextRenderingPreference>>,
     rem_size: Pixels,
     /// The stack of override values for the window's rem size.
     ///
@@ -1243,6 +1247,7 @@ pub struct Window {
     pub(crate) rendered_entity_stack: Vec<EntityId>,
     pub(crate) element_offset_stack: Vec<Point<Pixels>>,
     pub(crate) element_opacity: f32,
+    paint_only: bool,
     pub(crate) content_mask_stack: Vec<ContentMask<Pixels>>,
     pub(crate) requested_autoscroll: Option<Bounds<Pixels>>,
     /// The [`TextInputConfiguration`] most recently forwarded to the platform
@@ -1257,12 +1262,16 @@ pub struct Window {
     pub(crate) next_tooltip_id: TooltipId,
     pub(crate) tooltip_bounds: Option<TooltipBounds>,
     pub(crate) next_frame_callbacks: Rc<RefCell<Vec<FrameCallback>>>,
+    pub(crate) smooth_scroll: crate::smooth_scroll::ScrollAnimations,
+    pub(crate) touchpad_scroll: crate::touchpad_scroll::TouchpadScroll,
     pub(crate) dirty_views: FxHashSet<EntityId>,
     focus_listeners: SingleSubscriberSet<AnyWindowFocusListener>,
     pub(crate) focus_lost_listeners: SingleSubscriberSet<AnyObserver>,
     focus_lost_path: SmallVec<[FocusId; 8]>,
     default_prevented: bool,
     mouse_position: Point<Pixels>,
+    last_pointer_event_position: Option<Point<Pixels>>,
+    pointer_motion: bool,
     mouse_hit_test: HitTest,
     modifiers: Modifiers,
     capslock: Capslock,
@@ -1888,6 +1897,8 @@ impl Window {
             let input_rate_tracker = input_rate_tracker.clone();
             let mut deferred_force_render = false;
             let mut frame_pacer = FramePacer::default();
+            let log_frame_timings = std::env::var_os("STROLL_FRAME_TIMINGS").is_some_and(|v| v == "1");
+            let mut last_submission = None;
             move |request_frame_options| {
                 #[cfg(feature = "profiler")]
                 let (_foreground_turn, window_id) = {
@@ -2039,9 +2050,22 @@ impl Window {
                                     // atlas tile references after a GPU device recovery.
                                     window.refresh();
                                 }
+                                let started = log_frame_timings.then(Instant::now);
                                 let arena_clear_needed = window.draw(cx);
+                                let before_present = started.map(|_| Instant::now());
                                 window.present();
                                 arena_clear_needed.clear(cx);
+                                if let Some((started, before_present)) = started.zip(before_present) {
+                                    let end = Instant::now();
+                                    let interval = last_submission.replace(end)
+                                        .map_or(0, |previous| end.duration_since(previous).as_micros());
+                                    eprintln!(
+                                        "frame_timing window={:?} kind=draw draw_us={} submit_us={} interval_us={interval}",
+                                        window.handle.window_id(),
+                                        before_present.duration_since(started).as_micros(),
+                                        end.duration_since(before_present).as_micros(),
+                                    );
+                                }
                             })
                             .with_context(|| {
                                 format!(
@@ -2053,7 +2077,20 @@ impl Window {
                     })
                 } else if needs_present {
                     handle
-                        .update(&mut cx, |_, window, _| window.present())
+                        .update(&mut cx, |_, window, _| {
+                            let started = log_frame_timings.then(Instant::now);
+                            window.present();
+                            if let Some(started) = started {
+                                let end = Instant::now();
+                                let interval = last_submission.replace(end)
+                                    .map_or(0, |previous| end.duration_since(previous).as_micros());
+                                eprintln!(
+                                    "frame_timing window={:?} kind=present draw_us=0 submit_us={} interval_us={interval}",
+                                    window.handle.window_id(),
+                                    end.duration_since(started).as_micros(),
+                                );
+                            }
+                        })
                         .with_context(|| {
                             format!("presenting frame for window {:?}", handle.window_id())
                         })
@@ -2184,6 +2221,9 @@ impl Window {
                 handle
                     .update(&mut cx, |_, window, cx| {
                         window.active.set(active);
+                        if !active {
+                            window.smooth_scroll.cancel();
+                        }
                         window.modifiers = window.platform_window.modifiers();
                         window.capslock = window.platform_window.capslock();
                         window
@@ -2358,8 +2398,10 @@ impl Window {
             is_resizable,
             is_minimizable,
             sprite_atlas,
+            frame_glyphs: FxHashMap::default(),
             text_system,
             text_rendering_mode: cx.text_rendering_mode.clone(),
+            text_rendering_preference: cx.text_rendering_preference.clone(),
             rem_size: px(16.),
             rem_size_override_stack: SmallVec::new(),
             viewport_size: content_size,
@@ -2371,12 +2413,15 @@ impl Window {
             element_offset_stack: Vec::new(),
             content_mask_stack: Vec::new(),
             element_opacity: 1.0,
+            paint_only: false,
             requested_autoscroll: None,
             last_text_input_configuration: None,
             focused_text_input: None,
             rendered_frame: Frame::new(DispatchTree::new(cx.keymap.clone(), cx.actions.clone())),
             next_frame: Frame::new(DispatchTree::new(cx.keymap.clone(), cx.actions.clone())),
             next_frame_callbacks,
+            smooth_scroll: Default::default(),
+            touchpad_scroll: Default::default(),
             next_hitbox_id: HitboxId(0),
             next_tooltip_id: TooltipId::default(),
             tooltip_bounds: None,
@@ -2386,6 +2431,8 @@ impl Window {
             focus_lost_path: SmallVec::new(),
             default_prevented: true,
             mouse_position,
+            last_pointer_event_position: None,
+            pointer_motion: false,
             mouse_hit_test: HitTest::default(),
             modifiers,
             capslock,
@@ -3459,7 +3506,12 @@ impl Window {
     ) {
         self.invalidator.debug_assert_paint();
         let underline = self.underline(origin, width, style);
-        if exclusions.is_empty() {
+        let pattern = if style.wavy {
+            UnderlinePattern::Solid
+        } else {
+            style.pattern
+        };
+        if exclusions.is_empty() && pattern == UnderlinePattern::Solid {
             self.next_frame.scene.insert_primitive(underline);
             return;
         }
@@ -3477,22 +3529,46 @@ impl Window {
                 (start < end).then_some(start..end)
             })
             .collect::<SmallVec<[_; 4]>>();
-        if exclusions.is_empty() {
+        if exclusions.is_empty() && pattern == UnderlinePattern::Solid {
             self.next_frame.scene.insert_primitive(underline);
             return;
         }
         exclusions.sort_unstable_by_key(|span| span.start);
 
-        let mut paint_span = |start, end| {
-            self.next_frame.scene.insert_primitive(Underline {
-                content_mask: ContentMask {
-                    bounds: Bounds::from_corners(
-                        point(start, bounds.top()),
-                        point(end, bounds.bottom()),
-                    ),
-                },
-                ..underline
-            });
+        let mut paint_span = |start: ScaledPixels, end: ScaledPixels| {
+            let mut paint = |start, end| {
+                let mut segment = underline;
+                segment.content_mask.bounds = Bounds::from_corners(
+                    point(start, bounds.top()),
+                    point(end, bounds.bottom()),
+                );
+                if pattern != UnderlinePattern::Solid {
+                    segment.bounds.origin.x = start;
+                    segment.bounds.size.width = end - start;
+                }
+                self.next_frame.scene.insert_primitive(segment);
+            };
+            if pattern == UnderlinePattern::Solid {
+                paint(start, end);
+                return;
+            }
+
+            let unit = underline.thickness.0.max(1.);
+            let (stroke, gap) = match pattern {
+                UnderlinePattern::Dashed => (3. * unit, 2. * unit),
+                _ => (unit, 2. * unit),
+            };
+            let period = stroke + gap;
+            let origin = underline.bounds.left().0;
+            let mut x = origin + ((start.0 - origin) / period).floor() * period;
+            while x < end.0 {
+                let left = x.max(start.0);
+                let right = (x + stroke).min(end.0);
+                if left < right {
+                    paint(ScaledPixels(left), ScaledPixels(right));
+                }
+                x += period;
+            }
         };
         let mut start = bounds.left();
         for exclusion in exclusions {
@@ -3599,6 +3675,11 @@ impl Window {
         self.mouse_position
     }
 
+    /// Whether the current input callback is handling a pointer position change.
+    pub fn is_pointer_motion(&self) -> bool {
+        self.pointer_motion
+    }
+
     /// Captures the pointer for the given hitbox. While captured, all mouse move and mouse up
     /// events will be routed to listeners that check this hitbox's `is_hovered` status,
     /// regardless of actual hit testing. This enables drag operations that continue
@@ -3696,6 +3777,7 @@ impl Window {
             }
         }
         if !cx.mode.skip_drawing() {
+            self.frame_glyphs.clear();
             self.draw_roots(cx);
             #[cfg(feature = "profiler")]
             {
@@ -4130,7 +4212,15 @@ impl Window {
             traversal_order.sort_by_key(|ix| self.next_frame.deferred_draws[*ix].priority);
 
             for deferred_draw_ix in traversal_order {
-                let (element, parent_node, current_view, rem_size, absolute_offset, prepaint_range) = {
+                let (
+                    element,
+                    parent_node,
+                    current_view,
+                    rem_size,
+                    absolute_offset,
+                    prepaint_range,
+                    paint_only,
+                ) = {
                     let deferred_draw = &mut self.next_frame.deferred_draws[deferred_draw_ix];
                     self.element_id_stack
                         .clone_from(&deferred_draw.element_id_stack);
@@ -4143,11 +4233,13 @@ impl Window {
                         deferred_draw.rem_size,
                         deferred_draw.absolute_offset,
                         deferred_draw.prepaint_range.clone(),
+                        deferred_draw.paint_only,
                     )
                 };
                 self.next_frame.dispatch_tree.set_active_node(parent_node);
 
                 let prepaint_start = self.prepaint_index();
+                self.paint_only = paint_only;
                 if let Some(mut element) = element {
                     let ((), accessed_entities) = cx.detect_accessed_entities(|cx| {
                         self.with_rendered_view(current_view, |window| {
@@ -4170,6 +4262,7 @@ impl Window {
                     );
                     self.reuse_prepaint(prepaint_range);
                 }
+                self.paint_only = false;
                 let prepaint_end = self.prepaint_index();
                 self.next_frame.deferred_draws[deferred_draw_ix].prepaint_range =
                     prepaint_start..prepaint_end;
@@ -4202,6 +4295,7 @@ impl Window {
 
             let paint_start = self.paint_index();
             let content_mask = deferred_draw.content_mask;
+            self.paint_only = deferred_draw.paint_only;
             if let Some(element) = deferred_draw.element.as_mut() {
                 let ((), accessed_entities) = cx.detect_accessed_entities(|cx| {
                     self.with_rendered_view(deferred_draw.current_view, |window| {
@@ -4216,6 +4310,7 @@ impl Window {
             } else {
                 self.reuse_paint(deferred_draw.paint_range.clone());
             }
+            self.paint_only = false;
             let paint_end = self.paint_index();
             deferred_draw.paint_range = paint_start..paint_end;
         }
@@ -4288,6 +4383,7 @@ impl Window {
                     absolute_offset: deferred_draw.absolute_offset,
                     prepaint_range: deferred_draw.prepaint_range.clone(),
                     paint_range: deferred_draw.paint_range.clone(),
+                    paint_only: deferred_draw.paint_only,
                     accessed_entities: deferred_draw.accessed_entities.clone(),
                 }),
         );
@@ -4760,6 +4856,7 @@ impl Window {
         self.invalidator.debug_assert_prepaint();
         let parent_node = self.next_frame.dispatch_tree.active_node_id().unwrap();
         self.next_frame.deferred_draws.push(DeferredDraw {
+            paint_only: self.paint_only,
             current_view: self.current_view(),
             parent_node,
             element_id_stack: self.element_id_stack.clone(),
@@ -4773,6 +4870,38 @@ impl Window {
             paint_range: PaintIndex::default()..PaintIndex::default(),
             accessed_entities: FxHashSet::default(),
         });
+    }
+
+    /// Draw a leaving overlay without registering hit targets or input handlers.
+    pub fn with_paint_only<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
+        let previous = std::mem::replace(&mut self.paint_only, true);
+        let result = f(self);
+        self.paint_only = previous;
+        result
+    }
+
+    pub(crate) fn is_paint_only(&self) -> bool {
+        self.paint_only
+    }
+
+    /// Opt into independently repainting this clipped viewport on supporting renderers.
+    pub(crate) fn paint_partial_region(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        scroll: Option<Pixels>,
+        paint: impl FnOnce(&mut Self),
+    ) {
+        self.invalidator.debug_assert_paint();
+        let bounds = bounds.intersect(&self.content_mask().bounds);
+        if bounds.is_empty() {
+            paint(self);
+            return;
+        }
+        let region = self.cover_bounds(bounds);
+        let offset = scroll.map(|offset| offset.scale(self.scale_factor()));
+        self.next_frame.scene.begin_scroll_region(region, offset);
+        self.with_content_mask(Some(ContentMask { bounds }), paint);
+        self.next_frame.scene.end_partial_region();
     }
 
     /// Creates a new painting layer for the specified bounds. A "layer" is a batch
@@ -4800,6 +4929,33 @@ impl Window {
         result
     }
 
+    /// Blur the content already drawn within a rounded region of this window.
+    /// Renderers without a backdrop pass leave the underlying pixels unchanged.
+    pub fn paint_backdrop_blur(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        corner_radii: Corners<Pixels>,
+        radius: Pixels,
+        saturation: f32,
+    ) {
+        self.invalidator.debug_assert_paint();
+        let opacity = self.element_opacity();
+        if !radius.0.is_finite() || radius <= px(0.) || opacity <= 0. {
+            return;
+        }
+        let scale = self.scale_factor();
+        let blur = crate::BackdropBlur {
+            order: 0,
+            bounds: self.cover_bounds(bounds),
+            content_mask: self.snapped_content_mask(),
+            corner_radii: corner_radii.scale(scale),
+            radius: radius.scale(scale),
+            saturation,
+            opacity,
+        };
+        self.next_frame.scene.insert_backdrop_blur(blur);
+    }
+
     /// Paint the drop (non-inset) shadows from `shadows` into the scene at the current
     /// z-index. Inset shadows are skipped; paint those with [`Self::paint_inset_shadows`]
     /// after the element's background so they layer on top of the fill.
@@ -4810,6 +4966,16 @@ impl Window {
         bounds: Bounds<Pixels>,
         corner_radii: Corners<Pixels>,
         shadows: &[BoxShadow],
+    ) {
+        self.paint_drop_shadows_with_clip(bounds, corner_radii, shadows, false);
+    }
+
+    pub(crate) fn paint_drop_shadows_with_clip(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        corner_radii: Corners<Pixels>,
+        shadows: &[BoxShadow],
+        clip_interior: bool,
     ) {
         self.invalidator.debug_assert_paint();
 
@@ -4833,7 +4999,7 @@ impl Window {
                 element_bounds,
                 element_corner_radii,
                 inset: 0,
-                pad: 0,
+                clip_interior: u32::from(clip_interior),
             });
         }
     }
@@ -4878,7 +5044,7 @@ impl Window {
                 element_bounds,
                 element_corner_radii,
                 inset: 1,
-                pad: 0,
+                clip_interior: 0,
             });
         }
     }
@@ -5025,9 +5191,7 @@ impl Window {
         width: Pixels,
         style: &UnderlineStyle,
     ) {
-        self.invalidator.debug_assert_paint();
-        let underline = self.underline(origin, width, style);
-        self.next_frame.scene.insert_primitive(underline);
+        self.paint_underline_with_exclusions(origin, width, style, &[]);
     }
 
     /// Paint a strikethrough into the scene for the next frame at the current z-index.
@@ -5082,17 +5246,21 @@ impl Window {
         let scale_factor = self.scale_factor();
         let glyph_origin = origin.scale(scale_factor);
 
-        let quantized_origin = Point::new(
-            round_half_toward_zero(glyph_origin.x.0 * SUBPIXEL_VARIANTS_X as f32)
-                / SUBPIXEL_VARIANTS_X as f32,
-            round_half_toward_zero(glyph_origin.y.0 * SUBPIXEL_VARIANTS_Y as f32)
-                / SUBPIXEL_VARIANTS_Y as f32,
-        );
-        let subpixel_variant = Point::new(
-            (quantized_origin.x.fract() * SUBPIXEL_VARIANTS_X as f32) as u8,
-            (quantized_origin.y.fract() * SUBPIXEL_VARIANTS_Y as f32) as u8,
-        );
-        let integer_origin = quantized_origin.map(|c| ScaledPixels(c.trunc()));
+        let preference = if cfg!(any(target_os = "linux", target_os = "windows")) {
+            self.text_rendering_preference.get()
+        } else {
+            TextRenderingPreference::PixelAligned
+        };
+        let hinting = preference.uses_hinting(scale_factor);
+        let vertical_steps = match preference {
+            TextRenderingPreference::HighPrecision => 4,
+            _ => SUBPIXEL_VARIANTS_Y,
+        };
+        let subpixel_steps = point(SUBPIXEL_VARIANTS_X, vertical_steps);
+        let (integer_x, phase_x) = quantize_glyph_position(glyph_origin.x, subpixel_steps.x);
+        let (integer_y, phase_y) = quantize_glyph_position(glyph_origin.y, subpixel_steps.y);
+        let integer_origin = point(integer_x, integer_y);
+        let subpixel_variant = point(phase_x, phase_y);
         let subpixel_rendering = self.should_use_subpixel_rendering(font_id, font_size);
         let dilation = self.text_system().glyph_dilation_for_color(color);
         let params = RenderGlyphParams {
@@ -5100,23 +5268,17 @@ impl Window {
             glyph_id,
             font_size,
             subpixel_variant,
+            subpixel_steps,
             scale_factor,
             is_emoji: false,
             subpixel_rendering,
+            hinting,
             dilation,
         };
 
-        let raster_bounds = self.text_system().raster_bounds(&params)?;
-        if !raster_bounds.is_zero() {
-            let tile = self
-                .sprite_atlas
-                .get_or_insert_with(params.clone().into(), &mut || {
-                    let (size, bytes) = self.text_system().rasterize_glyph(&params)?;
-                    Ok(Some((size, Cow::Owned(bytes))))
-                })?
-                .expect("Callback above only errors or returns Some");
+        if let Some((tile, origin)) = self.glyph_tile(params)? {
             let bounds = Bounds {
-                origin: integer_origin + raster_bounds.origin.map(Into::into),
+                origin: integer_origin + origin,
                 size: tile.bounds.size.map(Into::into),
             };
             let content_mask = self.snapped_content_mask();
@@ -5144,6 +5306,31 @@ impl Window {
             }
         }
         Ok(())
+    }
+
+    fn glyph_tile(
+        &mut self,
+        params: RenderGlyphParams,
+    ) -> Result<Option<(AtlasTile, Point<ScaledPixels>)>> {
+        // 一帧内重复字形共用一次图集与字形边界查询。
+        if let Some(tile) = self.frame_glyphs.get(&params) {
+            return Ok(*tile);
+        }
+        let raster_bounds = self.text_system().raster_bounds(&params)?;
+        let tile = if raster_bounds.is_zero() {
+            None
+        } else {
+            let tile = self
+                .sprite_atlas
+                .get_or_insert_with(params.clone().into(), &mut || {
+                    let (size, bytes) = self.text_system().rasterize_glyph(&params)?;
+                    Ok(Some((size, Cow::Owned(bytes))))
+                })?
+                .expect("Callback above only errors or returns Some");
+            Some((tile, raster_bounds.origin.map(Into::into)))
+        };
+        self.frame_glyphs.insert(params, tile);
+        Ok(tile)
     }
 
     fn should_use_subpixel_rendering(&self, font_id: FontId, font_size: Pixels) -> bool {
@@ -5190,24 +5377,17 @@ impl Window {
             glyph_id,
             font_size,
             subpixel_variant: Default::default(),
+            subpixel_steps: point(SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y),
             scale_factor,
             is_emoji: true,
             subpixel_rendering: false,
+            hinting: true,
             dilation: 0,
         };
 
-        let raster_bounds = self.text_system().raster_bounds(&params)?;
-        if !raster_bounds.is_zero() {
-            let tile = self
-                .sprite_atlas
-                .get_or_insert_with(params.clone().into(), &mut || {
-                    let (size, bytes) = self.text_system().rasterize_glyph(&params)?;
-                    Ok(Some((size, Cow::Owned(bytes))))
-                })?
-                .expect("Callback above only errors or returns Some");
-
+        if let Some((tile, origin)) = self.glyph_tile(params)? {
             let bounds = Bounds {
-                origin: integer_origin + raster_bounds.origin.map(Into::into),
+                origin: integer_origin + origin,
                 size: tile.bounds.size.map(Into::into),
             };
             let content_mask = self.snapped_content_mask();
@@ -5215,7 +5395,7 @@ impl Window {
 
             self.next_frame.scene.insert_primitive(PolychromeSprite {
                 order: 0,
-                pad: 0,
+                nearest_neighbor: 0,
                 grayscale: false.into(),
                 bounds,
                 corner_radii: Default::default(),
@@ -5309,10 +5489,40 @@ impl Window {
         frame_index: usize,
         grayscale: bool,
     ) -> Result<()> {
+        self.paint_image_with_sampling(
+            bounds,
+            image_bounds,
+            corner_radii,
+            data,
+            frame_index,
+            grayscale,
+            ImageSampling::Linear,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn paint_image_with_sampling(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        image_bounds: Bounds<Pixels>,
+        corner_radii: Corners<Pixels>,
+        data: Arc<RenderImage>,
+        frame_index: usize,
+        grayscale: bool,
+        sampling: ImageSampling,
+    ) -> Result<()> {
         self.invalidator.debug_assert_paint();
 
         let visible_bounds = bounds.intersect(&image_bounds);
         if visible_bounds.size.width <= Pixels::ZERO || visible_bounds.size.height <= Pixels::ZERO {
+            return Ok(());
+        }
+        // 大表格只露出一部分时，完全在裁剪区外的图片无需分配图集空间或上传纹理。
+        let content_mask = self.snapped_content_mask();
+        let visible_bounds_snapped = self.snap_bounds(visible_bounds);
+        if visible_bounds_snapped.is_empty()
+            || !visible_bounds_snapped.intersects(&content_mask.bounds)
+        {
             return Ok(());
         }
         if image_bounds.size.width <= Pixels::ZERO || image_bounds.size.height <= Pixels::ZERO {
@@ -5336,8 +5546,6 @@ impl Window {
                 )))
             })?
             .expect("Callback above only returns Some");
-
-        let visible_bounds_snapped = self.snap_bounds(visible_bounds);
 
         let sub_tile = if visible_bounds == image_bounds {
             tile
@@ -5379,7 +5587,6 @@ impl Window {
             }
         };
 
-        let content_mask = self.snapped_content_mask();
         let corner_radii = corner_radii
             .clamp_radii_for_quad_size(visible_bounds.size)
             .scale(self.scale_factor());
@@ -5387,7 +5594,7 @@ impl Window {
 
         self.next_frame.scene.insert_primitive(PolychromeSprite {
             order: 0,
-            pad: 0,
+            nearest_neighbor: u32::from(sampling == ImageSampling::Nearest),
             grayscale: grayscale.into(),
             bounds: visible_bounds_snapped,
             content_mask,
@@ -5554,7 +5761,9 @@ impl Window {
             content_mask,
             behavior,
         };
-        self.next_frame.hitboxes.push(hitbox.clone());
+        if !self.paint_only {
+            self.next_frame.hitboxes.push(hitbox.clone());
+        }
         hitbox
     }
 
@@ -5706,6 +5915,9 @@ impl Window {
         mut listener: impl FnMut(&Event, DispatchPhase, &mut Window, &mut App) + 'static,
     ) {
         self.invalidator.debug_assert_paint();
+        if self.paint_only {
+            return;
+        }
 
         self.next_frame.mouse_listeners.push(Some(Box::new(
             move |event: &dyn Any, phase: DispatchPhase, window: &mut Window, cx: &mut App| {
@@ -5864,6 +6076,63 @@ impl Window {
     /// Dispatch a mouse, keyboard, or touch event on the window.
     #[profiling::function]
     pub fn dispatch_event(&mut self, event: PlatformInput, cx: &mut App) -> DispatchEventResult {
+        let pointer_motion = match &event {
+            PlatformInput::MouseMove(event) => {
+                self.last_pointer_event_position.replace(event.position) != Some(event.position)
+            }
+            PlatformInput::MouseDown(event) => {
+                self.last_pointer_event_position = Some(event.position);
+                false
+            }
+            PlatformInput::MouseUp(event) => {
+                self.last_pointer_event_position = Some(event.position);
+                false
+            }
+            PlatformInput::Scroll(event) if !self.touchpad_scroll.dispatching() => {
+                self.last_pointer_event_position = Some(event.position);
+                false
+            }
+            PlatformInput::MouseExited(_) => {
+                self.last_pointer_event_position = None;
+                false
+            }
+            _ => false,
+        };
+        match &event {
+            PlatformInput::Scroll(event) => {
+                if event.delta.precise() {
+                    self.smooth_scroll.cancel();
+                }
+                if !event.source.is_touchpad() {
+                    self.touchpad_scroll.cancel();
+                }
+            }
+            PlatformInput::KeyDown(_)
+            | PlatformInput::MouseDown(_)
+            | PlatformInput::Touch(_)
+            | PlatformInput::Pinch(_) => {
+                self.smooth_scroll.cancel();
+                self.touchpad_scroll.cancel();
+            }
+            _ => {}
+        }
+        // Shape raw touchpad movement at frame rate. The synthetic events
+        // emitted by the resampler come back through this method with
+        // `dispatching` set, so they reach the normal scroll listeners.
+        if let PlatformInput::Scroll(event) = &event
+            && event.source.is_touchpad()
+            && event.delta.precise()
+            && cx.smooth_scrolling()
+            && !cx.reduce_motion()
+            && !self.touchpad_scroll.dispatching()
+        {
+            self.mouse_position = event.position;
+            self.modifiers = event.modifiers;
+            let mut touchpad = std::mem::take(&mut self.touchpad_scroll);
+            touchpad.queue(event.clone(), self, cx);
+            self.touchpad_scroll = touchpad;
+            return DispatchEventResult::default();
+        }
         #[cfg(feature = "profiler")]
         self.window_profiler.begin_input(event.kind_name());
         let update_count_before = self.invalidator.update_count();
@@ -5873,7 +6142,13 @@ impl Window {
         let old_modality = self.last_input_modality;
         self.last_input_modality = match &event {
             PlatformInput::KeyDown(_) => InputModality::Keyboard,
-            PlatformInput::MouseMove(_) | PlatformInput::MouseDown(_) => InputModality::Mouse,
+            PlatformInput::MouseMove(_)
+            | PlatformInput::MouseDown(_)
+            | PlatformInput::FileDrop(
+                FileDropEvent::Entered { .. }
+                | FileDropEvent::Pending { .. }
+                | FileDropEvent::Submit { .. },
+            ) => InputModality::Mouse,
             PlatformInput::Touch(_) => InputModality::Touch,
             _ => self.last_input_modality,
         };
@@ -5892,6 +6167,12 @@ impl Window {
             PlatformInput::MouseMove(mouse_move) => {
                 self.mouse_position = mouse_move.position;
                 self.modifiers = mouse_move.modifiers;
+                // A move with the left button up also ends an internal drag
+                // if the release never reached this window. Native file drops
+                // have their own lifecycle, including synthetic move events.
+                if !mouse_move.dragging() {
+                    cx.cancel_internal_drag(self);
+                }
                 PlatformInput::MouseMove(mouse_move)
             }
             PlatformInput::MouseDown(mouse_down) => {
@@ -6002,7 +6283,9 @@ impl Window {
         };
 
         if let Some(any_mouse_event) = event.mouse_event() {
+            let previous = std::mem::replace(&mut self.pointer_motion, pointer_motion);
             self.dispatch_mouse_event(any_mouse_event, cx);
+            self.pointer_motion = previous;
         } else if let Some(any_key_event) = event.keyboard_event() {
             self.dispatch_key_event(any_key_event, cx);
         } else if let Some(touch_event) = event.touch_event() {
@@ -8163,6 +8446,14 @@ fn with_element_arena_erased(callback: &mut dyn FnMut(&mut Arena)) -> Result<(),
     }
 }
 
+fn quantize_glyph_position(origin: ScaledPixels, steps: u8) -> (ScaledPixels, u8) {
+    let steps = f32::from(steps);
+    let quantized = round_half_toward_zero(origin.0 * steps) / steps;
+    // Split at the preceding pixel so offscreen glyphs also get a nonnegative phase.
+    let whole = quantized.floor();
+    (ScaledPixels(whole), ((quantized - whole) * steps) as u8)
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -9875,6 +10166,7 @@ mod tests {
                                 thickness: px(thickness as f32 / 4.),
                                 color: Some(hsla(0.25, 0.5, 0.75, 0.5)),
                                 wavy,
+                                pattern: Default::default(),
                             };
                             let bounds = Bounds::new(
                                 point(snap(origin), snap(-origin)),
@@ -9960,6 +10252,7 @@ mod tests {
                 thickness: px(1.),
                 color: None,
                 wavy: true,
+                pattern: Default::default(),
             };
             let origin = point(px(2.888_183_8), px(15.357_917));
             let width = px(23.848_145) - origin.x;
@@ -10002,6 +10295,7 @@ mod tests {
                 thickness: px(2.),
                 color: Some(hsla(0.25, 0.5, 0.75, 0.5)),
                 wavy: true,
+                pattern: Default::default(),
             };
             let origin = point(px(-1.25), px(9.25));
             let width = px(24.);
@@ -10054,6 +10348,7 @@ mod tests {
                 thickness: px(1.),
                 color: None,
                 wavy: true,
+                pattern: Default::default(),
             };
             let origin = point(px(-4.), px(-1.));
             let width = px(8.);

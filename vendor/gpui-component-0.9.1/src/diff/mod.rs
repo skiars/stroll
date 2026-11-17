@@ -16,7 +16,7 @@ pub use decoration::{DiffDecoration, DiffGutterMarker};
 pub use document::{DiffFile, DiffFileStatus, DiffLinePosition, DiffLineRange, DiffSide};
 pub use parser::{DiffParseError, DiffParseOptions};
 pub use presentation::DiffInlineUnit;
-pub use state::{DiffEvent, DiffState};
+pub use state::{DiffEditorRow, DiffEvent, DiffState, DiffViewportAnchor};
 
 use std::{collections::HashMap, rc::Rc, sync::Arc};
 
@@ -35,7 +35,7 @@ use crate::{
     button::{Button, ButtonVariants as _},
     h_flex,
     input::{Copy, SelectAll},
-    scroll::{ScrollableMask, Scrollbar},
+    scroll::{ScrollableMask, Scrollbar, ScrollbarMode},
     v_flex,
 };
 use actions::*;
@@ -190,6 +190,7 @@ impl DiffAnnotation {
     }
 }
 
+type PreambleRenderer = Rc<dyn Fn(&mut Window, &mut App) -> AnyElement>;
 type FileRenderer = Rc<dyn Fn(&DiffFile, &mut Window, &mut App) -> AnyElement>;
 type AnnotationRenderer = Rc<dyn Fn(&DiffAnnotation, &mut Window, &mut App) -> AnyElement>;
 type MarkerRenderer = Rc<dyn Fn(&DiffGutterMarker, &mut Window, &mut App) -> AnyElement>;
@@ -223,15 +224,20 @@ struct Annotations {
 pub struct Diff {
     state: Entity<DiffState>,
     style: StyleRefinement,
+    code_font_size: Option<Pixels>,
+    hunk_actions: Option<HunkRenderer>,
+    pinned_hunk: Option<(SharedString, usize)>,
     line_number: bool,
     syntax_highlight: bool,
     header_visible: bool,
+    sticky_headers: bool,
     hover_highlight: DiffHoverHighlight,
     hunk_separator: DiffHunkSeparator,
     change_indicator: DiffChangeIndicator,
     change_background: bool,
     soft_wrap: bool,
     header: HeaderSlots,
+    preamble: Option<PreambleRenderer>,
     annotations: Rc<Annotations>,
     annotation_content: Option<AnnotationRenderer>,
     decorations: Rc<Decorations>,
@@ -241,6 +247,8 @@ pub struct Diff {
     on_line_click: Option<ClickHandler>,
     on_line_hover: Option<HoverHandler>,
 }
+
+type HunkRenderer = Rc<dyn Fn(&DiffFile, usize, &mut Window, &mut App) -> Option<AnyElement>>;
 
 fn file_renderer<F, E>(render: F) -> FileRenderer
 where
@@ -255,15 +263,20 @@ impl Diff {
         Self {
             state: state.clone(),
             style: StyleRefinement::default(),
+            code_font_size: None,
+            hunk_actions: None,
+            pinned_hunk: None,
             line_number: true,
             syntax_highlight: true,
             header_visible: true,
+            sticky_headers: false,
             hover_highlight: DiffHoverHighlight::default(),
             hunk_separator: DiffHunkSeparator::default(),
             change_indicator: DiffChangeIndicator::default(),
             change_background: true,
             soft_wrap: false,
             header: HeaderSlots::default(),
+            preamble: None,
             annotations: Rc::default(),
             annotation_content: None,
             decorations: Rc::default(),
@@ -273,6 +286,29 @@ impl Diff {
             on_line_click: None,
             on_line_hover: None,
         }
+    }
+    /// Set the font size used to measure and paint source rows.
+    pub fn code_font_size(mut self, size: Pixels) -> Self {
+        self.code_font_size = Some(size);
+        self
+    }
+
+    /// Render a toolbar at the upper-right of the hovered hunk.
+    /// A pinned hunk keeps its toolbar while an action is being confirmed.
+    pub fn render_hunk_actions<F, E>(
+        mut self,
+        pinned_hunk: Option<(SharedString, usize)>,
+        render: F,
+    ) -> Self
+    where
+        F: Fn(&DiffFile, usize, &mut Window, &mut App) -> Option<E> + 'static,
+        E: IntoElement,
+    {
+        self.hunk_actions = Some(Rc::new(move |file, hunk, window, cx| {
+            render(file, hunk, window, cx).map(IntoElement::into_any_element)
+        }));
+        self.pinned_hunk = pinned_hunk;
+        self
     }
     /// Shows the original and modified line-number lanes. Default is true.
     pub fn line_number(mut self, value: bool) -> Self {
@@ -378,6 +414,23 @@ impl Diff {
         }));
         self
     }
+    /// Keeps the active file header at the top of the viewport until the next file arrives.
+    pub fn sticky_headers(mut self, enabled: bool) -> Self {
+        self.sticky_headers = enabled;
+        self
+    }
+
+    /// Renders content before the first file in the same vertical viewport.
+    pub fn render_preamble<E: IntoElement>(
+        mut self,
+        render: impl Fn(&mut Window, &mut App) -> E + 'static,
+    ) -> Self {
+        self.preamble = Some(Rc::new(move |window, cx| {
+            render(window, cx).into_any_element()
+        }));
+        self
+    }
+
     /// Replaces the content of each file header, keeping its shell, separator
     /// and collapse control.
     pub fn render_header<F, E>(mut self, render: F) -> Self
@@ -509,15 +562,16 @@ fn render_diff(
     state.set_window(window.window_handle().window_id());
     state.ensure_presentation(cx);
     let rem = window.rem_size();
-    let font_size = rem * (f32::from(cx.theme().mono_font_size) / 16.);
-    let font_family = cx.theme().mono_font_family.clone();
+    let font_size = props
+        .code_font_size
+        .unwrap_or_else(|| rem * (f32::from(cx.theme().mono_font_size) / 16.));
+    let font = gpui::Font {
+        family: cx.theme().mono_font_family.clone(),
+        fallbacks: cx.theme().font_fallbacks.clone(),
+        ..Default::default()
+    };
     let row_height = font_size * 1.6;
-    let digits = state
-        .files()
-        .iter()
-        .map(|file| file.line_number_digits())
-        .max()
-        .unwrap_or(1);
+    let digits = state.line_number_digits();
     let gutter_width = if props.line_number {
         font_size * 0.7 * digits as f32 + rem
     } else {
@@ -530,7 +584,7 @@ fn render_diff(
     let layout = LayoutKey::new(
         rem,
         font_size,
-        font_family.clone(),
+        font.clone(),
         mode,
         props.line_number,
         marker_lane,
@@ -544,7 +598,7 @@ fn render_diff(
             measure_code_width(
                 state.files(),
                 font_size,
-                &font_family,
+                &font,
                 gutter_width,
                 lane_width,
                 mode,
@@ -554,6 +608,7 @@ fn render_diff(
         };
         state.set_content_width(width);
     }
+    state.sync_preamble(props.preamble.is_some());
     state.sync_annotations(&props.annotations.items);
     let content_width = state.content_width().max(state.viewport().width);
     let column_width = if mode == DiffMode::Split {
@@ -561,9 +616,13 @@ fn render_diff(
     } else {
         content_width
     };
+    let sticky_headers = props.sticky_headers && props.header_visible;
+    let title_height = rem * 1.75 + px(2.);
+    state.set_sticky_header_height(if sticky_headers { title_height } else { px(0.) });
+    let text_selection = selection::selected_source_range(state.selection(), cx);
     let code = Rc::new(CodePresentation {
-        files: state.files().to_vec(),
-        presentations: state.presentations().to_vec(),
+        files: state.render_files(),
+        presentations: state.presentations(),
         mode,
         content_width,
         column_width,
@@ -575,6 +634,7 @@ fn render_diff(
         line_number: props.line_number,
         syntax_highlight: props.syntax_highlight,
         header_visible: props.header_visible,
+        title_height: sticky_headers.then_some(title_height),
         hover_highlight: props.hover_highlight,
         hunk_separator: props.hunk_separator,
         change_indicator: props.change_indicator,
@@ -590,7 +650,8 @@ fn render_diff(
         on_add_annotation: props.on_add_annotation,
         on_line_click: props.on_line_click,
         on_line_hover: props.on_line_hover,
-        selection: state.selection().clone(),
+        text_selection,
+        a11y: window.is_a11y_active() || cfg!(any(test, feature = "test-support")),
         selected_lines: state.selected_lines(),
         selected: state.selected_span(),
         geometry: state.geometry().clone(),
@@ -600,10 +661,15 @@ fn render_diff(
     let scrollbar = state.list().clone();
     let horizontal = state.horizontal_scroll().clone();
     let has_rows = !rows.is_empty();
+    let preamble = props.preamble;
+    let viewport_width = state.viewport().width;
+    let preamble_scroll = horizontal.clone();
     let label = match state.files() {
         [file] => t!("Diff.Viewer", name = file.path().as_str()).to_string(),
         files => t!("Diff.ViewerFiles", count = files.len()).to_string(),
     };
+    let row_code = code.clone();
+    let diff = cx.entity().downgrade();
     let body = div()
         .id("diff-body")
         .relative()
@@ -618,20 +684,47 @@ fn render_diff(
                 // single-axis wheel remapping. The sibling mask owns X input.
                 .when(!soft_wrap, |this| this.overflow_x_hidden())
                 .track_scroll(&horizontal)
-                .child(gpui_base::ScrollBounce::new(
-                    "diff-bounce",
-                    &scrollbar,
-                    list(scrollbar.clone(), move |ix, window, cx| {
-                        let row = &rows[ix];
-                        div()
-                            .id(("diff-file", row.file()))
-                            .w_full()
-                            .child(render_row(row, code.clone(), window, cx))
-                            .into_any_element()
-                    })
-                    .w(content_width)
-                    .h_full(),
-                ))
+                .child(
+                    gpui_base::ScrollBounce::new(
+                        "diff-bounce",
+                        &scrollbar,
+                        list(scrollbar.clone(), move |ix, window, cx| {
+                            let row = &rows[ix];
+                            let Some(file) = row.file() else {
+                                return div()
+                                    .id("diff-preamble")
+                                    .w(viewport_width.max(px(1.)))
+                                    .relative()
+                                    .left(-preamble_scroll.offset().x)
+                                    .children(preamble.as_ref().map(|render| render(window, cx)))
+                                    .into_any_element();
+                            };
+                            div()
+                                .id(("diff-file", file))
+                                .w_full()
+                                .child(if sticky_headers && matches!(row, DisplayRow::File(_)) {
+                                    div()
+                                        .w(viewport_width.max(px(1.)))
+                                        .relative()
+                                        .left(-preamble_scroll.offset().x)
+                                        .child(render_row(row, row_code.clone(), window, cx))
+                                        .into_any_element()
+                                } else {
+                                    render_row(row, row_code.clone(), window, cx)
+                                })
+                                .into_any_element()
+                        })
+                        .w(content_width)
+                        .h_full(),
+                    )
+                    .wheel_line_height(px(30.))
+                    .on_scroll(move |window, cx| {
+                        let diff = diff.clone();
+                        window.defer(cx, move |_, cx| {
+                            let _ = diff.update(cx, |_, cx| cx.emit(DiffEvent::Scrolled));
+                        });
+                    }),
+                )
                 .into_any_element(),
             scrollbar.clone(),
             horizontal.clone(),
@@ -643,15 +736,28 @@ fn render_diff(
                 ScrollableMask::new(Axis::Horizontal, &horizontal).id("diff-horizontal-wheel"),
             )
         })
+        .when_some(props.hunk_actions, |body, render| {
+            body.on_mouse_move(cx.listener(|this, event: &gpui::MouseMoveEvent, _, cx| {
+                this.set_hunk_hover(Some(event.position), cx);
+            }))
+            .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
+                if !hovered {
+                    this.set_hunk_hover(None, cx);
+                }
+            }))
+            .child(active_hunk_toolbar(code.clone(), render, props.pinned_hunk))
+        })
+        .when(sticky_headers, |body| body.child(sticky_file_header(code)))
         .when(has_rows, |this| {
             this.child(
-                div()
-                    .absolute()
-                    .inset_0()
-                    .child(Scrollbar::vertical(&scrollbar).viewport_from_layout()),
+                div().absolute().inset_0().child(
+                    Scrollbar::vertical(&scrollbar)
+                        .mode(ScrollbarMode::Always)
+                        .viewport_from_layout(),
+                ),
             )
             .when(!soft_wrap, |this| {
-                this.child(Scrollbar::horizontal(&horizontal))
+                this.child(Scrollbar::horizontal(&horizontal).mode(ScrollbarMode::Always))
             })
         })
         // A line-number drag may finish anywhere, including outside the body.
@@ -755,7 +861,7 @@ fn render_diff(
             gpui::canvas(
                 {
                     let state = cx.entity();
-                    move |bounds, _, cx| {
+                    move |bounds, window, cx| {
                         state.update(cx, |state, cx| {
                             // Runs after the list's prepaint, which drops
                             // every row height when its width changes.
@@ -770,6 +876,14 @@ fn render_diff(
                             };
                             if state.record_paint(bounds.size, painted) || rehinted {
                                 cx.notify();
+                            }
+                            if state.update_visible_files() {
+                                let state = cx.weak_entity();
+                                window.defer(cx, move |_, cx| {
+                                    let _ = state.update(cx, |_, cx| {
+                                        cx.emit(DiffEvent::VisibleFilesChanged)
+                                    });
+                                });
                             }
                         });
                     }
@@ -809,8 +923,8 @@ fn body_focused(state: &DiffState, window: &Window, cx: &mut Context<DiffState>)
 }
 
 struct CodePresentation {
-    files: Vec<DiffFile>,
-    presentations: Vec<Option<Arc<FilePresentation>>>,
+    files: Rc<Vec<DiffFile>>,
+    presentations: Rc<Vec<Option<Arc<FilePresentation>>>>,
     mode: DiffMode,
     content_width: Pixels,
     column_width: Pixels,
@@ -822,6 +936,7 @@ struct CodePresentation {
     line_number: bool,
     syntax_highlight: bool,
     header_visible: bool,
+    title_height: Option<Pixels>,
     hover_highlight: DiffHoverHighlight,
     hunk_separator: DiffHunkSeparator,
     change_indicator: DiffChangeIndicator,
@@ -838,7 +953,8 @@ struct CodePresentation {
     on_add_annotation: Option<RangeHandler>,
     on_line_click: Option<ClickHandler>,
     on_line_hover: Option<HoverHandler>,
-    selection: gpui_base::TextSelectionHandle,
+    text_selection: Option<(usize, DiffSide, std::ops::Range<usize>)>,
+    a11y: bool,
     selected_lines: Option<DiffLineRange>,
     selected: Option<SelectedLines>,
     geometry: Rc<std::cell::RefCell<selection::SelectionGeometry>>,
@@ -883,7 +999,7 @@ fn code_width(
 fn measure_code_width(
     files: &[DiffFile],
     font_size: Pixels,
-    family: &SharedString,
+    font: &gpui::Font,
     gutter_width: Pixels,
     lane_width: Pixels,
     mode: DiffMode,
@@ -892,29 +1008,12 @@ fn measure_code_width(
 ) -> Pixels {
     // Glyph widths vary within a font, so shape several candidates rather
     // than trusting the single widest by cell count.
-    const CANDIDATES: usize = 8;
-    let mut candidates: Vec<(usize, &SharedString)> = Vec::with_capacity(CANDIDATES + 1);
+    let mut candidates = Vec::new();
     for file in files {
-        for side in [DiffSide::Original, DiffSide::Modified] {
-            for line in file.lines(side) {
-                let cells = unicode_width::UnicodeWidthStr::width(line.display().as_str());
-                if candidates.len() == CANDIDATES
-                    && candidates
-                        .last()
-                        .is_some_and(|(widest, _)| *widest >= cells)
-                {
-                    continue;
-                }
-                let ix = candidates.partition_point(|(widest, _)| *widest >= cells);
-                candidates.insert(ix, (cells, line.display()));
-                candidates.truncate(CANDIDATES);
-            }
+        for (cells, text) in file.wide_lines() {
+            document::insert_wide_line(&mut candidates, *cells, text);
         }
     }
-    let font = gpui::Font {
-        family: family.clone(),
-        ..Default::default()
-    };
     let width = candidates
         .into_iter()
         .map(|(_, text)| {
@@ -946,6 +1045,7 @@ fn render_row(
     cx: &mut App,
 ) -> AnyElement {
     match row {
+        DisplayRow::Preamble => unreachable!("preamble is rendered at the viewport width"),
         DisplayRow::File(file) => render_file_header(*file, &code, window, cx),
         DisplayRow::Notice(file) => render_notice(&code.files[*file], cx),
         DisplayRow::Hunk { file, hunk } => render_hunk_separator(*file, *hunk, &code, cx),
@@ -1011,7 +1111,7 @@ fn render_hunk_separator(
     file: usize,
     hunk: usize,
     code: &CodePresentation,
-    cx: &App,
+    cx: &mut App,
 ) -> AnyElement {
     let hunks = code.files[file].hunks();
     let row = h_flex()
@@ -1188,17 +1288,154 @@ fn conflict_tint(part: Option<ConflictPart>, cx: &App) -> Hsla {
     }
 }
 
+/// Place the toolbar after the list measures the visible hunk rows.
+fn active_hunk_toolbar(
+    code: Rc<CodePresentation>,
+    render: HunkRenderer,
+    pinned: Option<(SharedString, usize)>,
+) -> impl IntoElement {
+    gpui::canvas(
+        move |bounds, window, cx| {
+            let state = code.state.read(cx);
+            let list = state.list();
+            let visible = list.visible_range();
+            let mouse = window.mouse_position();
+            let sticky = state.sticky_file().is_some() && code.title_height.is_some();
+            let top = bounds.top()
+                + if sticky {
+                    code.title_height.unwrap_or_default()
+                } else {
+                    px(0.)
+                };
+            let (file, hunk, rows) = pinned
+                .as_ref()
+                .and_then(|(path, hunk)| state.hunk_on_path(path, *hunk))
+                .or_else(|| {
+                    (mouse.y >= top && bounds.contains(&mouse))
+                        .then(|| state.hunk_under_pointer(mouse))
+                        .flatten()
+                })?;
+            let first = rows.start.max(visible.start);
+            let last = rows.end.min(visible.end).checked_sub(1)?;
+            if first > last {
+                return None;
+            }
+            let first_row = list.bounds_for_item(first)?;
+            let last_row = list.bounds_for_item(last)?;
+            let top = top.max(first_row.top());
+            let available = (last_row.bottom().min(bounds.bottom()) - top).max(px(0.));
+            if available < px(16.) {
+                return None;
+            }
+            let mut toolbar = div()
+                .id(SharedString::from(format!(
+                    "diff-active-hunk:{}:{hunk}",
+                    code.files[file].path()
+                )))
+                .h_flex()
+                .items_start()
+                .justify_end()
+                .child(
+                    div()
+                        .id("diff-active-hunk-controls")
+                        .h_flex()
+                        .h(px(24.))
+                        .block_mouse_except_scroll()
+                        .child(render(&code.files[file], hunk, window, cx)?),
+                )
+                .into_any_element();
+            let right = px(12.);
+            toolbar.layout_as_root(
+                gpui::size(
+                    (bounds.size.width - right).max(px(1.)).into(),
+                    gpui::AvailableSpace::MinContent,
+                ),
+                window,
+                cx,
+            );
+            window.with_content_mask(Some(gpui::ContentMask { bounds }), |window| {
+                toolbar.prepaint_at(point(bounds.left(), top), window, cx);
+            });
+            Some(toolbar)
+        },
+        |bounds, toolbar, window, cx| {
+            if let Some(mut toolbar) = toolbar {
+                window.with_content_mask(Some(gpui::ContentMask { bounds }), |window| {
+                    toolbar.paint(window, cx);
+                });
+            }
+        },
+    )
+    .absolute()
+    .inset_0()
+    .size_full()
+}
+
+/// Lay out the floating header after the list has measured this frame. Only the
+/// header chrome floats; file annotations stay in the document flow.
+fn sticky_file_header(code: Rc<CodePresentation>) -> impl IntoElement {
+    gpui::canvas(
+        move |bounds, window, cx| {
+            let state = code.state.read(cx);
+            let (file, next) = state.sticky_file()?;
+            let next_top = next
+                .and_then(|row| state.list().bounds_for_item(row))
+                .map(|row| row.top());
+            let mut header = div()
+                .id(("sticky-diff-file", file))
+                .w_full()
+                .bg(cx.theme().background)
+                .block_mouse_except_scroll()
+                .child(render_file_title(file, &code, window, cx))
+                .into_any_element();
+            let height = header
+                .layout_as_root(
+                    gpui::size(bounds.size.width.into(), gpui::AvailableSpace::MinContent),
+                    window,
+                    cx,
+                )
+                .height;
+            let top = next_top.map_or(bounds.top(), |next| bounds.top().min(next - height));
+            window.with_content_mask(Some(gpui::ContentMask { bounds }), |window| {
+                header.prepaint_at(point(bounds.left(), top), window, cx);
+            });
+            Some(header)
+        },
+        |bounds, header, window, cx| {
+            if let Some(mut header) = header {
+                window.with_content_mask(Some(gpui::ContentMask { bounds }), |window| {
+                    header.paint(window, cx);
+                });
+            }
+        },
+    )
+    .absolute()
+    .top_0()
+    .left_0()
+    .size_full()
+}
+
 fn render_file_header(
     file: usize,
     code: &CodePresentation,
     window: &mut Window,
     cx: &mut App,
 ) -> AnyElement {
-    if !code.header_visible {
-        return div()
-            .children(file_annotations(file, code, window, cx))
-            .into_any_element();
-    }
+    v_flex()
+        .w_full()
+        .when(code.header_visible, |header| {
+            header.child(render_file_title(file, code, window, cx))
+        })
+        .children(file_annotations(file, code, window, cx))
+        .into_any_element()
+}
+
+fn render_file_title(
+    file: usize,
+    code: &CodePresentation,
+    window: &mut Window,
+    cx: &mut App,
+) -> impl IntoElement {
     let document = &code.files[file];
     let foreground = cx.theme().muted_foreground;
     let border = cx.theme().border;
@@ -1263,6 +1500,7 @@ fn render_file_header(
     v_flex()
         .id("file-header")
         .w_full()
+        .when_some(code.title_height, |header, height| header.h(height))
         .when(file > 0, |this| this.border_t_1())
         .border_b_1()
         .border_color(border)
@@ -1297,8 +1535,6 @@ fn render_file_header(
                 )
                 .child(div().flex_1().min_w_0().child(content)),
         )
-        .children(file_annotations(file, code, window, cx))
-        .into_any_element()
 }
 
 fn file_annotations(
@@ -1373,6 +1609,7 @@ fn render_gutter(
             let down = code.state.clone();
             let moved = code.state.clone();
             let dragged = position.clone();
+            let clicked = position.clone();
             // A plain hit target: line numbers need no button chrome or state.
             this.child(
                 div()
@@ -1387,15 +1624,16 @@ fn render_gutter(
                     .text_size(code.font_size)
                     .text_color(cx.theme().muted_foreground)
                     .hover(|this| this.text_color(cx.theme().foreground))
-                    .role(gpui::accesskit::Role::Button)
-                    .aria_label(
-                        t!(
-                            "Diff.SelectLine",
-                            side = side_label(side),
-                            line = position.line()
+                    .when(code.a11y, |gutter| {
+                        gutter.role(gpui::accesskit::Role::Button).aria_label(
+                            t!(
+                                "Diff.SelectLine",
+                                side = side_label(side),
+                                line = position.line()
+                            )
+                            .to_string(),
                         )
-                        .to_string(),
-                    )
+                    })
                     .child(position.line().to_string())
                     .on_mouse_down(MouseButton::Left, move |event, window, cx| {
                         down.update(cx, |state, cx| {
@@ -1413,6 +1651,17 @@ fn render_gutter(
                                 state.drag_line_selection(dragged.clone(), cx)
                             })
                         }
+                    })
+                    .when_some(code.on_line_click.clone(), |gutter, handler| {
+                        gutter.on_click(move |event, window, cx| {
+                            if let ClickEvent::Mouse(mouse) = event {
+                                let moved = mouse.up.position - mouse.down.position;
+                                if moved.x.abs() > px(3.) || moved.y.abs() > px(3.) {
+                                    return;
+                                }
+                            }
+                            handler(&clicked, event, window, cx);
+                        })
                     }),
             )
         })
@@ -1542,6 +1791,17 @@ fn render_unified_cell(
         .into_any_element()
 }
 
+fn diff_code_style(
+    side: DiffSide,
+    cx: &App,
+) -> Option<&(crate::highlighter::TintedSyntax, crate::highlighter::TintedSyntax)> {
+    let theme = &cx.theme().highlight_theme.style;
+    match side {
+        DiffSide::Original => theme.diff_removed.as_ref(),
+        DiffSide::Modified => theme.diff_added.as_ref(),
+    }
+}
+
 /// Syntax colors with inline-change and selection emphasis layered over them.
 #[allow(clippy::too_many_arguments)]
 fn line_highlights(
@@ -1556,22 +1816,55 @@ fn line_highlights(
 ) -> Vec<(std::ops::Range<usize>, HighlightStyle)> {
     let line = &code.files[file].lines(side)[ix];
     let presentation = code.presentations.get(file).and_then(Option::as_ref);
-    let mut highlights = match presentation {
-        Some(presentation) if code.syntax_highlight => {
-            presentation.syntax_highlights(line, side, ix, cx.theme().highlight_theme.as_ref())
+    let theme = &cx.theme().highlight_theme.style;
+    let contrast = diff_code_style(side, cx).filter(|_| changed && code.change_background);
+    let row_syntax = contrast
+        .filter(|_| !selected)
+        .map_or(&theme.syntax, |(row, _)| &row.syntax);
+    let mut highlights = Vec::new();
+    if let Some(foreground) = row_syntax.style("primary").and_then(|style| style.color)
+        && theme.editor_background.is_some()
+    {
+        highlights.push((
+            0..line.display().len(),
+            HighlightStyle { color: Some(foreground), ..Default::default() },
+        ));
+    }
+    if let Some(presentation) = presentation {
+        if code.syntax_highlight {
+            highlights.extend(presentation.syntax_highlights(line, side, ix, row_syntax));
         }
-        _ => Vec::new(),
-    };
-    if changed && let Some(presentation) = presentation {
-        highlights.extend(presentation.inline_changes(line, side, ix).map(|range| {
-            (
-                range,
-                HighlightStyle {
-                    background_color: Some(status.opacity(0.3)),
-                    ..Default::default()
-                },
-            )
-        }));
+        if changed {
+            let inline_background = contrast
+                .map(|(_, inline)| inline.background)
+                .unwrap_or_else(|| status.opacity(0.3));
+            let inline_syntax = contrast.filter(|_| !selected).map(|(_, inline)| &inline.syntax);
+            let inline_highlights = inline_syntax
+                .filter(|_| code.syntax_highlight)
+                .map(|syntax| presentation.syntax_highlights(line, side, ix, syntax))
+                .unwrap_or_default();
+            let foreground = inline_syntax
+                .and_then(|syntax| syntax.style("primary"))
+                .and_then(|style| style.color);
+            for range in presentation.inline_changes(line, side, ix) {
+                highlights.push((
+                    range.clone(),
+                    HighlightStyle {
+                        color: foreground,
+                        background_color: Some(inline_background),
+                        ..Default::default()
+                    },
+                ));
+                // Captures can overlap and are ordered by style precedence, not by byte range.
+                for (syntax_range, style) in &inline_highlights {
+                    let overlap =
+                        range.start.max(syntax_range.start)..range.end.min(syntax_range.end);
+                    if !overlap.is_empty() {
+                        highlights.push((overlap, *style));
+                    }
+                }
+            }
+        }
     }
     if selected {
         highlights.push((
@@ -1675,18 +1968,17 @@ fn code_line(
                 .iter()
                 .flatten()
                 .any(|(side, ix)| ix.is_some_and(|ix| code.is_selected(file, *side, ix))));
-    let highlights = line_highlights(file, side, ix, changed, selected, status, &code, cx);
+    let mut highlights = line_highlights(file, side, ix, changed, selected, status, &code, cx);
     // An unchanged Unified row shows one source line for both sides; follow
     // the side a text selection started on so its offsets stay consistent.
     let (text_side, text_ix) = if code.mode == DiffMode::Unified
         && !changed
-        && let Some((selected_file, selected_side, _)) =
-            selection::selected_source_range(&code.selection, cx)
-        && selected_file == file
-        && selected_side != side
+        && let Some((selected_file, selected_side, _)) = &code.text_selection
+        && *selected_file == file
+        && *selected_side != side
         && let Some(other_ix) = line.counterpart()
     {
-        (selected_side, other_ix)
+        (*selected_side, other_ix)
     } else {
         (side, ix)
     };
@@ -1694,11 +1986,33 @@ fn code_line(
     let source_line = &document.lines(text_side)[text_ix];
     // Wrapped text must be one run to break across the column; unwrapped
     // long lines stay chunked to bound shaping and selection projection.
-    let ranges: Vec<_> = if code.soft_wrap {
-        vec![0..source_line.display().len()]
-    } else {
-        source_line.chunk_ranges().collect()
-    };
+    let ranges = code
+        .soft_wrap
+        .then_some(0..source_line.display().len())
+        .into_iter()
+        .chain(
+            source_line
+                .chunk_ranges()
+                .take(if code.soft_wrap { 0 } else { usize::MAX }),
+        );
+    if let Some((selected_file, selected_side, range)) = &code.text_selection
+        && *selected_file == file
+        && *selected_side == text_side
+    {
+        let line_start = source_line.source().start;
+        let start = range.start.max(line_start);
+        let end = range.end.min(source_line.content_end());
+        if start < end {
+            highlights.push((
+                source_line.display_range(start - line_start..end - line_start),
+                HighlightStyle {
+                    background_color: Some(cx.theme().selection),
+                    ..Default::default()
+                },
+            ));
+        }
+    }
+    let highlights = selection::merge_highlights(source_line.display().len(), highlights);
     // A block container gives wrapped text a definite width to break at.
     let text = div()
         .map(|this| {
@@ -1708,7 +2022,16 @@ fn code_line(
                 this.flex().flex_row().flex_shrink_0()
             }
         })
-        .children(ranges.into_iter().enumerate().map(|(chunk_ix, range)| {
+        .children(ranges.enumerate().map(|(chunk_ix, range)| {
+            let first = highlights.partition_point(|(highlight, _)| highlight.end <= range.start);
+            let chunk_highlights = highlights[first..]
+                .iter()
+                .take_while(|(highlight, _)| highlight.start < range.end)
+                .filter_map(|(highlight, style)| {
+                    selection::clip_highlight(highlight.clone(), &range)
+                        .map(|range| (range, *style))
+                })
+                .collect();
             CodeText::new(
                 ("code", chunk_ix).into(),
                 document.clone(),
@@ -1716,8 +2039,7 @@ fn code_line(
                 text_side,
                 text_ix,
                 range,
-                highlights.clone(),
-                code.selection.clone(),
+                chunk_highlights,
                 code.geometry.clone(),
             )
         }));
@@ -1758,14 +2080,15 @@ fn code_line(
         cx,
     );
     // Unified rows of unchanged lines carry both sides; either may be targeted.
-    let positions: Vec<_> = gutters
-        .iter()
+    let positions = || {
+        gutters
+            .iter()
+            .flatten()
+            .filter_map(|(side, ix)| ix.map(|ix| code.position(file, *side, ix)))
+    };
+    let decoration = (!code.decorations.is_empty())
+        .then(|| positions().find_map(|position| code.decorations.at(&position)))
         .flatten()
-        .filter_map(|(side, ix)| ix.map(|ix| code.position(file, *side, ix)))
-        .collect();
-    let decoration = positions
-        .iter()
-        .find_map(|position| code.decorations.at(position))
         .filter(|_| !selected)
         .map(|decoration| {
             decoration
@@ -1773,9 +2096,7 @@ fn code_line(
                 .unwrap_or_else(|| cx.theme().warning.opacity(0.2))
         });
     let marker_lane = code.gutter_marker_content.clone().map(|render| {
-        let marker = positions
-            .iter()
-            .find_map(|position| code.gutter_markers.at(position));
+        let marker = positions().find_map(|position| code.gutter_markers.at(&position));
         div()
             .id("marker-lane")
             .flex_shrink_0()
@@ -1807,8 +2128,16 @@ fn code_line(
         .font_family(cx.theme().mono_font_family.clone())
         .text_size(code.font_size)
         .line_height(code.row_height)
+        .when_some(cx.theme().highlight_theme.style.editor_background, |this, surface| {
+            this.bg(surface)
+        })
         .when(changed && code.change_background, |this| {
-            this.bg(status.opacity(0.12))
+            this.bg(
+                diff_code_style(side, cx)
+                    .filter(|_| conflict_part.is_none())
+                    .map(|(row, _)| row.background)
+                    .unwrap_or_else(|| status.opacity(0.12)),
+            )
         })
         // An overlay, so the change background shows through a translucent fill.
         .when_some(decoration, |this, background| {
@@ -1845,24 +2174,27 @@ fn code_line(
                         this.flex_shrink_0()
                     }
                 })
-                .role(gpui::accesskit::Role::Label)
-                .aria_label(source_line.text().clone())
-                .aria_description(
-                    t!(
-                        if changed {
-                            if side == DiffSide::Original {
-                                "Diff.RemovedLine"
-                            } else {
-                                "Diff.AddedLine"
-                            }
-                        } else {
-                            "Diff.SourceLine"
-                        },
-                        side = side_label(text_side),
-                        line = position.line()
-                    )
-                    .to_string(),
-                )
+                .when(code.a11y, |source| {
+                    source
+                        .role(gpui::accesskit::Role::Label)
+                        .aria_label(source_line.text().clone())
+                        .aria_description(
+                            t!(
+                                if changed {
+                                    if side == DiffSide::Original {
+                                        "Diff.RemovedLine"
+                                    } else {
+                                        "Diff.AddedLine"
+                                    }
+                                } else {
+                                    "Diff.SourceLine"
+                                },
+                                side = side_label(text_side),
+                                line = position.line()
+                            )
+                            .to_string(),
+                        )
+                })
                 .when_some(code.on_line_click.clone(), |this, handler| {
                     let position = position.clone();
                     this.on_click(move |event, window, cx| {

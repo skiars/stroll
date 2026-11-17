@@ -47,6 +47,7 @@ use wayland_protocols::ext::background_effect::v1::client::{
 use wayland_protocols::wp::pointer_gestures::zv1::client::{
     zwp_pointer_gesture_pinch_v1, zwp_pointer_gestures_v1,
 };
+use wayland_protocols::wp::presentation_time::client::{wp_presentation, wp_presentation_feedback};
 use wayland_protocols::wp::primary_selection::zv1::client::zwp_primary_selection_offer_v1::{
     self, ZwpPrimarySelectionOfferV1,
 };
@@ -242,6 +243,7 @@ pub(crate) fn take_wayland_socket_from_environment() -> Option<UnixStream> {
 #[derive(Clone)]
 pub struct Globals {
     pub qh: QueueHandle<WaylandClientStatePtr>,
+    pub presentation_feedback: Option<wp_presentation::WpPresentation>,
     pub activation: Option<xdg_activation_v1::XdgActivationV1>,
     pub compositor: wl_compositor::WlCompositor,
     pub cursor_shape_manager: Option<wp_cursor_shape_manager_v1::WpCursorShapeManagerV1>,
@@ -277,6 +279,10 @@ impl Globals {
     ) -> anyhow::Result<Self> {
         let dialog_v = XdgWmDialogV1::interface().version;
         Ok(Globals {
+            presentation_feedback: (std::env::var_os("STROLL_FRAME_TIMINGS").as_deref()
+                == Some(std::ffi::OsStr::new("1")))
+            .then(|| globals.bind(&qh, 1..=2, ()).ok())
+            .flatten(),
             activation: globals.bind(&qh, 1..=1, ()).ok(),
             compositor: globals
                 .bind(
@@ -397,10 +403,13 @@ pub(crate) struct WaylandClientState {
     axis_source: AxisSource,
     pub mouse_location: Option<Point<Pixels>>,
     continuous_scroll_delta: Option<Point<Pixels>>,
+    continuous_scroll_time: u32,
     discrete_scroll_delta: Option<Point<f32>>,
     vertical_modifier: f32,
     horizontal_modifier: f32,
     scroll_event_received: bool,
+    scroll_started: bool,
+    scroll_end_pending: Option<u32>,
     enter_token: Option<()>,
     button_pressed: Option<MouseButton>,
     mouse_focused_window: Option<WaylandWindowStatePtr>,
@@ -1118,7 +1127,10 @@ impl WaylandConnection {
             },
             capslock: Capslock { on: false },
             scroll_event_received: false,
+            scroll_started: false,
+            scroll_end_pending: None,
             axis_source: AxisSource::Wheel,
+            continuous_scroll_time: 0,
             mouse_location: None,
             continuous_scroll_delta: None,
             discrete_scroll_delta: None,
@@ -1680,6 +1692,56 @@ delegate_noop!(WaylandClientStatePtr: ignore zwp_text_input_manager_v3::ZwpTextI
 delegate_noop!(WaylandClientStatePtr: ignore org_kde_kwin_blur::OrgKdeKwinBlur);
 delegate_noop!(WaylandClientStatePtr: ignore wp_viewporter::WpViewporter);
 delegate_noop!(WaylandClientStatePtr: ignore wp_viewport::WpViewport);
+impl Dispatch<wp_presentation::WpPresentation, ()> for WaylandClientStatePtr {
+    fn event(
+        _: &mut Self,
+        _: &wp_presentation::WpPresentation,
+        event: wp_presentation::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if let wp_presentation::Event::ClockId { clk_id } = event {
+            eprintln!("wayland_presentation_clock clock_id={clk_id}");
+        }
+    }
+}
+
+impl Dispatch<wp_presentation_feedback::WpPresentationFeedback, (gpui::WindowId, u64)>
+    for WaylandClientStatePtr
+{
+    fn event(
+        _: &mut Self,
+        _: &wp_presentation_feedback::WpPresentationFeedback,
+        event: wp_presentation_feedback::Event,
+        (window, frame): &(gpui::WindowId, u64),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        match event {
+            wp_presentation_feedback::Event::Presented {
+                tv_sec_hi,
+                tv_sec_lo,
+                tv_nsec,
+                refresh,
+                seq_hi,
+                seq_lo,
+                ..
+            } => {
+                let seconds = (u64::from(tv_sec_hi) << 32) | u64::from(tv_sec_lo);
+                let sequence = (u64::from(seq_hi) << 32) | u64::from(seq_lo);
+                let presented_ns = u128::from(seconds) * 1_000_000_000 + u128::from(tv_nsec);
+                eprintln!(
+                    "wayland_presentation window={window:?} frame={frame} presented_ns={presented_ns} refresh_ns={refresh} sequence={sequence}"
+                );
+            }
+            wp_presentation_feedback::Event::Discarded => {
+                eprintln!("wayland_presentation window={window:?} frame={frame} discarded");
+            }
+            _ => {}
+        }
+    }
+}
 
 impl Dispatch<WlCallback, ObjectId> for WaylandClientStatePtr {
     fn event(
@@ -2449,6 +2511,11 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandClientStatePtr {
                 }
             }
             wl_pointer::Event::Leave { .. } => {
+                state.scroll_started = false;
+                state.scroll_end_pending = None;
+                state.continuous_scroll_delta = None;
+                state.discrete_scroll_delta = None;
+                state.scroll_event_received = false;
                 if let Some(focused_window) = state.mouse_focused_window.clone() {
                     let input = PlatformInput::MouseExited(MouseExitEvent {
                         position: state.mouse_location.unwrap(),
@@ -2623,6 +2690,7 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandClientStatePtr {
             wl_pointer::Event::Axis {
                 axis: WEnum::Value(axis),
                 value,
+                time,
                 ..
             } => {
                 if state.axis_source == AxisSource::Wheel {
@@ -2639,6 +2707,7 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandClientStatePtr {
                     _ => 1.0,
                 };
                 state.scroll_event_received = true;
+                state.continuous_scroll_time = time;
                 let scroll_delta = state
                     .continuous_scroll_delta
                     .get_or_insert(point(px(0.0), px(0.0)));
@@ -2708,35 +2777,78 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandClientStatePtr {
                     _ => unreachable!(),
                 }
             }
+            wl_pointer::Event::AxisStop { time, .. } => {
+                if matches!(
+                    state.axis_source,
+                    AxisSource::Finger | AxisSource::Continuous
+                ) && (state.scroll_started || state.scroll_event_received)
+                {
+                    state.scroll_end_pending = Some(time);
+                }
+            }
             wl_pointer::Event::Frame => {
-                if state.scroll_event_received {
+                let stopped = std::mem::take(&mut state.scroll_end_pending);
+                if state.scroll_event_received || stopped.is_some() {
                     state.scroll_event_received = false;
                     let continuous = state.continuous_scroll_delta.take();
                     let discrete = state.discrete_scroll_delta.take();
+                    let position = state.mouse_location.unwrap_or_default();
+                    let modifiers = state.modifiers;
+                    let touchpad = state.axis_source == AxisSource::Finger;
+                    let continuous_source = matches!(
+                        state.axis_source,
+                        AxisSource::Finger | AxisSource::Continuous
+                    );
+                    let window = state.mouse_focused_window.clone();
+                    let mut inputs = Vec::new();
                     if let Some(continuous) = continuous {
-                        if let Some(window) = state.mouse_focused_window.clone() {
-                            let input = PlatformInput::Scroll(ScrollEvent {
-                                position: state.mouse_location.unwrap(),
-                                delta: ScrollDelta::Pixels(continuous),
-                                modifiers: state.modifiers,
-                                touch_phase: TouchPhase::Moved,
-                                source: ScrollSource::Pointer,
-                            });
-                            drop(state);
-                            window.handle_input(input);
-                        }
-                    } else if let Some(discrete) = discrete
-                        && let Some(window) = state.mouse_focused_window.clone()
-                    {
-                        let input = PlatformInput::Scroll(ScrollEvent {
-                            position: state.mouse_location.unwrap(),
+                        let touch_phase = if continuous_source && !state.scroll_started {
+                            state.scroll_started = true;
+                            TouchPhase::Started
+                        } else {
+                            TouchPhase::Moved
+                        };
+                        inputs.push(PlatformInput::Scroll(ScrollEvent {
+                            position,
+                            delta: ScrollDelta::Pixels(continuous),
+                            modifiers,
+                            touch_phase,
+                            source: if touchpad {
+                                ScrollSource::TimedTouchpad(state.continuous_scroll_time)
+                            } else {
+                                ScrollSource::Pointer
+                            },
+                        }));
+                    } else if let Some(discrete) = discrete {
+                        inputs.push(PlatformInput::Scroll(ScrollEvent {
+                            position,
                             delta: ScrollDelta::Lines(discrete),
-                            modifiers: state.modifiers,
+                            modifiers,
                             touch_phase: TouchPhase::Moved,
                             source: ScrollSource::Pointer,
-                        });
-                        drop(state);
-                        window.handle_input(input);
+                        }));
+                    }
+                    if let Some(time) = stopped
+                        && state.scroll_started
+                    {
+                        state.scroll_started = false;
+                        inputs.push(PlatformInput::Scroll(ScrollEvent {
+                            position,
+                            delta: ScrollDelta::Pixels(point(px(0.0), px(0.0))),
+                            modifiers,
+                            touch_phase: TouchPhase::Ended,
+                            source: if touchpad {
+                                ScrollSource::TimedTouchpad(time)
+                            } else {
+                                ScrollSource::Pointer
+                            },
+                        }));
+                    }
+                    drop(state);
+                    if let Some(window) = window {
+                        for input in inputs {
+                            window.handle_input(input);
+                        }
                     }
                 }
             }

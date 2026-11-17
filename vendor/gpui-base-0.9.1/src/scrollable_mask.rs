@@ -4,11 +4,11 @@ use std::rc::Rc;
 use instant::Instant;
 
 use gpui::{
-    App, Axis, BorderStyle, Bounds, ContentMask, Edges, Element, ElementId, GlobalElementId,
-    Hitbox, Hsla, InteractiveElement as _, IntoElement, IsZero as _, LayoutId, OngoingScroll,
-    PaintQuad, ParentElement as _, Point, Position, ScrollDelta, ScrollEvent, ScrollHandle,
-    StatefulInteractiveElement as _, Style, StyleRefinement, Styled as _, Window, div, px,
-    relative,
+    Along as _, App, Axis, BorderStyle, Bounds, ContentMask, Edges, Element, ElementId,
+    GlobalElementId, Hitbox, Hsla, InteractiveElement as _, IntoElement, IsZero as _, LayoutId,
+    OngoingScroll, PaintQuad, ParentElement as _, Point, Position, ScrollDelta, ScrollEvent,
+    ScrollHandle, SmoothScroll, StatefulInteractiveElement as _, Style, StyleRefinement,
+    Styled as _, Window, div, px, relative,
 };
 use gpui::{Corners, Pixels};
 
@@ -22,6 +22,15 @@ thread_local! {
 /// Offsets closer than this count as unchanged, so a sub-pixel residue left at
 /// an edge does not read as room to scroll.
 const CLAIM_EPSILON: Pixels = px(0.5);
+
+fn record_horizontal_scroll(delta_x: Pixels) {
+    if delta_x.abs() >= CLAIM_EPSILON {
+        LAST_HORIZONTAL_SCROLL_CLAIM.set(Some(HorizontalScrollClaim {
+            at: Instant::now(),
+            delta_x,
+        }));
+    }
+}
 
 /// A scroll step that a horizontal [`ScrollableMask`] used to move its content.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -473,11 +482,11 @@ impl<H: ScrollbarHandle + Clone> Element for ScrollableMask<H> {
         _: &mut Self::RequestLayoutState,
         hitbox: &mut Self::PrepaintState,
         window: &mut Window,
-        _: &mut App,
+        cx: &mut App,
     ) {
-        let is_horizontal = self.axis.is_horizontal();
+        let axis = self.axis;
+        let is_horizontal = axis.is_horizontal();
         let vertical_wheel = self.vertical_wheel;
-        let line_height = window.line_height();
         let bounds = hitbox.bounds;
         let ongoing_scroll = global_id
             .map(|global_id| {
@@ -487,6 +496,12 @@ impl<H: ScrollbarHandle + Clone> Element for ScrollableMask<H> {
                 })
             })
             .unwrap_or_default();
+        let smooth_scroll = global_id.filter(|_| cx.smooth_scrolling()).map(|id| {
+            window.with_element_state(id, |state: Option<SmoothScroll>, _| {
+                let state = state.unwrap_or_default();
+                (state.clone(), state)
+            })
+        });
 
         window.with_content_mask(Some(ContentMask { bounds }), |window| {
             if let Some(color) = self.debug {
@@ -522,7 +537,50 @@ impl<H: ScrollbarHandle + Clone> Element for ScrollableMask<H> {
                     }
 
                     let mut offset = scroll_handle.offset();
-                    let mut delta = event.delta.pixel_delta(line_height);
+                    let mut delta = event.delta.content_delta();
+                    let animate_lines = smooth_scroll.is_some() && cx.smooth_scrolling();
+
+                    let mut animate = |axis: Axis, distance: Pixels| {
+                        let Some(smooth_scroll) = &smooth_scroll else {
+                            return false;
+                        };
+                        let scroll_max = (scroll_handle.content_size().along(axis)
+                            - scroll_handle.viewport_bounds().size.along(axis))
+                        .max(px(0.));
+                        let delta = match axis {
+                            Axis::Horizontal => gpui::point(distance, px(0.)),
+                            Axis::Vertical => gpui::point(px(0.), distance),
+                        };
+                        let target = smooth_scroll
+                            .target(offset, delta, window)
+                            .apply_along(axis, |value| value.clamp(-scroll_max, px(0.)));
+                        let handle = scroll_handle.clone();
+                        let handled = smooth_scroll.animate(
+                            offset,
+                            target,
+                            window,
+                            cx,
+                            move |last, next, _, cx| {
+                                if handle.offset() != last {
+                                    return None;
+                                }
+                                let max = (handle.content_size().along(axis)
+                                    - handle.viewport_bounds().size.along(axis))
+                                .max(px(0.));
+                                let next =
+                                    next.apply_along(axis, |value| value.clamp(-max, px(0.)));
+                                if last != next {
+                                    handle.set_offset(next);
+                                    cx.notify(view_id);
+                                }
+                                Some(handle.offset())
+                            },
+                        );
+                        if handled && is_horizontal && !vertical_wheel {
+                            record_horizontal_scroll(target.x - offset.x);
+                        }
+                        handled
+                    };
 
                     // A plain mouse wheel's vertical lines move the scroller
                     // sideways; once it is at its edge the parent scrolls
@@ -532,6 +590,12 @@ impl<H: ScrollbarHandle + Clone> Element for ScrollableMask<H> {
                             return;
                         };
                         if lines.x != 0. || lines.y == 0. || !lines.y.is_finite() {
+                            return;
+                        }
+                        if animate_lines {
+                            if animate(Axis::Horizontal, delta.y) {
+                                cx.stop_propagation();
+                            }
                             return;
                         }
                         let axis_max = (scroll_handle.content_size().width
@@ -580,6 +644,14 @@ impl<H: ScrollbarHandle + Clone> Element for ScrollableMask<H> {
                         }
                     }
 
+                    if !event.delta.precise() && animate_lines {
+                        let distance = delta.along(axis);
+                        if !distance.is_zero() && (animate(axis, distance) || is_horizontal) {
+                            cx.stop_propagation();
+                        }
+                        return;
+                    }
+
                     if !is_horizontal {
                         // The current offset must be clamped too: after a
                         // bubbled event, the scrolled element's own listener
@@ -614,13 +686,9 @@ impl<H: ScrollbarHandle + Clone> Element for ScrollableMask<H> {
                             - scroll_handle.viewport_bounds().size.width)
                             .max(px(0.));
                         let current = offset.x.clamp(-axis_max, px(0.));
-                        let moved = (offset.x + delta.x).clamp(-axis_max, px(0.)) - current;
-                        if moved.abs() >= CLAIM_EPSILON {
-                            LAST_HORIZONTAL_SCROLL_CLAIM.set(Some(HorizontalScrollClaim {
-                                at: Instant::now(),
-                                delta_x: moved,
-                            }));
-                        }
+                        record_horizontal_scroll(
+                            (offset.x + delta.x).clamp(-axis_max, px(0.)) - current,
+                        );
                     }
 
                     offset.x += delta.x;
@@ -1469,7 +1537,7 @@ mod tests {
     #[gpui::test]
     fn vertical_wheel_scrolls_the_strip_and_then_the_parent(cx: &mut TestAppContext) {
         let (cx, strip, page) = vertical_wheel_test(cx);
-        let line_height = cx.update(|window, _| window.line_height());
+        let line_height = ScrollDelta::Lines(gpui::point(0., 1.)).content_delta().y;
 
         wheel(cx, ScrollDelta::Lines(point(0., -1.)));
         assert_eq!(strip.offset().x, -line_height);
@@ -1493,7 +1561,7 @@ mod tests {
         cx: &mut TestAppContext,
     ) {
         let (cx, strip, page) = vertical_wheel_test(cx);
-        let line_height = cx.update(|window, _| window.line_height());
+        let line_height = ScrollDelta::Lines(gpui::point(1., 0.)).content_delta().x;
 
         // A vertical trackpad swipe keeps the strip's axis lock.
         wheel(cx, ScrollDelta::Pixels(point(px(0.), px(-20.))));

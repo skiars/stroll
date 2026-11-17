@@ -100,46 +100,49 @@
 (parameter (identifier) @variable.parameter)
 
 (lifetime (identifier) @label)
+(type_parameter name: (type_identifier) @type.parameter)
+(trait_item name: (type_identifier) @type.interface)
+(mod_item name: (identifier) @namespace)
 
 "as" @keyword
-"async" @keyword
-"await" @keyword
-"break" @keyword
-"const" @keyword
-"continue" @keyword
-"default" @keyword
-"dyn" @keyword
-"else" @keyword
+"async" @keyword.modifier
+"await" @keyword.modifier
+"break" @keyword.return
+"const" @keyword.modifier
+"continue" @keyword.return
+"default" @keyword.modifier
+"dyn" @keyword.modifier
+"else" @keyword.conditional
 "enum" @keyword
-"extern" @keyword
+"extern" @keyword.modifier
 "fn" @keyword
-"for" @keyword
+"for" @keyword.repeat
 "gen" @keyword
-"if" @keyword
+"if" @keyword.conditional
 "impl" @keyword
-"in" @keyword
+"in" @keyword.repeat
 "let" @keyword
-"loop" @keyword
+"loop" @keyword.repeat
 "macro_rules!" @keyword
-"match" @keyword
+"match" @keyword.conditional
 "mod" @keyword
-"move" @keyword
-"pub" @keyword
-"raw" @keyword
-"ref" @keyword
-"return" @keyword
-"static" @keyword
+"move" @keyword.modifier
+"pub" @keyword.modifier
+"raw" @keyword.modifier
+"ref" @keyword.modifier
+"return" @keyword.return
+"static" @keyword.modifier
 "struct" @keyword
 "trait" @keyword
 "type" @keyword
 "union" @keyword
-"unsafe" @keyword
+"unsafe" @keyword.modifier
 "use" @keyword
 "where" @keyword
-"while" @keyword
-"yield" @keyword
+"while" @keyword.repeat
+"yield" @keyword.return
 (crate) @keyword
-(mutable_specifier) @keyword
+(mutable_specifier) @keyword.modifier
 (use_list (self) @keyword)
 (scoped_use_list (self) @keyword)
 (scoped_identifier (self) @keyword)
@@ -151,9 +154,9 @@
 (string_literal) @string
 (raw_string_literal) @string
 
-(boolean_literal) @constant.builtin
-(integer_literal) @constant.builtin
-(float_literal) @constant.builtin
+(boolean_literal) @constant.builtin.boolean
+(integer_literal) @constant.builtin.number
+(float_literal) @constant.builtin.number
 
 (escape_sequence) @escape
 

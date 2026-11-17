@@ -12,7 +12,7 @@ pub use gpui_base::text::{
     InlineElement, InlineRenderContext, MarkdownBlockParserFn, MarkdownBlockRenderFn,
     MarkdownExtensions, MarkdownNode, MarkdownParseContext, MarkdownPlugin, RangeHighlight,
     RangeHighlightError, RenderedText, SelectionFormat, TableData, TaskToggleEvent, TextViewMotion,
-    TextViewState, markdown_ast,
+    TextViewState, data_url_image, markdown_ast,
 };
 pub use style::TextViewStyle;
 
@@ -43,6 +43,13 @@ pub(crate) fn base_text_view_style(theme: &crate::Theme) -> gpui_base::TextViewS
     table.corner_radii.bottom_right = Some(radius.into());
     let mut code_block = gpui::StyleRefinement::default();
     code_block.corner_radii = table.corner_radii.clone();
+    let code_theme = &theme.highlight_theme.style;
+    if let Some(foreground) = code_theme.editor_foreground {
+        code_block = code_block.text_color(foreground);
+    }
+    if let Some(background) = code_theme.code_block_background {
+        code_block = code_block.bg(background);
+    }
     let table_head = gpui::StyleRefinement::default()
         .bg(theme.table_head)
         .text_color(theme.table_head_foreground);
@@ -57,7 +64,6 @@ pub(crate) fn base_text_view_style(theme: &crate::Theme) -> gpui_base::TextViewS
         .with_code_block(code_block)
         .with_table(table)
         .with_table_head(table_head)
-        .with_table_row_hover(theme.table_hover)
         .with_inline_code(gpui::HighlightStyle {
             background_color: Some(theme.accent),
             ..Default::default()
@@ -80,6 +86,10 @@ pub(crate) fn install_text_view_defaults(theme: &crate::Theme, cx: &mut gpui::Ap
     defaults.install(cx);
 }
 
+/// Language aliases for a particular document or workspace.
+pub type CodeLanguages =
+    std::sync::Arc<std::collections::BTreeMap<gpui::SharedString, gpui::SharedString>>;
+
 #[cfg(feature = "tree-sitter")]
 pub(crate) fn component_code_block_highlighter(
     highlight_theme: std::sync::Arc<crate::highlighter::HighlightTheme>,
@@ -87,27 +97,43 @@ pub(crate) fn component_code_block_highlighter(
 + Send
 + Sync
 + 'static {
+    component_code_block_highlighter_with_languages(highlight_theme, None)
+}
+
+#[cfg(feature = "tree-sitter")]
+fn component_code_block_highlighter_with_languages(
+    highlight_theme: std::sync::Arc<crate::highlighter::HighlightTheme>,
+    languages: Option<CodeLanguages>,
+) -> impl Fn(&gpui_base::text::CodeBlock) -> Vec<(std::ops::Range<usize>, gpui::HighlightStyle)>
++ Send
++ Sync
++ 'static {
     move |block| {
         thread_local! {
-            static HIGHLIGHTERS: RefCell<HashMap<gpui::SharedString, SyntaxHighlighter>> =
-                RefCell::new(HashMap::new());
+            static HIGHLIGHTERS: RefCell<(u64, HashMap<gpui::SharedString, SyntaxHighlighter>)> =
+                RefCell::new((0, HashMap::new()));
         }
 
         let Some(lang) = block.lang() else {
             return Vec::new();
         };
+        let lang = languages
+            .as_ref()
+            .and_then(|languages| languages.get(&lang))
+            .cloned()
+            .unwrap_or(lang);
         let code = block.code();
         HIGHLIGHTERS.with(|cache| {
             let mut cache = cache.borrow_mut();
+            let generation = LanguageRegistry::singleton().generation();
+            if cache.0 != generation {
+                cache.0 = generation;
+                cache.1.clear();
+            }
             let highlighter = cache
+                .1
                 .entry(lang.clone())
                 .or_insert_with(|| SyntaxHighlighter::new(lang.as_ref()));
-            if let Some(config) = LanguageRegistry::singleton().language(lang.as_ref())
-                && highlighter.language() != &config.name
-            {
-                *highlighter = SyntaxHighlighter::new(lang.as_ref());
-            }
-
             let old_end_byte = highlighter.text().len();
             let old_end_position = highlighter.text().offset_to_point(old_end_byte);
             let code_rope = Rope::from_str(code.as_ref());
@@ -174,11 +200,32 @@ pub(crate) fn shared_code_block_highlighter(
     shared_code_block_highlighter_at(highlight_theme, generation)
 }
 
+#[cfg(feature = "tree-sitter")]
+fn scoped_code_block_highlighter(
+    theme: &std::sync::Arc<crate::highlighter::HighlightTheme>,
+    languages: &CodeLanguages,
+) -> std::sync::Arc<SharedCodeBlockHighlighter> {
+    cached_code_block_highlighter(
+        theme,
+        LanguageRegistry::singleton().generation(),
+        Some(languages),
+    )
+}
+
 /// [`shared_code_block_highlighter`] at an explicit registry `generation`.
 #[cfg(any(feature = "tree-sitter", feature = "syntect"))]
 fn shared_code_block_highlighter_at(
     highlight_theme: &std::sync::Arc<crate::highlighter::HighlightTheme>,
     generation: u64,
+) -> std::sync::Arc<SharedCodeBlockHighlighter> {
+    cached_code_block_highlighter(highlight_theme, generation, None)
+}
+
+#[cfg(any(feature = "tree-sitter", feature = "syntect"))]
+fn cached_code_block_highlighter(
+    highlight_theme: &std::sync::Arc<crate::highlighter::HighlightTheme>,
+    generation: u64,
+    _languages: Option<&CodeLanguages>,
 ) -> std::sync::Arc<SharedCodeBlockHighlighter> {
     use std::sync::Arc;
 
@@ -187,7 +234,11 @@ fn shared_code_block_highlighter_at(
     /// The registry generation the entries were built at, and the entries.
     type SharedHighlighters = (
         u64,
-        Vec<(Arc<HighlightTheme>, Arc<SharedCodeBlockHighlighter>)>,
+        Vec<(
+            Arc<HighlightTheme>,
+            Option<CodeLanguages>,
+            Arc<SharedCodeBlockHighlighter>,
+        )>,
     );
 
     const CAPACITY: usize = 4;
@@ -201,19 +252,34 @@ fn shared_code_block_highlighter_at(
             *cached_generation = generation;
             shared.clear();
         }
-        if let Some((_, highlighter)) = shared
-            .iter()
-            .find(|(theme, _)| Arc::ptr_eq(theme, highlight_theme))
-        {
+        if let Some((_, _, highlighter)) = shared.iter().find(|(theme, languages, _)| {
+            Arc::ptr_eq(theme, highlight_theme)
+                && match (languages, _languages) {
+                    (Some(existing), Some(languages)) => Arc::ptr_eq(existing, languages),
+                    (None, None) => true,
+                    _ => false,
+                }
+        }) {
             return highlighter.clone();
         }
 
+        #[cfg(feature = "tree-sitter")]
+        let highlighter: Arc<SharedCodeBlockHighlighter> =
+            Arc::new(component_code_block_highlighter_with_languages(
+                highlight_theme.clone(),
+                _languages.cloned(),
+            ));
+        #[cfg(not(feature = "tree-sitter"))]
         let highlighter: Arc<SharedCodeBlockHighlighter> =
             Arc::new(component_code_block_highlighter(highlight_theme.clone()));
         if shared.len() == CAPACITY {
             shared.remove(0);
         }
-        shared.push((highlight_theme.clone(), highlighter.clone()));
+        shared.push((
+            highlight_theme.clone(),
+            _languages.cloned(),
+            highlighter.clone(),
+        ));
         highlighter
     })
 }
@@ -264,6 +330,21 @@ mod tests {
         use gpui_base::text::CodeBlock;
 
         use crate::highlighter::{HighlightTheme, LanguageConfig, LanguageRegistry};
+
+        #[cfg(feature = "tree-sitter-bash")]
+        #[test]
+        fn bash_and_sh_fences_use_the_theme() {
+            let theme = HighlightTheme::default_dark();
+            let highlighter = super::super::component_code_block_highlighter(theme.clone());
+            let code = "if true; then echo \"$HOME\"; fi";
+            for language in ["bash", "sh"] {
+                let spans = highlighter(&CodeBlock::from_code(code, Some(language)));
+                assert!(
+                    spans.iter().any(|(range, style)| range.contains(&0)
+                        && Some(*style) == theme.style("keyword"))
+                );
+            }
+        }
 
         fn register_json(lang: &SharedString) {
             LanguageRegistry::singleton().register(
@@ -380,7 +461,9 @@ mod tests {
         assert_eq!(style.link(), theme.link);
         assert_eq!(style.selection(), theme.selection);
         assert_eq!(style.inline_code().background_color, Some(theme.accent));
-        assert_eq!(style.table_row_hover(), Some(theme.table_hover));
+        // Table body rows do not take a hover fill: the reading surface keeps
+        // tables flat, matching the document styling.
+        assert_eq!(style.table_row_hover(), None);
         let radius = theme.semantic_tokens().radius.md;
         assert_eq!(style.table().corner_radii.top_left, Some(radius.into()));
         assert_eq!(style.table().corner_radii.top_right, Some(radius.into()));

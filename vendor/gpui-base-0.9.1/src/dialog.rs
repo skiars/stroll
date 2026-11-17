@@ -650,7 +650,7 @@ impl RenderOnce for Dialog {
                     .refine_style(&self.style),
             ),
         )
-        .with_priority(10 + self.layer)
+        .with_priority(crate::MODAL_POPUP_PRIORITY + self.layer)
         .into_any_element()
     }
 }

@@ -285,7 +285,8 @@ fn render_control(
         .min_w_0()
         .when(multiline, |this| this.min_h_16())
         .when(!multiline, |this| {
-            this.when(presentation.inline_start, |this| this.pl_2())
+            this.when(!presentation.block_start && !presentation.block_end, |this| this.h_full())
+                .when(presentation.inline_start, |this| this.pl_2())
                 .when(presentation.inline_end, |this| this.pr_2())
         })
         .refine_style(&style)

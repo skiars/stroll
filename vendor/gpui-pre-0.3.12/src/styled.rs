@@ -540,18 +540,14 @@ pub trait Styled: Sized {
         self
     }
 
-    /// Sets the text size to 'extra small'.
-    /// [Docs](https://tailwindcss.com/docs/font-size#setting-the-font-size)
-    fn text_xs(mut self) -> Self {
-        self.text_style().font_size = Some(rems(0.75).into());
-        self
+    /// Sets the extra-small text tier to the default UI minimum of 12 logical pixels.
+    fn text_xs(self) -> Self {
+        self.text_sm()
     }
 
-    /// Sets the text size to 'small'.
-    /// [Docs](https://tailwindcss.com/docs/font-size#setting-the-font-size)
-    fn text_sm(mut self) -> Self {
-        self.text_style().font_size = Some(rems(0.875).into());
-        self
+    /// Sets the small text tier to the default UI minimum of 12 logical pixels.
+    fn text_sm(self) -> Self {
+        self.text_size(px(12.))
     }
 
     /// Sets the text size to 'base'.
@@ -647,6 +643,7 @@ pub trait Styled: Sized {
         let style = self.text_style();
         let underline = style.underline.get_or_insert_with(Default::default);
         underline.wavy = false;
+        underline.pattern = Default::default();
         self
     }
 

@@ -118,6 +118,7 @@ pub struct InputEditorStyle {
     pub highlight_styles: SharedHighlightStyleResolver,
     pub editor_invisible: Option<Hsla>,
     pub editor_active_line: Option<Hsla>,
+    pub editor_search_match_background: Option<Hsla>,
     pub editor_gutter_background: Option<Hsla>,
     pub fold_icon_renderer: Option<FoldIconRenderer>,
 }
@@ -173,6 +174,7 @@ impl Default for InputEditorStyle {
             highlight_styles: Arc::new(NoHighlightStyles),
             editor_invisible: None,
             editor_active_line: None,
+            editor_search_match_background: None,
             editor_gutter_background: None,
             fold_icon_renderer: None,
         }

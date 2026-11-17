@@ -3,9 +3,9 @@ use crate::{
     ThemeStyled as _, text::Text, tooltip::ComponentTooltip,
 };
 use gpui::{
-    App, Background, ElementId, Hsla, InteractiveElement, IntoElement, ParentElement as _,
-    RenderOnce, SharedString, StyleRefinement, Styled, Window, div, prelude::FluentBuilder as _,
-    px,
+    App, Background, BoxShadow, ElementId, Hsla, InteractiveElement, IntoElement,
+    ParentElement as _, RenderOnce, SharedString, StyleRefinement, Styled, Window, div,
+    prelude::FluentBuilder as _, px, rgba,
 };
 use gpui_base::{Switch as BaseSwitch, SwitchThumb, SwitchTrack, spring};
 use std::{rc::Rc, time::Duration};
@@ -185,23 +185,29 @@ impl RenderOnce for Switch {
         let unchecked_bg: Background = cx.theme().tokens.switch.into();
         // GPUI's element opacity multiplies each primitive's alpha instead of
         // compositing the subtree as one group, so fading the whole control
-        // would let the track show through the thumb. Fading the track alone
-        // lands on the pixels a grouped fade would: the thumb is `background`.
+        // would let the track show through the thumb. Fade the track alone
+        // so the thumb stays opaque.
         let disabled_bg = if checked { checked_bg } else { unchecked_bg }.opacity(0.5);
         let toggle_bg: Background = cx.theme().tokens.switch_thumb.into();
+        let thumb_shadow = BoxShadow::new(
+            px(0.),
+            px(1.),
+            if cx.theme().is_dark() {
+                rgba(0x00000066).into()
+            } else {
+                rgba(0x181a2812).into()
+            },
+        )
+        .blur_radius(px(1.));
         let disabled_label_color = cx.theme().muted_foreground;
 
         let (bg_width, bg_height) = match self.size {
             Size::XSmall | Size::Small => (px(28.), px(16.)),
             Size::Large => (px(44.), px(24.)),
-            _ => (px(36.), px(20.)),
-        };
-        let bar_width = match self.size {
-            Size::XSmall | Size::Small => px(12.),
-            Size::Large => px(20.),
-            _ => px(16.),
+            _ => (px(34.), px(20.)),
         };
         let inset = px(2.);
+        let thumb_size = bg_height - inset * 2;
         let radius = if cx.theme().radius >= px(4.) {
             bg_height
         } else {
@@ -216,7 +222,7 @@ impl RenderOnce for Switch {
         let thumb_x = spring(
             (self.id.clone(), "thumb"),
             if checked {
-                bg_width - bar_width - inset * 2
+                bg_width - thumb_size - inset * 2
             } else {
                 px(0.)
             },
@@ -286,9 +292,10 @@ impl RenderOnce for Switch {
                             // Switch Toggle
                             SwitchThumb::new(checked)
                                 .rounded(radius)
-                                .size(bar_width)
+                                .size(thumb_size)
                                 .left(thumb_x)
-                                .bg(toggle_bg),
+                                .bg(toggle_bg)
+                                .shadow(vec![thumb_shadow]),
                         ),
                 )
                 .when_some(self.label, |this, label| {
@@ -542,7 +549,7 @@ mod tests {
         cx.update(crate::init);
         for (size, width, height) in [
             (Size::Small, 28., 16.),
-            (Size::Medium, 36., 20.),
+            (Size::Medium, 34., 20.),
             (Size::Large, 44., 24.),
         ] {
             for checked in [false, true] {
@@ -586,7 +593,7 @@ mod tests {
         let bounds = cx
             .debug_bounds("labeled-switch")
             .expect("the complete labeled Switch must participate in prepaint");
-        assert!(bounds.size.width > px(36.));
+        assert!(bounds.size.width > px(34.));
         let bar = cx
             .debug_bounds("switch-bar")
             .expect("the Switch bar must participate in prepaint");

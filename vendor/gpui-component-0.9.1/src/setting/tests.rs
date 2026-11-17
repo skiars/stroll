@@ -397,11 +397,14 @@ fn resetting_search_results_leaves_hidden_settings_unchanged(cx: &mut TestAppCon
 struct VariantHost {
     pages: Vec<SettingPage>,
     outline: bool,
+    font_size: Pixels,
 }
 
 impl Render for VariantHost {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let mut settings = Settings::new("variant-test").pages(self.pages.clone());
+        let mut settings = Settings::new("variant-test")
+            .font_size(self.font_size)
+            .pages(self.pages.clone());
         if self.outline {
             settings = settings.with_group_variant(GroupBoxVariant::Outline);
         }
@@ -432,7 +435,11 @@ fn group_variant_overrides_the_settings_default(cx: &mut TestAppContext) {
 
     let open_window = |pages, outline, cx: &mut TestAppContext| {
         let (_, cx) = cx.add_window_view(|window, cx| {
-            let view = cx.new(|_| VariantHost { pages, outline });
+            let view = cx.new(|_| VariantHost {
+                pages,
+                outline,
+                font_size: px(13.5),
+            });
             Root::new(view, window, cx)
         });
         cx.simulate_resize(size(px(1000.), px(700.)));
@@ -491,4 +498,54 @@ fn selecting_a_group_from_another_page_scrolls_to_it(cx: &mut TestAppContext) {
     select(1, Some(2), cx);
     let target = cx.debug_bounds("setting-1-2-1").unwrap();
     assert!(target.top() >= px(0.) && target.bottom() <= px(700.));
+}
+
+#[cfg(feature = "test-support")]
+#[gpui::test]
+fn settings_uses_its_instance_font_size_and_line_heights(cx: &mut TestAppContext) {
+    cx.update(|cx| {
+        crate::init(cx);
+        crate::Theme::global_mut(cx).font_size = px(13.5);
+    });
+    let (_, cx) = cx.add_window_view(|window, cx| {
+        let pages = vec![
+            SettingPage::new("Appearance")
+                .description("Page description")
+                .group(SettingGroup::new().items([
+                    SettingItem::new(
+                        "Setting label",
+                        crate::setting::SettingField::switch(|_| true, |_, _| {}),
+                    ),
+                    SettingItem::render(|options, _, _| {
+                        div()
+                            .w(options.font_size())
+                            .h(px(1.))
+                            .debug_selector(|| "settings-instance-font-size".into())
+                    }),
+                ])),
+        ];
+        let view = cx.new(|_| VariantHost {
+            pages,
+            outline: false,
+            font_size: px(14.),
+        });
+        Root::new(view, window, cx)
+    });
+    cx.simulate_resize(size(px(1000.), px(700.)));
+    draw(cx);
+    assert_eq!(
+        cx.debug_bounds("settings-instance-font-size")
+            .unwrap()
+            .size
+            .width,
+        px(14.)
+    );
+
+    cx.update(|window, _| {
+        let texts = gpui_base::test_support::texts(window);
+        for (label, height) in [("Setting label", px(18.)), ("Page description", px(17.))] {
+            let text = texts.iter().find(|text| text.text() == label).unwrap();
+            assert_eq!(text.bounds().size.height, height, "{label}");
+        }
+    });
 }

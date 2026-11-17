@@ -53,6 +53,7 @@ mod pagination;
 pub mod plot;
 mod popover;
 mod popup;
+mod popup_motion;
 mod positioner;
 mod progress;
 pub mod questionnaire;
@@ -155,6 +156,9 @@ pub use pagination::{Pagination, PaginationItem, PaginationState};
 pub use plot::PlotMotion;
 pub use popover::{Popover, PopoverState};
 pub use popup::{POPUP_PRIORITY, Popup};
+pub use popup_motion::{
+    DROPDOWN_TRAVEL, MODAL_POPUP_PRIORITY, PopupFrame, PopupMotion, PopupMotionKind,
+};
 pub use positioner::{Align, Positioner, ResolvedPosition};
 pub use progress::{Progress, ProgressIndicator, ProgressTrack};
 pub use radio::{Radio, RadioStyles};

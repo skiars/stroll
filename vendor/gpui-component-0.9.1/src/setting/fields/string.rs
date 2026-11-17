@@ -9,7 +9,7 @@ use crate::{
     AxisExt as _, Sizable, StyledExt,
     input::{Input, InputEvent, InputState},
     setting::{
-        AnySettingField, RenderOptions,
+        AnySettingField, CONTROL_LINE_HEIGHT, RenderOptions,
         fields::{SettingFieldRender, get_value, set_value},
     },
 };
@@ -95,6 +95,8 @@ where
             .aria_label(self.title.clone())
             .disabled(options.is_disabled())
             .with_size(options.size())
+            .text_size(options.font_size())
+            .line_height(CONTROL_LINE_HEIGHT)
             .map(|this| {
                 if options.layout().is_horizontal() {
                     this.w_64()

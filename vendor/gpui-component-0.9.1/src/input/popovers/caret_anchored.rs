@@ -28,6 +28,13 @@ pub(crate) fn caret_popup_anchor(geometry: PrepaintCaretGeometry) -> Point<Pixel
     )
 }
 
+/// Available vertical room on the side of the caret with the most space.
+pub(crate) fn caret_popup_height(anchor: Point<Pixels>, window: &Window) -> Pixels {
+    let above = anchor.y - px(8.);
+    let below = window.viewport_size().height - anchor.y - px(8.);
+    above.max(below).max(px(0.))
+}
+
 /// A popup positioned at the caret from the input's current-frame prepaint.
 ///
 /// The content is built in prepaint (not render) from the resolved anchor,
@@ -95,7 +102,7 @@ impl Element for CaretAnchoredPopup {
         let anchor = caret_popup_anchor(geometry);
         let mut content = (self.build)(anchor, window, cx);
         let viewport = window.viewport_size();
-        content.layout_as_root(
+        let size = content.layout_as_root(
             Size {
                 width: AvailableSpace::Definite(viewport.width),
                 height: AvailableSpace::Definite(viewport.height),
@@ -103,7 +110,19 @@ impl Element for CaretAnchoredPopup {
             window,
             cx,
         );
-        content.prepaint_at(anchor, window, cx);
+        let margin = px(8.);
+        let bottom = (viewport.height - size.height - margin).max(margin);
+        let right = (viewport.width - size.width - margin).max(margin);
+        let y = if anchor.y + size.height <= viewport.height - margin {
+            anchor.y
+        } else {
+            anchor.y - geometry.line_height() - px(8.) - size.height
+        };
+        content.prepaint_at(
+            Point::new(anchor.x.clamp(margin, right), y.clamp(margin, bottom)),
+            window,
+            cx,
+        );
         self.content = Some(content);
     }
 

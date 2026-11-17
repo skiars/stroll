@@ -178,6 +178,10 @@ impl RenderOnce for NumberInput {
                     .gap_0()
                     .rounded_none()
                     .text_align(TextAlign::Center)
+                    .when_some(self.style.text.font_size, |this, size| this.text_size(size))
+                    .when_some(self.style.text.line_height, |this, height| {
+                        this.line_height(height)
+                    })
                     .when_some(self.prefix, |this, prefix| this.prefix(prefix))
                     .when_some(self.suffix, |this, suffix| this.suffix(suffix)),
             )

@@ -1367,6 +1367,10 @@ impl WindowsWindowInner {
         };
         let mut request_frame = self.state.callbacks.request_frame.take()?;
 
+        // A vsync may invalidate this window while drawing or presenting.
+        // Clear the current update region first so that newer request survives.
+        unsafe { ValidateRect(Some(handle), None).ok().log_err() };
+
         self.state.direct_manipulation.update();
 
         let events = self.state.direct_manipulation.drain_events();
@@ -1398,7 +1402,6 @@ impl WindowsWindowInner {
 
         self.state.callbacks.request_frame.set(Some(request_frame));
         self.update_ime_enabled(handle);
-        unsafe { ValidateRect(Some(handle), None).ok().log_err() };
 
         Some(0)
     }

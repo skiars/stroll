@@ -436,7 +436,17 @@ impl Render for Notification {
             .gap_3()
             .refine_style(&self.style)
             .when_some(icon, |this, icon| {
-                this.child(div().absolute().top(px(18.)).left_4().child(icon))
+                this.child(
+                    div()
+                        .absolute()
+                        // Share the first line's top edge: pinning the icon to a
+                        // fixed offset let it drift below the title on systems
+                        // whose line height is taller than the default.
+                        .top(px(14.))
+                        .left_4()
+                        .debug_selector(|| "notification-icon".into())
+                        .child(icon),
+                )
             })
             .child(
                 v_flex()
@@ -444,10 +454,21 @@ impl Render for Notification {
                     .overflow_hidden()
                     .when(has_icon, |this| this.pl_6())
                     .when_some(self.title.clone(), |this, title| {
-                        this.child(div().text_sm().font_semibold().child(title))
+                        this.child(
+                            div()
+                                .text_sm()
+                                .font_semibold()
+                                .debug_selector(|| "notification-title".into())
+                                .child(title),
+                        )
                     })
                     .when_some(self.message.clone(), |this, message| {
-                        this.child(div().text_sm().child(message))
+                        this.child(
+                            div()
+                                .text_sm()
+                                .debug_selector(|| "notification-message".into())
+                                .child(message),
+                        )
                     })
                     .when_some(content, |this, content| this.child(content)),
             )

@@ -6,7 +6,7 @@ use ropey::Rope;
 
 use super::{
     InputBaseState, InputModeKind,
-    popovers::{CodeActionMenu, CompletionMenu, DiagnosticPopover, HoverPopover},
+    popovers::{CodeActionMenu, CompletionMenu, HoverPopover},
     search::SearchPanel,
 };
 use gpui_base::input::CompletionHighlighter;
@@ -68,11 +68,8 @@ pub(crate) struct LspOverlays {
     completion: Entity<CompletionMenu>,
     code_actions: Entity<CodeActionMenu>,
     hover: Option<Entity<HoverPopover>>,
-    diagnostic: Option<Entity<DiagnosticPopover>>,
     completion_signature: OverlaySignature,
     code_action_signature: OverlaySignature,
-    hover_signature: Option<std::ops::Range<usize>>,
-    diagnostic_signature: Option<std::rc::Rc<gpui_base::input::DiagnosticEntry>>,
     /// Highlighter last copied onto the completion menu.
     ///
     /// Compared by `Rc` identity, so swapping the host's closure repaints an
@@ -89,17 +86,12 @@ pub(crate) struct LspSnapshot {
     completion: OverlaySignature,
     completion_start: Option<usize>,
     code_action: OverlaySignature,
-    hover: Option<std::ops::Range<usize>>,
-    diagnostic: Option<std::rc::Rc<gpui_base::input::DiagnosticEntry>>,
-    cursor: usize,
+    hover: bool,
 }
 
 impl LspSnapshot {
     fn has_overlay(&self) -> bool {
-        self.completion.open
-            || self.code_action.open
-            || self.hover.is_some()
-            || self.diagnostic.is_some()
+        self.completion.open || self.code_action.open || self.hover
     }
 }
 
@@ -118,6 +110,14 @@ pub(crate) trait OverlayMode: InputModeKind + Sized {
     }
 
     /// Installs the routing that lets an open menu consume actions first.
+    fn code_action_indicator(
+        _state: &Entity<InputBaseState<Self>>,
+        _window: &mut Window,
+        _cx: &mut App,
+    ) -> Option<AnyElement> {
+        None
+    }
+
     fn install_action_handler(_state: &Entity<InputBaseState<Self>>, _cx: &mut App) {}
 
     fn build_lsp(
@@ -142,6 +142,17 @@ impl OverlayMode for crate::input::InputMode {}
 impl OverlayMode for crate::input::TextareaMode {}
 
 impl OverlayMode for crate::input::EditorMode {
+    fn code_action_indicator(
+        state: &Entity<InputBaseState<Self>>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Option<AnyElement> {
+        state.update(cx, |editor, cx| {
+            editor.refresh_code_action_indicator(window, cx)
+        });
+        super::popovers::code_action_indicator(state, window, cx)
+    }
+
     fn install_action_handler(state: &Entity<InputBaseState<Self>>, cx: &mut App) {
         let id = state.entity_id();
         state.update(cx, move |state, _| {
@@ -179,11 +190,7 @@ impl OverlayMode for crate::input::EditorMode {
                 open: code_actions.open,
                 revision: code_actions.revision(),
             },
-            hover: state
-                .hover_popover()
-                .map(|popover| popover.symbol_range.clone()),
-            diagnostic: state.diagnostic_popover(),
-            cursor: state.cursor(),
+            hover: state.hover_popover().is_some(),
         })
     }
 
@@ -194,13 +201,10 @@ impl OverlayMode for crate::input::EditorMode {
     ) -> Option<LspOverlays> {
         Some(LspOverlays {
             completion: CompletionMenu::new(state.clone(), window, cx),
-            code_actions: CodeActionMenu::new(state.clone(), window, cx),
+            code_actions: CodeActionMenu::new(state.clone(), cx),
             hover: None,
-            diagnostic: None,
             completion_signature: OverlaySignature::default(),
             code_action_signature: OverlaySignature::default(),
-            hover_signature: None,
-            diagnostic_signature: None,
             completion_highlight: None,
         })
     }
@@ -212,8 +216,6 @@ impl OverlayMode for crate::input::EditorMode {
         window: &mut Window,
         cx: &mut App,
     ) {
-        let cursor = snapshot.cursor;
-
         let highlight = state.read(cx).lsp().completion_highlighter().clone();
         if lsp
             .completion_highlight
@@ -233,62 +235,65 @@ impl OverlayMode for crate::input::EditorMode {
             let open = snapshot.completion.open;
             let start = snapshot.completion_start;
             // Read the items only now, on a frame where they changed.
-            let (query, items) = {
+            let (query, items, (document_revision, caret)) = {
                 let menu = state.read(cx).completion_menu_state();
-                (menu.query.clone(), menu.items.clone())
+                (menu.query.clone(), menu.items.clone(), menu.origin())
             };
             lsp.completion.update(cx, |menu, cx| {
                 if open {
-                    menu.update_query(start.unwrap_or(cursor), query);
-                    menu.show(cursor, items, window, cx);
+                    menu.update_query(start.unwrap_or(caret), query);
+                    menu.set_revision(document_revision, snapshot.completion.revision);
+                    menu.show(caret, items, window, cx);
                 } else {
                     menu.hide(cx);
                 }
             });
         }
 
+        // A code action session inserts its content into the existing hover
+        // surface and freezes the diagnostic/documentation snapshot.
+        let hover = {
+            let state = state.read(cx);
+            state
+                .code_action_hover()
+                .or_else(|| state.hover_popover().cloned())
+        };
+        match (lsp.hover.as_ref(), hover) {
+            (Some(surface), Some(hover)) => {
+                if surface.read(cx).needs_update(&hover) {
+                    surface.update(cx, |surface, cx| surface.update_hover(hover, cx));
+                }
+            }
+            (None, Some(hover)) => {
+                lsp.hover = Some(HoverPopover::new(state.clone(), hover, cx));
+            }
+            (Some(surface), None) if !surface.read(cx).closing() => {
+                surface.update(cx, |surface, cx| surface.close(cx));
+            }
+            _ => {}
+        }
         if snapshot.code_action != lsp.code_action_signature {
+            let menu_state = state.read(cx).code_action_menu_state().clone();
+            let open = snapshot.code_action.open;
             lsp.code_action_signature = OverlaySignature {
-                open: snapshot.code_action.open,
+                open,
                 revision: snapshot.code_action.revision,
             };
-            let open = snapshot.code_action.open;
-            let items = state.read(cx).code_action_menu_state().items.clone();
-            lsp.code_actions.update(cx, |menu, cx| {
-                if open {
-                    menu.show(cursor, items, window, cx);
-                } else {
-                    menu.hide(cx);
-                }
-            });
+            if let Some(surface) = &lsp.hover {
+                let scroll = surface.read(cx).scroll_handle().clone();
+                lsp.code_actions
+                    .update(cx, |menu, cx| menu.sync(menu_state, &scroll, cx));
+                surface.update(cx, |surface, cx| {
+                    surface.set_code_actions(open.then(|| lsp.code_actions.clone()), cx);
+                });
+            }
         }
-
-        // A hover popover is anchored to one symbol, so a new range means new
-        // content and the same range means the same content.
-        if snapshot.hover != lsp.hover_signature {
-            lsp.hover_signature = snapshot.hover.clone();
-            let popover = state
-                .read(cx)
-                .hover_popover()
-                .map(|popover| (popover.symbol_range.clone(), popover.hover.clone()));
-            lsp.hover = popover.map(|(symbol_range, hover)| {
-                HoverPopover::new(state.clone(), symbol_range, &hover, cx)
-            });
-        }
-
-        // The engine hands out the diagnostic behind an `Rc`, so pointer
-        // identity already answers "is this the same entry".
-        let diagnostic_changed = match (&snapshot.diagnostic, &lsp.diagnostic_signature) {
-            (Some(new), Some(old)) => !std::rc::Rc::ptr_eq(new, old),
-            (None, None) => false,
-            _ => true,
-        };
-        if diagnostic_changed {
-            lsp.diagnostic_signature = snapshot.diagnostic.clone();
-            lsp.diagnostic = snapshot
-                .diagnostic
-                .as_deref()
-                .map(|entry| DiagnosticPopover::new(entry, state.clone(), cx));
+        if lsp
+            .hover
+            .as_ref()
+            .is_some_and(|hover| !hover.read(cx).visible(window, cx))
+        {
+            lsp.hover = None;
         }
     }
 }
@@ -392,23 +397,27 @@ impl<M: OverlayMode> InputOverlayHost<M> {
         }
 
         let search = search_open.then(|| self.search.clone().into_any_element());
-        let mut floating = Vec::with_capacity(4);
+        let mut floating = Vec::with_capacity(3);
         if let (Some(lsp), Some(snapshot)) = (self.lsp.as_ref(), snapshot.as_ref()) {
             if snapshot.completion.open {
                 floating.push(lsp.completion.clone().into_any_element());
             }
-            if snapshot.code_action.open {
-                floating.push(lsp.code_actions.clone().into_any_element());
-            }
             if let Some(hover) = lsp.hover.as_ref() {
                 floating.push(hover.clone().into_any_element());
-            }
-            if let Some(diagnostic) = lsp.diagnostic.as_ref() {
-                floating.push(diagnostic.clone().into_any_element());
             }
         }
         InputOverlays { search, floating }
     }
+}
+
+pub(super) fn search_has_focus(
+    state: &Entity<crate::input::EditorState>,
+    window: &Window,
+    cx: &App,
+) -> bool {
+    cx.try_global::<InputOverlayRegistry<crate::input::EditorMode>>()
+        .and_then(|registry| registry.hosts.get(&state.entity_id()))
+        .is_some_and(|(_, host)| host.search.read(cx).has_focus(window, cx))
 }
 
 pub(super) fn render_overlays<M: OverlayMode>(
@@ -417,12 +426,18 @@ pub(super) fn render_overlays<M: OverlayMode>(
     cx: &mut App,
 ) -> InputOverlays {
     M::install_action_handler(state, cx);
+    let indicator = M::code_action_indicator(state, window, cx);
     let has_overlay = {
         let state = state.read(cx);
         state.search_session().open
             || M::lsp_snapshot(state, cx).is_some_and(|lsp| lsp.has_overlay())
     };
-    if !has_overlay {
+    let leaving = cx
+        .try_global::<InputOverlayRegistry<M>>()
+        .and_then(|registry| registry.hosts.get(&state.entity_id()))
+        .and_then(|(_, host)| host.lsp.as_ref())
+        .is_some_and(|lsp| lsp.hover.is_some());
+    if !has_overlay && !leaving {
         if cx.has_global::<InputOverlayRegistry<M>>() {
             let registry = cx.global_mut::<InputOverlayRegistry<M>>();
             registry.hosts.remove(&state.entity_id());
@@ -430,7 +445,10 @@ pub(super) fn render_overlays<M: OverlayMode>(
                 .hosts
                 .retain(|_, (owner, _)| owner.upgrade().is_some());
         }
-        return InputOverlays::default();
+        return InputOverlays {
+            search: None,
+            floating: indicator.into_iter().collect(),
+        };
     }
 
     if !cx.has_global::<InputOverlayRegistry<M>>() {
@@ -444,10 +462,22 @@ pub(super) fn render_overlays<M: OverlayMode>(
         .remove(&id)
         .map(|(_, host)| host)
         .unwrap_or_else(|| InputOverlayHost::new(state.clone(), window, cx));
-    let overlays = host.sync(state, window, cx);
-    cx.global_mut::<InputOverlayRegistry<M>>()
-        .hosts
-        .insert(id, (state.downgrade(), host));
+    let mut overlays = host.sync(state, window, cx);
+    overlays.floating.extend(indicator);
+    if has_overlay || !overlays.floating.is_empty() {
+        // A keyed token keeps the host available to action dispatch while this
+        // editor is mounted. Its release removes strong references held by the
+        // registry after the editor is switched out or closed.
+        window.use_keyed_state(("input-overlay-lifetime", id), cx, |_, cx| {
+            cx.on_release(move |_: &mut (), cx| {
+                cx.global_mut::<InputOverlayRegistry<M>>().hosts.remove(&id);
+            })
+            .detach();
+        });
+        cx.global_mut::<InputOverlayRegistry<M>>()
+            .hosts
+            .insert(id, (state.downgrade(), host));
+    }
     overlays
 }
 
@@ -681,9 +711,9 @@ mod tests {
             let mut host = InputOverlayHost::new(state.clone(), window, cx);
             let overlays = host.sync(&state, window, cx);
             assert!(overlays.search.is_some());
-            assert_eq!(overlays.floating.len(), 4);
-            assert_eq!(overlays.len(), 5);
-            assert_eq!(render_overlays(&state, window, cx).len(), 5);
+            assert_eq!(overlays.floating.len(), 2);
+            assert_eq!(overlays.len(), 3);
+            assert_eq!(render_overlays(&state, window, cx).len(), 3);
             assert!(
                 cx.global::<InputOverlayRegistry<crate::input::EditorMode>>()
                     .hosts

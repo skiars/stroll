@@ -23,8 +23,9 @@ use crate::{
     KeyUpEvent, KeyboardButton, KeyboardClickEvent, LayoutId, LongPressEvent,
     ModifiersChangedEvent, MouseButton, MouseClickEvent, MouseDownEvent, MouseExitEvent,
     MouseMoveEvent, MousePressureEvent, MouseUpEvent, OngoingScroll, Overflow, ParentElement,
-    PinchEvent, Pixels, Point, Render, ScrollEvent, SharedString, Size, Style, StyleRefinement,
-    Styled, Task, TooltipId, TouchPhase, Visibility, Window, WindowControlArea, point, px, size,
+    PinchEvent, Pixels, Point, Render, ScrollDelta, ScrollEvent, SharedString, Size, SmoothScroll,
+    Style, StyleRefinement, Styled, Task, TooltipId, TouchPhase, Visibility, Window,
+    WindowControlArea, point, px, size,
 };
 use collections::HashMap;
 use gpui_util::ResultExt;
@@ -902,10 +903,8 @@ pub trait InteractiveElement: Sized {
     /// Set a key that can be used to look up this element's bounds
     /// in the [`crate::VisualTestContext::debug_bounds`] map.
     ///
-    /// Selectors are only recorded in debug builds with the `test-support`
-    /// feature. Elsewhere this is a no-op, so `test-support` can stay enabled
-    /// in release builds without the per-frame cost.
-    #[cfg(any(test, all(debug_assertions, feature = "test-support")))]
+    /// 测试及启用了 `test-support` 的构建会记录选择器。
+    #[cfg(any(test, feature = "test-support"))]
     fn debug_selector(mut self, f: impl FnOnce() -> String) -> Self {
         self.interactivity().debug_selector = Some(f());
         self
@@ -914,10 +913,8 @@ pub trait InteractiveElement: Sized {
     /// Set a key that can be used to look up this element's bounds
     /// in the [`crate::VisualTestContext::debug_bounds`] map.
     ///
-    /// Selectors are only recorded in debug builds with the `test-support`
-    /// feature. Elsewhere this is a no-op, so `test-support` can stay enabled
-    /// in release builds without the per-frame cost.
-    #[cfg(not(any(test, all(debug_assertions, feature = "test-support"))))]
+    /// 未启用 `test-support` 的应用构建会忽略选择器。
+    #[cfg(not(any(test, feature = "test-support")))]
     #[inline]
     fn debug_selector(self, _: impl FnOnce() -> String) -> Self {
         self
@@ -1798,12 +1795,14 @@ pub enum HoverListenerMode {
     /// keyboard-modality filtering; all other [`StatefulInteractiveElement::on_hover`] behavior
     /// remains unchanged.
     InputModalityIndependent,
+    /// Enter only on pointer motion while still reporting layout-driven exits.
+    PointerTriggered,
 }
 
 impl HoverListenerMode {
     fn is_hovered(self, hitbox: &Hitbox, window: &Window) -> bool {
         match self {
-            Self::InputModalityAware => hitbox.is_hovered(window),
+            Self::InputModalityAware | Self::PointerTriggered => hitbox.is_hovered(window),
             Self::InputModalityIndependent => hitbox.id.is_hovered_ignoring_last_input(window),
         }
     }
@@ -1848,6 +1847,8 @@ pub fn div() -> Div {
         prepaint_listener: None,
         image_cache: None,
         prepaint_order_fn: None,
+        viewport_overlays: Vec::new(),
+        partial_repaint: None,
     }
 }
 
@@ -1855,12 +1856,36 @@ pub fn div() -> Div {
 pub struct Div {
     interactivity: Interactivity,
     children: SmallVec<[StackSafe<AnyElement>; 2]>,
+    viewport_overlays: Vec<Box<AnyElement>>,
+    partial_repaint: Option<Box<dyn Fn(&App) -> Option<Pixels>>>,
     prepaint_listener: Option<Box<dyn Fn(Vec<Bounds<Pixels>>, &mut Window, &mut App) + 'static>>,
     image_cache: Option<Box<dyn ImageCacheProvider>>,
     prepaint_order_fn: Option<Box<dyn Fn(&mut Window, &mut App) -> SmallVec<[usize; 8]>>>,
 }
 
 impl Div {
+    /// Clip children to this viewport and allow the renderer to update it independently.
+    pub fn partial_repaint(mut self) -> Self {
+        self.partial_repaint = Some(Box::new(|_| None));
+        self
+    }
+
+    /// Allow independent repainting and supply the current vertical scroll offset.
+    /// The first painted child must fill the region with an opaque solid color
+    /// for shifted pixels to be reused.
+    pub fn partial_scroll(mut self, offset: impl Fn(&App) -> Pixels + 'static) -> Self {
+        self.partial_repaint = Some(Box::new(move |cx| Some(offset(cx))));
+        self
+    }
+
+    /// Paint an overlay within this viewport, outside the scrolled contents.
+    /// Overlays do not contribute to the layout or to indexed scroll targets.
+    pub fn viewport_overlay(mut self, element: impl IntoElement) -> Self {
+        self.viewport_overlays
+            .push(Box::new(element.into_any_element()));
+        self
+    }
+
     /// Add a listener to be called when the children of this `Div` are prepainted.
     /// This allows you to store the [`Bounds`] of the children for later use.
     pub fn on_children_prepainted(
@@ -1891,6 +1916,28 @@ impl Div {
     ) -> Self {
         self.prepaint_order_fn = Some(Box::new(order_fn));
         self
+    }
+}
+
+impl Stateful<Div> {
+    /// Clip children to this viewport and allow the renderer to update it independently.
+    pub fn partial_repaint(mut self) -> Self {
+        self.element.partial_repaint = Some(Box::new(|_| None));
+        self
+    }
+
+    /// Allow independent repainting of a vertically scrolling opaque viewport.
+    pub fn partial_scroll(self, offset: impl Fn(&App) -> Pixels + 'static) -> Self {
+        Self {
+            element: self.element.partial_scroll(offset),
+        }
+    }
+
+    /// Paint an overlay within this viewport, outside the scrolled contents.
+    pub fn viewport_overlay(self, element: impl IntoElement) -> Self {
+        Self {
+            element: self.element.viewport_overlay(element),
+        }
     }
 }
 
@@ -2095,6 +2142,15 @@ impl Element for Div {
                         }
                     });
 
+                    for overlay in &mut self.viewport_overlays {
+                        overlay.prepaint_as_root(
+                            bounds.origin,
+                            bounds.size.map(Into::into),
+                            window,
+                            cx,
+                        );
+                    }
+
                     if let Some(listener) = self.prepaint_listener.as_ref() {
                         listener(children_bounds, window, cx);
                     }
@@ -2135,8 +2191,19 @@ impl Element for Div {
                         return;
                     }
 
-                    for child in &mut self.children {
-                        child.paint(window, cx);
+                    let scroll = self.partial_repaint.as_ref().map(|offset| offset(cx));
+                    let mut paint = |window: &mut Window| {
+                        for child in &mut self.children {
+                            child.paint(window, cx);
+                        }
+                        for overlay in &mut self.viewport_overlays {
+                            overlay.paint(window, cx);
+                        }
+                    };
+                    if let Some(scroll) = scroll {
+                        window.paint_partial_region(bounds, scroll, paint);
+                    } else {
+                        paint(window);
                     }
                 },
             )
@@ -2196,6 +2263,8 @@ pub struct Interactivity {
     pub(crate) tracked_scroll_handle: Option<ScrollHandle>,
     pub(crate) scroll_anchor: Option<ScrollAnchor>,
     pub(crate) scroll_offset: Option<Rc<RefCell<Point<Pixels>>>>,
+    pub(crate) smooth_scroll: Option<SmoothScroll>,
+    pub(crate) scroll_max: Point<Pixels>,
     pub(crate) ongoing_scroll: Option<Rc<RefCell<OngoingScroll>>>,
     pub(crate) group: Option<SharedString>,
     /// The base style of the element, before any modifications are applied
@@ -2251,7 +2320,7 @@ pub struct Interactivity {
     #[cfg(any(feature = "inspector", debug_assertions))]
     pub(crate) source_location: Option<&'static core::panic::Location<'static>>,
 
-    #[cfg(any(test, all(debug_assertions, feature = "test-support")))]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) debug_selector: Option<String>,
 }
 
@@ -2321,6 +2390,9 @@ impl Interactivity {
                 }
 
                 if let Some(scroll_handle) = self.tracked_scroll_handle.as_ref() {
+                    if cx.smooth_scrolling() {
+                        self.smooth_scroll = Some(scroll_handle.smooth_scroll());
+                    }
                     let scroll_handle_state = scroll_handle.0.borrow();
                     self.scroll_offset = Some(scroll_handle_state.offset.clone());
                     self.ongoing_scroll = Some(scroll_handle_state.ongoing_scroll.clone());
@@ -2334,6 +2406,14 @@ impl Interactivity {
                             .get_or_insert_with(Rc::default)
                             .clone(),
                     );
+                    if cx.smooth_scrolling() {
+                        self.smooth_scroll = Some(
+                            element_state
+                                .smooth_scroll
+                                .get_or_insert_with(SmoothScroll::default)
+                                .clone(),
+                        );
+                    }
                     self.ongoing_scroll = Some(
                         element_state
                             .ongoing_scroll
@@ -2374,7 +2454,9 @@ impl Interactivity {
             },
         );
 
-        if let Some(focus_handle) = self.tracked_focus_handle.as_ref() {
+        if !window.is_paint_only()
+            && let Some(focus_handle) = self.tracked_focus_handle.as_ref()
+        {
             window.set_focus_handle(focus_handle, cx);
 
             if window.a11y.is_active() {
@@ -2395,7 +2477,8 @@ impl Interactivity {
             }
         }
 
-        if self.report_active_descendant_focus && window.a11y.is_active() {
+        if !window.is_paint_only() && self.report_active_descendant_focus && window.a11y.is_active()
+        {
             if let Some(global_id) = global_id {
                 window
                     .a11y
@@ -2419,7 +2502,9 @@ impl Interactivity {
                             .hover_state
                             .get_or_insert_with(Default::default);
                     }
-                    if let Some(active_tooltip) = element_state.active_tooltip.as_ref() {
+                    if !window.is_paint_only()
+                        && let Some(active_tooltip) = element_state.active_tooltip.as_ref()
+                    {
                         if self.tooltip_builder.is_some() {
                             self.tooltip_id = set_tooltip_on_window(active_tooltip, window);
                         } else {
@@ -2438,7 +2523,9 @@ impl Interactivity {
                     window.with_content_mask(
                         style.overflow_mask(bounds, window.rem_size()),
                         |window| {
-                            let hitbox = if self.should_insert_hitbox(&style, window, cx) {
+                            let hitbox = if !window.is_paint_only()
+                                && self.should_insert_hitbox(&style, window, cx)
+                            {
                                 Some(window.insert_hitbox(bounds, self.hitbox_behavior))
                             } else {
                                 None
@@ -2486,7 +2573,7 @@ impl Interactivity {
     }
 
     fn clamp_scroll_position(
-        &self,
+        &mut self,
         bounds: Bounds<Pixels>,
         style: &Style,
         window: &mut Window,
@@ -2528,6 +2615,7 @@ impl Interactivity {
             let scroll_max = Point::from(padded_content_size - bounds.size)
                 .map(round_to_two_decimals)
                 .max(&Default::default());
+            self.scroll_max = scroll_max;
             // Clamp scroll offset in case scroll max is smaller now (e.g., if children
             // were removed or the bounds became larger).
             let mut scroll_offset = scroll_offset.borrow_mut();
@@ -2577,14 +2665,16 @@ impl Interactivity {
 
                 let style = self.compute_style_internal(hitbox, element_state.as_mut(), window, cx);
 
-                #[cfg(any(test, all(debug_assertions, feature = "test-support")))]
+                #[cfg(any(test, feature = "test-support"))]
                 if let Some(debug_selector) = &self.debug_selector {
                     window
                         .next_frame
                         .record_debug_bounds(debug_selector.clone(), bounds);
                 }
 
-                self.paint_hover_group_handler(window, cx);
+                if !window.is_paint_only() {
+                    self.paint_hover_group_handler(window, cx);
+                }
 
                 if style.visibility == Visibility::Hidden {
                     return ((), element_state);
@@ -2610,7 +2700,9 @@ impl Interactivity {
                                         // sibling groups every container would then sort ahead of
                                         // every item, and `focus_next` from a container would jump
                                         // to the first item in the whole window instead of its own.
-                                        if let Some(focus_handle) = &self.tracked_focus_handle {
+                                        if !window.is_paint_only()
+                                            && let Some(focus_handle) = &self.tracked_focus_handle
+                                        {
                                             window.next_frame.tab_stops.insert(focus_handle);
                                         }
                                         if let Some(hitbox) = hitbox {
@@ -2649,9 +2741,11 @@ impl Interactivity {
                                             self.paint_scroll_listener(hitbox, &style, window, cx);
                                         }
 
-                                        self.paint_keyboard_listeners(window, cx);
+                                        if !window.is_paint_only() {
+                                            self.paint_keyboard_listeners(window, cx);
+                                        }
 
-                                        if window.a11y.is_active() {
+                                        if !window.is_paint_only() && window.a11y.is_active() {
                                             if let Some(global_id) = global_id {
                                                 if !self.a11y_action_listeners.is_empty() {
                                                     let node_id = global_id.accesskit_node_id();
@@ -3033,6 +3127,19 @@ impl Interactivity {
                     let pending_mouse_down = pending_mouse_down.clone();
                     let hitbox = hitbox.clone();
                     move |event: &MouseMoveEvent, phase, window, cx| {
+                        if !event.dragging() {
+                            if phase.capture()
+                                && pending_mouse_down
+                                    .borrow()
+                                    .as_ref()
+                                    .is_some_and(|down| down.button == MouseButton::Left)
+                            {
+                                pending_mouse_down.borrow_mut().take();
+                                *clicked_state.borrow_mut() = ElementClickedState::default();
+                                window.refresh();
+                            }
+                            return;
+                        }
                         if phase == DispatchPhase::Capture {
                             return;
                         }
@@ -3202,20 +3309,27 @@ impl Interactivity {
                     .clone();
                 let hover_listener = Rc::new(hover_listener);
                 let hover_listener_state = was_hovered.clone();
+                let hover_listener_mode = self.hover_listener_mode;
                 let update_hover = move |is_hovered: bool, window: &mut Window, cx: &mut App| {
                     let mut was_hovered = hover_listener_state.borrow_mut();
-                    if is_hovered != *was_hovered {
+                    if is_hovered != *was_hovered
+                        && (!is_hovered
+                            || hover_listener_mode != HoverListenerMode::PointerTriggered
+                            || window.is_pointer_motion())
+                    {
                         *was_hovered = is_hovered;
                         drop(was_hovered);
                         hover_listener(&is_hovered, window, cx);
                     }
                 };
-                let hover_listener_mode = self.hover_listener_mode;
 
                 if has_mouse_down.borrow().is_none() {
                     let is_hovered =
                         !cx.has_active_drag() && hover_listener_mode.is_hovered(hitbox, window);
-                    if is_hovered != *was_hovered.borrow() {
+                    if is_hovered != *was_hovered.borrow()
+                        && (!is_hovered
+                            || hover_listener_mode != HoverListenerMode::PointerTriggered)
+                    {
                         let update_hover = update_hover.clone();
                         window.defer(cx, move |window, cx| {
                             update_hover(is_hovered, window, cx);
@@ -3391,17 +3505,16 @@ impl Interactivity {
     ) {
         if let Some(scroll_offset) = self.scroll_offset.clone() {
             let ongoing_scroll = self.ongoing_scroll.clone();
+            let smooth_scroll = self.smooth_scroll.clone();
+            let max = self.scroll_max;
             let overflow = style.overflow;
             let allow_concurrent_scroll = style.allow_concurrent_scroll;
             let restrict_scroll_to_axis = style.restrict_scroll_to_axis;
-            let line_height = window.line_height();
             let hitbox = hitbox.clone();
             let current_view = window.current_view();
             window.on_mouse_event(move |event: &ScrollEvent, phase, window, cx| {
                 if phase == DispatchPhase::Bubble && hitbox.should_handle_scroll(window) {
-                    let mut scroll_offset = scroll_offset.borrow_mut();
-                    let old_scroll_offset = *scroll_offset;
-                    let mut delta = event.delta.pixel_delta(line_height);
+                    let mut delta = event.delta.content_delta();
 
                     if restrict_scroll_to_axis
                         && event.delta.precise()
@@ -3437,9 +3550,43 @@ impl Interactivity {
                             delta_x = Pixels::ZERO;
                         }
                     }
-                    scroll_offset.y += delta_y;
-                    scroll_offset.x += delta_x;
-                    if *scroll_offset != old_scroll_offset {
+                    let delta = point(delta_x, delta_y);
+                    if delta.is_zero() {
+                        return;
+                    }
+                    let current = *scroll_offset.borrow();
+                    if cx.smooth_scrolling()
+                        && matches!(event.delta, ScrollDelta::Lines(_))
+                        && let Some(smooth_scroll) = &smooth_scroll
+                    {
+                        let target = smooth_scroll.target(current, delta, window);
+                        let target = point(
+                            target.x.clamp(-max.x, Pixels::ZERO),
+                            target.y.clamp(-max.y, Pixels::ZERO),
+                        );
+                        let offset = Rc::downgrade(&scroll_offset);
+                        if smooth_scroll.animate(
+                            current,
+                            target,
+                            window,
+                            cx,
+                            move |last, next, _, cx| {
+                                let offset = offset.upgrade()?;
+                                let mut offset = offset.borrow_mut();
+                                if *offset != last {
+                                    return None;
+                                }
+                                if *offset != next {
+                                    *offset = next;
+                                    cx.notify(current_view);
+                                }
+                                Some(next)
+                            },
+                        ) {
+                            cx.stop_propagation();
+                        }
+                    } else {
+                        *scroll_offset.borrow_mut() = current + delta;
                         cx.notify(current_view);
                     }
                 }
@@ -3682,6 +3829,7 @@ pub struct InteractiveElementState {
     /// blur). `None` means no activation key is pending.
     pub(crate) pending_keyboard_down: Option<Rc<RefCell<Option<u64>>>>,
     pub(crate) scroll_offset: Option<Rc<RefCell<Point<Pixels>>>>,
+    smooth_scroll: Option<SmoothScroll>,
     ongoing_scroll: Option<Rc<RefCell<OngoingScroll>>>,
     pub(crate) active_tooltip: Option<Rc<RefCell<Option<ActiveTooltip>>>>,
     long_press_tooltip_active: Option<Rc<Cell<bool>>>,
@@ -3896,7 +4044,7 @@ fn handle_tooltip_mouse_move(
     let action = match active_tooltip.borrow().as_ref() {
         None => {
             let is_hovered = check_is_hovered(window);
-            if is_hovered && phase.bubble() {
+            if is_hovered && phase.bubble() && window.is_pointer_motion() {
                 Action::ScheduleShow
             } else {
                 Action::None
@@ -4281,6 +4429,7 @@ impl ScrollAnchor {
 #[derive(Default, Debug)]
 struct ScrollHandleState {
     offset: Rc<RefCell<Point<Pixels>>>,
+    smooth_scroll: Option<SmoothScroll>,
     ongoing_scroll: Rc<RefCell<OngoingScroll>>,
     bounds: Bounds<Pixels>,
     max_offset: Point<Pixels>,
@@ -4324,6 +4473,15 @@ impl ScrollHandle {
     /// Get the current scroll offset.
     pub fn offset(&self) -> Point<Pixels> {
         *self.0.borrow().offset.borrow()
+    }
+
+    /// The wheel animation identity shared by users of this handle.
+    pub fn smooth_scroll(&self) -> SmoothScroll {
+        self.0
+            .borrow_mut()
+            .smooth_scroll
+            .get_or_insert_with(SmoothScroll::default)
+            .clone()
     }
 
     /// Get the maximum scroll offset.

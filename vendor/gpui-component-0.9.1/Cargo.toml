@@ -96,6 +96,7 @@ tree-sitter-cmake = [
 ]
 tree-sitter-cpp = [
     "tree-sitter",
+    "dep:tree-sitter-c",
     "dep:tree-sitter-cpp",
 ]
 tree-sitter-csharp = [
@@ -261,10 +262,6 @@ tree-sitter-zig = [
 name = "gpui_component"
 path = "src/lib.rs"
 doctest = false
-
-[[test]]
-name = "integration"
-path = "tests/integration/main.rs"
 
 [dependencies.anyhow]
 version = "1"

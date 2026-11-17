@@ -649,8 +649,8 @@ impl DirectWriteState {
             bidiLevel: 0,
         };
         let baseline_origin = Vector2::new(
-            params.subpixel_variant.x as f32 / SUBPIXEL_VARIANTS_X as f32,
-            params.subpixel_variant.y as f32 / gpui::SUBPIXEL_VARIANTS_Y as f32,
+            params.subpixel_variant.x as f32 / params.subpixel_steps.x as f32,
+            params.subpixel_variant.y as f32 / params.subpixel_steps.y as f32,
         );
         f(&glyph_run, baseline_origin)
     }
@@ -659,6 +659,13 @@ impl DirectWriteState {
         &self,
         params: &RenderGlyphParams,
     ) -> Result<(DWRITE_RENDERING_MODE1, DWRITE_GRID_FIT_MODE)> {
+        if !params.is_emoji && !params.hinting {
+            return Ok((
+                DWRITE_RENDERING_MODE1_NATURAL_SYMMETRIC,
+                DWRITE_GRID_FIT_MODE_DISABLED,
+            ));
+        }
+
         let font = &self.fonts[params.font_id.0];
         let mut rendering_mode = DWRITE_RENDERING_MODE1::default();
         let mut grid_fit_mode = DWRITE_GRID_FIT_MODE::default();
@@ -681,6 +688,9 @@ impl DirectWriteState {
             DWRITE_RENDERING_MODE1_OUTLINE => DWRITE_RENDERING_MODE1_NATURAL_SYMMETRIC,
             mode => mode,
         };
+        if !params.is_emoji {
+            grid_fit_mode = DWRITE_GRID_FIT_MODE_ENABLED;
+        }
         Ok((rendering_mode, grid_fit_mode))
     }
 

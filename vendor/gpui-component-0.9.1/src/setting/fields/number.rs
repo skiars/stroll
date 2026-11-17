@@ -144,6 +144,8 @@ impl SettingFieldRender for NumberField {
             .accessibility_label(self.title.clone())
             .disabled(options.is_disabled())
             .with_size(options.size())
+            .text_size(options.font_size())
+            .line_height(crate::setting::CONTROL_LINE_HEIGHT)
             .map(|this| {
                 if options.layout().is_horizontal() {
                     this.w_32()

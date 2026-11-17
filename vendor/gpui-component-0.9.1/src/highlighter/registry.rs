@@ -2,6 +2,7 @@ use gpui::{App, FontWeight, HighlightStyle, Hsla, SharedString};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_repr::{Deserialize_repr, Serialize_repr};
+use std::collections::BTreeMap;
 use std::{
     collections::HashMap,
     ops::Deref,
@@ -173,6 +174,9 @@ pub struct SyntaxColors {
     #[serde(rename = "variable.special")]
     pub variable_special: Option<ThemeStyle>,
     pub variant: Option<ThemeStyle>,
+    /// Exact styles for captures beyond the built-in vocabulary.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub additional: BTreeMap<String, ThemeStyle>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, JsonSchema, Serialize, Deserialize)]
@@ -228,6 +232,10 @@ pub struct ThemeStyle {
     color: Option<Hsla>,
     font_style: Option<FontStyle>,
     font_weight: Option<FontWeightContent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub underline: Option<gpui::UnderlineStyle>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strikethrough: Option<gpui::StrikethroughStyle>,
 }
 
 impl From<ThemeStyle> for HighlightStyle {
@@ -236,8 +244,21 @@ impl From<ThemeStyle> for HighlightStyle {
             color: style.color,
             font_weight: style.font_weight.map(Into::into),
             font_style: style.font_style.map(Into::into),
+            underline: style.underline.or_else(|| {
+                (style.font_style == Some(FontStyle::Underline)).then_some(gpui::UnderlineStyle {
+                    thickness: gpui::px(1.),
+                    ..Default::default()
+                })
+            }),
+            strikethrough: style.strikethrough,
             ..Default::default()
         }
+    }
+}
+
+impl gpui_base::input::HighlightStyleResolver for SyntaxColors {
+    fn style(&self, name: &str) -> Option<HighlightStyle> {
+        self.style(name)
     }
 }
 
@@ -245,6 +266,10 @@ impl SyntaxColors {
     pub fn style(&self, name: &str) -> Option<HighlightStyle> {
         if name.is_empty() {
             return None;
+        }
+
+        if let Some(style) = self.additional.get(name) {
+            return Some((*style).into());
         }
 
         let style = match name {
@@ -293,20 +318,10 @@ impl SyntaxColors {
         }
         .map(|s| s.into());
 
-        if style.is_some() {
-            style
-        } else {
-            // Fallback `keyword.modifier` to `keyword`
-            if name.contains(".") {
-                if let Some(prefix) = name.split(".").next() {
-                    return self.style(prefix);
-                }
-
-                None
-            } else {
-                None
-            }
-        }
+        style.or_else(|| {
+            name.rsplit_once('.')
+                .and_then(|(prefix, _)| self.style(prefix))
+        })
     }
 
     #[inline]
@@ -468,6 +483,8 @@ impl StatusColors {
 pub struct HighlightThemeStyle {
     #[serde(rename = "editor.background")]
     pub editor_background: Option<Hsla>,
+    #[serde(rename = "code_block.background")]
+    pub code_block_background: Option<Hsla>,
     #[serde(rename = "editor.foreground")]
     pub editor_foreground: Option<Hsla>,
     #[serde(rename = "editor.active_line.background")]
@@ -482,10 +499,18 @@ pub struct HighlightThemeStyle {
     /// Falls back to [`Self::editor_background`] when unset.
     #[serde(rename = "editor.gutter.background")]
     pub editor_gutter_background: Option<Hsla>,
+    #[serde(rename = "editor.search_match.background")]
+    pub editor_search_match_background: Option<gpui::Hsla>,
     #[serde(flatten)]
     pub status: StatusColors,
     #[serde(rename = "syntax")]
     pub syntax: SyntaxColors,
+    /// Syntax palettes for removed rows and their inline changes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub diff_removed: Option<(super::TintedSyntax, super::TintedSyntax)>,
+    /// Syntax palettes for added rows and their inline changes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub diff_added: Option<(super::TintedSyntax, super::TintedSyntax)>,
 }
 
 /// Theme for Tree-sitter Highlight from JSON theme file.
@@ -534,10 +559,15 @@ impl gpui_base::input::HighlightStyleResolver for HighlightTheme {
 pub type LanguageParserFactory =
     Arc<dyn Fn() -> Result<(tree_sitter::Parser, tree_sitter::Language)> + Send + Sync>;
 
+/// Produces theme capture names in UTF-8 byte coordinates.
+pub type LanguageTokenizer =
+    Arc<dyn Fn(&str) -> Vec<(std::ops::Range<usize>, SharedString)> + Send + Sync>;
+
 /// Registry for code highlighter languages.
 pub struct LanguageRegistry {
     languages: Mutex<HashMap<SharedString, GrammarConfig>>,
     parser_factories: Mutex<HashMap<SharedString, LanguageParserFactory>>,
+    tokenizers: Mutex<HashMap<SharedString, LanguageTokenizer>>,
     /// Bumped by every registration; see [`Self::generation`].
     generation: AtomicU64,
 }
@@ -552,6 +582,7 @@ impl LanguageRegistry {
                     .collect(),
             ),
             parser_factories: Mutex::new(HashMap::new()),
+            tokenizers: Mutex::new(HashMap::new()),
             generation: AtomicU64::new(0),
         });
         &INSTANCE
@@ -575,6 +606,27 @@ impl LanguageRegistry {
             .lock()
             .unwrap()
             .insert(lang.to_string().into(), factory);
+        self.generation.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Registers a tokenizer that supplies syntax colors without a parse tree.
+    pub fn register_tokenizer(&self, name: &str, tokenizer: LanguageTokenizer) {
+        self.tokenizers
+            .lock()
+            .unwrap()
+            .insert(name.to_owned().into(), tokenizer);
+        self.generation.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn tokenizer(&self, name: &str) -> Option<LanguageTokenizer> {
+        self.tokenizers.lock().unwrap().get(name).cloned()
+    }
+
+    /// Removes resources registered under an application-owned language identity.
+    pub fn unregister(&self, name: &str) {
+        self.languages.lock().unwrap().remove(name);
+        self.parser_factories.lock().unwrap().remove(name);
+        self.tokenizers.lock().unwrap().remove(name);
         self.generation.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -667,6 +719,7 @@ mod tests {
         let registry = super::LanguageRegistry {
             languages: std::sync::Mutex::new(std::collections::HashMap::new()),
             parser_factories: std::sync::Mutex::new(std::collections::HashMap::new()),
+            tokenizers: Default::default(),
             generation: std::sync::atomic::AtomicU64::new(0),
         };
         registry.register("json", &GrammarConfig::plain("canonical"));
@@ -691,6 +744,7 @@ mod tests {
         let registry = super::LanguageRegistry {
             languages: std::sync::Mutex::new(std::collections::HashMap::new()),
             parser_factories: std::sync::Mutex::new(std::collections::HashMap::new()),
+            tokenizers: Default::default(),
             generation: std::sync::atomic::AtomicU64::new(0),
         };
         registry.register("typescript", &GrammarConfig::plain("typescript"));

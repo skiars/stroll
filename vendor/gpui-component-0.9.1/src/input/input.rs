@@ -23,6 +23,14 @@ use super::state::{TextInputState, sync_focused_input_registry};
 use super::{InputContentType, InputState, sync_native_content_type};
 use crate::ThemeStyled as _;
 
+type BuildContextMenu = Rc<dyn Fn(NativeMenu, &mut Window, &mut App) -> NativeMenu>;
+
+#[derive(Clone)]
+pub(super) enum ContextMenuBuilder {
+    Replace(BuildContextMenu),
+    Extend(BuildContextMenu),
+}
+
 /// Set when the platform draws the touch selection UI of a focused input.
 #[derive(Default)]
 struct NativeTouchSelection(bool);
@@ -141,6 +149,8 @@ pub struct Input {
     suffix: Option<AnyElement>,
     height: Option<DefiniteLength>,
     appearance: bool,
+    preview: bool,
+    external_search_panel: bool,
     cleanable: bool,
     mask_toggle: bool,
     disabled: bool,
@@ -154,10 +164,7 @@ pub struct Input {
     accessibility_id: Option<SharedString>,
     aria_label: Option<SharedString>,
 
-    /// An optional context menu builder to allow a custom context menu on the input.
-    ///
-    /// If set, this overrides the built-in context menu.
-    context_menu_builder: Option<Rc<dyn Fn(NativeMenu, &mut Window, &mut App) -> NativeMenu>>,
+    context_menu_builder: Option<ContextMenuBuilder>,
 
     /// An optional paste handler. If set, it is invoked with the clipboard item
     /// before the default text insertion. Return `true` if handled.
@@ -253,6 +260,8 @@ impl Input {
             suffix: None,
             height: None,
             appearance: true,
+            preview: false,
+            external_search_panel: false,
             cleanable: false,
             mask_toggle: false,
             disabled: false,
@@ -310,7 +319,7 @@ impl Input {
         self
     }
 
-    /// Set height of the input (Multi-line only).
+    /// Set the outer height of the input.
     pub fn h(mut self, height: impl Into<DefiniteLength>) -> Self {
         self.height = Some(height.into());
         self
@@ -319,6 +328,16 @@ impl Input {
     /// Set the appearance of the input field, if false the input field will no border, background.
     pub fn appearance(mut self, appearance: bool) -> Self {
         self.appearance = appearance;
+        self
+    }
+
+    pub(super) fn external_search_panel(mut self, external: bool) -> Self {
+        self.external_search_panel = external;
+        self
+    }
+
+    pub(super) fn preview_style(mut self, preview: bool) -> Self {
+        self.preview = preview;
         self
     }
 
@@ -390,10 +409,14 @@ impl Input {
     /// If set, this overrides the built-in right-click context menu. It shows
     /// only while the state's context menu is enabled, which is the default.
     pub fn context_menu(
-        mut self,
+        self,
         f: impl Fn(NativeMenu, &mut Window, &mut App) -> NativeMenu + 'static,
     ) -> Self {
-        self.context_menu_builder = Some(Rc::new(f));
+        self.with_context_menu_builder(ContextMenuBuilder::Replace(Rc::new(f)))
+    }
+
+    pub(super) fn with_context_menu_builder(mut self, builder: ContextMenuBuilder) -> Self {
+        self.context_menu_builder = Some(builder);
         self
     }
 
@@ -559,10 +582,19 @@ impl RenderOnce for Input {
         sync_focused_input_registry(&state, window, cx);
 
         state.ensure_highlighter_factory(crate::highlighter::input_highlighter_factory(), cx);
+        let theme = cx.theme();
+        let code_theme = &theme.highlight_theme.style;
+        let is_code_editor = state.presentation(cx).is_code_editor();
         state.set_editor_style(
             gpui_base::input::InputEditorStyle {
-                foreground: cx.theme().foreground,
-                muted_foreground: cx.theme().muted_foreground,
+                foreground: code_theme
+                    .editor_foreground
+                    .filter(|_| is_code_editor)
+                    .unwrap_or(theme.foreground),
+                muted_foreground: code_theme
+                    .editor_line_number
+                    .filter(|_| is_code_editor)
+                    .unwrap_or(theme.muted_foreground),
                 background: cx.theme().editor_background(),
                 border: cx.theme().border,
                 selection: cx.theme().selection,
@@ -575,8 +607,17 @@ impl RenderOnce for Input {
                 },
                 highlight_styles: cx.theme().highlight_theme.clone(),
                 editor_invisible: cx.theme().highlight_theme.style.editor_invisible,
-                editor_active_line: cx.theme().highlight_theme.style.editor_active_line,
-                editor_gutter_background: cx.theme().highlight_theme.style.editor_gutter_background,
+                editor_active_line: if self.preview {
+                    None
+                } else {
+                    cx.theme().highlight_theme.style.editor_active_line
+                },
+                editor_search_match_background: code_theme.editor_search_match_background,
+                editor_gutter_background: if self.preview {
+                    Some(gpui::transparent_black())
+                } else {
+                    cx.theme().highlight_theme.style.editor_gutter_background
+                },
                 fold_icon_renderer: Some(Rc::new(|ix, is_folded| {
                     Button::new(("fold-icon", ix))
                         .ghost()
@@ -617,53 +658,68 @@ impl RenderOnce for Input {
         let custom = self.context_menu_builder.clone();
         state.on_context_menu(
             Rc::new(move |_, capabilities, position, window, cx| {
-                let menu = if let Some(custom) = custom.as_ref() {
-                    custom(NativeMenu::new(), window, cx)
+                let menu = if let Some(ContextMenuBuilder::Replace(replace)) = custom.as_ref() {
+                    replace(NativeMenu::new(), window, cx)
                 } else {
                     let enabled = !capabilities.is_disabled();
                     // A read-only input can still navigate the code, it only
                     // rejects the items that would change the text.
                     let editable = enabled && !capabilities.is_readonly();
-                    let mut menu = NativeMenu::new();
+                    use gpui_kit_assets::IconName as Glyph;
+                    let mut menu = NativeMenu::new()
+                        .menu_with_icon_disabled(
+                            t!("Input.Cut"),
+                            Glyph::Scissors,
+                            !(editable && capabilities.is_copyable()),
+                            Box::new(gpui_base::input::Cut),
+                        )
+                        .menu_with_icon_disabled(
+                            t!("Input.Copy"),
+                            Glyph::Copy,
+                            !capabilities.is_copyable(),
+                            Box::new(gpui_base::input::Copy),
+                        )
+                        // An empty clipboard is harmless, so keep Paste available when editable.
+                        .menu_with_icon_disabled(
+                            t!("Input.Paste"),
+                            Glyph::ClipboardPaste,
+                            !editable,
+                            Box::new(gpui_base::input::Paste),
+                        )
+                        .menu_with_icon(
+                            t!("Input.Select All"),
+                            Glyph::SquareDashed,
+                            Box::new(gpui_base::input::SelectAll),
+                        );
                     if capabilities.is_code_editor() {
                         menu = menu
-                            .menu_with_disabled(
-                                t!("Input.Go to Definition"),
-                                !(enabled && capabilities.has_definition()),
-                                Box::new(gpui_base::input::GoToDefinition),
-                            )
-                            .menu_with_disabled(
+                            .separator()
+                            .menu_with_icon_disabled(
                                 t!("Input.Show Code Actions"),
+                                Glyph::Lightbulb,
                                 !(editable && capabilities.has_code_actions()),
                                 Box::new(gpui_base::input::ToggleCodeActions),
                             )
-                            .separator();
+                            .menu_with_icon_disabled(
+                                t!("Input.Rename Symbol"),
+                                Glyph::Pencil,
+                                !(editable && capabilities.has_rename()),
+                                Box::new(gpui_base::input::RenameSymbol),
+                            )
+                            .menu_with_icon_disabled(
+                                t!("Input.Go to Definition"),
+                                Glyph::ArrowRightToLine,
+                                !(enabled && capabilities.has_definition()),
+                                Box::new(gpui_base::input::GoToDefinition),
+                            );
                     }
-                    menu.menu_with_disabled(
-                        t!("Input.Cut"),
-                        !(editable && capabilities.is_copyable()),
-                        Box::new(gpui_base::input::Cut),
-                    )
-                    .menu_with_disabled(
-                        t!("Input.Copy"),
-                        !capabilities.is_copyable(),
-                        Box::new(gpui_base::input::Copy),
-                    )
-                    // Offered whenever the text can change, without peeking
-                    // at the clipboard: the synchronous read is always empty
-                    // on the web, and an empty clipboard pastes nothing.
-                    .menu_with_disabled(
-                        t!("Input.Paste"),
-                        !editable,
-                        Box::new(gpui_base::input::Paste),
-                    )
-                    .separator()
-                    .menu(
-                        t!("Input.Select All"),
-                        Box::new(gpui_base::input::SelectAll),
-                    )
+                    if let Some(ContextMenuBuilder::Extend(extend)) = custom.as_ref() {
+                        extend(menu, window, cx)
+                    } else {
+                        menu
+                    }
                 };
-                menu.show(position, window, cx);
+                menu.show_in_window(position, window, cx);
             }),
             cx,
         );
@@ -787,15 +843,14 @@ impl RenderOnce for Input {
             .size_full()
             .line_height(LINE_HEIGHT)
             .when(!is_multi_line, |this| {
-                this.input_px(self.size).input_py(self.size)
+                this.input_px(self.size).py(self.size.control_padding_y())
             })
             .input_h(self.size)
             .input_text_size(self.size)
+            .when(!is_multi_line, |this| this.text_size(cx.theme().control_font_size))
             .items_center()
-            .when(presentation.is_multi_line(), |this| {
-                this.h_auto()
-                    .when_some(self.height, |this, height| this.h(height))
-            })
+            .when(is_multi_line, |this| this.h_auto())
+            .when_some(self.height, |this, height| this.h(height))
             .when(self.appearance, |this| {
                 this.bg(bg)
                     .rounded(cx.theme().radius)
@@ -816,7 +871,13 @@ impl RenderOnce for Input {
                     .child(p)
             }))
             .when(presentation.is_multi_line(), |this| {
-                this.child(Self::render_editor(state.clone(), overlays.search, window))
+                this.child(Self::render_editor(
+                    state.clone(),
+                    (!self.external_search_panel)
+                        .then_some(overlays.search)
+                        .flatten(),
+                    window,
+                ))
             })
             .when(!presentation.is_multi_line(), |this| {
                 this.child(state.clone().into_any_element())
@@ -848,7 +909,10 @@ impl RenderOnce for Input {
                 )
             })
             .relative()
-            .children(overlays.floating)
+            .when(!overlays.floating.is_empty(), |this| {
+                // Even a zero-width popup placeholder would add a flex gap.
+                this.child(div().absolute().inset_0().children(overlays.floating))
+            })
             .when_some(paste_handler, |this, handler| {
                 this.capture_action(move |_: &gpui_base::input::Paste, window, cx| {
                     if let Some(clipboard) = cx.read_from_clipboard() {

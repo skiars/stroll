@@ -10,7 +10,7 @@ use crate::{
     button::Button,
     menu::{DropdownMenu, PopupMenuItem},
     setting::{
-        AnySettingField, RenderOptions,
+        AnySettingField, CONTROL_LINE_HEIGHT, RenderOptions,
         fields::{SettingFieldRender, get_value, set_value},
     },
 };
@@ -66,6 +66,8 @@ where
             .when(options.layout().is_vertical(), |this| this.w_full())
             .accessibility_label(format!("{}: {}", self.title, old_label))
             .label(old_label)
+            .label_size(options.font_size())
+            .line_height(CONTROL_LINE_HEIGHT)
             .dropdown_caret(true)
             .outline()
             .disabled(options.is_disabled())

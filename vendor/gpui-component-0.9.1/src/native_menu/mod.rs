@@ -193,6 +193,13 @@ impl NativeMenu {
         self.items.is_empty()
     }
 
+    /// Present these actions in the standard in-window popup menu.
+    pub fn show_in_window(self, position: Point<Pixels>, window: &mut Window, cx: &mut App) {
+        if !self.items.is_empty() {
+            fallback::show(self.items, position, window, cx);
+        }
+    }
+
     /// Pop up the menu at `position` (window coordinates, in logical pixels).
     ///
     /// The menu is shown without blocking the caller: the OS tracking loop runs

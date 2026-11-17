@@ -30,6 +30,7 @@ pub use state::*;
 pub use stream_fade::TextViewMotion;
 pub use style::*;
 pub use text_view::*;
+pub use utils::data_url_image;
 
 pub(crate) fn init(cx: &mut App) {
     inline::init(cx);

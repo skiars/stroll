@@ -700,8 +700,9 @@ impl TextLayout {
                     return size;
                 }
 
-                let mut line_wrapper = cx.text_system().line_wrapper(text_style.font(), font_size);
                 let (text, runs) = if let Some(truncate_width) = truncate_width {
+                    let mut line_wrapper =
+                        cx.text_system().line_wrapper(text_style.font(), font_size);
                     if let Some(max_lines) = text_style.line_clamp
                         && let Some(wrap_width) = wrap_width
                     {
@@ -831,7 +832,18 @@ impl TextLayout {
         let line_height = element_state.line_height;
         let mut line_origin = bounds.origin;
         let text_style = window.text_style();
+        let clip = window.content_mask().bounds;
+        // Text and decorations can overhang the nominal line box.
+        let overhang = line_height.max(text_style.font_size.to_pixels(window.rem_size()));
         for line in &element_state.lines {
+            if line_origin.y - overhang >= clip.bottom() {
+                break;
+            }
+            let next_y = line_origin.y + line.size(line_height).height;
+            if next_y + overhang <= clip.top() {
+                line_origin.y = next_y;
+                continue;
+            }
             if matches!(pass, TextPaintPass::All | TextPaintPass::Background) {
                 line.paint_background(
                     line_origin,
@@ -854,7 +866,7 @@ impl TextLayout {
                 )
                 .log_err();
             }
-            line_origin.y += line.size(line_height).height;
+            line_origin.y = next_y;
         }
         Ok(())
     }

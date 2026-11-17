@@ -955,13 +955,13 @@ struct Shadow {
     corner_radii: Corners,
     content_mask: Bounds,
     color: Hsla,
-    // Only consulted when `inset == 1u`: the element's own bounds, used as a rounded-rect
+    // The element's own bounds and corners are used as a rounded-rect
     // clip so the shadow never escapes the element.
     element_bounds: Bounds,
     element_corner_radii: Corners,
     // 0 = drop shadow, 1 = inset shadow.
     inset: u32,
-    pad: u32, // align to 8 bytes
+    clip_interior: u32,
 }
 
 struct ShadowVarying {
@@ -974,18 +974,35 @@ struct ShadowVarying {
 
 @vertex
 fn vs_shadow(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index) instance_id: u32) -> ShadowVarying {
-    let unit_vertex = vec2<f32>(f32(vertex_id & 1u), 0.5 * f32(vertex_id & 2u));
-    var shadow = load_shadow(instance_id);
+    let vertices = array<vec2<f32>, 6>(
+        vec2<f32>(0., 0.), vec2<f32>(1., 0.), vec2<f32>(0., 1.),
+        vec2<f32>(0., 1.), vec2<f32>(1., 0.), vec2<f32>(1., 1.),
+    );
+    let unit_vertex = vertices[vertex_id % 6u];
+    let section = vertex_id / 6u;
+    let shadow = load_shadow(instance_id);
 
-    var geometry: Bounds;
-    if (shadow.inset != 0u) {
-        geometry = shadow.element_bounds;
-    } else {
-        // Leave room for the gaussian tail outside the shadow rect.
+    var geometry = shadow.element_bounds;
+    if shadow.inset == 0u {
         let margin = 3.0 * shadow.blur_radius;
-        geometry = shadow.bounds;
-        geometry.origin -= vec2<f32>(margin);
-        geometry.size += 2.0 * vec2<f32>(margin);
+        geometry = Bounds(shadow.bounds.origin - vec2<f32>(margin), shadow.bounds.size + vec2<f32>(2.0 * margin));
+    }
+    if shadow.inset == 0u && shadow.clip_interior != 0u {
+        // 内矩形完全落在圆角裁剪内。只为它外面的四条边生成几何。
+        let corners = shadow.element_corner_radii;
+        let inner_margin = 1.0 + max(max(corners.top_left, corners.top_right), max(corners.bottom_left, corners.bottom_right));
+        let outer_min = geometry.origin;
+        let outer_max = outer_min + geometry.size;
+        let inner_min = clamp(shadow.element_bounds.origin + vec2<f32>(inner_margin), outer_min, outer_max);
+        let inner_max = clamp(shadow.element_bounds.origin + shadow.element_bounds.size - vec2<f32>(inner_margin), inner_min, outer_max);
+        switch section {
+            case 0u: { geometry.size.y = inner_min.y - outer_min.y; }
+            case 1u: { geometry = Bounds(vec2<f32>(outer_min.x, inner_max.y), vec2<f32>(geometry.size.x, outer_max.y - inner_max.y)); }
+            case 2u: { geometry = Bounds(vec2<f32>(outer_min.x, inner_min.y), vec2<f32>(inner_min.x - outer_min.x, inner_max.y - inner_min.y)); }
+            default: { geometry = Bounds(vec2<f32>(inner_max.x, inner_min.y), vec2<f32>(outer_max.x - inner_max.x, inner_max.y - inner_min.y)); }
+        }
+    } else if section != 0u {
+        geometry.size = vec2<f32>(0.);
     }
 
     var out = ShadowVarying();
@@ -1004,6 +1021,15 @@ fn fs_shadow(input: ShadowVarying) -> @location(0) vec4<f32> {
     }
 
     let shadow = load_shadow(input.shadow_id);
+    var exterior_coverage = 1.0;
+    if (shadow.inset == 0u && shadow.clip_interior != 0u) {
+        // 浮层内部没有外阴影，直接跳过高斯积分。
+        let edge = quad_sdf(input.position.xy, shadow.element_bounds, shadow.element_corner_radii);
+        exterior_coverage = saturate(0.5 + edge);
+        if (exterior_coverage == 0.0) {
+            return vec4<f32>(0.0);
+        }
+    }
     let half_size = shadow.bounds.size / 2.0;
     let center = shadow.bounds.origin + half_size;
     let center_to_point = input.position.xy - center;
@@ -1042,7 +1068,7 @@ fn fs_shadow(input: ShadowVarying) -> @location(0) vec4<f32> {
         alpha *= saturate(0.5 - element_distance);
     }
 
-    return blend_color(input.color, alpha);
+    return blend_color(input.color, alpha * exterior_coverage);
 }
 
 // --- path rasterization --- //
@@ -1052,6 +1078,7 @@ struct PathRasterizationVertex {
     st_position: vec2<f32>,
     color: Background,
     bounds: Bounds,
+    raster: Bounds,
 }
 
 
@@ -1069,7 +1096,8 @@ fn vs_path_rasterization(@builtin(vertex_index) vertex_id: u32) -> PathRasteriza
     let v = load_path_vertex(vertex_id);
 
     var out = PathRasterizationVarying();
-    out.position = to_device_position_impl(v.xy_position);
+    let local = (v.xy_position - v.raster.origin) / v.raster.size;
+    out.position = vec4f(local * vec2f(2., -2.) + vec2f(-1., 1.), 0., 1.);
     out.st_position = v.st_position;
     out.vertex_id = vertex_id;
     out.clip_distances = distance_from_clip_rect_impl(v.xy_position, v.bounds);
@@ -1104,7 +1132,7 @@ fn fs_path_rasterization(input: PathRasterizationVarying) -> @location(0) vec4<f
         background.solid,
         background.colors,
     );
-    let color = gradient_color(background, input.position.xy, bounds,
+    let color = gradient_color(background, input.position.xy + v.raster.origin, bounds,
         prepared_gradient.solid, prepared_gradient.color0, prepared_gradient.color1);
     return vec4<f32>(color.rgb * color.a * alpha, color.a * alpha);
 }
@@ -1113,12 +1141,13 @@ fn fs_path_rasterization(input: PathRasterizationVarying) -> @location(0) vec4<f
 
 struct PathSprite {
     bounds: Bounds,
+    raster_origin: vec2f,
 }
 
 
 struct PathVarying {
     @builtin(position) position: vec4<f32>,
-    @location(0) texture_coords: vec2<f32>,
+    @location(0) @interpolate(flat) raster_origin: vec2f,
 }
 
 @vertex
@@ -1127,20 +1156,16 @@ fn vs_path(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index) insta
     let sprite = load_path_sprite(instance_id);
     // Don't apply content mask because it was already accounted for when rasterizing the path.
     let device_position = to_device_position(unit_vertex, sprite.bounds);
-    // For screen-space intermediate texture, convert screen position to texture coordinates
-    let screen_position = sprite.bounds.origin + unit_vertex * sprite.bounds.size;
-    let texture_coords = screen_position / globals.viewport_size;
-
     var out = PathVarying();
     out.position = device_position;
-    out.texture_coords = texture_coords;
+    out.raster_origin = sprite.raster_origin;
 
     return out;
 }
 
 @fragment
 fn fs_path(input: PathVarying) -> @location(0) vec4<f32> {
-    let sample = textureSample(t_sprite, s_sprite, input.texture_coords);
+    let sample = textureLoad(t_sprite, vec2i(input.position.xy - input.raster_origin), 0);
     return sample;
 }
 
@@ -1261,7 +1286,7 @@ fn fs_mono_sprite(input: MonoSpriteVarying) -> @location(0) vec4<f32> {
 
 struct PolychromeSprite {
     order: u32,
-    pad: u32,
+    nearest_neighbor: u32,
     tile: AtlasTile,
     grayscale: u32,
     opacity: f32,
@@ -1293,13 +1318,21 @@ fn vs_poly_sprite(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index
 
 @fragment
 fn fs_poly_sprite(input: PolySpriteVarying) -> @location(0) vec4<f32> {
-    let sample = textureSample(t_sprite, s_sprite, input.tile_position);
-    // Alpha clip after using the derivatives.
     if (any(input.clip_distances < vec4<f32>(0.0))) {
         return vec4<f32>(0.0);
     }
 
     let sprite = load_poly_sprite(input.sprite_id);
+    var sample: vec4<f32>;
+    if (sprite.nearest_neighbor != 0u) {
+        let atlas_size = vec2<f32>(textureDimensions(t_sprite, 0));
+        let first_texel = sprite.tile.bounds.origin;
+        let last_texel = first_texel + max(sprite.tile.bounds.size, vec2<i32>(1)) - vec2<i32>(1);
+        let texel = clamp(vec2<i32>(floor(input.tile_position * atlas_size)), first_texel, last_texel);
+        sample = textureLoad(t_sprite, texel, 0);
+    } else {
+        sample = textureSampleLevel(t_sprite, s_sprite, input.tile_position, 0.0);
+    }
     let distance = quad_sdf(input.position.xy, sprite.bounds, sprite.corner_radii);
 
     var color = sample;

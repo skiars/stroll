@@ -228,6 +228,42 @@ impl SvgRenderer {
         self.render_parsed(&svg, scale_factor)
     }
 
+    /// Renders a standalone SVG without resolving embedded or external images.
+    /// Bounds both raster dimensions by `max_dimension` in device pixels.
+    pub fn render_standalone_svg(
+        &self,
+        source: &str,
+        max_dimension: u32,
+    ) -> Result<Arc<RenderImage>, usvg::Error> {
+        let options = usvg::Options {
+            font_resolver: usvg::FontResolver {
+                select_font: Box::new(|font, db| (self.usvg_options.font_resolver.select_font)(font, db)),
+                select_fallback: Box::new(|ch, excluded, db| {
+                    (self.usvg_options.font_resolver.select_fallback)(ch, excluded, db)
+                }),
+            },
+            image_href_resolver: usvg::ImageHrefResolver {
+                resolve_data: Box::new(|_, _, _| None),
+                resolve_string: Box::new(|_, _| None),
+            },
+            ..Default::default()
+        };
+        let xml_options = usvg::roxmltree::ParsingOptions {
+            nodes_limit: 50_000,
+            ..Default::default()
+        };
+        let document = usvg::roxmltree::Document::parse_with_options(source, xml_options)
+            .map_err(usvg::Error::ParsingFailed)?;
+        let tree = usvg::Tree::from_xmltree(&document, &options)?;
+        let size = tree.size();
+        let scale = (max_dimension as f32 / size.width().max(size.height())).min(1.0);
+        let dimensions = Size::new(
+            DevicePixels((size.width() * scale).round().max(1.0) as i32),
+            DevicePixels((size.height() * scale).round().max(1.0) as i32),
+        );
+        self.render_parsed(&ParsedSvg(tree), SvgSize::ExactSize(dimensions))
+    }
+
     pub(crate) fn render_alpha_mask(
         &self,
         params: &RenderSvgParams,

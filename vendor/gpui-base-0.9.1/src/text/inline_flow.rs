@@ -15,7 +15,7 @@ use gpui::{
     size,
 };
 
-use crate::text::text_view::{LinkClickHandlerFn, handle_link_click};
+use crate::text::text_view::{ImageClickHandlerFn, LinkClickHandlerFn, handle_link_click};
 
 use super::{
     inline::{Inline, InlineHighlight, InlineState, code_insets, text_runs, text_size_ranges},
@@ -31,6 +31,7 @@ pub(super) struct InlineFlow {
     id: ElementId,
     items: Vec<InlineFlowItem>,
     link_click_handler: Option<Arc<LinkClickHandlerFn>>,
+    image_click_handler: Option<Arc<ImageClickHandlerFn>>,
     /// The block editor leaf this flow renders (design D3): its fragments
     /// and atoms are reported to the editor sink as pieces.
     editor_key: Option<u64>,
@@ -67,6 +68,7 @@ pub(super) enum InlineFlowItem {
     },
     Image {
         source: ImageSource,
+        url: SharedString,
         link: Option<LinkMark>,
         title: String,
         width: Option<DefiniteLength>,
@@ -278,11 +280,13 @@ impl InlineFlow {
         id: impl Into<ElementId>,
         items: Vec<InlineFlowItem>,
         link_click_handler: Option<Arc<LinkClickHandlerFn>>,
+        image_click_handler: Option<Arc<ImageClickHandlerFn>>,
     ) -> Self {
         Self {
             id: id.into(),
             items,
             link_click_handler,
+            image_click_handler,
             editor_key: None,
         }
     }
@@ -298,45 +302,55 @@ impl InlineFlow {
     fn image_element(
         ix: usize,
         source: &ImageSource,
+        url: &SharedString,
         link: &Option<LinkMark>,
         _title: &str,
         size: Size<Pixels>,
         link_click_handler: Option<Arc<LinkClickHandlerFn>>,
+        image_click_handler: Option<Arc<ImageClickHandlerFn>>,
     ) -> AnyElement {
-        img(source.clone())
+        let mut element = img(source.clone())
             .id(ix)
             .object_fit(ObjectFit::Contain)
             .max_w(relative(1.))
             .w(size.width)
-            .h(size.height)
-            .when_some(link.clone(), |this, link| {
-                let aux_link = link.clone();
-                let aux_link_click_handler = link_click_handler.clone();
-                this.cursor_pointer()
-                    .on_click(move |event, window, cx| {
-                        crate::TextSelection::end(window, cx);
-                        cx.stop_propagation();
-                        handle_link_click(
-                            &link_click_handler,
-                            link.url.clone(),
-                            event.clone(),
-                            window,
-                            cx,
-                        );
-                    })
-                    .on_aux_click(move |event, window, cx| {
-                        crate::TextSelection::end(window, cx);
-                        cx.stop_propagation();
-                        handle_link_click(
-                            &aux_link_click_handler,
-                            aux_link.url.clone(),
-                            event.clone(),
-                            window,
-                            cx,
-                        );
-                    })
-            })
-            .into_any_element()
+            .h(size.height);
+        if let Some(image_click_handler) = image_click_handler {
+            let url = url.clone();
+            element = element.cursor_pointer().on_click(move |event, window, cx| {
+                crate::TextSelection::end(window, cx);
+                cx.stop_propagation();
+                image_click_handler(&url, &event, window, cx);
+            });
+        } else if let Some(link) = link.clone() {
+            let aux_link = link.clone();
+            let aux_link_click_handler = link_click_handler.clone();
+            element = element
+                .cursor_pointer()
+                .on_click(move |event, window, cx| {
+                    crate::TextSelection::end(window, cx);
+                    cx.stop_propagation();
+                    handle_link_click(
+                        &link_click_handler,
+                        link.url.clone(),
+                        event.clone(),
+                        window,
+                        cx,
+                    );
+                })
+                .on_aux_click(move |event, window, cx| {
+                    crate::TextSelection::end(window, cx);
+                    cx.stop_propagation();
+                    handle_link_click(
+                        &aux_link_click_handler,
+                        aux_link.url.clone(),
+                        event.clone(),
+                        window,
+                        cx,
+                    );
+                });
+        }
+        element.into_any_element()
     }
 }
 
@@ -731,6 +745,7 @@ impl Element for InlineFlow {
                 } => {
                     let InlineFlowItem::Image {
                         source,
+                        url,
                         link,
                         title,
                         ..
@@ -744,10 +759,12 @@ impl Element for InlineFlow {
                     let mut element = Self::image_element(
                         elements.len(),
                         source,
+                        url,
                         link,
                         title.as_str(),
                         fragment_size,
                         self.link_click_handler.clone(),
+                        self.image_click_handler.clone(),
                     );
                     element.prepaint_as_root(
                         bounds.origin + origin,

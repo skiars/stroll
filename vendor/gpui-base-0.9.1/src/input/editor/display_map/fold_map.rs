@@ -91,6 +91,10 @@ impl FoldMap {
             .map_or(self.total_hidden, |run| run.hidden_before)
     }
 
+    pub(super) fn invalidate_projection(&mut self) {
+        self.needs_rebuild = true;
+    }
+
     /// Convert wrap_row to display_row
     /// Returns None if the wrap_row is hidden by folding
     pub(super) fn wrap_row_to_display_row(&self, wrap_row: usize) -> Option<usize> {
@@ -166,11 +170,19 @@ impl FoldMap {
         candidates.dedup_by_key(|r| r.start_line);
         self.candidates = candidates;
 
-        // Remove any folded ranges that are no longer in candidates
-        self.folded.retain(|fold| {
-            self.candidates
-                .iter()
-                .any(|c| c.start_line == fold.start_line)
+        // A completed parse can change the end of an existing fold or remove it.
+        self.folded.retain_mut(|fold| {
+            let Ok(index) = self
+                .candidates
+                .binary_search_by_key(&fold.start_line, |range| range.start_line)
+            else {
+                self.needs_rebuild = true;
+                return false;
+            };
+            let range = self.candidates[index];
+            self.needs_rebuild |= *fold != range;
+            *fold = range;
+            true
         });
     }
 

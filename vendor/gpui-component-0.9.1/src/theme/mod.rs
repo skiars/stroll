@@ -3,7 +3,7 @@ use crate::{
     scroll::ScrollbarMode, sheet::SheetSettings,
 };
 use gpui::{
-    App, Global, Hsla, IsZero as _, Pixels, SharedString, Window, WindowAppearance,
+    App, FontFallbacks, Global, Hsla, IsZero as _, Pixels, SharedString, Window, WindowAppearance,
     prelude::FluentBuilder as _, px,
 };
 pub use gpui_base::{
@@ -79,11 +79,11 @@ fn plot_appear_easing(t: f32) -> f32 {
 }
 
 /// How long the scrollbar stays visible after the last scroll, drag, or hover.
-const SCROLLBAR_IDLE: Duration = Duration::from_secs(2);
+const SCROLLBAR_IDLE: Duration = Duration::from_millis(800);
 /// How long the scrollbar takes to appear.
 const SCROLLBAR_ENTER: Duration = Duration::from_millis(300);
 /// How long the scrollbar takes to fade away once the idle hold expires.
-const SCROLLBAR_EXIT: Duration = Duration::from_millis(500);
+const SCROLLBAR_EXIT: Duration = Duration::from_millis(300);
 /// How long the thumb takes to reach its hovered or resting width.
 const SCROLLBAR_EXPAND: Duration = Duration::from_millis(300);
 
@@ -168,8 +168,14 @@ pub struct Theme {
     /// [`Theme::change`] names that family here, so every text lookup hits
     /// the font cache. A family set explicitly is used as-is.
     pub font_family: SharedString,
+    /// Ordered glyph fallback families for text in the component root.
+    #[serde(default)]
+    pub font_fallbacks: Option<FontFallbacks>,
     /// The base font size for the application, default is 16px.
     pub font_size: Pixels,
+    /// Text size for single-line inputs, dropdowns, and menu options.
+    #[serde(default = "default_control_font_size")]
+    pub control_font_size: Pixels,
     /// The monospace font family for the application.
     ///
     /// Defaults to:
@@ -385,6 +391,14 @@ impl Theme {
     /// projects it onto the Base scrollbar and refreshes every window.
     pub fn set_scrollbar_mode(mode: ScrollbarMode, cx: &mut App) {
         Self::update(cx, |theme| theme.scrollbar_mode = mode);
+    }
+
+    /// The scrollbar motion this theme projects onto Base.
+    ///
+    /// UI that paints its own scrollbar can use this to share the idle hold,
+    /// fade-in, and fade-out timing of the standard scrollbar.
+    pub fn scrollbar_motion(&self) -> gpui_base::ScrollbarMotion {
+        scrollbar_motion(self.scrollbar_mode)
     }
 
     /// Change the theme mode.
@@ -770,13 +784,19 @@ mod semantic_token_tests {
     }
 }
 
+fn default_control_font_size() -> Pixels {
+    px(13.)
+}
+
 impl From<&ThemeColor> for Theme {
     fn from(colors: &ThemeColor) -> Self {
         Theme {
             mode: ThemeMode::default(),
             transparent: Hsla::transparent_black(),
             font_family: ".SystemUIFont".into(),
+            font_fallbacks: None,
             font_size: px(16.),
+            control_font_size: default_control_font_size(),
             mono_font_family: mono_font::default_mono_font_family(),
             mono_font_size: px(13.),
             radius: px(6.),
@@ -1080,8 +1100,10 @@ mod base_theme_projection_tests {
             Theme::set_scrollbar_mode(ScrollbarMode::Scrolling, cx);
             let motion = gpui_base::Theme::global(cx).scrollbar.motion();
             assert_eq!(motion.idle(), SCROLLBAR_IDLE);
+            assert_eq!(motion.idle(), Duration::from_millis(800));
             assert_eq!(motion.enter(), SCROLLBAR_ENTER);
             assert_eq!(motion.exit(), SCROLLBAR_EXIT);
+            assert_eq!(motion.exit(), Duration::from_millis(300));
             assert_eq!(motion.expand(), SCROLLBAR_EXPAND);
             assert_eq!(
                 motion.entrance(),

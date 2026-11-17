@@ -1825,6 +1825,7 @@ pub trait AtlasBackend {
 pub struct AtlasState<Backend> {
     tiles_by_key: FxHashMap<AtlasKey, AtlasTile>,
     pub backend: Backend,
+    revision: u64,
 }
 
 impl<Backend> AtlasState<Backend> {
@@ -1832,7 +1833,12 @@ impl<Backend> AtlasState<Backend> {
         Self {
             tiles_by_key: FxHashMap::default(),
             backend,
+            revision: 0,
         }
+    }
+
+    pub fn revision(&self) -> u64 {
+        self.revision
     }
 
     pub fn contains(&self, key: &AtlasKey) -> bool {
@@ -1841,6 +1847,7 @@ impl<Backend> AtlasState<Backend> {
 
     pub fn clear(&mut self, reset_backend: impl FnOnce(&mut Backend)) {
         self.tiles_by_key.clear();
+        self.revision = self.revision.wrapping_add(1);
         reset_backend(&mut self.backend);
     }
 }
@@ -1868,6 +1875,7 @@ impl<Backend: AtlasBackend> AtlasState<Backend> {
                     .backend
                     .insert(entry.key().texture_kind(), size, &bytes)?;
                 entry.insert(tile);
+                self.revision = self.revision.wrapping_add(1);
                 Ok(Some(tile))
             }
         }
@@ -1876,6 +1884,7 @@ impl<Backend: AtlasBackend> AtlasState<Backend> {
     pub fn remove(&mut self, key: &AtlasKey) {
         if let Some(tile) = self.tiles_by_key.remove(key) {
             self.backend.remove(tile);
+            self.revision = self.revision.wrapping_add(1);
         }
     }
 }

@@ -8,7 +8,7 @@ use gpui::{
     FocusHandle, Focusable, GlobalElementId, Hitbox, HitboxBehavior, InspectorElementId,
     InteractiveElement, IntoElement, LayoutId, LongPressEvent, MouseButton, MouseDownEvent,
     ParentElement, Pixels, Point, Position, Style, StyleRefinement, Styled, Subscription,
-    TouchPhase, Window, anchored, deferred, div, px,
+    TouchPhase, Window, anchored, deferred, div, prelude::FluentBuilder as _, px,
 };
 
 use crate::{input::AnyInputState, menu::PopupMenu, root::WindowState};
@@ -50,6 +50,7 @@ pub struct ContextMenu<E: ParentElement + Styled + Sized> {
     // This is not in use, just for style refinement forwarding.
     _ignore_style: StyleRefinement,
     anchor: Anchor,
+    shared_layer: bool,
 }
 
 impl<E: ParentElement + Styled> ContextMenu<E> {
@@ -60,8 +61,15 @@ impl<E: ParentElement + Styled> ContextMenu<E> {
             element: Some(element),
             menu: None,
             anchor: Anchor::TopLeft,
+            shared_layer: false,
             _ignore_style: StyleRefinement::default(),
         }
+    }
+
+    /// Place this context menu in the window's shared menu layer.
+    pub fn shared_layer(mut self) -> Self {
+        self.shared_layer = true;
+        self
     }
 
     /// Build the context menu using the given builder function.
@@ -174,6 +182,7 @@ struct DeferredMenu {
     position: Point<Pixels>,
     anchor: Anchor,
     menu: Option<AnyElement>,
+    closing: bool,
 }
 
 impl DeferredMenu {
@@ -183,8 +192,10 @@ impl DeferredMenu {
                 div()
                     .w(window.bounds().size.width)
                     .h(window.bounds().size.height)
-                    .on_scroll(|_, _, cx| {
-                        cx.stop_propagation();
+                    .when(!self.closing, |layer| {
+                        layer.on_scroll(|_, _, cx| {
+                            cx.stop_propagation();
+                        })
                     })
                     .child(
                         anchored()
@@ -307,9 +318,16 @@ impl<E: ParentElement + Styled + IntoElement + 'static> Element for ContextMenu<
                 let menu_view = state.shared_state.borrow().menu_view.clone();
                 let draws_menu = Rc::new(Cell::new(false));
                 let menu_element = menu_view
-                    .filter(|menu| open && !menu.read(cx).is_empty())
+                    .filter(|menu| {
+                        if this.shared_layer {
+                            return false;
+                        }
+                        let menu = menu.read(cx);
+                        (open || menu.closing()) && !menu.is_empty() && menu.visible(window, cx)
+                    })
                     .map(|menu_view| DeferredMenu {
                         draws: draws_menu.clone(),
+                        closing: menu_view.read(cx).closing(),
                         menu_view,
                         position,
                         anchor,
@@ -373,6 +391,7 @@ impl<E: ParentElement + Styled + IntoElement + 'static> Element for ContextMenu<
         cx: &mut App,
     ) {
         let builder = self.menu.clone();
+        let shared_layer = self.shared_layer;
         let shared_state = request_layout.shared_state.clone();
 
         // A finger has no right button, so a long press opens the menu. This
@@ -391,7 +410,14 @@ impl<E: ParentElement + Styled + IntoElement + 'static> Element for ContextMenu<
                     && !gpui_base::TextSelection::is_selectable_at(event.start_position, window, cx)
                 {
                     window.prevent_default();
-                    open_menu(&shared_state, &builder, event.start_position, window, cx);
+                    open_menu(
+                        &shared_state,
+                        &builder,
+                        event.start_position,
+                        shared_layer,
+                        window,
+                        cx,
+                    );
                 }
             }
         });
@@ -402,7 +428,14 @@ impl<E: ParentElement + Styled + IntoElement + 'static> Element for ContextMenu<
         window.on_mouse_event(move |event: &MouseDownEvent, phase, window, cx| {
             if phase.bubble() && event.button == MouseButton::Right && hitbox.is_hovered(window) {
                 cx.stop_propagation();
-                open_menu(&shared_state, &builder, event.position, window, cx);
+                open_menu(
+                    &shared_state,
+                    &builder,
+                    event.position,
+                    shared_layer,
+                    window,
+                    cx,
+                );
             }
         });
 
@@ -419,6 +452,7 @@ fn open_menu(
     shared_state: &Rc<RefCell<ContextMenuSharedState>>,
     builder: &Option<Rc<MenuBuilder>>,
     position: Point<Pixels>,
+    shared_layer: bool,
     window: &mut Window,
     cx: &mut App,
 ) {
@@ -502,6 +536,10 @@ fn open_menu(
             // Focus before the menu's first frame, not while prepainting it:
             // a frame reports one focused accessibility node, and the element
             // that held focus may already have claimed it by then.
+            if shared_layer {
+                PopupMenu::show_at(menu, position, window, cx);
+                return;
+            }
             menu.focus_handle(cx).focus(window, cx);
 
             // Set up the subscription for dismiss handling.

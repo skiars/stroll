@@ -3,6 +3,7 @@ pub use gpui_base::input::{
     Diagnostic, DiagnosticEntry, DiagnosticRelatedInformation, DiagnosticSet, DiagnosticSeverity,
     DiagnosticSummary, DiagnosticTag, RelatedInformation,
 };
+pub use language_name::is_bash_source;
 pub(crate) use language_name::language_name;
 
 mod diagnostic_styles;
@@ -11,16 +12,18 @@ pub(crate) use diagnostic_styles::*;
 #[cfg(feature = "tree-sitter")]
 mod input_adapter;
 #[cfg(feature = "tree-sitter")]
-pub(crate) use input_adapter::input_highlighter_factory;
+pub use input_adapter::input_highlighter_factory;
 
 // The lighter highlighter, used when tree-sitter is not enabled.
 #[cfg(all(feature = "syntect", not(feature = "tree-sitter")))]
 mod syntect_backend;
 #[cfg(all(feature = "syntect", not(feature = "tree-sitter")))]
-pub(crate) use syntect_backend::{highlight_code, input_highlighter_factory};
+pub(crate) use syntect_backend::highlight_code;
+#[cfg(all(feature = "syntect", not(feature = "tree-sitter")))]
+pub use syntect_backend::input_highlighter_factory;
 
 #[cfg(not(any(feature = "tree-sitter", feature = "syntect")))]
-pub(crate) fn input_highlighter_factory() -> gpui_base::input::InputHighlighterFactory {
+pub fn input_highlighter_factory() -> gpui_base::input::InputHighlighterFactory {
     std::rc::Rc::new(|_| None)
 }
 
@@ -46,3 +49,12 @@ pub use registry::*;
 mod wasm_stub;
 #[cfg(not(feature = "tree-sitter"))]
 pub use wasm_stub::*;
+
+/// A code background and the syntax colors adjusted for it.
+#[derive(
+    Debug, Clone, PartialEq, Eq, Hash, schemars::JsonSchema, serde::Serialize, serde::Deserialize,
+)]
+pub struct TintedSyntax {
+    pub background: gpui::Hsla,
+    pub syntax: SyntaxColors,
+}

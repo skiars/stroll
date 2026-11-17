@@ -1,11 +1,8 @@
-[
-  (code_span)
-] @text.code.span
+((code_span) @text.code.span
+  (#set! highlight.allow-overlap))
 
-[
-  (emphasis_delimiter)
-  (code_span_delimiter)
-] @punctuation.delimiter
+(emphasis_delimiter) @punctuation.delimiter
+(code_span_delimiter) @punctuation.delimiter.code
 
 ((emphasis) @emphasis
   (#set! highlight.allow-overlap))

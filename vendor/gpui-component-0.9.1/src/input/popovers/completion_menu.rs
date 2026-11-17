@@ -52,11 +52,12 @@ use crate::{
     ActiveTheme, IndexPath, Selectable, ThemeStyled as _, actions, h_flex,
     input::{
         self, EditorState,
-        popovers::{CaretAnchoredPopup, editor_popover, render_markdown},
+        popovers::{CaretAnchoredPopup, caret_popup_height, editor_popover, render_markdown},
     },
     label::Label,
     list::{List, ListDelegate, ListEvent, ListState},
     menu::MenuItemElement,
+    scroll::ScrollableElement as _,
 };
 
 struct ContextMenuDelegate {
@@ -219,6 +220,7 @@ impl ListDelegate for ContextMenuDelegate {
 /// A context menu for code completions and code actions.
 pub struct CompletionMenu {
     offset: usize,
+    revision: Option<(u64, u64)>,
     editor: WeakEntity<EditorState>,
     list: Entity<ListState<ContextMenuDelegate>>,
     open: bool,
@@ -265,6 +267,7 @@ impl CompletionMenu {
 
             Self {
                 offset: 0,
+                revision: None,
                 editor: editor.downgrade(),
                 list,
                 open: false,
@@ -280,10 +283,19 @@ impl CompletionMenu {
         let range = self.trigger_start_offset.unwrap_or(self.offset)..self.offset;
 
         let editor = self.editor.clone();
+        let offset = self.offset;
+        let revision = self.revision;
 
         cx.spawn_in(window, async move |_, cx| {
             editor.update_in(cx, |editor, window, cx| {
-                editor.insert_completion(&item, range, window, cx);
+                if editor.cursor() == offset
+                    && revision.is_none_or(|(document, menu)| {
+                        editor.document_revision() == document
+                            && editor.completion_menu_state().revision() == menu
+                    })
+                {
+                    editor.insert_completion(&item, range, window, cx);
+                }
             })
         })
         .detach();
@@ -314,6 +326,7 @@ impl CompletionMenu {
             return false;
         }
 
+        cx.stop_propagation();
         true
     }
 
@@ -351,17 +364,25 @@ impl CompletionMenu {
     fn dismiss(&mut self, cx: &mut Context<Self>) {
         self.hide(cx);
         let editor = self.editor.clone();
+        let revision = self.revision;
         cx.spawn(async move |_, cx| {
-            let _ = editor.update(cx, |editor, cx| editor.dismiss_completion_overlay(cx));
+            let _ = editor.update(cx, |editor, cx| {
+                if revision.is_none_or(|(_, revision)| {
+                    editor.completion_menu_state().revision() == revision
+                }) {
+                    editor.dismiss_completion_overlay(cx);
+                }
+            });
         })
         .detach();
     }
 
-    /// Sets the trigger start offset if it is not already set.
+    pub(crate) fn set_revision(&mut self, document: u64, menu: u64) {
+        self.revision = Some((document, menu));
+    }
+
     pub(crate) fn update_query(&mut self, start_offset: usize, query: impl Into<SharedString>) {
-        if self.trigger_start_offset.is_none() {
-            self.trigger_start_offset = Some(start_offset);
-        }
+        self.trigger_start_offset = Some(start_offset);
         self.query = query.into();
     }
 
@@ -439,6 +460,7 @@ impl Render for CompletionMenu {
                     anchor.x + configured_max + POPOVER_GAP + configured_max + POPOVER_GAP
                         > window.bounds().size.width;
 
+                let available_height = (caret_popup_height(anchor, window) - px(6.)).max(px(0.));
                 let selected_documentation = list
                     .read(cx)
                     .delegate()
@@ -453,6 +475,7 @@ impl Render for CompletionMenu {
                     .when(vertical_layout, |this| this.flex_col())
                     .child(
                         editor_popover("completion-menu", cx)
+                            .debug_selector(|| "completion-menu".into())
                             .popover_style(cx)
                             .text_sm()
                             // Each virtual row includes the menu's inter-item gap.
@@ -460,7 +483,17 @@ impl Render for CompletionMenu {
                             .test_support()
                             .max_w(max_width)
                             .min_w(px(120.))
-                            .child(List::new(&list).max_h(MAX_MENU_HEIGHT)),
+                            .child(
+                                List::new(&list)
+                                    .popup_scrollbar()
+                                    .max_h(MAX_MENU_HEIGHT.min(
+                                        if vertical_layout && selected_documentation.is_some() {
+                                            available_height * 0.7
+                                        } else {
+                                            available_height
+                                        },
+                                    )),
+                            ),
                     )
                     .when_some(selected_documentation, |this, documentation| {
                         let mut doc = match documentation {
@@ -477,8 +510,20 @@ impl Render for CompletionMenu {
                                     .popover_style(cx)
                                     .text_sm()
                                     .w(configured_max)
-                                    .px_2()
-                                    .child(render_markdown("doc", doc, window, cx)),
+                                    .child(
+                                        div()
+                                            .max_h(
+                                                if vertical_layout {
+                                                    available_height * 0.3 - POPOVER_GAP
+                                                } else {
+                                                    available_height
+                                                }
+                                                .max(px(0.)),
+                                            )
+                                            .px_2()
+                                            .child(render_markdown("doc", doc, window, cx))
+                                            .overflow_y_popup_scrollbar(),
+                                    ),
                             ),
                         )
                     })

@@ -22,6 +22,7 @@ pub(crate) struct FallbackMenuOverlay {
 struct ActiveMenu {
     menu: Entity<PopupMenu>,
     position: Point<Pixels>,
+    priority: usize,
     _subscription: Subscription,
 }
 
@@ -44,16 +45,35 @@ impl FallbackMenuOverlay {
         cx: &mut Context<Self>,
     ) {
         let menu = build_popup(items, action_context, window, cx);
+        self.show_popup(menu, position, window, cx);
+    }
 
-        let subscription = cx.subscribe(&menu, |this, _, _: &DismissEvent, cx| {
-            this.active = None;
-            cx.notify();
+    pub(crate) fn show_popup(
+        &mut self,
+        menu: Entity<PopupMenu>,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let previous_focus = if let Some(active) = self.active.as_ref()
+            && active.menu.focus_handle(cx).contains_focused(window, cx)
+        {
+            active.menu.read(cx).previous_focus_handle.clone()
+        } else {
+            window.focused(cx)
+        };
+        menu.update(cx, |menu, cx| {
+            menu.set_previous_focus(previous_focus, cx);
+            menu.begin_open();
         });
-        menu.focus_handle(cx).focus(window, cx);
 
+        let subscription = cx.subscribe(&menu, |_, _, _: &DismissEvent, cx| cx.notify());
+        menu.focus_handle(cx).focus(window, cx);
+        let priority = gpui_base::MODAL_POPUP_PRIORITY + gpui_base::POPUP_PRIORITY;
         self.active = Some(ActiveMenu {
             menu,
             position,
+            priority,
             _subscription: subscription,
         });
         cx.notify();
@@ -116,7 +136,14 @@ fn build_popup(
 }
 
 impl Render for FallbackMenuOverlay {
-    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self
+            .active
+            .as_ref()
+            .is_some_and(|active| !active.menu.read(cx).visible(window, cx))
+        {
+            self.active = None;
+        }
         let mut root = div();
         if let Some(active) = self.active.as_ref() {
             root = root.child(
@@ -126,7 +153,7 @@ impl Render for FallbackMenuOverlay {
                         .snap_to_window_with_margin(px(8.))
                         .child(active.menu.clone()),
                 )
-                .with_priority(gpui_base::POPUP_PRIORITY),
+                .with_priority(active.priority),
             );
         }
         root

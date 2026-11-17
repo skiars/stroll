@@ -80,6 +80,41 @@ pub struct GutterDecoration {
     range: Range<usize>,
     color: Option<Hsla>,
     folded_color: Option<Hsla>,
+    action: Option<usize>,
+    outlined: bool,
+}
+
+/// The hanging action label attaches to the first displayed row of a diff block.
+pub const HUNK_TOOLBAR_HEIGHT: Pixels = gpui::px(24.);
+
+/// Anchor the label to the first row or the top of the viewport while hovered.
+pub fn hovered_hunk_top(
+    block: gpui::Bounds<Pixels>,
+    clip: gpui::Bounds<Pixels>,
+    mouse: gpui::Point<Pixels>,
+) -> Option<Pixels> {
+    (clip.contains(&mouse) && block.contains(&mouse) && block.bottom() > clip.top())
+        .then(|| block.top().max(clip.top()))
+}
+
+/// An expanded hunk. Sections are ordered by their position in the working text.
+pub struct GutterHunk {
+    pub(crate) action: usize,
+    pub(crate) sections: Vec<GutterHunkSection>,
+    pub(crate) marker_color: Hsla,
+    pub(crate) staged: bool,
+    pub(crate) render: std::rc::Rc<dyn Fn(&mut gpui::Window, &mut App) -> gpui::AnyElement>,
+}
+
+/// Read-only deleted lines before a zero-based working line, followed by
+/// the working lines to highlight. These rows are outside the text buffer.
+#[derive(Clone)]
+pub struct GutterHunkSection {
+    pub line: usize,
+    pub deleted: Vec<gpui::SharedString>,
+    pub added: usize,
+    pub deleted_background: Hsla,
+    pub added_background: Hsla,
 }
 
 impl GutterDecoration {
@@ -89,6 +124,8 @@ impl GutterDecoration {
             range,
             color: None,
             folded_color: None,
+            action: None,
+            outlined: false,
         }
     }
 
@@ -118,6 +155,26 @@ impl GutterDecoration {
     pub fn with_folded_color(mut self, color: Hsla) -> Self {
         self.folded_color = Some(color);
         self
+    }
+
+    /// Identify this mark in a gutter click event.
+    pub fn with_action(mut self, action: usize) -> Self {
+        self.action = Some(action);
+        self
+    }
+
+    pub(crate) fn action(&self) -> Option<usize> {
+        self.action
+    }
+
+    /// Draw this mark as an outline, using the same color as a solid mark.
+    pub fn outlined(mut self, outlined: bool) -> Self {
+        self.outlined = outlined;
+        self
+    }
+
+    pub(crate) fn is_outlined(&self) -> bool {
+        self.outlined
     }
 }
 
@@ -876,6 +933,13 @@ fn normalize<T: TrackedDecoration>(text: &Rope, decorations: Vec<T>) -> Vec<T> {
 }
 
 impl InputBaseState<EditorMode> {
+    /// Mirror gutter decorations and diagnostics on the vertical scrollbar and
+    /// let clicks on the track reveal their display positions.
+    pub fn navigable_overview_ruler(mut self) -> Self {
+        self.extras.navigable_overview_ruler = true;
+        self
+    }
+
     /// Create an independently owned collection of geometric range decorations.
     ///
     /// Ranges use UTF-8 byte offsets and the same tracking as text decorations:
@@ -1004,6 +1068,43 @@ impl InputBaseState<EditorMode> {
     pub fn set_gutter_decorations_width(&mut self, width: Pixels, cx: &mut Context<Self>) {
         if self.extras.gutter_decorations_width != width {
             self.extras.gutter_decorations_width = width;
+            cx.notify();
+        }
+    }
+
+    /// Enable hover expansion and full-width click targets for actionable gutter marks.
+    /// The width is measured from the editor's outer edge and includes the gap before
+    /// the line numbers.
+    pub fn set_interactive_gutter_width(&mut self, width: Pixels, cx: &mut Context<Self>) {
+        if !self.extras.interactive_gutter || self.extras.gutter_decorations_width != width {
+            self.extras.interactive_gutter = true;
+            self.extras.gutter_decorations_width = width;
+            cx.notify();
+        }
+    }
+
+    /// Expand the hunk in the editor at its working-line boundaries.
+    pub fn set_gutter_hunk(
+        &mut self,
+        action: usize,
+        sections: Vec<GutterHunkSection>,
+        marker_color: Hsla,
+        staged: bool,
+        render: impl Fn(&mut gpui::Window, &mut App) -> gpui::AnyElement + 'static,
+        cx: &mut Context<Self>,
+    ) {
+        self.extras.gutter_hunk = Some(GutterHunk {
+            action,
+            sections,
+            marker_color,
+            staged,
+            render: std::rc::Rc::new(render),
+        });
+        cx.notify();
+    }
+
+    pub fn clear_gutter_hunk(&mut self, cx: &mut Context<Self>) {
+        if self.extras.gutter_hunk.take().is_some() {
             cx.notify();
         }
     }

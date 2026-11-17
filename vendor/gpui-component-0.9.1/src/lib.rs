@@ -105,6 +105,7 @@ pub use gpui_base::{
     AxisExt, Edges, FocusTrapElement, InteractiveElementExt, LengthExt, Measure, OngoingScrollExt,
     Placement, Side, measure, measure_if,
 };
+pub use gpui_base::{MODAL_POPUP_PRIORITY, PopupFrame, PopupMotion, PopupMotionKind};
 pub use gpui_component_macros::icon_named;
 pub use icon::*;
 pub use index_path::IndexPath;

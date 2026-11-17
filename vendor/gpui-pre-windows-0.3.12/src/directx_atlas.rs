@@ -33,6 +33,10 @@ struct DirectXAtlasTexture {
 }
 
 impl DirectXAtlas {
+    pub(crate) fn revision(&self) -> u64 {
+        self.0.lock().revision()
+    }
+
     pub(crate) fn new(device: &ID3D11Device, device_context: &ID3D11DeviceContext) -> Self {
         DirectXAtlas(Mutex::new(AtlasState::new(DirectXAtlasTextures {
             device: device.clone(),

@@ -4,15 +4,25 @@ use gpui::{Context, Window};
 use ropey::Rope;
 use std::{ops::Range, rc::Rc};
 
-use super::{
-    InputBaseState, Replace, RopeExt as _, Search, movement::MoveDirection, state::ScrollPadding,
-};
+use super::{InputBaseState, Replace, Search, movement::MoveDirection, state::ScrollPadding};
+
+type MatchRanges = Rc<dyn Fn(&str) -> Vec<Range<usize>>>;
+
+#[derive(Clone)]
+struct SearchPattern(MatchRanges);
+
+impl std::fmt::Debug for SearchPattern {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("SearchPattern")
+    }
+}
 
 /// Stateful, presentation-independent search engine used by text inputs.
 #[derive(Debug, Clone)]
 pub struct SearchMatcher {
     text: Rope,
     pub query: Option<AhoCorasick>,
+    pattern: Option<SearchPattern>,
     matched_ranges: Rc<Vec<Range<usize>>>,
     current_match_ix: usize,
     replacing: bool,
@@ -197,6 +207,24 @@ impl<M: InputModeKind> InputBaseState<M> {
         cx.notify();
     }
 
+    /// Seed Find with a caller-provided pattern. The next change to the query
+    /// or case option resumes the built-in literal matcher.
+    pub fn set_search_pattern(
+        &mut self,
+        query: String,
+        case_insensitive: bool,
+        matches: impl Fn(&str) -> Vec<Range<usize>> + 'static,
+        cx: &mut Context<Self>,
+    ) {
+        self.set_search_query(query, case_insensitive, cx);
+        self.search_session.matcher.pattern = Some(SearchPattern(Rc::new(matches)));
+        self.search_session.matcher.update_matches();
+        if let Some(anchor) = self.search_session.anchor_offset {
+            self.search_session.matcher.update_cursor_by_offset(anchor);
+        }
+        cx.notify();
+    }
+
     /// End the search: hide the built-in panel and the match highlights. The
     /// query is kept so the next [`InputBaseState::open_search`] resumes it.
     pub fn close_search(&mut self, cx: &mut Context<Self>) {
@@ -242,6 +270,10 @@ impl<M: InputModeKind> InputBaseState<M> {
         else {
             return false;
         };
+        if !self.can_edit_ranges(std::slice::from_ref(&range), cx) {
+            return false;
+        }
+        let matcher = &mut self.search_session.matcher;
         let next = matcher.peek().unwrap_or_else(|| range.clone());
         let direction = matcher
             .has_next_without_wrap()
@@ -267,17 +299,20 @@ impl<M: InputModeKind> InputBaseState<M> {
             return 0;
         }
         self.sync_search_matcher();
-        let ranges = self.search_session.matcher.matched_ranges();
-        if ranges.is_empty() {
+        let edits = self
+            .search_session
+            .matcher
+            .matched_ranges()
+            .iter()
+            .filter(|range| self.can_edit_ranges(std::slice::from_ref(range), cx))
+            .map(|range| (range.clone(), replacement.to_owned()))
+            .collect::<Vec<_>>();
+        if edits.is_empty() {
             return 0;
         }
-        let mut text = self.text.clone();
-        for range in ranges.iter().rev() {
-            text.replace(range.clone(), replacement);
-        }
         self.search_session.matcher.begin_replacement();
-        let count = ranges.len();
-        self.replace_text_in_range_silent(Some(0..self.text.len()), &text.to_string(), window, cx);
+        let count = edits.len();
+        self.apply_editor_edits(&edits, true, window, cx);
         self.scroll_to(0, Some(MoveDirection::Down), cx);
         count
     }
@@ -332,6 +367,7 @@ impl SearchMatcher {
         Self {
             text: "".into(),
             query: None,
+            pattern: None,
             matched_ranges: Rc::new(Vec::new()),
             current_match_ix: 0,
             replacing: false,
@@ -349,6 +385,7 @@ impl SearchMatcher {
     }
 
     pub fn update_query(&mut self, query: &str, case_insensitive: bool) {
+        self.pattern = None;
         self.query = (!query.is_empty()).then(|| {
             AhoCorasick::builder()
                 .ascii_case_insensitive(case_insensitive)
@@ -427,7 +464,9 @@ impl SearchMatcher {
 
     fn update_matches(&mut self) {
         let mut ranges = Vec::new();
-        if let Some(query) = &self.query {
+        if let Some(pattern) = &self.pattern {
+            ranges = (pattern.0)(&self.text.to_string());
+        } else if let Some(query) = &self.query {
             let text = self.text.to_string();
             ranges.extend(
                 query

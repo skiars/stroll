@@ -15,114 +15,102 @@ use gpui_base::input::{
     InputHighlighterFactory,
 };
 use ropey::Rope;
-use tree_sitter::{InputEdit, ParseOptions, Point};
+use tree_sitter::{InputEdit, Point};
 
-use super::{LanguageRegistry, SyntaxHighlighter, highlighter::parse_input_bytes};
+use super::{LanguageRegistry, SyntaxHighlighter};
 
-pub(crate) fn input_highlighter_factory() -> InputHighlighterFactory {
+pub fn input_highlighter_factory() -> InputHighlighterFactory {
     Rc::new(|language| {
-        LanguageRegistry::singleton().has_parser(language).then(|| {
+        let registry = LanguageRegistry::singleton();
+        (registry.has_parser(language) || registry.tokenizer(language).is_some()).then(|| {
             Box::new(TreeSitterInputHighlighter::new(language)) as Box<dyn InputHighlighter>
         })
     })
 }
 
-const SYNC_PARSE_TIMEOUT: Duration = Duration::from_millis(2);
-const SYNC_PARSE_MAX_BYTES: usize = 256 * 1024;
-const PARSE_DEBOUNCE: Duration = Duration::from_millis(150);
+const PARSE_DEBOUNCE: Duration = Duration::from_millis(40);
 
 struct TreeSitterInputHighlighter {
-    inner: Rc<RefCell<SyntaxHighlighter>>,
-    parse_task: Rc<RefCell<Option<Task<()>>>>,
+    language: SharedString,
+    inner: Rc<RefCell<Option<SyntaxHighlighter>>>,
+    parse_task: Option<Task<()>>,
+    cancel: Arc<AtomicBool>,
+}
+
+impl Drop for TreeSitterInputHighlighter {
+    fn drop(&mut self) {
+        self.cancel.store(true, Ordering::Relaxed);
+    }
 }
 
 impl TreeSitterInputHighlighter {
     fn new(language: &str) -> Self {
         Self {
-            inner: Rc::new(RefCell::new(SyntaxHighlighter::new(language))),
-            parse_task: Rc::new(RefCell::new(None)),
+            language: language.to_owned().into(),
+            inner: Rc::default(),
+            parse_task: None,
+            cancel: Arc::default(),
         }
     }
 
-    /// Settle after the edits reached the tree: drop a pending background
-    /// parse when the synchronous one `completed`, or schedule one for `text`.
-    fn finish_update(
+    fn schedule(
         &mut self,
-        completed: bool,
+        edits: impl IntoIterator<Item = InputEdit>,
         text: &Rope,
         folding: bool,
         window: &mut gpui::Window,
         cx: &mut gpui::Context<EditorState>,
     ) {
-        if completed {
-            self.parse_task.borrow_mut().take();
-            return;
-        }
-
-        let highlighter = self.inner.clone();
-        let parse_task = self.parse_task.clone();
-        let language = highlighter.borrow().language().clone();
-        let old_tree = highlighter.borrow().tree().cloned();
-        let injection_data = highlighter.borrow().injection_parse_data();
+        self.cancel.store(true, Ordering::Relaxed);
+        self.cancel = Arc::default();
+        let cancel = self.cancel.clone();
+        let inner = self.inner.clone();
+        let language = self.language.clone();
         let text = text.clone();
-        let text_for_apply = text.clone();
-        let cancel = Arc::new(AtomicBool::new(false));
-
-        let task = cx.spawn_in(window, async move |entity, cx| {
-            struct CancelOnDrop(Arc<AtomicBool>);
-            impl Drop for CancelOnDrop {
-                fn drop(&mut self) {
-                    self.0.store(true, Ordering::Relaxed);
-                }
+        let (previous, injections) = if let Some(highlighter) = inner.borrow_mut().as_mut() {
+            for edit in edits {
+                highlighter.edit_tree(Some(edit), &text);
             }
-            let _cancel_guard = CancelOnDrop(cancel.clone());
-            cx.background_executor().timer(PARSE_DEBOUNCE).await;
-
-            let parse_cancel = cancel.clone();
+            (
+                highlighter.tree().cloned(),
+                highlighter.injection_parse_data(),
+            )
+        } else {
+            (None, None)
+        };
+        let debounce = self.parse_task.is_some();
+        self.parse_task = Some(cx.spawn_in(window, async move |editor, cx| {
+            if debounce {
+                cx.background_executor().timer(PARSE_DEBOUNCE).await;
+            }
+            let worker_cancel = cancel.clone();
             let result = cx
                 .background_executor()
                 .spawn(async move {
-                    let (mut parser, grammar) =
-                        LanguageRegistry::singleton().parser(&language).ok()?;
-                    parser.set_language(&grammar).ok()?;
-                    let mut progress = |_: &tree_sitter::ParseState| {
-                        if parse_cancel.load(Ordering::Relaxed) {
-                            std::ops::ControlFlow::Break(())
-                        } else {
-                            std::ops::ControlFlow::Continue(())
-                        }
-                    };
-                    let options = ParseOptions::new().progress_callback(&mut progress);
-                    let tree = parser.parse_with_options(
-                        &mut |offset, _| parse_input_bytes(&text, offset),
-                        old_tree.as_ref(),
-                        Some(options),
-                    )?;
-                    if parse_cancel.load(Ordering::Relaxed) {
-                        return None;
-                    }
-                    let injections = injection_data.map_or_else(Default::default, |data| {
-                        SyntaxHighlighter::compute_injection_layers(data, &tree, &text)
-                    });
+                    let mut highlighter = SyntaxHighlighter::new(&language);
+                    highlighter.parse_background(text, previous.as_ref(), injections, || {
+                        worker_cancel.load(Ordering::Relaxed)
+                    })?;
                     let folds = if folding {
-                        extract_fold_ranges(&tree)
+                        highlighter
+                            .tree()
+                            .map(extract_fold_ranges)
+                            .unwrap_or_default()
                     } else {
                         Vec::new()
                     };
-                    Some((tree, injections, folds))
+                    Some((highlighter, folds))
                 })
                 .await;
-
-            if let Some((tree, injections, folds)) = result {
-                highlighter
-                    .borrow_mut()
-                    .apply_background_tree(tree, &text_for_apply, injections);
-                let _ = entity.update(cx, |state, cx| {
-                    state.apply_highlighter_fold_candidates(folds, cx);
+            if let Some((highlighter, folds)) = result
+                && !cancel.load(Ordering::Relaxed)
+            {
+                *inner.borrow_mut() = Some(highlighter);
+                let _ = editor.update(cx, |state, cx| {
+                    state.apply_highlighter_fold_candidates(folds, cx)
                 });
             }
-        });
-        parse_task.borrow_mut().replace(task);
+        }));
     }
 }
 
@@ -139,7 +127,7 @@ impl SyntaxHighlighter {
 
 impl InputHighlighter for TreeSitterInputHighlighter {
     fn language(&self) -> SharedString {
-        self.inner.borrow().language().clone()
+        self.language.clone()
     }
 
     fn update(
@@ -150,17 +138,7 @@ impl InputHighlighter for TreeSitterInputHighlighter {
         window: &mut gpui::Window,
         cx: &mut gpui::Context<EditorState>,
     ) {
-        let edit = edit.map(to_tree_sitter_edit);
-        let completed = {
-            let mut highlighter = self.inner.borrow_mut();
-            if text.len() > SYNC_PARSE_MAX_BYTES {
-                highlighter.edit_tree(edit, text);
-                false
-            } else {
-                highlighter.update(edit, text, Some(SYNC_PARSE_TIMEOUT))
-            }
-        };
-        self.finish_update(completed, text, folding, window, cx);
+        self.schedule(edit.map(to_tree_sitter_edit), text, folding, window, cx);
     }
 
     fn update_batch(
@@ -170,25 +148,15 @@ impl InputHighlighter for TreeSitterInputHighlighter {
         window: &mut gpui::Window,
         cx: &mut gpui::Context<EditorState>,
     ) {
-        let Some((_, text)) = edits.last() else {
-            return;
-        };
-        let edits: Vec<InputEdit> = edits
-            .iter()
-            .map(|(edit, _)| to_tree_sitter_edit(*edit))
-            .collect();
-        let completed = {
-            let mut highlighter = self.inner.borrow_mut();
-            if text.len() > SYNC_PARSE_MAX_BYTES {
-                for edit in edits {
-                    highlighter.edit_tree(Some(edit), text);
-                }
-                false
-            } else {
-                highlighter.update_edits(&edits, text, Some(SYNC_PARSE_TIMEOUT))
-            }
-        };
-        self.finish_update(completed, text, folding, window, cx);
+        if let Some((_, text)) = edits.last() {
+            self.schedule(
+                edits.iter().map(|(edit, _)| to_tree_sitter_edit(*edit)),
+                text,
+                folding,
+                window,
+                cx,
+            );
+        }
     }
 
     fn styles(
@@ -196,22 +164,24 @@ impl InputHighlighter for TreeSitterInputHighlighter {
         range: &Range<usize>,
         resolver: &dyn HighlightStyleResolver,
     ) -> Vec<(Range<usize>, HighlightStyle)> {
-        self.inner.borrow().styles(range, resolver)
+        self.inner.borrow().as_ref().map_or_else(
+            || vec![(range.clone(), HighlightStyle::default())],
+            |highlighter| highlighter.styles(range, resolver),
+        )
     }
     fn fold_ranges(&self, _: &Rope) -> Vec<FoldRange> {
         self.inner
             .borrow()
-            .tree()
+            .as_ref()
+            .and_then(SyntaxHighlighter::tree)
             .map(extract_fold_ranges)
             .unwrap_or_default()
     }
 
-    fn fold_ranges_for_edit(&self, range: Range<usize>, _: &Rope) -> Vec<FoldRange> {
-        self.inner
-            .borrow()
-            .tree()
-            .map(|tree| extract_fold_ranges_in_range(tree, range))
-            .unwrap_or_default()
+    fn fold_ranges_for_edit(&self, _: Range<usize>, _: &Rope) -> Vec<FoldRange> {
+        // The next completed parse provides a fresh full list; the editor
+        // already shifts unaffected ranges in response to the edit.
+        Vec::new()
     }
 }
 

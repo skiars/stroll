@@ -863,7 +863,7 @@ struct Shadow {
     Bounds element_bounds;
     Corners element_corner_radii;
     uint inset;
-    uint pad; // align to 8 bytes
+    uint clip_interior;
 };
 
 struct ShadowVertexOutput {
@@ -948,9 +948,81 @@ float4 shadow_fragment(ShadowFragmentInput input): SV_TARGET {
         float element_distance = quad_sdf(input.position.xy, shadow.element_bounds,
                                           shadow.element_corner_radii);
         alpha *= saturate(0.5 - element_distance);
+    } else if (shadow.clip_interior != 0u) {
+        float element_distance = quad_sdf(input.position.xy, shadow.element_bounds,
+                                          shadow.element_corner_radii);
+        alpha *= saturate(0.5 + element_distance);
     }
 
     return input.color * float4(1., 1., 1., alpha);
+}
+
+// Downsample and filter the captured scene; composite at native resolution.
+cbuffer BackdropParams : register(b2) {
+    Bounds backdrop_bounds;
+    Corners backdrop_corners;
+    float2 backdrop_origin;
+    float2 backdrop_extent;
+    float2 backdrop_filtered_extent;
+    float2 backdrop_direction;
+    uint backdrop_mode;
+    uint backdrop_scale;
+    uint backdrop_pairs;
+    float backdrop_center;
+    float backdrop_opacity;
+    float backdrop_saturation;
+    float2 backdrop_padding;
+    float4 backdrop_taps[16];
+};
+
+Texture2D<float4> backdrop_source : register(t2);
+Texture2D<float4> backdrop_original : register(t3);
+
+float4 backdrop_vertex(uint id : SV_VertexID) : SV_Position {
+    return float4(id == 1 ? 3. : -1., id == 2 ? 3. : -1., 0., 1.);
+}
+
+float4 backdrop_fragment(float4 position : SV_Position) : SV_TARGET {
+    uint width, height;
+    backdrop_source.GetDimensions(width, height);
+    float2 size = float2(width, height);
+    if (backdrop_mode == 0u) {
+        float2 start = floor(position.xy) * backdrop_scale;
+        uint pairs = backdrop_scale / 2u;
+        float4 result = 0.;
+        [loop]
+        for (uint y = 0; y < pairs; ++y) {
+            [loop]
+            for (uint x = 0; x < pairs; ++x) {
+                float2 pixel = min(start + float2(2*x+1, 2*y+1), backdrop_extent - 0.5);
+                result += backdrop_source.SampleLevel(s_sprite, pixel / size, 0.);
+            }
+        }
+        return result / float(pairs * pairs);
+    }
+    float2 min_uv = 0.5 / size;
+    float2 max_uv = (backdrop_filtered_extent - 0.5) / size;
+    if (backdrop_mode == 1u) {
+        float2 uv = position.xy / size;
+        float4 result = backdrop_center * backdrop_source.SampleLevel(s_sprite, uv, 0.);
+        [loop]
+        for (uint i = 0; i < backdrop_pairs; ++i) {
+            float2 tap = backdrop_taps[i].xy;
+            float2 offset = backdrop_direction * tap.x / size;
+            result += tap.y * (
+                backdrop_source.SampleLevel(s_sprite, clamp(uv + offset, min_uv, max_uv), 0.) +
+                backdrop_source.SampleLevel(s_sprite, clamp(uv - offset, min_uv, max_uv), 0.));
+        }
+        return result;
+    }
+    float2 local = position.xy - backdrop_origin;
+    float2 uv = clamp(local / (backdrop_scale * size), min_uv, max_uv);
+    float4 blurred = backdrop_source.SampleLevel(s_sprite, uv, 0.);
+    float coverage = saturate(0.5 - quad_sdf(position.xy, backdrop_bounds, backdrop_corners));
+    float4 original = backdrop_original.Load(int3(int2(local), 0));
+    float luma = dot(blurred.rgb, float3(0.213, 0.715, 0.072));
+    float3 color = lerp(luma.xxx, blurred.rgb, backdrop_saturation);
+    return lerp(original, float4(saturate(color), blurred.a), coverage * backdrop_opacity);
 }
 
 /*
@@ -964,6 +1036,7 @@ struct PathRasterizationSprite {
     float2 st_position;
     Background color;
     Bounds bounds;
+    Bounds raster;
 };
 
 StructuredBuffer<PathRasterizationSprite> path_rasterization_sprites: register(t1);
@@ -985,7 +1058,8 @@ PathVertexOutput path_rasterization_vertex(uint vertex_id: SV_VertexID) {
     PathRasterizationSprite sprite = path_rasterization_sprites[vertex_id];
 
     PathVertexOutput output;
-    output.position = to_device_position_impl(sprite.xy_position);
+    float2 local = (sprite.xy_position - sprite.raster.origin) / sprite.raster.size;
+    output.position = float4(local * float2(2., -2.) + float2(-1., 1.), 0., 1.);
     output.st_position = sprite.st_position;
     output.vertex_id = vertex_id;
     output.clip_distance = distance_from_clip_rect_impl(sprite.xy_position, sprite.bounds);
@@ -1014,7 +1088,7 @@ float4 path_rasterization_fragment(PathFragmentInput input): SV_Target {
     GradientColor gradient = prepare_gradient_color(
         background.tag, background.color_space, background.solid, background.colors);
 
-    float4 color = gradient_color(background, input.position.xy, bounds,
+    float4 color = gradient_color(background, input.position.xy + sprite.raster.origin, bounds,
         gradient.solid, gradient.color0, gradient.color1);
     return float4(color.rgb * color.a * alpha, alpha * color.a);
 }
@@ -1027,11 +1101,12 @@ float4 path_rasterization_fragment(PathFragmentInput input): SV_Target {
 
 struct PathSprite {
     Bounds bounds;
+    float2 raster_origin;
 };
 
 struct PathSpriteVertexOutput {
     float4 position: SV_Position;
-    float2 texture_coords: TEXCOORD0;
+    nointerpolation float2 raster_origin: TEXCOORD0;
 };
 
 StructuredBuffer<PathSprite> path_sprites: register(t1);
@@ -1043,17 +1118,14 @@ PathSpriteVertexOutput path_sprite_vertex(uint vertex_id: SV_VertexID, uint spri
     // Don't apply content mask because it was already accounted for when rasterizing the path
     float4 device_position = to_device_position(unit_vertex, sprite.bounds);
 
-    float2 screen_position = sprite.bounds.origin + unit_vertex * sprite.bounds.size;
-    float2 texture_coords = screen_position / global_viewport_size;
-
     PathSpriteVertexOutput output;
     output.position = device_position;
-    output.texture_coords = texture_coords;
+    output.raster_origin = sprite.raster_origin;
     return output;
 }
 
 float4 path_sprite_fragment(PathSpriteVertexOutput input): SV_Target {
-    return t_sprite.Sample(s_sprite, input.texture_coords);
+    return t_sprite.Load(int3(int2(input.position.xy - input.raster_origin), 0));
 }
 
 /*
@@ -1212,7 +1284,7 @@ SubpixelSpriteFragmentOutput subpixel_sprite_fragment(MonochromeSpriteFragmentIn
 
 struct PolychromeSprite {
     uint order;
-    uint pad;
+    uint nearest_neighbor;
     AtlasTile tile;
     uint grayscale;
     float opacity;
@@ -1255,7 +1327,18 @@ PolychromeSpriteVertexOutput polychrome_sprite_vertex(uint vertex_id: SV_VertexI
 
 float4 polychrome_sprite_fragment(PolychromeSpriteFragmentInput input): SV_Target {
     PolychromeSprite sprite = poly_sprites[input.sprite_id];
-    float4 sample = t_sprite.Sample(s_sprite, input.tile_position);
+    float4 sample;
+    if (sprite.nearest_neighbor != 0u) {
+        uint width, height;
+        t_sprite.GetDimensions(width, height);
+        int2 first_texel = sprite.tile.bounds.origin;
+        int2 last_texel = first_texel + max(sprite.tile.bounds.size, int2(1, 1)) - int2(1, 1);
+        int2 texel = clamp(int2(floor(input.tile_position * float2(width, height))),
+                           first_texel, last_texel);
+        sample = t_sprite.Load(int3(texel, 0));
+    } else {
+        sample = t_sprite.SampleLevel(s_sprite, input.tile_position, 0.0);
+    }
     float distance = quad_sdf(input.position.xy, sprite.bounds, sprite.corner_radii);
 
     float4 color = sample;

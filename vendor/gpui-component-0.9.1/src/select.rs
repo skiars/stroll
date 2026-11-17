@@ -1,7 +1,7 @@
 use gpui::{
     AnyElement, App, ClickEvent, Context, DismissEvent, Edges, ElementId, Entity, EventEmitter,
-    FocusHandle, Focusable, Hsla, InteractiveElement, IntoElement, Length, ParentElement, Render,
-    RenderOnce, SharedString, StatefulInteractiveElement, StyleRefinement, Styled, Window,
+    FocusHandle, Focusable, Hsla, InteractiveElement, IntoElement, Length, ParentElement, Pixels,
+    Render, RenderOnce, SharedString, StatefulInteractiveElement, StyleRefinement, Styled, Window,
     deferred, div, prelude::FluentBuilder, px, rems,
 };
 use gpui_base::TestSupportExt as _;
@@ -128,6 +128,8 @@ where
 
     // Select-specific fields
     searchable: bool,
+    popup_priority: usize,
+    popup_row_height: Option<Pixels>,
     icon: Option<Icon>,
     title_prefix: Option<SharedString>,
     focus_ring_enabled: bool,
@@ -205,7 +207,7 @@ where
 
                             cx.emit(SelectEvent::Confirm(final_value.clone()));
                             cx.notify();
-                            this.set_open(false, cx);
+                            this.set_open(false, window, cx);
                             this.focus(window, cx);
 
                             (this.state.selection.clone(), final_value)
@@ -263,7 +265,7 @@ where
                         list_state.set_selected_index(committed_ix, window, cx);
 
                         _ = weak_cancel.update(cx, |this, cx| {
-                            this.set_open(false, cx);
+                            this.set_open(false, window, cx);
                             this.focus(window, cx);
                         });
                     }
@@ -293,6 +295,8 @@ where
         Self {
             state,
             searchable: false,
+            popup_priority: gpui_base::POPUP_PRIORITY,
+            popup_row_height: None,
             icon: None,
             title_prefix: None,
             focus_ring_enabled: true,
@@ -413,14 +417,14 @@ where
         }
 
         self.clear_query_and_restore_cursor(window, cx);
-        self.set_open(false, cx);
+        self.set_open(false, window, cx);
         cx.notify();
     }
 
     fn toggle_menu(&mut self, _: &ClickEvent, window: &mut Window, cx: &mut Context<Self>) {
         cx.stop_propagation();
 
-        self.set_open(!self.state.open, cx);
+        self.set_open(!self.state.open, window, cx);
 
         if self.state.open {
             self.state.list.focus_handle(cx).focus(window, cx);
@@ -439,7 +443,7 @@ where
 
         cx.stop_propagation();
         self.clear_query_and_restore_cursor(window, cx);
-        self.set_open(false, cx);
+        self.set_open(false, window, cx);
         self.focus(window, cx);
         cx.notify();
     }
@@ -458,7 +462,15 @@ where
         });
     }
 
-    fn set_open(&mut self, open: bool, cx: &mut Context<Self>) {
+    fn set_open(&mut self, open: bool, window: &Window, cx: &mut Context<Self>) {
+        if open && !self.state.open {
+            self.popup_row_height = None;
+            self.popup_priority = crate::root::WindowState::select_popup_priority(
+                window,
+                cx,
+                &self.state.focus_handle,
+            );
+        }
         let dismissed = self.state.open && !open;
         self.state.open = open;
         self.state.deferred_context = open.then(|| GlobalState::register_deferred_popover(cx));
@@ -543,13 +555,40 @@ where
         let bounds = self.state.bounds;
         let allow_open = !(self.state.open || self.state.disabled);
         let outline_visible = self.state.open || (is_focused && !self.state.disabled);
-
         let (bg, fg) = input_style(self.state.disabled, cx);
 
         self.state.list.update(cx, |list, cx| {
             list.set_searchable(searchable, cx);
             list.delegate_mut().size = self.state.size;
         });
+
+        // Use the unfiltered row height for this opening, even if a search
+        // returns fewer rows or replaces them with the empty state.
+        if self.state.open && self.popup_row_height.is_none() {
+            self.popup_row_height = Some(
+                self.state
+                    .list
+                    .update(cx, |list, cx| list.measure_item(window, cx))
+                    .height,
+            );
+        }
+        let fixed_height = px(2.) // popup border
+            + if searchable {
+                self.state.size.control_height().to_pixels(window.rem_size()) + px(1.)
+            } else {
+                px(0.)
+            };
+        let minimum_height =
+            fixed_height + self.popup_row_height.unwrap_or_default() + 2. * DROPDOWN_LIST_PADDING;
+        let (positioner, popup_height) =
+            crate::popover::dropdown_list_positioner(bounds, minimum_height, window);
+        let available_rows_height = (popup_height - fixed_height).max(px(0.));
+        let rows_height = match self.state.menu_max_h {
+            Length::Auto => available_rows_height,
+            Length::Definite(max) => max
+                .to_pixels(available_rows_height.into(), window.rem_size())
+                .min(available_rows_height),
+        };
 
         div().size_full().relative().child(
             div()
@@ -576,7 +615,7 @@ where
                                 .rounded(cx.theme().radius)
                         })
                         .input_size(self.state.size)
-                        .input_text_size(self.state.size)
+                        .text_size(cx.theme().control_font_size)
                         .refine_style(&self.state.style)
                         .when(outline_visible && self.state.appearance, |this| {
                             this.border_1().border_color(cx.theme().ring)
@@ -632,41 +671,43 @@ where
                                 }),
                         ),
                 )
-                .when(self.state.open, |this| {
-                    this.child(
-                        deferred(crate::popover::dropdown_popup(
-                            ("select-popup", cx.entity_id()),
-                            bounds,
-                            v_flex()
-                                .occlude()
-                                .map(|this| match self.state.menu_width {
-                                    Length::Auto => this.w(bounds.size.width),
-                                    Length::Definite(w) => this.w(w),
-                                })
-                                .popover_style(cx)
-                                .child(
-                                    List::new(&self.state.list)
-                                        .when_some(
-                                            self.state.search_placeholder.clone(),
-                                            |this, placeholder| {
-                                                this.search_placeholder(placeholder)
-                                            },
-                                        )
-                                        .with_size(self.state.size)
-                                        .max_h(self.state.menu_max_h)
-                                        .when_some(self.state.scroll_bounce, |list, on| {
-                                            list.scroll_bounce(on)
-                                        })
-                                        .paddings(Edges::all(DROPDOWN_LIST_PADDING)),
-                                )
-                                .on_mouse_down_out(cx.listener(|this, _, window, cx| {
-                                    this.escape(&Cancel, window, cx);
-                                })),
-                            cx,
-                        ))
-                        .with_priority(gpui_base::POPUP_PRIORITY),
-                    )
-                }),
+                .child(
+                    deferred(crate::popover::dropdown_popup(
+                        ("select-popup", cx.entity_id()),
+                        positioner,
+                        self.state.open,
+                        v_flex()
+                            .debug_selector(|| "select-popup-surface".into())
+                            .occlude()
+                            .overflow_hidden()
+                            .max_h(popup_height)
+                            .map(|this| match self.state.menu_width {
+                                Length::Auto => this.w(bounds.size.width),
+                                Length::Definite(w) => this.w(w),
+                            })
+                            .popover_style(cx)
+                            .child(
+                                List::new(&self.state.list)
+                                    .popup_scrollbar()
+                                    .when_some(
+                                        self.state.search_placeholder.clone(),
+                                        |this, placeholder| this.search_placeholder(placeholder),
+                                    )
+                                    .with_size(self.state.size)
+                                    .max_h(rows_height)
+                                    .when_some(self.state.scroll_bounce, |list, on| {
+                                        list.scroll_bounce(on)
+                                    })
+                                    .paddings(Edges::all(DROPDOWN_LIST_PADDING)),
+                            )
+                            .on_mouse_down_out(cx.listener(|this, _, window, cx| {
+                                this.escape(&Cancel, window, cx);
+                            })),
+                        window,
+                        cx,
+                    ))
+                    .with_priority(self.popup_priority),
+                ),
         )
     }
 }
@@ -890,7 +931,7 @@ where
                     if !open {
                         state.clear_query_and_restore_cursor(window, cx);
                     }
-                    state.set_open(open, cx);
+                    state.set_open(open, window, cx);
                 });
             })
             .size_full()
@@ -1145,7 +1186,7 @@ mod tests {
                         cx,
                     )
                 });
-                state.update(cx, |state, cx| state.set_open(true, cx));
+                state.update(cx, |state, cx| state.set_open(true, window, cx));
                 let list = state.read(cx).state.list.clone();
                 list.update(cx, |list, cx| {
                     list.delegate_mut().confirm(false, window, cx)

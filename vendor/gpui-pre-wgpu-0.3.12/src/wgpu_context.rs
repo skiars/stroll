@@ -431,6 +431,11 @@ impl WgpuContext {
             .contains(wgpu::Features::DUAL_SOURCE_BLENDING);
 
         let mut required_features = wgpu::Features::empty();
+        if crate::frame_timing::enabled()
+            && adapter.features().contains(crate::frame_timing::FEATURES)
+        {
+            required_features |= crate::frame_timing::FEATURES;
+        }
         if dual_source_blending {
             required_features |= wgpu::Features::DUAL_SOURCE_BLENDING;
         } else {

@@ -44,9 +44,9 @@ pub(super) fn list_item_prefix(
 
 /// Decodes a `data:` URL whose mime type names an image format GPUI can
 /// decode. Anything else (another scheme, a non-image body, malformed
-/// base64) yields `None`, and the caller keeps the URL URI-backed so GPUI's
-/// own loader reports the failure.
-pub(super) fn data_url_image(url: &str) -> Option<Arc<Image>> {
+/// base64) yields `None`. The default text renderer keeps those URLs
+/// URI-backed.
+pub fn data_url_image(url: &str) -> Option<Arc<Image>> {
     let data_url = DataUrl::process(url).ok()?;
     let mime = data_url.mime_type();
     let format = ImageFormat::from_mime_type(&format!("{}/{}", mime.type_, mime.subtype))?;

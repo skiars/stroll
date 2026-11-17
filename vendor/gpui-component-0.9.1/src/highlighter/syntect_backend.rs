@@ -38,7 +38,7 @@ const PARSE_DEBOUNCE: Duration = Duration::from_millis(150);
 /// Highlight names, ordered and non-overlapping.
 type Highlights = Vec<(Range<usize>, &'static str)>;
 
-pub(crate) fn input_highlighter_factory() -> InputHighlighterFactory {
+pub fn input_highlighter_factory() -> InputHighlighterFactory {
     Rc::new(|language| {
         find_syntax(language)
             .map(|syntax| Box::new(SyntectInputHighlighter::new(language, syntax)) as _)

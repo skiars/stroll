@@ -6,7 +6,7 @@
 //! Note: diagnostics.rs is available in WASM, only syntax highlighting requires stubs.
 
 use gpui::{HighlightStyle, SharedString};
-use std::ops::Range;
+use std::{collections::BTreeMap, ops::Range};
 use std::time::Duration;
 
 // Syntax highlighter stub. With `syntect` it names highlights for the
@@ -154,6 +154,10 @@ pub struct ThemeStyle {
     pub color: Option<gpui::Hsla>,
     pub font_style: Option<FontStyle>,
     pub font_weight: Option<FontWeightContent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub underline: Option<gpui::UnderlineStyle>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strikethrough: Option<gpui::StrikethroughStyle>,
 }
 
 impl From<ThemeStyle> for HighlightStyle {
@@ -176,6 +180,13 @@ impl From<ThemeStyle> for HighlightStyle {
                 FontStyle::Italic => gpui::FontStyle::Italic,
                 FontStyle::Underline => gpui::FontStyle::Normal,
             }),
+            underline: style.underline.or_else(|| {
+                (style.font_style == Some(FontStyle::Underline)).then_some(gpui::UnderlineStyle {
+                    thickness: gpui::px(1.),
+                    ..Default::default()
+                })
+            }),
+            strikethrough: style.strikethrough,
             ..Default::default()
         }
     }
@@ -242,12 +253,25 @@ pub struct SyntaxColors {
     #[serde(rename = "variable.special")]
     pub variable_special: Option<ThemeStyle>,
     pub variant: Option<ThemeStyle>,
+    /// Exact styles for captures beyond the built-in vocabulary.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub additional: BTreeMap<String, ThemeStyle>,
+}
+
+impl gpui_base::input::HighlightStyleResolver for SyntaxColors {
+    fn style(&self, name: &str) -> Option<HighlightStyle> {
+        self.style(name)
+    }
 }
 
 impl SyntaxColors {
     pub fn style(&self, name: &str) -> Option<HighlightStyle> {
         if name.is_empty() {
             return None;
+        }
+
+        if let Some(style) = self.additional.get(name) {
+            return Some((*style).into());
         }
 
         let style = match name {
@@ -296,13 +320,7 @@ impl SyntaxColors {
         }
         .map(|s| s.into());
 
-        if style.is_some() {
-            style
-        } else if name.contains('.') {
-            name.split('.').next().and_then(|prefix| self.style(prefix))
-        } else {
-            None
-        }
+        style.or_else(|| name.rsplit_once('.').and_then(|(prefix, _)| self.style(prefix)))
     }
 
     pub fn style_for_index(&self, index: usize) -> Option<HighlightStyle> {
@@ -437,6 +455,8 @@ impl StatusColors {
 #[non_exhaustive]
 pub struct HighlightThemeStyle {
     pub editor_background: Option<gpui::Hsla>,
+    #[serde(rename = "code_block.background")]
+    pub code_block_background: Option<gpui::Hsla>,
     pub editor_foreground: Option<gpui::Hsla>,
     pub editor_active_line: Option<gpui::Hsla>,
     pub editor_line_number: Option<gpui::Hsla>,
@@ -444,10 +464,18 @@ pub struct HighlightThemeStyle {
     pub editor_invisible: Option<gpui::Hsla>,
     #[serde(rename = "editor.gutter.background")]
     pub editor_gutter_background: Option<gpui::Hsla>,
+    #[serde(rename = "editor.search_match.background")]
+    pub editor_search_match_background: Option<gpui::Hsla>,
     #[serde(flatten)]
     pub status: StatusColors,
     #[serde(rename = "syntax")]
     pub syntax: SyntaxColors,
+    /// Syntax palettes for removed rows and their inline changes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub diff_removed: Option<(super::TintedSyntax, super::TintedSyntax)>,
+    /// Syntax palettes for added rows and their inline changes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub diff_added: Option<(super::TintedSyntax, super::TintedSyntax)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, JsonSchema, Serialize, Deserialize)]

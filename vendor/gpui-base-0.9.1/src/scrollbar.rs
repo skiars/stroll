@@ -10,10 +10,10 @@ use crate::{
 use gpui::{
     Anchor, App, Axis, Background, BorderStyle, Bounds, ContentMask, CursorStyle, Edges, Element,
     ElementId, EntityId, GlobalElementId, Hitbox, HitboxBehavior, Hsla, InspectorElementId,
-    IntoElement, IsZero, LayoutId, ListState, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
-    PaintQuad, Pixels, Point, Position, ScrollEvent, ScrollHandle, Size, Style, TouchDragEvent,
-    TouchPhase, UniformListScrollHandle, Window, fill, point, prelude::FluentBuilder, px, relative,
-    size,
+    IntoElement, IsZero, LayoutId, ListState, MouseButton, MouseDownEvent, MouseMoveEvent,
+    MouseUpEvent, PaintQuad, Pixels, Point, Position, ScrollEvent, ScrollHandle, Size, Style,
+    TouchDragEvent, TouchPhase, UniformListScrollHandle, Window, fill, point,
+    prelude::FluentBuilder, px, relative, size,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -35,7 +35,7 @@ const THUMB_ACTIVE_INSET: Pixels = px(4.);
 ///
 /// This is a visibility hold rather than motion: without it [`ScrollbarMode::Scrolling`]
 /// could never reveal the scrollbar.
-const DEFAULT_IDLE: Duration = Duration::from_secs(2);
+const DEFAULT_IDLE: Duration = Duration::from_millis(800);
 
 fn clamp_thumb_radius(radius: Pixels, bounds: Bounds<Pixels>) -> Pixels {
     radius
@@ -154,7 +154,9 @@ struct ScrollbarStateInner {
     hovered_axis: Option<Axis>,
     hovered_on_thumb: Option<Axis>,
     dragged_axis: Option<Axis>,
+    mouse_drag: bool,
     drag_pos: Point<Pixels>,
+    ruler_mouse_down: Option<Point<Pixels>>,
     last_scroll_offset: Point<Pixels>,
     last_scroll_time: Option<Instant>,
     // Last update offset
@@ -174,7 +176,9 @@ impl Default for ScrollbarState {
             hovered_axis: None,
             hovered_on_thumb: None,
             dragged_axis: None,
+            mouse_drag: false,
             drag_pos: point(px(0.), px(0.)),
+            ruler_mouse_down: None,
             last_scroll_offset: point(px(0.), px(0.)),
             last_scroll_time: None,
             last_update: now,
@@ -442,25 +446,44 @@ impl VisibilityAnimation {
     ) {
         let target = if visible { 1.0 } else { 0.0 };
         let full_duration = if visible { enter } else { exit };
+        let resting_position = if entrance == ScrollbarEntrance::Fade {
+            // A fade never moves the bar. Keep it parked at its visible
+            // position in both directions; only opacity changes.
+            1.0
+        } else {
+            target
+        };
         if full_duration.is_zero() {
             // A motionless policy — reduced motion, an always-visible scrollbar,
             // or a theme that projects no motion — adopts the target outright,
             // even if a transition was in flight when the policy changed.
             self.opacity.settle(target, now);
-            self.position.settle(target, now);
+            self.position.settle(resting_position, now);
             self.entrance = entrance;
             return;
         }
         if self.opacity.target == target
-            && self.position.target == target
+            && self.position.target == resting_position
             && self.entrance == entrance
         {
             return;
         }
 
+        if entrance == ScrollbarEntrance::Fade {
+            self.position.settle(resting_position, now);
+            let sample = self.sample(now);
+            let distance = (target - sample.opacity).abs();
+            let duration = full_duration.mul_f32(distance);
+            self.opacity.start(sample.opacity, target, duration, now);
+            self.entrance = entrance;
+            return;
+        }
+
         let sample = self.sample(now);
-        let from_position = if visible && entrance == ScrollbarEntrance::Fade {
-            1.0
+        // A slide still starts at the edge when the bar is fully hidden, even
+        // if the previous policy parked it at its visible position.
+        let from_position = if visible && sample.opacity == 0.0 {
+            0.0
         } else {
             sample.position
         };
@@ -555,7 +578,12 @@ impl ScrollbarState {
 }
 
 impl ScrollbarStateInner {
-    fn with_drag_pos(&self, axis: Axis, pos: Point<Pixels>) -> Self {
+    fn with_ruler_mouse_down(mut self, position: Option<Point<Pixels>>) -> Self {
+        self.ruler_mouse_down = position;
+        self
+    }
+
+    fn with_drag_pos(&self, axis: Axis, pos: Point<Pixels>, mouse_drag: bool) -> Self {
         let mut state = *self;
         if axis.is_vertical() {
             state.drag_pos.y = pos.y;
@@ -564,6 +592,7 @@ impl ScrollbarStateInner {
         }
 
         state.dragged_axis = Some(axis);
+        state.mouse_drag = mouse_drag;
         state.last_update = Instant::now();
         state.drag_update_scheduled = false;
         state.drag_update_generation = state.drag_update_generation.wrapping_add(1);
@@ -573,6 +602,7 @@ impl ScrollbarStateInner {
     fn with_unset_drag_pos(&self, now: Instant) -> Self {
         let mut state = *self;
         state.dragged_axis = None;
+        state.mouse_drag = false;
         state.drag_update_scheduled = false;
         state.drag_update_generation = state.drag_update_generation.wrapping_add(1);
         state.last_scroll_time = Some(now);
@@ -828,6 +858,15 @@ pub struct Scrollbar {
     /// being dragged for some complex interactions for reducing CPU usage.
     max_fps: usize,
     styles: ScrollbarStyles,
+    overview_target: Option<OverviewTarget>,
+}
+
+pub(crate) type OverviewTarget = Rc<dyn Fn(Point<Pixels>) -> Option<Pixels>>;
+const OVERVIEW_DRAG_THRESHOLD: Pixels = px(4.);
+
+fn is_overview_click(start: Point<Pixels>, end: Point<Pixels>) -> bool {
+    let delta = end - start;
+    delta.x.as_f32().hypot(delta.y.as_f32()) <= OVERVIEW_DRAG_THRESHOLD.as_f32()
 }
 
 impl Scrollbar {
@@ -848,7 +887,13 @@ impl Scrollbar {
             scroll_viewport_size: None,
             use_layout_bounds: false,
             styles: ScrollbarStyles::default(),
+            overview_target: None,
         }
+    }
+
+    pub(crate) fn overview_target(mut self, target: Option<OverviewTarget>) -> Self {
+        self.overview_target = target;
+        self
     }
 
     /// Create with horizontal scrollbar.
@@ -1384,7 +1429,9 @@ impl Element for Scrollbar {
         let scroll_size = self
             .scroll_size
             .unwrap_or(self.scroll_handle.content_size());
-        let scroll_viewport_size = self.scroll_viewport_size.unwrap_or(hitbox.size);
+        let scroll_viewport_size = self
+            .scroll_viewport_size
+            .unwrap_or_else(|| self.scroll_handle.viewport_bounds().size);
 
         for axis in self.axis.all().into_iter() {
             let is_vertical = axis.is_vertical();
@@ -1614,6 +1661,7 @@ impl Element for Scrollbar {
                     let geometry = state.geometry;
                     let active_geometry = state.active_geometry;
                     let is_vertical = axis.is_vertical();
+                    let overview_target = self.overview_target.as_ref().filter(|_| is_vertical);
                     let visibility_opacity = state.visibility_opacity;
                     let is_visible = state.visibility_requested || visibility_opacity > 0.0;
                     let translation =
@@ -1695,8 +1743,11 @@ impl Element for Scrollbar {
                                 state.set(state.get().with_drag_pos(
                                     axis,
                                     event.start_position - thumb_bounds.origin,
+                                    false,
                                 ));
-                            } else if state.get().dragged_axis != Some(axis) {
+                            } else if state.get().dragged_axis != Some(axis)
+                                || state.get().mouse_drag
+                            {
                                 return;
                             }
                             if event.phase != TouchPhase::Cancelled {
@@ -1735,26 +1786,44 @@ impl Element for Scrollbar {
                             let bar_hitbox = state.bar_hitbox.clone();
                             let state = scrollbar_state.clone();
                             let scroll_handle = self.scroll_handle.clone();
+                            let overview_target = overview_target.cloned();
 
                             move |event: &MouseDownEvent, phase, window, cx| {
-                                if phase.bubble() && bar_hitbox.is_hovered(window) {
+                                if phase.bubble()
+                                    && event.button == MouseButton::Left
+                                    && bar_hitbox.is_hovered(window)
+                                {
                                     cx.stop_propagation();
 
-                                    if thumb_bounds.contains(&event.position) {
+                                    let on_mark = overview_target
+                                        .as_ref()
+                                        .is_some_and(|target| target(event.position).is_some());
+                                    if is_vertical {
+                                        state.set(state.get().with_ruler_mouse_down(
+                                            on_mark.then_some(event.position),
+                                        ));
+                                    }
+                                    let on_thumb = thumb_bounds.contains(&event.position)
+                                        || (on_mark
+                                            && event.position.y >= thumb_bounds.top()
+                                            && event.position.y <= thumb_bounds.bottom());
+                                    if on_thumb {
                                         // click on the thumb bar, set the drag position
                                         let pos = event.position - thumb_bounds.origin;
 
                                         scroll_handle.start_drag();
-                                        state.set(state.get().with_drag_pos(axis, pos));
+                                        state.set(state.get().with_drag_pos(axis, pos, true));
                                         // Active styling can change the inset or minimum length.
                                         // Keep the original grab point under the pointer on that frame.
-                                        scroll_handle.set_offset(active_geometry.drag_offset(
-                                            axis,
-                                            event.position,
-                                            pos,
-                                            scroll_handle.offset(),
-                                        ));
-                                    } else {
+                                        if !on_mark {
+                                            scroll_handle.set_offset(active_geometry.drag_offset(
+                                                axis,
+                                                event.position,
+                                                pos,
+                                                scroll_handle.offset(),
+                                            ));
+                                        }
+                                    } else if !on_mark {
                                         // click on the scrollbar, jump to the position
                                         // Set the thumb bar center to the click position
                                         let center =
@@ -1781,6 +1850,19 @@ impl Element for Scrollbar {
 
                         move |event: &MouseMoveEvent, _, window, cx| {
                             let mut notify = false;
+                            let mouse_drag =
+                                state.get().dragged_axis == Some(axis) && state.get().mouse_drag;
+                            if is_vertical
+                                && let Some(start) = state.get().ruler_mouse_down
+                                && (!event.dragging() || !is_overview_click(start, event.position))
+                            {
+                                state.set(state.get().with_ruler_mouse_down(None));
+                            }
+                            if mouse_drag && !event.dragging() {
+                                scroll_handle.end_drag();
+                                state.set(state.get().with_unset_drag_pos(Instant::now()));
+                                notify = true;
+                            }
                             // When is hover to show mode or it was visible,
                             // we need to update the hovered state and increase the last_scroll_time.
                             let need_hover_to_update = is_hover_to_show || is_visible;
@@ -1812,9 +1894,15 @@ impl Element for Scrollbar {
                             }
 
                             // Move thumb position on dragging
-                            if state.get().dragged_axis == Some(axis) && event.dragging() {
+                            if mouse_drag && event.dragging() {
                                 // Stop the event propagation to avoid selecting text or other side effects.
                                 cx.stop_propagation();
+                                if is_vertical && state.get().ruler_mouse_down.is_some() {
+                                    if notify {
+                                        cx.notify(view_id);
+                                    }
+                                    return;
+                                }
 
                                 let offset = active_geometry.drag_offset(
                                     axis,
@@ -1846,19 +1934,43 @@ impl Element for Scrollbar {
                     });
 
                     window.on_mouse_event({
+                        let bar_hitbox = state.bar_hitbox.clone();
                         let state = scrollbar_state.clone();
                         let scroll_handle = self.scroll_handle.clone();
+                        let overview_target = overview_target.cloned();
 
-                        move |event: &MouseUpEvent, phase, _, cx| {
-                            if phase.bubble() && state.get().dragged_axis == Some(axis) {
-                                scroll_handle.set_offset(active_geometry.drag_offset(
-                                    axis,
-                                    event.position,
-                                    state.get().drag_pos,
-                                    scroll_handle.offset(),
-                                ));
+                        move |event: &MouseUpEvent, phase, window, cx| {
+                            if !phase.capture() || event.button != MouseButton::Left {
+                                return;
+                            }
+                            let press = state.get().ruler_mouse_down.filter(|_| is_vertical);
+                            if press.is_some() {
+                                state.set(state.get().with_ruler_mouse_down(None));
+                            }
+                            let click =
+                                press.filter(|start| is_overview_click(*start, event.position));
+                            if state.get().dragged_axis == Some(axis) && state.get().mouse_drag {
+                                if click.is_none() {
+                                    scroll_handle.set_offset(active_geometry.drag_offset(
+                                        axis,
+                                        event.position,
+                                        state.get().drag_pos,
+                                        scroll_handle.offset(),
+                                    ));
+                                }
                                 scroll_handle.end_drag();
                                 state.set(state.get().with_unset_drag_pos(Instant::now()));
+                                cx.notify(view_id);
+                            }
+                            if let Some(start) = click
+                                && bar_hitbox.is_hovered(window)
+                                && let Some(y) =
+                                    overview_target.as_ref().and_then(|target| target(start))
+                            {
+                                let mut offset = scroll_handle.offset();
+                                offset.y = y;
+                                scroll_handle.set_offset(offset);
+                                cx.stop_propagation();
                                 cx.notify(view_id);
                             }
                         }
@@ -2035,7 +2147,10 @@ mod tests {
         visibility.set_visible(false, motion.entrance(), motion.enter(), motion.exit(), now);
         let hidden = visibility.sample(now);
         assert_eq!(hidden.opacity, 0.0);
-        assert_eq!(hidden.position, 0.0);
+        assert_eq!(
+            hidden.position, 1.0,
+            "a fade exit must not move the bar even without motion"
+        );
         assert!(!hidden.running);
 
         let mut width = WidthAnimation::new(now);
@@ -2209,6 +2324,54 @@ mod tests {
             DEFAULT_IDLE,
             left_at + DEFAULT_IDLE - Duration::from_millis(1),
         ));
+    }
+
+    #[test]
+    fn fade_exit_holds_position_without_sliding() {
+        let start = Instant::now();
+        let mut animation = VisibilityAnimation::hidden(start);
+        animation.set_visible(true, ScrollbarEntrance::Fade, ENTER, EXIT, start);
+        let entered = animation.sample(start + ENTER);
+        assert_eq!(entered.opacity, 1.0);
+        assert_eq!(entered.position, 1.0);
+
+        animation.set_visible(false, ScrollbarEntrance::Fade, ENTER, EXIT, start + ENTER);
+        for elapsed in [Duration::ZERO, EXIT / 4, EXIT / 2, EXIT.mul_f32(0.75), EXIT] {
+            let sample = animation.sample(start + ENTER + elapsed);
+            assert_eq!(
+                sample.position, 1.0,
+                "fade exit must keep the bar at its visible position"
+            );
+            assert_eq!(
+                visibility_translation(Axis::Vertical, px(16.), sample.position),
+                Point::default()
+            );
+        }
+        assert_eq!(animation.sample(start + ENTER + EXIT).opacity, 0.0);
+    }
+
+    #[test]
+    fn slide_entrance_still_starts_at_the_edge_after_a_fade_exit() {
+        let start = Instant::now();
+        let mut animation = VisibilityAnimation::hidden(start);
+        animation.set_visible(true, ScrollbarEntrance::Fade, ENTER, EXIT, start);
+        animation.set_visible(false, ScrollbarEntrance::Fade, ENTER, EXIT, start + ENTER);
+        assert_eq!(animation.sample(start + ENTER + EXIT).position, 1.0);
+
+        let slide_start = start + ENTER + EXIT;
+        animation.set_visible(
+            true,
+            ScrollbarEntrance::SlideAndFade,
+            ENTER,
+            EXIT,
+            slide_start,
+        );
+        let initial = animation.sample(slide_start);
+        assert_eq!(
+            initial.position, 0.0,
+            "a slide entrance must start at the edge rather than inherit the fade's parked position"
+        );
+        assert!(animation.sample(slide_start + ENTER).position > 0.9);
     }
 
     #[test]
@@ -2696,7 +2859,9 @@ mod tests {
         let state = ScrollbarState::default();
         let now = Instant::now();
         let interval = Duration::from_secs_f64(1. / 30.);
-        let mut inner = state.get().with_drag_pos(Axis::Vertical, Point::default());
+        let mut inner = state
+            .get()
+            .with_drag_pos(Axis::Vertical, Point::default(), true);
         inner.last_update = now;
         state.set(inner);
         let update = |offset, elapsed, cx: &mut VisualTestContext| {

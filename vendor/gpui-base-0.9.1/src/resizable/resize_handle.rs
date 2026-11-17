@@ -450,7 +450,8 @@ impl<T: 'static, E: 'static + Render> Element for ResizeHandle<T, E> {
                 let state = state.clone();
                 let hitbox = hitbox.clone();
                 move |ev: &MouseMoveEvent, phase, window, _| {
-                    if !phase.bubble() {
+                    let dragging = ev.dragging();
+                    if (dragging && !phase.bubble()) || (!dragging && !phase.capture()) {
                         return;
                     }
 
@@ -459,7 +460,7 @@ impl<T: 'static, E: 'static + Render> Element for ResizeHandle<T, E> {
                     // outside this nine-pixel band, so where it is says nothing
                     // about whether the handle is still being dragged.
                     let next = match state.get() {
-                        engaged if engaged.is_active() => ResizeHandleState::Dragging,
+                        engaged if engaged.is_active() && dragging => ResizeHandleState::Dragging,
                         _ if hitbox.is_hovered_at(ev.position, window) => {
                             ResizeHandleState::Hovered
                         }

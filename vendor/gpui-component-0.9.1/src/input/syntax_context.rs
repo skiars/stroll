@@ -10,8 +10,8 @@ use gpui_base::input::SyntaxContextProvider;
 pub(crate) fn syntax_context_provider(language: &str) -> Option<Rc<dyn SyntaxContextProvider>> {
     use crate::highlighter::LanguageRegistry;
 
-    let grammar = LanguageRegistry::singleton().grammar(language).ok()?;
-    TreeSitterSyntaxContext::new(grammar)
+    let (parser, grammar) = LanguageRegistry::singleton().parser(language).ok()?;
+    TreeSitterSyntaxContext::new(parser, grammar)
         .map(|provider| Rc::new(provider) as Rc<dyn SyntaxContextProvider>)
 }
 
@@ -41,8 +41,7 @@ impl TreeSitterSyntaxContext {
     /// Synchronous parse budget per query; mirrors the highlighter's sync path.
     const PARSE_BUDGET: std::time::Duration = std::time::Duration::from_millis(5);
 
-    fn new(language: tree_sitter::Language) -> Option<Self> {
-        let mut parser = tree_sitter::Parser::new();
+    fn new(mut parser: tree_sitter::Parser, language: tree_sitter::Language) -> Option<Self> {
         parser.set_language(&language).ok()?;
         Some(Self {
             parser: std::cell::RefCell::new(parser),

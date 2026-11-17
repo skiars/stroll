@@ -17,6 +17,8 @@ use gpui::{
 };
 use rust_i18n::t;
 
+use super::{CONTROL_FONT_SIZE, CONTROL_LINE_HEIGHT};
+
 const STACKED_LAYOUT_MAX_WIDTH: Pixels = px(480.);
 
 /// The settings structure containing multiple pages for app settings.
@@ -37,6 +39,7 @@ pub struct Settings {
     pages: Vec<SettingPage>,
     group_variant: GroupBoxVariant,
     size: Size,
+    font_size: Pixels,
     sidebar_width: Pixels,
     sidebar_size_range: Range<Pixels>,
     sidebar_style: StyleRefinement,
@@ -52,12 +55,19 @@ impl Settings {
             pages: vec![],
             group_variant: GroupBoxVariant::default(),
             size: Size::default(),
+            font_size: CONTROL_FONT_SIZE,
             sidebar_width: px(250.0),
             sidebar_size_range: px(160.0)..px(360.0),
             sidebar_style: StyleRefinement::default(),
             default_selected_index: SelectIndex::default(),
             header_style: StyleRefinement::default(),
         }
+    }
+
+    /// Sets the primary text size for this settings view and its controls.
+    pub fn font_size(mut self, size: Pixels) -> Self {
+        self.font_size = size;
+        self
     }
 
     /// Set the width of the sidebar, default is `250px`.
@@ -160,6 +170,9 @@ impl Settings {
     ) -> impl IntoElement {
         let selected_index = state.read(cx).selected_index;
         let search_input = state.read(cx).search_input.clone();
+        let control_text = StyleRefinement::default()
+            .text_size(self.font_size)
+            .line_height(CONTROL_LINE_HEIGHT);
 
         Sidebar::new("settings-sidebar")
             .w(relative(1.))
@@ -187,7 +200,11 @@ impl Settings {
                             search_input.update(cx, |input, cx| input.clean(window, cx));
                         }
                     })
-                    .child(Input::new(&search_input).prefix(IconName::Search)),
+                    .child(
+                        Input::new(&search_input)
+                            .prefix(IconName::Search)
+                            .refine_style(&control_text),
+                    ),
             )
             .child(
                 SidebarMenu::new().children(filter.visible_pages().map(|page_ix| {
@@ -196,6 +213,7 @@ impl Settings {
                     let is_page_active = selected_index.page_ix == page_ix
                         && (selected_index.group_ix.is_none() || groups.len() == 1);
                     SidebarMenuItem::new(page.title.clone())
+                        .label_style(control_text.clone())
                         .click_to_open(true)
                         .when_some(page.icon.clone(), |this, icon| this.icon(icon))
                         .default_open(page.default_open)
@@ -225,19 +243,23 @@ impl Settings {
                                             && selected_index.group_ix == Some(group_ix);
                                         let title = group.title.clone().unwrap_or_default();
 
-                                        SidebarMenuItem::new(title).active(is_active).on_click({
-                                            let state = state.clone();
-                                            move |_, _, cx| {
-                                                state.update(cx, |state, cx| {
-                                                    state.selected_index = SelectIndex {
-                                                        page_ix,
-                                                        group_ix: Some(group_ix),
-                                                    };
-                                                    state.deferred_scroll_group_ix = Some(group_ix);
-                                                    cx.notify();
-                                                })
-                                            }
-                                        })
+                                        SidebarMenuItem::new(title)
+                                            .label_style(control_text.clone())
+                                            .active(is_active)
+                                            .on_click({
+                                                let state = state.clone();
+                                                move |_, _, cx| {
+                                                    state.update(cx, |state, cx| {
+                                                        state.selected_index = SelectIndex {
+                                                            page_ix,
+                                                            group_ix: Some(group_ix),
+                                                        };
+                                                        state.deferred_scroll_group_ix =
+                                                            Some(group_ix);
+                                                        cx.notify();
+                                                    })
+                                                }
+                                            })
                                     }),
                             )
                         })
@@ -323,6 +345,7 @@ pub struct RenderOptions {
     group_ix: usize,
     item_ix: usize,
     size: Size,
+    font_size: Pixels,
     group_variant: GroupBoxVariant,
     layout: Axis,
     disabled: bool,
@@ -335,6 +358,7 @@ impl RenderOptions {
             group_ix: 0,
             item_ix: 0,
             size: Size::default(),
+            font_size: CONTROL_FONT_SIZE,
             group_variant: GroupBoxVariant::default(),
             layout: Axis::Horizontal,
             disabled: false,
@@ -390,6 +414,11 @@ impl RenderOptions {
 
     pub fn size(&self) -> Size {
         self.size
+    }
+
+    /// Returns the primary text size for custom settings content.
+    pub fn font_size(&self) -> Pixels {
+        self.font_size
     }
 
     pub fn group_variant(&self) -> GroupBoxVariant {
@@ -454,9 +483,12 @@ impl RenderOnce for Settings {
                 state.deferred_scroll_group_ix = None;
             });
         }
-        let options = RenderOptions::new()
-            .with_size(self.size)
-            .with_group_variant(self.group_variant);
+        let options = RenderOptions {
+            font_size: self.font_size,
+            ..RenderOptions::new()
+        }
+        .with_size(self.size)
+        .with_group_variant(self.group_variant);
         let sidebar_size_range = self.sidebar_size_range.clone();
         let sidebar = self
             .render_sidebar(&state, &filter, window, cx)

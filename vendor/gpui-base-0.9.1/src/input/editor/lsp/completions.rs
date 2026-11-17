@@ -1,4 +1,4 @@
-use crate::input::EditorMode;
+use crate::input::{EditorMode, EditorState};
 use anyhow::Result;
 use gpui::{App, Context, EntityInputHandler, Pixels, Task, Window, px};
 use lsp_types::{
@@ -142,11 +142,39 @@ impl Default for CompletionMenuOptions {
     }
 }
 
+/// Input that can start an application-owned completion request.
+#[doc(hidden)]
+pub enum CompletionInput<'a> {
+    Invoked,
+    Typed {
+        text: &'a str,
+        /// Start of a single insertion. Compound edits have no insertion start.
+        insertion_start: Option<usize>,
+    },
+}
+
 /// A trait for providing code completions based on the current input state and context.
 pub trait CompletionProvider {
+    /// Prepare candidates using application policy. The editor owns task
+    /// cancellation, menu presentation and acceptance.
+    #[doc(hidden)]
+    fn prepare_completion(
+        &self,
+        _editor: &EditorState,
+        _input: CompletionInput<'_>,
+        _window: &mut Window,
+        _cx: &mut Context<EditorState>,
+    ) -> Option<(usize, Task<Result<CompletionResponse>>)> {
+        None
+    }
+
+    #[doc(hidden)]
+    fn completion_dismissed(&self) {}
+
     /// Fetches completions based on the given byte offset.
     ///
-    /// - The `offset` is in bytes of current cursor.
+    /// The caret offset is in bytes. Returned edits use editor positions
+    /// (Unicode scalar columns).
     ///
     /// textDocument/completion
     ///
@@ -227,18 +255,35 @@ impl Default for InlineCompletion {
 impl InputBaseState<EditorMode> {
     pub(crate) fn handle_completion_trigger(
         &mut self,
-        _range: &Range<usize>,
+        range: &Range<usize>,
         new_text: &str,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.completion_inserting {
-            return;
-        }
-
         let Some(provider) = self.extras.lsp.completion_provider.clone() else {
             return;
         };
+
+        if self.selections.is_single() && !self.is_composing() && self.is_editable() {
+            let insertion_start = match self.last_input_edits.as_slice() {
+                [(edit, _)]
+                    if range.is_empty()
+                        && edit.start_byte == edit.old_end_byte
+                        && edit.new_end_byte == self.cursor()
+                        && edit.new_end_byte - edit.start_byte == new_text.len() =>
+                {
+                    Some(edit.start_byte)
+                }
+                _ => None,
+            };
+            let input = CompletionInput::Typed {
+                text: new_text,
+                insertion_start,
+            };
+            if self.request_prepared_completion(&*provider, input, window, cx) {
+                return;
+            }
+        }
 
         // Always schedule inline completion (debounced).
         // It will check if menu is open before showing the suggestion.
@@ -324,7 +369,6 @@ impl InputBaseState<EditorMode> {
     pub fn show_completions(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.disabled
             || self.readonly
-            || self.completion_inserting
             || self.ime_marked_range.is_some()
             || self.extras.context_menu_content.completion.open
         {
@@ -333,6 +377,16 @@ impl InputBaseState<EditorMode> {
         let Some(provider) = self.extras.lsp.completion_provider.clone() else {
             return;
         };
+
+        self.hide_context_menu(cx);
+        self.clear_inline_completion(cx);
+        self.focus(window, cx);
+        if self.selections.is_single()
+            && self.selected_range().is_empty()
+            && self.request_prepared_completion(&*provider, CompletionInput::Invoked, window, cx)
+        {
+            return;
+        }
 
         let offset = self.cursor();
         let word_len: usize = self
@@ -344,10 +398,6 @@ impl InputBaseState<EditorMode> {
             .sum();
         let start_offset = offset - word_len;
         let query = self.text.slice(start_offset..offset).to_string();
-
-        self.hide_context_menu(cx);
-        self.clear_inline_completion(cx);
-        self.focus(window, cx);
 
         self.request_completions(
             provider,
@@ -362,6 +412,25 @@ impl InputBaseState<EditorMode> {
         );
     }
 
+    fn request_prepared_completion(
+        &mut self,
+        provider: &dyn CompletionProvider,
+        input: CompletionInput<'_>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some((start, task)) = provider.prepare_completion(self, input, window, cx) else {
+            return false;
+        };
+        let caret = self.cursor();
+        if start > caret || !self.text().is_char_boundary(start) {
+            return true;
+        }
+        let query = self.text().slice(start..caret).to_string();
+        self.present_completion_task(start, query, task, window, cx);
+        true
+    }
+
     /// Record the word a menu is for and ask `provider` about the caret.
     fn request_completions(
         &mut self,
@@ -369,6 +438,19 @@ impl InputBaseState<EditorMode> {
         start_offset: usize,
         query: String,
         completion_context: CompletionContext,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let response =
+            provider.completions(&self.text, self.cursor(), completion_context, window, cx);
+        self.present_completion_task(start_offset, query, response, window, cx);
+    }
+
+    fn present_completion_task(
+        &mut self,
+        start_offset: usize,
+        query: String,
+        provider_responses: Task<Result<CompletionResponse>>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -386,8 +468,6 @@ impl InputBaseState<EditorMode> {
             .query
             .clone_from(&query);
 
-        let provider_responses =
-            provider.completions(&self.text, new_offset, completion_context, window, cx);
         self.extras.context_menu_task = cx.spawn_in(window, async move |editor, cx| {
             let mut completions: Vec<CompletionItem> = vec![];
             if let Some(provider_responses) = provider_responses.await.ok() {
@@ -409,10 +489,7 @@ impl InputBaseState<EditorMode> {
                         return;
                     }
 
-                    editor.extras.context_menu_content.completion.open = !completions.is_empty();
-                    editor.extras.context_menu_content.completion.items = completions;
-                    editor.extras.context_menu_content.completion.bump();
-                    cx.notify();
+                    editor.present_completion_items(start_offset, query, completions, cx);
                 })
                 .ok();
 
@@ -421,6 +498,13 @@ impl InputBaseState<EditorMode> {
     }
 
     pub(crate) fn hide_context_menu(&mut self, cx: &mut Context<Self>) {
+        if let Some(provider) = &self.extras.lsp.completion_provider {
+            provider.completion_dismissed();
+        }
+        self.hide_context_menu_for_edit(cx);
+    }
+
+    pub(crate) fn hide_context_menu_for_edit(&mut self, cx: &mut Context<Self>) {
         self.extras.context_menu_content.completion.open = false;
         self.extras.context_menu_content.code_action.open = false;
         self.extras.context_menu_task = Task::ready(Ok(()));
@@ -438,6 +522,16 @@ impl InputBaseState<EditorMode> {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
+        if self.extras.context_menu_content.completion.open
+            && action.partial_eq(&crate::input::Enter {
+                secondary: false,
+                shift: true,
+            })
+        {
+            self.hide_context_menu(cx);
+            return false;
+        }
+
         let closes_overlay =
             crate::input::Enter::is_primary(&*action) || action.partial_eq(&crate::input::Escape);
         let kind = if self.extras.context_menu_content.completion.open {
@@ -451,7 +545,7 @@ impl InputBaseState<EditorMode> {
             return false;
         };
         let handled = handler(kind, action, window, cx);
-        if handled && closes_overlay {
+        if handled && closes_overlay && kind == super::InputOverlayKind::Completion {
             self.hide_context_menu(cx);
         }
         handled

@@ -94,6 +94,14 @@ pub trait InputExtras: Default + 'static {
         None
     }
 
+    fn interactive_gutter(&self) -> bool {
+        false
+    }
+
+    fn gutter_hunk(&self) -> Option<&super::GutterHunk> {
+        None
+    }
+
     /// Return the gutter decorations that touch a UTF-8 byte range, in paint
     /// order. An empty decoration touches the range when it lies inside it.
     fn gutter_decorations(&self, _range: std::ops::Range<usize>) -> Vec<&GutterDecoration> {
@@ -111,10 +119,19 @@ pub trait InputExtras: Default + 'static {
         0
     }
 
+    fn overview_ruler_gutter_revision(&self) -> Option<u64> {
+        None
+    }
+
+    fn overview_ruler_gutter(&self) -> Vec<&GutterDecoration> {
+        Vec::new()
+    }
+
     /// Semantic-token styles for a visible range, when an LSP supplies them.
     fn semantic_token_styles(
         &self,
         _text: &Rope,
+        _revision: u64,
         _range: &std::ops::Range<usize>,
         _resolver: &dyn HighlightStyleResolver,
     ) -> Vec<(std::ops::Range<usize>, gpui::HighlightStyle)> {
@@ -141,8 +158,8 @@ pub trait InputExtras: Default + 'static {
     }
 
     /// What this mode can offer its context menu: go-to-definition, code actions.
-    fn context_menu_capabilities(&self) -> (bool, bool) {
-        (false, false)
+    fn context_menu_capabilities(&self) -> (bool, bool, bool) {
+        (false, false, false)
     }
 }
 
@@ -283,6 +300,14 @@ pub trait InputModeKind: sealed::Sealed + Sized + 'static {
     ) {
     }
 
+    #[doc(hidden)]
+    fn validate_hover_anchor(
+        _state: &mut InputBaseState<Self>,
+        _clip: gpui::Bounds<gpui::Pixels>,
+        _cx: &mut gpui::Context<InputBaseState<Self>>,
+    ) {
+    }
+
     /// Offers freshly typed text to the completion engine.
     fn on_text_typed(
         _state: &mut InputBaseState<Self>,
@@ -305,6 +330,15 @@ pub trait InputModeKind: sealed::Sealed + Sized + 'static {
         _state: &mut InputBaseState<Self>,
         _cx: &mut gpui::Context<InputBaseState<Self>>,
     ) {
+    }
+
+    /// Cancels visible language menus before an edit. Editor completions may
+    /// retain their response for filtering after the next typed character.
+    fn hide_context_menu_for_edit(
+        state: &mut InputBaseState<Self>,
+        cx: &mut gpui::Context<InputBaseState<Self>>,
+    ) {
+        Self::hide_context_menu(state, cx);
     }
 
     /// Whether a completion or code-action menu is currently open.
@@ -379,7 +413,10 @@ pub struct EditorExtras {
     pub(crate) range_decorations: DecorationCollections<RangeDecoration>,
     pub(crate) gutter_decorations: DecorationCollections<GutterDecoration>,
     pub(crate) gutter_decorations_width: gpui::Pixels,
+    pub(crate) interactive_gutter: bool,
+    pub(crate) gutter_hunk: Option<super::GutterHunk>,
     pub(crate) overview_ruler_decorations: DecorationCollections<OverviewRulerDecoration>,
+    pub(crate) navigable_overview_ruler: bool,
     pub(crate) inline_completion: InlineCompletion,
     pub(crate) context_menu_content: ContextMenuContent,
     pub(crate) hover_popover: Option<HoverPopoverState>,
@@ -395,7 +432,10 @@ impl Default for EditorExtras {
             range_decorations: DecorationCollections::default(),
             gutter_decorations: DecorationCollections::default(),
             gutter_decorations_width: gpui::px(3.),
+            interactive_gutter: false,
+            gutter_hunk: None,
             overview_ruler_decorations: DecorationCollections::default(),
+            navigable_overview_ruler: false,
             inline_completion: InlineCompletion::default(),
             context_menu_content: ContextMenuContent::default(),
             hover_popover: None,

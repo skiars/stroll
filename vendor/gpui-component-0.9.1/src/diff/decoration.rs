@@ -108,6 +108,10 @@ impl Decorations {
         index
     }
 
+    pub(super) fn is_empty(&self) -> bool {
+        self.files.is_empty()
+    }
+
     /// The decoration shown on a line: the last supplied one covering it.
     pub(super) fn at(&self, position: &DiffLinePosition) -> Option<&DiffDecoration> {
         self.files

@@ -114,7 +114,7 @@ impl RenderContext {
         identifier: impl Into<SharedString>,
         link: LinkMark,
     ) -> Self {
-        self.node.link_refs.insert(identifier.into(), link);
+        self.node.add_ref(identifier.into(), link);
         self
     }
 

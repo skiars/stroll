@@ -327,16 +327,31 @@ impl<T: Interpolate + PartialEq + 'static> TransitionState<T> {
         window: &mut Window,
         cx: &mut App,
     ) -> MotionValue<T> {
+        self.sample_from(None, target, policy, window, cx)
+    }
+
+    /// Supplies the starting value for the first sample of a new transition.
+    pub(crate) fn sample_from(
+        &self,
+        initial: Option<T>,
+        target: T,
+        policy: Transition,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> MotionValue<T> {
         let now = cx.background_executor().now();
         let mut state = self.state.borrow_mut();
-        let state = state.get_or_insert_with(|| ValueTransition {
-            from: target.clone(),
-            reversing_adjusted_start: target.clone(),
-            policy: policy.clone(),
-            target: target.clone(),
-            started_at: now,
-            reversing_factor: 1.0,
-            duration: policy.duration,
+        let state = state.get_or_insert_with(|| {
+            let initial = initial.unwrap_or_else(|| target.clone());
+            ValueTransition {
+                from: initial.clone(),
+                reversing_adjusted_start: initial.clone(),
+                policy: policy.clone(),
+                target: initial,
+                started_at: now,
+                reversing_factor: 1.0,
+                duration: policy.duration,
+            }
         });
         let snapshot = state.clone();
         let sampled = sample_transition(

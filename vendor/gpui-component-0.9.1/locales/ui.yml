@@ -451,6 +451,33 @@ Input:
     zh-CN: 显示代码操作
     zh-HK: 顯示代碼操作
     zh-TW: 顯示程式碼動作
+  Rename Symbol:
+    en: Rename Symbol
+    zh-CN: 重命名符号
+  Code Actions:
+    en: Code Actions
+    zh-CN: 代码操作
+  Select Fix:
+    en: Select fix
+    zh-CN: 选择修复
+  Apply Fix:
+    en: Apply fix
+    zh-CN: 应用修复
+  Close Code Actions:
+    en: Esc close
+    zh-CN: Esc 关闭
+  Quick Fix:
+    en: Quick Fix
+    zh-CN: 快速修复
+  Preview Code Action:
+    en: Preview Code Action
+    zh-CN: 预览代码操作
+  Loading Code Actions:
+    en: Loading code actions…
+    zh-CN: 正在获取代码操作…
+  No Code Actions:
+    en: No code actions available
+    zh-CN: 没有可用的代码操作
   Show Password:
     en: Show password
     pt-BR: "Mostrar senha"

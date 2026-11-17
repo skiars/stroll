@@ -1,9 +1,9 @@
 // From:
 // https://github.com/zed-industries/zed/blob/56daba28d40301ee4c05546fadb691d070b7b2b6/crates/gpui/examples/window_shadow.rs
 use gpui::{
-    AnyElement, App, Corners, CursorStyle, Decorations, Edges, Hsla, InteractiveElement as _,
-    IntoElement, MouseButton, ParentElement, Pixels, Point, RenderOnce, ResizeEdge, Size,
-    Styled as _, Tiling, Window, div, point, prelude::FluentBuilder as _, px,
+    AnyElement, App, Background, Corners, CursorStyle, Decorations, Edges, Hsla,
+    InteractiveElement as _, IntoElement, MouseButton, ParentElement, Pixels, Point, RenderOnce,
+    ResizeEdge, Size, Styled as _, Tiling, Window, div, point, prelude::FluentBuilder as _, px,
 };
 
 use crate::ActiveTheme;
@@ -16,17 +16,18 @@ const BORDER_SIZE: Pixels = px(1.0);
 /// Half-width of the resize hit band on each side of the visible frame (inner border).
 const RESIZE_HIT_SIZE: Pixels = px(4.0);
 
-/// The window's current corner radii: the theme's `window.radius`
-/// ([`crate::Theme::window_radius`]) for every corner of a client-decorated
-/// window that isn't next to a tiled edge, zero otherwise.
+/// The corner radii for content inside the client-drawn window border.
 ///
-/// GPUI clips overflowing children to a rectangular content mask, so a non-zero
-/// radius only rounds the frame itself. Elements with a background that touch a
-/// window corner (the root surface, [`crate::TitleBar`], an application's bottom
-/// bar) must round that corner too, for example
-/// `div().rounded_bl(radii.bottom_left)`. The default stays square.
+/// The content is inset by the border width, so its radius is reduced by the
+/// same amount to share the frame's arc center. Tiled and server-decorated
+/// corners stay square. Backgrounds that reach a window corner, such as a
+/// title bar or status bar, should use the corresponding content radius.
 pub fn window_corner_radii(window: &Window, cx: &App) -> Corners<Pixels> {
-    corner_radii(cx.theme().window_radius, window.window_decorations())
+    content_corner_radii(cx.theme().window_radius, window.window_decorations())
+}
+
+fn content_corner_radii(radius: Pixels, decorations: Decorations) -> Corners<Pixels> {
+    corner_radii((radius - BORDER_SIZE).max(px(0.0)), decorations)
 }
 
 fn corner_radii(radius: Pixels, decorations: Decorations) -> Corners<Pixels> {
@@ -52,6 +53,7 @@ pub fn window_border() -> WindowBorder {
 pub struct WindowBorder {
     shadow_size: Pixels,
     resize_hit_size: Pixels,
+    background: Option<Background>,
     children: Vec<AnyElement>,
 }
 
@@ -60,6 +62,7 @@ impl Default for WindowBorder {
         Self {
             shadow_size: SHADOW_SIZE,
             resize_hit_size: RESIZE_HIT_SIZE,
+            background: None,
             children: Vec::new(),
         }
     }
@@ -68,6 +71,11 @@ impl Default for WindowBorder {
 impl WindowBorder {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub(crate) fn background(mut self, background: Background) -> Self {
+        self.background = Some(background);
+        self
     }
 
     /// Set the shadow size for typical Linux client-side decorations.
@@ -193,7 +201,7 @@ impl RenderOnce for WindowBorder {
         };
         let resize_hit_size = self.resize_hit_size;
         window.set_client_inset(platform_inset);
-        let radii = window_corner_radii(window, cx);
+        let radii = corner_radii(cx.theme().window_radius, decorations);
         // Lets the compositor treat the rounded corners as transparent.
         window.set_client_corner_radii(radii);
         let window_size = window.window_bounds().get_bounds().size;
@@ -289,7 +297,7 @@ impl RenderOnce for WindowBorder {
                     .on_mouse_move(|_e, _, cx| {
                         cx.stop_propagation();
                     })
-                    .bg(gpui::transparent_black())
+                    .when_some(self.background, |div, background| div.bg(background))
                     .children(children),
             )
             .when(window.is_resizable(), |parent| {
@@ -354,6 +362,26 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn content_corners_are_concentric_with_the_frame() {
+        let decorations = Decorations::Client {
+            tiling: Tiling {
+                left: true,
+                ..Tiling::default()
+            },
+        };
+        let frame = corner_radii(px(8.0), decorations);
+        let content = content_corner_radii(px(8.0), decorations);
+        assert_eq!(content.top_left, px(0.0));
+        assert_eq!(content.bottom_left, px(0.0));
+        assert_eq!(content.top_right + BORDER_SIZE, frame.top_right);
+        assert_eq!(content.bottom_right + BORDER_SIZE, frame.bottom_right);
+        assert_eq!(
+            content_corner_radii(BORDER_SIZE, decorations),
+            Corners::default()
+        );
+    }
 
     #[test]
     fn only_client_decorated_windows_use_the_client_border() {

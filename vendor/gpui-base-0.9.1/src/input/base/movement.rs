@@ -5,7 +5,7 @@ use sum_tree::Bias;
 use crate::input::{
     InputBaseState, MoveDown, MoveEnd, MoveHome, MoveLeft, MovePageDown, MovePageUp, MoveRight,
     MoveToEnd, MoveToNextWord, MoveToPreviousWord, MoveToStart, MoveUp, RopeExt as _,
-    cursor::CursorSelection,
+    cursor::CursorSelection, display_map::WrapDisplayPoint,
 };
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -113,65 +113,60 @@ impl<M: InputModeKind> InputBaseState<M> {
 
         // Start from the row the caret is drawn on, not the row the raw offset falls in: on a
         // soft wrap boundary those are two different rows.
-        let mut display_point = self
+        let start = self
             .display_map
             .offset_to_wrap_display_point_with_affinity(offset, line_end_affinity);
-
-        // Convert wrap row → display row (skips folded rows), move, then convert back
-        let current_display_row = self
-            .display_map
-            .wrap_row_to_display_row(display_point.row)
-            .unwrap_or_else(|| {
-                self.display_map
-                    .nearest_visible_display_row(display_point.row)
-            });
-        let max_display_row = self.display_map.display_row_count().saturating_sub(1);
-        let target_display_row = current_display_row
-            .saturating_add_signed(move_lines)
-            .min(max_display_row);
-        let target_wrap_row = self
-            .display_map
-            .display_row_to_wrap_row(target_display_row)
-            .unwrap_or(display_point.row);
-
-        display_point.row = target_wrap_row;
-        display_point.column = 0;
-        let mut new_offset = self.display_map.wrap_display_point_to_offset(display_point);
-
+        let mut row = self.display_map.move_wrap_row(start.row, move_lines);
         let column_anchor = column_anchor
             .or_else(|| self.preferred_column_for_with_affinity(offset, line_end_affinity));
-        let mut new_affinity = false;
-        if let Some((preferred_x, column)) = column_anchor {
-            // Get display point again to update local_row.
-            let mut next_display_point = self.display_map.offset_to_wrap_display_point(new_offset);
-            next_display_point.column = 0;
-            let next_point = self
-                .display_map
-                .wrap_display_point_to_point(next_display_point);
-            let line_start_offset = self.text.line_start_offset(next_point.row);
-
-            // If in visible range, prefer to use position to get column.
-            if let Some(line) = last_layout.line(next_point.row) {
-                if let Some((x, line_end_affinity)) = line.closest_index_for_position(
-                    Point {
-                        x: preferred_x,
-                        y: next_display_point.local_row * last_layout.line_height,
-                    },
-                    last_layout,
-                ) {
-                    new_offset = line_start_offset + x;
-                    // Landing on a wrap boundary means the preferred column pointed past the
-                    // last glyph of the target row, so the caret stays on that row.
-                    new_affinity = line_end_affinity;
+        loop {
+            let (line, continuation) = self.display_map.wrap_row_location(row);
+            let line_start = self.text.line_start_offset(line);
+            let mut target = (
+                self.display_map
+                    .wrap_display_point_to_offset(WrapDisplayPoint::new(row, continuation, 0)),
+                false,
+            );
+            if let Some((preferred_x, column)) = column_anchor {
+                if let Some(layout) = last_layout.line(line) {
+                    if let Some((column, affinity)) = layout.closest_index_for_position(
+                        Point {
+                            x: preferred_x,
+                            y: continuation * last_layout.line_height,
+                        },
+                        last_layout,
+                    ) {
+                        target = (line_start + column, affinity);
+                    }
+                } else {
+                    let max_line_len = self.text.slice_line(line).len();
+                    target = (line_start + column.min(max_line_len), false);
                 }
-            } else {
-                // Not in visible range, use column directly.
-                let max_line_len = self.text.slice_line(next_point.row).len();
-                new_offset = line_start_offset + column.min(max_line_len);
             }
+            if row == start.row || self.display_map.inlay_line(line).is_none() {
+                return target;
+            }
+            let resolved = self
+                .display_map
+                .offset_to_wrap_display_point_with_affinity(target.0, target.1)
+                .row;
+            if (move_lines < 0 && resolved < start.row) || (move_lines > 0 && resolved > start.row)
+            {
+                return target;
+            }
+            if move_lines < 0 {
+                let before = self.previous_boundary(target.0);
+                if self.display_map.offset_to_wrap_display_point(before).row == row {
+                    return (before, false);
+                }
+            }
+            // A wrap row can consist entirely of a label anchored to another row.
+            let next = self.display_map.move_wrap_row(row, move_lines.signum());
+            if row == next {
+                return (offset, line_end_affinity);
+            }
+            row = next;
         }
-
-        (new_offset, new_affinity)
     }
 
     /// Extend to the document edge when there is no further visual row. Plain

@@ -5,6 +5,8 @@ use gpui::{
     Window, prelude::FluentBuilder as _,
 };
 
+use super::{DESCRIPTION_FONT_SIZE, DESCRIPTION_LINE_HEIGHT};
+
 use crate::{
     ActiveTheme, StyledExt,
     group_box::{GroupBox, GroupBoxVariant, GroupBoxVariants},
@@ -127,7 +129,8 @@ impl SettingGroup {
                     |this, description| {
                         this.child(
                             Label::new(description)
-                                .text_sm()
+                                .text_size(DESCRIPTION_FONT_SIZE)
+                                .line_height(DESCRIPTION_LINE_HEIGHT)
                                 .text_color(cx.theme().muted_foreground),
                         )
                     },

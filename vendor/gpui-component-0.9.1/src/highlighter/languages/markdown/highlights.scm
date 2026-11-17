@@ -19,9 +19,7 @@
   (fenced_code_block)
 ] @text.literal
 
-[
-  (fenced_code_block_delimiter)
-] @punctuation.delimiter
+(fenced_code_block_delimiter) @punctuation.delimiter.code
 
 (code_fence_content) @none
 

@@ -7,15 +7,15 @@ use crate::list::cache::{MeasuredEntrySize, RowEntry, RowsCache};
 use crate::{
     ActiveTheme, IconName, Size,
     input::{Input, InputEvent},
-    scroll::Scrollbar,
+    scroll::{popup_scrollbar, thin_scrollbar},
     v_flex,
 };
 use crate::{Icon, IndexPath, Selectable, Sizable, StyledExt};
 use crate::{VirtualListScrollHandle, list::ListDelegate, v_virtual_list};
 use gpui::{
     App, AvailableSpace, ClickEvent, Context, DefiniteLength, EdgesRefinement, EventEmitter,
-    ListSizingBehavior, RenderOnce, Role, ScrollStrategy, SharedString, StatefulInteractiveElement,
-    StyleRefinement, Subscription, px, size,
+    ListSizingBehavior, Pixels, RenderOnce, Role, ScrollStrategy, SharedString,
+    StatefulInteractiveElement, StyleRefinement, Subscription, px, size,
 };
 use gpui::{
     AppContext, Entity, FocusHandle, Focusable, InteractiveElement, IntoElement, KeyBinding,
@@ -56,6 +56,7 @@ struct ListOptions {
     scroll_bounce: Option<bool>,
     size: Size,
     scrollbar_visible: bool,
+    popup_scrollbar: bool,
     search_placeholder: Option<SharedString>,
     max_height: Option<Length>,
     paddings: EdgesRefinement<DefiniteLength>,
@@ -67,6 +68,7 @@ impl Default for ListOptions {
             scroll_bounce: None,
             size: Size::default(),
             scrollbar_visible: true,
+            popup_scrollbar: false,
             max_height: None,
             search_placeholder: None,
             paddings: EdgesRefinement::default(),
@@ -438,12 +440,12 @@ where
         self.select_item(next_ix, window, cx);
     }
 
-    fn prepare_items_if_needed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn measure_item(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::Size<Pixels> {
         let sections_count = self.delegate.sections_count(cx).max(1);
-        let mut measured_size = MeasuredEntrySize::default();
-
-        // Measure the item_height and section header/footer height.
-        let available_space = size(AvailableSpace::MinContent, AvailableSpace::MinContent);
         // Use the fallback for this measurement without overwriting the caller's configured index.
         let requested = self.item_to_measure_index;
         let item_to_measure = if requested.section < sections_count
@@ -455,13 +457,24 @@ where
                 .find(|section| self.delegate.items_count(*section, cx) > 0)
                 .map(|section| IndexPath::default().section(section))
         };
-        if let Some(index) = item_to_measure {
-            measured_size.item_size = self
-                .render_list_item(index, window, cx)
+        item_to_measure.map_or_else(gpui::Size::default, |index| {
+            self.render_list_item(index, window, cx)
                 .into_any_element()
-                .layout_as_root(available_space, window, cx);
-        }
+                .layout_as_root(
+                    size(AvailableSpace::MinContent, AvailableSpace::MinContent),
+                    window,
+                    cx,
+                )
+        })
+    }
 
+    fn prepare_items_if_needed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let sections_count = self.delegate.sections_count(cx).max(1);
+        let mut measured_size = MeasuredEntrySize {
+            item_size: self.measure_item(window, cx),
+            ..Default::default()
+        };
+        let available_space = size(AvailableSpace::MinContent, AvailableSpace::MinContent);
         if let Some(mut el) = self
             .delegate
             .render_section_header(0, window, cx)
@@ -618,7 +631,12 @@ where
                 }
             })
             .when(scrollbar_visible, |this| {
-                this.child(Scrollbar::vertical(&scroll_handle).viewport_from_layout())
+                let scrollbar = if self.options.popup_scrollbar {
+                    popup_scrollbar(&scroll_handle)
+                } else {
+                    thin_scrollbar(&scroll_handle)
+                };
+                this.child(scrollbar.viewport_from_layout())
             })
     }
 }
@@ -692,6 +710,10 @@ where
             .when_some(query_input, |this, input| {
                 this.child(
                     div()
+                        .when(self.options.popup_scrollbar, |this| {
+                            this.debug_selector(|| "popup-list-search".into())
+                        })
+                        .flex_shrink_0()
                         .map(|this| match self.options.size {
                             Size::Small => this.px_1p5(),
                             _ => this.px_2(),
@@ -759,6 +781,12 @@ where
     /// Set whether the scrollbar is visible, default is `true`.
     pub fn scrollbar_visible(mut self, visible: bool) -> Self {
         self.options.scrollbar_visible = visible;
+        self
+    }
+
+    /// Uses the narrow overlay scrollbar for a list displayed in a popup.
+    pub fn popup_scrollbar(mut self) -> Self {
+        self.options.popup_scrollbar = true;
         self
     }
 

@@ -7,6 +7,8 @@ use gpui::{
 };
 use rust_i18n::t;
 
+use super::{CONTROL_LINE_HEIGHT, DESCRIPTION_FONT_SIZE, DESCRIPTION_LINE_HEIGHT};
+
 use crate::{
     ActiveTheme, Icon, IconName, Sizable, StyledExt,
     button::{Button, ButtonVariants},
@@ -253,7 +255,13 @@ impl SettingPage {
                             .child(
                                 h_flex()
                                     .gap_1()
-                                    .child(self.title.clone())
+                                    .child(
+                                        div()
+                                            .text_size(options.font_size())
+                                            .line_height(CONTROL_LINE_HEIGHT)
+                                            .font_semibold()
+                                            .child(self.title.clone()),
+                                    )
                                     .when_some(self.title_suffix.clone(), |this, suffix| {
                                         this.child(suffix(window, cx))
                                     }),
@@ -261,6 +269,7 @@ impl SettingPage {
                             .when(self.is_resettable(&query, cx), |this| {
                                 this.child(
                                     Button::new("reset")
+                                        .rounded(gpui::px(5.))
                                         .icon(IconName::Undo2)
                                         .ghost()
                                         .small()
@@ -278,7 +287,8 @@ impl SettingPage {
                     .when_some(self.description.clone(), |this, description| {
                         this.child(
                             Label::new(description)
-                                .text_sm()
+                                .text_size(DESCRIPTION_FONT_SIZE)
+                                .line_height(DESCRIPTION_LINE_HEIGHT)
                                 .text_color(cx.theme().muted_foreground),
                         )
                     }),

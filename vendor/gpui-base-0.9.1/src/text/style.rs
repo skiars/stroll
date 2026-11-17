@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use gpui::{HighlightStyle, Hsla, Rems, StyleRefinement, rems};
+use gpui::{HighlightStyle, Hsla, Pixels, Rems, StyleRefinement, rems};
 
 use crate::ColorTokens;
 
@@ -19,6 +19,11 @@ pub struct TextViewStyle {
     code_background: Hsla,
     border: Hsla,
     paragraph_gap: Rems,
+    rule_spacing: Option<Pixels>,
+    /// A caller-pinned gap above a heading, replacing the heading metrics' own.
+    heading_top_gap: Option<Pixels>,
+    /// A caller-pinned gap below a heading, replacing the heading metrics' own.
+    heading_bottom_gap: Option<Pixels>,
     heading: Arc<dyn Fn(u8) -> StyleRefinement + Send + Sync + 'static>,
     code_block: StyleRefinement,
     table: StyleRefinement,
@@ -44,6 +49,9 @@ pub struct TextViewStyle {
 impl PartialEq for TextViewStyle {
     fn eq(&self, other: &Self) -> bool {
         self.paragraph_gap == other.paragraph_gap
+            && self.rule_spacing == other.rule_spacing
+            && self.heading_top_gap == other.heading_top_gap
+            && self.heading_bottom_gap == other.heading_bottom_gap
             && self.foreground == other.foreground
             && self.muted_foreground == other.muted_foreground
             && self.link == other.link
@@ -95,6 +103,9 @@ impl TextViewStyle {
             code_background: colors.accent,
             border: colors.border,
             paragraph_gap: rems(0.75),
+            rule_spacing: None,
+            heading_top_gap: None,
+            heading_bottom_gap: None,
             heading: Arc::new(|_| StyleRefinement::default()),
             code_block: StyleRefinement::default(),
             table: StyleRefinement::default(),
@@ -155,6 +166,33 @@ impl TextViewStyle {
     /// Sets the gap between paragraphs. Defaults to 0.75 rem.
     pub fn with_paragraph_gap(mut self, gap: Rems) -> Self {
         self.paragraph_gap = gap;
+        self
+    }
+
+    /// Sets the spacing above and below horizontal rules.
+    pub fn with_rule_spacing(mut self, space: Pixels) -> Self {
+        self.rule_spacing = Some(space);
+        self
+    }
+
+    pub(crate) fn rule_spacing(&self, font_size: Pixels) -> Pixels {
+        self.rule_spacing.unwrap_or(font_size * 1.6)
+    }
+
+    /// Sets the total space above every heading, measured from the previous
+    /// block. The previous block's own gap is subtracted from it, so the
+    /// rendered distance is the same whatever precedes the heading. The first
+    /// block of a container still starts flush, and the gap below the heading
+    /// is unaffected.
+    pub fn with_heading_top_gap(mut self, gap: Pixels) -> Self {
+        self.heading_top_gap = Some(gap);
+        self
+    }
+
+    /// Sets a fixed gap below every heading, replacing the heading's own
+    /// section gap. A heading that ends its container still has no gap.
+    pub fn with_heading_bottom_gap(mut self, gap: Pixels) -> Self {
+        self.heading_bottom_gap = Some(gap);
         self
     }
 
@@ -307,6 +345,16 @@ impl TextViewStyle {
     /// The gap between paragraphs.
     pub fn paragraph_gap(&self) -> Rems {
         self.paragraph_gap
+    }
+
+    /// The pinned gap above a heading, if the caller set one.
+    pub fn heading_top_gap(&self) -> Option<Pixels> {
+        self.heading_top_gap
+    }
+
+    /// The pinned gap below a heading, if the caller set one.
+    pub fn heading_bottom_gap(&self) -> Option<Pixels> {
+        self.heading_bottom_gap
     }
 
     /// The style refinement for a heading at `level` (1-6).

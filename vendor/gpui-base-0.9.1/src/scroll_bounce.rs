@@ -5,7 +5,7 @@ use crate::{OngoingScrollExt as _, ScrollbarHandle};
 use gpui::{
     AnyElement, App, Bounds, ContentMask, DispatchPhase, Element, ElementId, Global,
     GlobalElementId, Hitbox, HitboxBehavior, HitboxId, InspectorElementId, IntoElement, LayoutId,
-    OngoingScroll, Pixels, ScrollDelta, ScrollEvent, TouchPhase, Window, point, px,
+    OngoingScroll, Pixels, ScrollDelta, ScrollEvent, SmoothScroll, TouchPhase, Window, point, px,
 };
 #[cfg(not(target_family = "wasm"))]
 use std::time::Instant;
@@ -146,6 +146,7 @@ pub struct ScrollBounce {
     child: AnyElement,
     enabled: bool,
     scroll_wheel: bool,
+    wheel_line_height: Option<Pixels>,
     motion: ScrollBounceMotion,
     on_scroll: Option<Rc<dyn Fn(&mut Window, &mut App)>>,
 }
@@ -162,6 +163,7 @@ impl ScrollBounce {
             child: child.into_any_element(),
             enabled: Self::enabled_by_default(),
             scroll_wheel: true,
+            wheel_line_height: None,
             motion: ScrollBounceMotion::default(),
             on_scroll: None,
         }
@@ -195,15 +197,21 @@ impl ScrollBounce {
         self
     }
 
+    /// Overrides the displacement of one wheel line for this viewport.
+    /// Pixel-based scroll events are passed through unchanged.
+    pub fn wheel_line_height(mut self, height: Pixels) -> Self {
+        self.wheel_line_height = Some(height);
+        self
+    }
+
     /// Set how far a drag stretches past an edge and how the edge returns.
     pub fn motion(mut self, motion: ScrollBounceMotion) -> Self {
         self.motion = motion;
         self
     }
 
-    /// Observe a logical scroll performed when a reverse drag leaves the stretched
-    /// region. Runs after the handle update, with no internal state borrowed.
-    /// Ordinary child scrolling continues to use the child's own notifications.
+    /// Observe logical scrolling performed by this wrapper. Runs after the
+    /// handle update, with no internal state borrowed.
     pub fn on_scroll(mut self, handler: impl Fn(&mut Window, &mut App) + 'static) -> Self {
         self.on_scroll = Some(Rc::new(handler));
         self
@@ -280,6 +288,7 @@ fn max_scroll_extent(handle: &dyn ScrollbarHandle) -> Pixels {
 pub struct ScrollBouncePrepaintState {
     state: Rc<RefCell<State>>,
     hitbox: Hitbox,
+    smooth_scroll: Option<SmoothScroll>,
 }
 
 impl IntoElement for ScrollBounce {
@@ -319,13 +328,11 @@ impl Element for ScrollBounce {
         window: &mut Window,
         cx: &mut App,
     ) -> Self::PrepaintState {
-        let state = window.with_element_state(
-            id.expect("ScrollBounce has an id"),
-            |state: Option<Rc<RefCell<State>>>, _| {
-                let state = state.unwrap_or_default();
-                (state.clone(), state)
-            },
-        );
+        let id = id.expect("ScrollBounce has an id");
+        let state = window.with_element_state(id, |state: Option<Rc<RefCell<State>>>, _| {
+            let state = state.unwrap_or_default();
+            (state.clone(), state)
+        });
         let offset = {
             let mut state = state.borrow_mut();
             if !self.enabled || cx.reduce_motion() {
@@ -369,7 +376,17 @@ impl Element for ScrollBounce {
                 window.request_animation_frame();
             }
         }
-        ScrollBouncePrepaintState { state, hitbox }
+        let smooth_scroll = (self.scroll_wheel && cx.smooth_scrolling()).then(|| {
+            window.with_element_state(id, |state: Option<SmoothScroll>, _| {
+                let state = state.unwrap_or_default();
+                (state.clone(), state)
+            })
+        });
+        ScrollBouncePrepaintState {
+            state,
+            hitbox,
+            smooth_scroll,
+        }
     }
 
     fn paint(
@@ -554,6 +571,8 @@ impl Element for ScrollBounce {
             let handle = self.handle.clone();
             let view = window.current_view();
             let on_scroll = self.on_scroll.clone();
+            let smooth_scroll = prepaint.smooth_scroll.clone();
+            let wheel_line_height = self.wheel_line_height;
             window.on_mouse_event(move |event: &ScrollEvent, phase, window, cx| {
                 if phase != DispatchPhase::Capture
                     || !hitbox.should_handle_scroll(window)
@@ -561,7 +580,10 @@ impl Element for ScrollBounce {
                 {
                     return;
                 }
-                let mut delta = event.delta.pixel_delta(window.line_height());
+                let mut delta = match wheel_line_height {
+                    Some(height) => event.delta.pixel_delta(height),
+                    None => event.delta.content_delta(),
+                };
                 let mut state = state.borrow_mut();
                 state
                     .ongoing_scroll
@@ -578,6 +600,44 @@ impl Element for ScrollBounce {
                     return;
                 }
                 let before = handle.offset();
+                if cx.smooth_scrolling()
+                    && matches!(event.delta, ScrollDelta::Lines(_))
+                    && let Some(smooth_scroll) = &smooth_scroll
+                {
+                    let displaced = state.overscroll.offset() != 0.;
+                    state.overscroll.reset();
+                    drop(state);
+
+                    let mut target = smooth_scroll.target(before, point(px(0.), delta.y), window);
+                    target.y = target.y.clamp(-max, px(0.));
+                    let handle = handle.clone();
+                    let on_scroll = on_scroll.clone();
+                    smooth_scroll.animate(
+                        before,
+                        target,
+                        window,
+                        cx,
+                        move |last, mut next, window, cx| {
+                            if handle.offset() != last {
+                                return None;
+                            }
+                            next.y = next.y.clamp(-max_scroll_extent(handle.as_ref()), px(0.));
+                            if last != next {
+                                handle.set_offset(next);
+                                cx.notify(view);
+                                if let Some(handler) = &on_scroll {
+                                    handler(window, cx);
+                                }
+                            }
+                            Some(handle.offset())
+                        },
+                    );
+                    if displaced {
+                        cx.notify(view);
+                    }
+                    cx.stop_propagation();
+                    return;
+                }
                 let changed = if !bounces || matches!(event.delta, ScrollDelta::Lines(_)) {
                     let displaced = state.overscroll.offset() != 0.;
                     state.overscroll.reset();

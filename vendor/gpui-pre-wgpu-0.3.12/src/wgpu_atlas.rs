@@ -1,3 +1,4 @@
+use collections::FxHashMap;
 // Modified for gpui-pre (snapshot of zed@d2a4fb6): adapt device queues and sRGB detection to wgpu 30.0.1.
 use anyhow::{Context as _, Result};
 use etagere::{BucketedAtlasAllocator, size2};
@@ -37,6 +38,8 @@ struct WgpuAtlasTextures {
     storage: WgpuAtlasStorage,
     pending_uploads: Vec<PendingUpload>,
     next_texture_generation: u64,
+    next_tile_generation: u64,
+    tile_generations: FxHashMap<(AtlasTextureId, u32), u64>,
 }
 
 pub struct WgpuTextureInfo {
@@ -46,6 +49,22 @@ pub struct WgpuTextureInfo {
 }
 
 impl WgpuAtlas {
+    pub(crate) fn tile_generations(
+        &self,
+        tiles: impl Iterator<Item = AtlasTile>,
+        generations: &mut Vec<Option<u64>>,
+    ) {
+        let atlas = self.0.lock();
+        generations.clear();
+        generations.extend(tiles.map(|tile| {
+            atlas
+                .backend
+                .tile_generations
+                .get(&(tile.texture_id, tile.tile_id.0))
+                .copied()
+        }));
+    }
+
     pub fn new(
         device: Arc<wgpu::Device>,
         queue: Arc<wgpu::Queue>,
@@ -60,6 +79,8 @@ impl WgpuAtlas {
             storage: WgpuAtlasStorage::default(),
             pending_uploads: Vec::new(),
             next_texture_generation: 0,
+            next_tile_generation: 0,
+            tile_generations: FxHashMap::default(),
         })))
     }
 
@@ -95,6 +116,7 @@ impl WgpuAtlas {
         self.0.lock().clear(|textures| {
             textures.storage = WgpuAtlasStorage::default();
             textures.pending_uploads.clear();
+            textures.tile_generations.clear();
         });
     }
 
@@ -107,6 +129,7 @@ impl WgpuAtlas {
             textures.color_texture_format = context.color_texture_format();
             textures.storage = WgpuAtlasStorage::default();
             textures.pending_uploads.clear();
+            textures.tile_generations.clear();
         });
     }
 }
@@ -134,10 +157,16 @@ impl AtlasBackend for WgpuAtlasTextures {
     ) -> Result<AtlasTile> {
         let tile = self.allocate(size, kind).context("failed to allocate")?;
         self.upload_texture(tile.texture_id, tile.bounds, bytes);
+        let generation = self.next_tile_generation;
+        self.next_tile_generation = generation.wrapping_add(1);
+        self.tile_generations
+            .insert((tile.texture_id, tile.tile_id.0), generation);
         Ok(tile)
     }
 
     fn remove(&mut self, tile: AtlasTile) {
+        self.tile_generations
+            .remove(&(tile.texture_id, tile.tile_id.0));
         let id = tile.texture_id;
         let Some(texture_slot) = self.storage[id.kind].textures.get_mut(id.index as usize) else {
             return;

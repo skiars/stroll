@@ -41,7 +41,7 @@ impl From<bool> for PaddedBool32 {
 pub struct Scene {
     pub(crate) paint_operations: Vec<PaintOperation>,
     primitive_bounds: BoundsTree<ScaledPixels>,
-    layer_stack: Vec<DrawOrder>,
+    layer_stack: Vec<(Bounds<ScaledPixels>, DrawOrder)>,
     pub shadows: Vec<Shadow>,
     pub quads: Vec<Quad>,
     pub paths: Vec<Path<ScaledPixels>>,
@@ -50,6 +50,10 @@ pub struct Scene {
     pub subpixel_sprites: Vec<SubpixelSprite>,
     pub polychrome_sprites: Vec<PolychromeSprite>,
     pub surfaces: Vec<PaintSurface>,
+    pub backdrop_blurs: Vec<BackdropBlur>,
+    partial_regions: Vec<PartialRegion>,
+    partial_order_offset: DrawOrder,
+    max_order: DrawOrder,
 }
 
 #[expect(missing_docs)]
@@ -66,6 +70,10 @@ impl Scene {
         self.subpixel_sprites.clear();
         self.polychrome_sprites.clear();
         self.surfaces.clear();
+        self.backdrop_blurs.clear();
+        self.partial_regions.clear();
+        self.partial_order_offset = 0;
+        self.max_order = 0;
     }
 
     pub fn len(&self) -> usize {
@@ -73,8 +81,9 @@ impl Scene {
     }
 
     pub fn push_layer(&mut self, bounds: Bounds<ScaledPixels>) {
-        let order = self.primitive_bounds.insert(bounds);
-        self.layer_stack.push(order);
+        let order = self.primitive_bounds.insert(bounds) + self.partial_order_offset;
+        self.max_order = self.max_order.max(order);
+        self.layer_stack.push((bounds, order));
         self.paint_operations
             .push(PaintOperation::StartLayer(bounds));
     }
@@ -97,8 +106,12 @@ impl Scene {
         let order = self
             .layer_stack
             .last()
-            .copied()
-            .unwrap_or_else(|| self.primitive_bounds.insert(clipped_bounds));
+            .map(|&(_, order)| order)
+            .unwrap_or_else(|| {
+                self.primitive_bounds.insert(clipped_bounds) + self.partial_order_offset
+            });
+        let order = order.max(self.partial_order_offset + 1);
+        self.max_order = self.max_order.max(order);
         match &mut primitive {
             Primitive::Shadow(shadow) => {
                 shadow.order = order;
@@ -138,14 +151,190 @@ impl Scene {
             .push(PaintOperation::Primitive(primitive));
     }
 
+    /// Insert a filter after the primitives already present in its paint region.
+    pub fn insert_backdrop_blur(&mut self, mut blur: BackdropBlur) {
+        let clipped = blur.bounds.intersect(&blur.content_mask.bounds);
+        if clipped.is_empty() {
+            return;
+        }
+        blur.order = self.primitive_bounds.insert(clipped) + self.partial_order_offset;
+        self.max_order = self.max_order.max(blur.order);
+        // A backdrop is a paint barrier even inside an explicit layer.
+        for (bounds, order) in &mut self.layer_stack {
+            *order = self.primitive_bounds.insert(*bounds) + self.partial_order_offset;
+            self.max_order = self.max_order.max(*order);
+        }
+        self.backdrop_blurs.push(blur);
+        self.paint_operations
+            .push(PaintOperation::BackdropBlur(blur));
+    }
+
     pub fn replay(&mut self, range: Range<usize>, prev_scene: &Scene) {
         for operation in &prev_scene.paint_operations[range] {
             match operation {
                 PaintOperation::Primitive(primitive) => self.insert_primitive(primitive.clone()),
+                PaintOperation::BackdropBlur(blur) => self.insert_backdrop_blur(*blur),
                 PaintOperation::StartLayer(bounds) => self.push_layer(*bounds),
                 PaintOperation::EndLayer => self.pop_layer(),
+                PaintOperation::BeginPartial { bounds, scroll } => {
+                    self.begin_scroll_region(*bounds, *scroll)
+                }
+                PaintOperation::EndPartial => self.end_partial_region(),
             }
         }
+    }
+
+    #[doc(hidden)]
+    pub fn begin_partial_region(&mut self, bounds: Bounds<ScaledPixels>) {
+        self.begin_scroll_region(bounds, None);
+    }
+
+    #[doc(hidden)]
+    pub fn begin_scroll_region(
+        &mut self,
+        bounds: Bounds<ScaledPixels>,
+        scroll: Option<ScaledPixels>,
+    ) {
+        self.partial_order_offset = self.max_order;
+        for (_, order) in &mut self.layer_stack {
+            *order = self.partial_order_offset + 1;
+        }
+        self.partial_regions.push(PartialRegion {
+            bounds,
+            scroll,
+            order: self.partial_order_offset + 1,
+            end_order: 0,
+            start: self.paint_operations.len(),
+            end: None,
+        });
+        self.paint_operations
+            .push(PaintOperation::BeginPartial { bounds, scroll });
+    }
+
+    #[doc(hidden)]
+    pub fn end_partial_region(&mut self) {
+        if let Some(region) = self
+            .partial_regions
+            .iter_mut()
+            .rev()
+            .find(|region| region.end.is_none())
+        {
+            region.end = Some(self.paint_operations.len());
+            region.end_order = self.max_order + 1;
+        }
+        self.partial_order_offset = self.max_order;
+        for (_, order) in &mut self.layer_stack {
+            *order = self.partial_order_offset + 1;
+        }
+        self.paint_operations.push(PaintOperation::EndPartial);
+    }
+
+    /// 返回局部绘制区域和捕获位置。滚动区域上方有模糊时，额外返回浮层的起始位置。
+    #[doc(hidden)]
+    pub fn partial_frame(
+        &self,
+        key: &mut PartialFrame,
+    ) -> Option<(Bounds<ScaledPixels>, DrawOrder, Option<DrawOrder>)> {
+        let (region, others) = self.partial_regions.split_first()?;
+        let end = region.end?;
+        if !self.surfaces.is_empty() || others.iter().any(|other| other.start <= end) {
+            return None;
+        }
+        let suffix = &self.paint_operations[end + 1..];
+        let first_blur = suffix
+            .iter()
+            .filter_map(|operation| match operation {
+                PaintOperation::BackdropBlur(blur) => Some(blur.order),
+                _ => None,
+            })
+            .min();
+        // 正文后的固定栏若完全位于滚动区外，可以和正文留在同一纹理中。
+        // 这样第一道模糊就能直接读取已合成的底图。
+        let overlay = first_blur.map(|order| {
+            let hits_scroll = suffix.iter().any(|operation| {
+                matches!(operation, PaintOperation::Primitive(p)
+                    if PartialFrame::scroll_paint_order(p).0 < order
+                        && p.scroll_bounds(ScaledPixels(0.)).intersects(&region.bounds.dilate(ScaledPixels(1.))))
+            });
+            if hits_scroll { region.end_order } else { order }
+        });
+        if (overlay.is_some() && region.scroll.is_none())
+            || (!others.is_empty() && overlay.is_none())
+        {
+            return None;
+        }
+        // A custom element that bypasses the viewport clip can affect pixels
+        // retained outside the scissor, so fall back to a full frame.
+        if self.paint_operations[region.start + 1..end]
+            .iter()
+            .any(|operation| {
+                if let PaintOperation::Primitive(primitive) = operation {
+                    let clip = primitive.content_mask().bounds;
+                    clip.intersect(&region.bounds) != clip
+                } else {
+                    matches!(operation, PaintOperation::BackdropBlur(_))
+                }
+            })
+        {
+            return None;
+        }
+        key.scroll = region.scroll;
+        key.moving.clear();
+        key.after.clear();
+        if region.scroll.is_some() {
+            key.moving.extend(
+                self.paint_operations[region.start + 1..end]
+                    .iter()
+                    .filter_map(|operation| {
+                        if let PaintOperation::Primitive(primitive) = operation {
+                            Some(primitive.clone())
+                        } else {
+                            None
+                        }
+                    }),
+            );
+        }
+        if region.scroll.is_some() && overlay.is_none() {
+            key.after.extend(
+                self.paint_operations[end + 1..]
+                    .iter()
+                    .filter_map(|operation| match operation {
+                        PaintOperation::Primitive(primitive)
+                            if primitive
+                                .scroll_bounds(ScaledPixels(0.))
+                                .intersects(&region.bounds) =>
+                        {
+                            Some(primitive.clone())
+                        }
+                        _ => None,
+                    }),
+            );
+        }
+        let opaque = key.opaque_scroll_background(region.bounds);
+        key.prefix_len = region.start;
+        key.outside.clear();
+        key.outside.extend(
+            self.paint_operations[..region.start]
+                .iter()
+                .map(PaintOperation::without_order),
+        );
+        key.separate_overlay = overlay.is_some();
+        if let Some(order) = overlay {
+            key.outside.extend(suffix.iter().filter_map(|operation| {
+                matches!(operation, PaintOperation::Primitive(p)
+                    if PartialFrame::scroll_paint_order(p).0 < order)
+                .then(|| operation.without_order())
+            }));
+        }
+        if overlay.is_none() {
+            key.outside.extend(self.paint_operations[end + 1..].iter().filter(|operation| {
+                // Suffix draws fully inside an opaque scroll region are compared
+                // with its moving paints. They cannot invalidate retained pixels outside.
+                !opaque || !matches!(operation, PaintOperation::Primitive(p)
+                    if p.scroll_bounds(ScaledPixels(0.)).intersect(&region.bounds) == p.scroll_bounds(ScaledPixels(0.)))
+            }).map(PaintOperation::without_order));
+        }
+        Some((region.bounds, region.order, overlay))
     }
 
     pub fn finish(&mut self) {
@@ -160,6 +349,7 @@ impl Scene {
         self.polychrome_sprites
             .sort_by_key(|sprite| (sprite.order, sprite.tile.texture_id.index));
         self.surfaces.sort_by_key(|surface| surface.order);
+        self.backdrop_blurs.sort_by_key(|blur| blur.order);
     }
 
     #[cfg_attr(
@@ -170,6 +360,119 @@ impl Scene {
         allow(dead_code)
     )]
     pub fn batches(&self) -> impl Iterator<Item = PrimitiveBatch> + '_ {
+        self.batch_iterator()
+    }
+
+    /// Draw batches in paint order, with a boundary at each backdrop sample.
+    pub fn batches_with_backdrop(&self) -> impl Iterator<Item = SceneBatch> + '_ {
+        self.batches_with_capture(None, None)
+    }
+
+    #[doc(hidden)]
+    pub fn batches_with_capture(
+        &self,
+        mut capture: Option<DrawOrder>,
+        mut overlay: Option<DrawOrder>,
+    ) -> impl Iterator<Item = SceneBatch> + '_ {
+        let mut batches = self.batch_iterator();
+        let mut blurs = self.backdrop_blurs.iter().peekable();
+        std::iter::from_fn(move || {
+            let blur_order = blurs.peek().map_or(u32::MAX, |blur| blur.order);
+            let limit = blur_order
+                .min(capture.unwrap_or(u32::MAX))
+                .min(overlay.unwrap_or(u32::MAX));
+            if let Some(batch) = batches.next_before(limit) {
+                Some(SceneBatch::Draw(batch))
+            } else if capture == Some(limit) {
+                capture = None;
+                Some(SceneBatch::Capture)
+            } else if overlay == Some(limit) {
+                overlay = None;
+                Some(SceneBatch::Overlay)
+            } else {
+                blurs.next().copied().map(SceneBatch::Backdrop)
+            }
+        })
+    }
+
+    /// Compare the scene pixels a backdrop can sample, independently of
+    /// foreground animations and of paint commands outside that region.
+    #[doc(hidden)]
+    pub fn backdrop_input(
+        &self,
+        effect: BackdropBlur,
+        mut region: Bounds<ScaledPixels>,
+        input: &mut BackdropInput,
+    ) -> bool {
+        input.primitives.clear();
+        input.effects.clear();
+        // Earlier filters contribute both their output and their input pixels.
+        for previous in self
+            .backdrop_blurs
+            .iter()
+            .rev()
+            .filter(|blur| blur.order < effect.order)
+        {
+            let visible = previous.bounds.intersect(&previous.content_mask.bounds);
+            if !visible.intersect(&region).is_empty() {
+                region =
+                    region.union(&visible.dilate(ScaledPixels(previous.sampling_margin() as f32)));
+                input.effects.push(*previous);
+            }
+        }
+        let visible = |bounds: Bounds<ScaledPixels>, clip: ContentMask<ScaledPixels>| {
+            !region.intersect(&bounds.intersect(&clip.bounds)).is_empty()
+        };
+        if self
+            .surfaces
+            .iter()
+            .take_while(|surface| surface.order < effect.order)
+            .any(|surface| visible(surface.bounds, surface.content_mask))
+        {
+            return false;
+        }
+        // An outer shadow can intersect the sample even when its source
+        // rectangle lies outside it. Transformed glyph bounds are likewise
+        // conservative: include them even when their untransformed box misses.
+        input.primitives.extend(
+            self.shadows
+                .iter()
+                .take_while(|item| item.order < effect.order)
+                .filter(|item| {
+                    visible(
+                        item.bounds.dilate(ScaledPixels(3. * item.blur_radius.0)),
+                        item.content_mask,
+                    )
+                })
+                .copied()
+                .map(BackdropPrimitive::Shadow),
+        );
+        macro_rules! remember {
+            ($field:ident, $variant:ident $(, $include:expr)?) => {
+                input.primitives.extend(self.$field.iter()
+                    .take_while(|item| item.order < effect.order)
+                    .filter(|item| visible(item.bounds, item.content_mask) $(|| ($include)(item))?)
+                    .cloned().map(BackdropPrimitive::$variant));
+            };
+        }
+        remember!(quads, Quad);
+        remember!(paths, Path);
+        remember!(underlines, Underline);
+        remember!(
+            monochrome_sprites,
+            MonochromeSprite,
+            |item: &&MonochromeSprite| item.transformation != TransformationMatrix::unit()
+        );
+        remember!(
+            subpixel_sprites,
+            SubpixelSprite,
+            |item: &&SubpixelSprite| item.transformation != TransformationMatrix::unit()
+        );
+        remember!(polychrome_sprites, PolychromeSprite);
+        true
+    }
+
+    fn batch_iterator(&self) -> BatchIterator<'_> {
         BatchIterator {
             shadows_start: 0,
             shadows_iter: self.shadows.iter().peekable(),
@@ -211,10 +514,124 @@ pub(crate) enum PrimitiveKind {
     Surface,
 }
 
+#[derive(Clone, PartialEq)]
 pub(crate) enum PaintOperation {
     Primitive(Primitive),
+    BackdropBlur(BackdropBlur),
     StartLayer(Bounds<ScaledPixels>),
     EndLayer,
+    BeginPartial {
+        bounds: Bounds<ScaledPixels>,
+        scroll: Option<ScaledPixels>,
+    },
+    EndPartial,
+}
+
+struct PartialRegion {
+    bounds: Bounds<ScaledPixels>,
+    scroll: Option<ScaledPixels>,
+    order: DrawOrder,
+    end_order: DrawOrder,
+    start: usize,
+    end: Option<usize>,
+}
+
+#[doc(hidden)]
+#[derive(Default)]
+pub struct PartialFrame {
+    scroll: Option<ScaledPixels>,
+    moving: Vec<Primitive>,
+    after: Vec<Primitive>,
+    prefix_len: usize,
+    separate_overlay: bool,
+    outside: Vec<PaintOperation>,
+}
+
+impl PartialEq for PartialFrame {
+    fn eq(&self, other: &Self) -> bool {
+        self.prefix_len == other.prefix_len
+            && self.separate_overlay == other.separate_overlay
+            && self.outside == other.outside
+            && self.scroll.is_some() == other.scroll.is_some()
+    }
+}
+
+impl PartialFrame {
+    #[doc(hidden)]
+    pub fn scroll_offset(&self) -> Option<ScaledPixels> {
+        self.scroll
+    }
+
+    #[doc(hidden)]
+    pub fn scroll_primitives(&self) -> impl Iterator<Item = &Primitive> {
+        self.moving.iter().chain(self.after.iter())
+    }
+
+    #[doc(hidden)]
+    pub fn scroll_paint_order(primitive: &Primitive) -> (DrawOrder, u8, u32) {
+        match primitive {
+            Primitive::Shadow(p) => (p.order, 0, 0),
+            Primitive::Quad(p) => (p.order, 1, 0),
+            Primitive::Path(p) => (p.order, 2, 0),
+            Primitive::Underline(p) => (p.order, 3, 0),
+            Primitive::MonochromeSprite(p) => (p.order, 4, p.tile.texture_id.index),
+            Primitive::SubpixelSprite(p) => (p.order, 5, p.tile.texture_id.index),
+            Primitive::PolychromeSprite(p) => (p.order, 6, p.tile.texture_id.index),
+            Primitive::Surface(p) => (p.order, 7, 0),
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn opaque_scroll_background(&self, region: Bounds<ScaledPixels>) -> bool {
+        matches!(self.moving.first(), Some(Primitive::Quad(quad))
+            if quad.bounds.intersect(&region) == region
+                && quad.content_mask.bounds.intersect(&region) == region
+                && quad.background.as_solid().is_some_and(|color| color.is_opaque())
+                && quad.corner_radii == Corners::default()
+                && quad.border_widths == Edges::default())
+    }
+
+    #[doc(hidden)]
+    pub fn replace_scroll(&mut self, other: &mut Self) {
+        std::mem::swap(&mut self.scroll, &mut other.scroll);
+        std::mem::swap(&mut self.moving, &mut other.moving);
+        std::mem::swap(&mut self.after, &mut other.after);
+    }
+
+    /// Atlas tiles referenced by the pixels retained outside the region.
+    #[doc(hidden)]
+    pub fn atlas_tiles(&self) -> impl Iterator<Item = AtlasTile> + '_ {
+        self.outside.iter().filter_map(|operation| match operation {
+            PaintOperation::Primitive(Primitive::MonochromeSprite(item)) => Some(item.tile),
+            PaintOperation::Primitive(Primitive::SubpixelSprite(item)) => Some(item.tile),
+            PaintOperation::Primitive(Primitive::PolychromeSprite(item)) => Some(item.tile),
+            _ => None,
+        })
+    }
+}
+
+impl PaintOperation {
+    fn without_order(&self) -> Self {
+        let mut operation = self.clone();
+        match &mut operation {
+            Self::Primitive(primitive) => match primitive {
+                Primitive::Shadow(item) => item.order = 0,
+                Primitive::Quad(item) => item.order = 0,
+                Primitive::Path(item) => {
+                    item.order = 0;
+                    item.id = PathId(0);
+                }
+                Primitive::Underline(item) => item.order = 0,
+                Primitive::MonochromeSprite(item) => item.order = 0,
+                Primitive::SubpixelSprite(item) => item.order = 0,
+                Primitive::PolychromeSprite(item) => item.order = 0,
+                Primitive::Surface(_) => unreachable!("surface frames cannot be reused"),
+            },
+            Self::BackdropBlur(blur) => blur.order = 0,
+            _ => {}
+        }
+        operation
+    }
 }
 
 #[derive(Clone)]
@@ -228,6 +645,21 @@ pub enum Primitive {
     SubpixelSprite(SubpixelSprite),
     PolychromeSprite(PolychromeSprite),
     Surface(PaintSurface),
+}
+
+impl PartialEq for Primitive {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Shadow(a), Self::Shadow(b)) => a == b,
+            (Self::Quad(a), Self::Quad(b)) => a == b,
+            (Self::Path(a), Self::Path(b)) => a == b,
+            (Self::Underline(a), Self::Underline(b)) => a == b,
+            (Self::MonochromeSprite(a), Self::MonochromeSprite(b)) => a == b,
+            (Self::SubpixelSprite(a), Self::SubpixelSprite(b)) => a == b,
+            (Self::PolychromeSprite(a), Self::PolychromeSprite(b)) => a == b,
+            _ => false,
+        }
+    }
 }
 
 #[expect(missing_docs)]
@@ -255,6 +687,112 @@ impl Primitive {
             Primitive::SubpixelSprite(sprite) => &sprite.content_mask,
             Primitive::PolychromeSprite(sprite) => &sprite.content_mask,
             Primitive::Surface(surface) => &surface.content_mask,
+        }
+    }
+}
+
+impl Primitive {
+    #[doc(hidden)]
+    pub fn scroll_tile(&self) -> Option<AtlasTile> {
+        match self {
+            Self::MonochromeSprite(item) => Some(item.tile),
+            Self::SubpixelSprite(item) => Some(item.tile),
+            Self::PolychromeSprite(item) => Some(item.tile),
+            _ => None,
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn scroll_bounds(&self, dy: ScaledPixels) -> Bounds<ScaledPixels> {
+        let mut bounds = *self.bounds();
+        match self {
+            Self::Shadow(shadow) => bounds = bounds.dilate(ScaledPixels(shadow.blur_radius.0 * 3.)),
+            Self::MonochromeSprite(sprite)
+                if sprite.transformation != TransformationMatrix::unit() =>
+            {
+                bounds = self.content_mask().bounds
+            }
+            Self::SubpixelSprite(sprite)
+                if sprite.transformation != TransformationMatrix::unit() =>
+            {
+                bounds = self.content_mask().bounds
+            }
+            _ => {}
+        }
+        bounds = bounds.intersect(&self.content_mask().bounds);
+        bounds.origin.y += dy;
+        bounds
+    }
+
+    #[doc(hidden)]
+    pub fn same_scrolled_paint(
+        &self,
+        other: &Self,
+        dy: ScaledPixels,
+        tile: Bounds<ScaledPixels>,
+    ) -> bool {
+        macro_rules! compare {
+            ($a:expr, $b:expr) => {{
+                let (mut a, mut b) = (*$a, *$b);
+                a.order = 0;
+                b.order = 0;
+                a.bounds.origin.y += dy;
+                a.content_mask.bounds.origin.y += dy;
+                a.content_mask.bounds = a.content_mask.bounds.intersect(&tile);
+                b.content_mask.bounds = b.content_mask.bounds.intersect(&tile);
+                a == b
+            }};
+        }
+        match (self, other) {
+            (Self::Quad(a), Self::Quad(b)) => {
+                // A solid rectangle may extend beyond the reusable pixels.
+                if a.corner_radii == Corners::default()
+                    && b.corner_radii == Corners::default()
+                    && a.border_widths == Edges::default()
+                    && b.border_widths == Edges::default()
+                    && a.background.as_solid().is_some()
+                    && a.background == b.background
+                {
+                    self.scroll_bounds(dy).intersect(&tile)
+                        == other.scroll_bounds(ScaledPixels(0.)).intersect(&tile)
+                } else {
+                    compare!(a, b)
+                }
+            }
+            (Self::Path(a), Self::Path(b))
+                if a.color.as_solid().is_some() && a.color == b.color =>
+            {
+                // 矢量路径离屏栅格化。裁剪边界和三角形一起平移时，
+                // 整数设备像素位移保留相同的采样位置。
+                let mut clip = a.clipped_bounds();
+                clip.origin.y += dy;
+                clip == b.clipped_bounds()
+                    && a.vertices.len() == b.vertices.len()
+                    && a.vertices.iter().zip(&b.vertices).all(|(a, b)| {
+                        a.xy_position.x == b.xy_position.x
+                            && a.xy_position.y + dy == b.xy_position.y
+                            && a.st_position == b.st_position
+                    })
+            }
+            (Self::Underline(a), Self::Underline(b))
+                if a.wavy == false.into() && b.wavy == false.into() =>
+            {
+                compare!(a, b)
+            }
+            (Self::MonochromeSprite(a), Self::MonochromeSprite(b))
+                if a.transformation == TransformationMatrix::unit()
+                    && b.transformation == TransformationMatrix::unit() =>
+            {
+                compare!(a, b)
+            }
+            (Self::SubpixelSprite(a), Self::SubpixelSprite(b))
+                if a.transformation == TransformationMatrix::unit()
+                    && b.transformation == TransformationMatrix::unit() =>
+            {
+                compare!(a, b)
+            }
+            (Self::PolychromeSprite(a), Self::PolychromeSprite(b)) => compare!(a, b),
+            _ => false,
         }
     }
 }
@@ -289,6 +827,12 @@ impl<'a> Iterator for BatchIterator<'a> {
     type Item = PrimitiveBatch;
 
     fn next(&mut self) -> Option<Self::Item> {
+        self.next_before(u32::MAX)
+    }
+}
+
+impl BatchIterator<'_> {
+    fn next_before(&mut self, before: DrawOrder) -> Option<PrimitiveBatch> {
         let mut orders_and_kinds = [
             (
                 self.shadows_iter.peek().map(|s| s.order),
@@ -321,11 +865,13 @@ impl<'a> Iterator for BatchIterator<'a> {
 
         let first = orders_and_kinds[0];
         let second = orders_and_kinds[1];
-        let (batch_kind, max_order_and_kind) = if first.0.is_some() {
-            (first.1, (second.0.unwrap_or(u32::MAX), second.1))
-        } else {
+        let first_order = first.0?;
+        if first_order >= before {
             return None;
-        };
+        }
+        let batch_kind = first.1;
+        let max_order_and_kind =
+            (second.0.unwrap_or(u32::MAX), second.1).min((before, PrimitiveKind::Shadow));
 
         match batch_kind {
             PrimitiveKind::Shadow => {
@@ -474,6 +1020,7 @@ impl<'a> Iterator for BatchIterator<'a> {
     allow(dead_code)
 )]
 #[allow(missing_docs)]
+#[derive(Clone)]
 pub enum PrimitiveBatch {
     Shadows(Range<usize>),
     Quads(Range<usize>),
@@ -529,7 +1076,134 @@ impl PrimitiveBatch {
     }
 }
 
-#[derive(Default, Debug, Copy, Clone)]
+#[derive(Default, PartialEq)]
+#[doc(hidden)]
+pub struct BackdropInput {
+    primitives: Vec<BackdropPrimitive>,
+    effects: Vec<BackdropBlur>,
+}
+
+impl BackdropInput {
+    #[doc(hidden)]
+    pub fn atlas_tiles(&self) -> impl Iterator<Item = AtlasTile> + '_ {
+        self.primitives
+            .iter()
+            .filter_map(|primitive| match primitive {
+                BackdropPrimitive::MonochromeSprite(item) => Some(item.tile),
+                BackdropPrimitive::SubpixelSprite(item) => Some(item.tile),
+                BackdropPrimitive::PolychromeSprite(item) => Some(item.tile),
+                _ => None,
+            })
+    }
+}
+
+#[derive(PartialEq)]
+enum BackdropPrimitive {
+    Shadow(Shadow),
+    Quad(Quad),
+    Path(Path<ScaledPixels>),
+    Underline(Underline),
+    MonochromeSprite(MonochromeSprite),
+    SubpixelSprite(SubpixelSprite),
+    PolychromeSprite(PolychromeSprite),
+}
+
+/// A rounded backdrop filter at a particular point in the scene's paint order.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BackdropBlur {
+    /// Draw order assigned by the scene.
+    pub order: DrawOrder,
+    /// Rounded destination rectangle in device pixels.
+    pub bounds: Bounds<ScaledPixels>,
+    /// Clip applied at the paint call.
+    pub content_mask: ContentMask<ScaledPixels>,
+    /// Corner radii of the uncut rectangle.
+    pub corner_radii: Corners<ScaledPixels>,
+    /// Gaussian standard deviation in device pixels.
+    pub radius: ScaledPixels,
+    /// Saturation multiplier for the filtered pixels.
+    pub saturation: f32,
+    /// Amount of filtered backdrop to mix with the original.
+    pub opacity: f32,
+}
+
+impl BackdropBlur {
+    /// Downsample broad filters while keeping the working Gaussian between
+    /// three and eight pixels wide. Narrow filters retain full resolution.
+    #[doc(hidden)]
+    pub fn kernel(self) -> BackdropKernel {
+        let sigma = self.radius.0.clamp(0.25, 64.);
+        let scale = self.kernel_scale();
+        let scale_f = scale as f32;
+        let variance = (scale_f * scale_f - 1.) / 12.;
+        let sigma = ((sigma * sigma - variance).sqrt() / scale_f).max(0.25);
+        let pairs = (sigma * 1.5).ceil() as usize;
+        let mut taps = [[0.; 4]; 16];
+        let gaussian = |x: f32| (-0.5 * (x / sigma).powi(2)).exp();
+        let mut total = 1.;
+        for (i, tap) in taps.iter_mut().take(pairs).enumerate() {
+            let first = (2 * i + 1) as f32;
+            let a = gaussian(first);
+            let b = gaussian(first + 1.);
+            let weight = a + b;
+            if weight > 0. {
+                *tap = [first + b / weight, weight, 0., 0.];
+            }
+            total += 2. * weight;
+        }
+        for tap in &mut taps[..pairs] {
+            tap[1] /= total;
+        }
+        BackdropKernel {
+            scale,
+            pairs: pairs as u32,
+            center: 1. / total,
+            taps,
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn kernel_scale(self) -> u32 {
+        let sigma = self.radius.0;
+        if sigma >= 32. {
+            8
+        } else if sigma >= 16. {
+            4
+        } else if sigma >= 8. {
+            2
+        } else {
+            1
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn sampling_margin(self) -> u32 {
+        (3. * self.radius.0.clamp(0.25, 64.)).ceil() as u32 + 24
+    }
+}
+
+#[doc(hidden)]
+pub struct BackdropKernel {
+    pub scale: u32,
+    pub pairs: u32,
+    pub center: f32,
+    pub taps: [[f32; 4]; 16],
+}
+
+/// A run of draw commands, or a backdrop filter sampling the preceding runs.
+#[derive(Clone)]
+pub enum SceneBatch {
+    /// A batch of regular primitives.
+    Draw(PrimitiveBatch),
+    /// A single read of the preceding scene color.
+    Backdrop(BackdropBlur),
+    /// Capture the composed color before a partial update region.
+    Capture,
+    /// 正文滚动区域结束，接下来绘制窗口浮层。
+    Overlay,
+}
+
+#[derive(Default, Debug, Copy, Clone, PartialEq)]
 #[repr(C)]
 #[expect(missing_docs)]
 pub struct Quad {
@@ -549,7 +1223,7 @@ impl From<Quad> for Primitive {
     }
 }
 
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Copy, Clone, PartialEq)]
 #[repr(C)]
 #[expect(missing_docs)]
 pub struct Underline {
@@ -568,7 +1242,7 @@ impl From<Underline> for Primitive {
     }
 }
 
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Copy, Clone, PartialEq)]
 #[repr(C)]
 #[expect(missing_docs)]
 pub struct Shadow {
@@ -582,7 +1256,8 @@ pub struct Shadow {
     pub element_corner_radii: Corners<ScaledPixels>,
     /// 0 = drop shadow (rendered outside the element), 1 = inset shadow (rendered inside).
     pub inset: u32,
-    pub pad: u32, // align to 8 bytes
+    /// Clip the drop shadow to the exterior of its element.
+    pub clip_interior: u32,
 }
 
 impl From<Shadow> for Primitive {
@@ -705,7 +1380,7 @@ impl Default for TransformationMatrix {
     }
 }
 
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, PartialEq)]
 #[repr(C)]
 #[expect(missing_docs)]
 pub struct MonochromeSprite {
@@ -724,7 +1399,7 @@ impl From<MonochromeSprite> for Primitive {
     }
 }
 
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, PartialEq)]
 #[repr(C)]
 #[expect(missing_docs)]
 pub struct SubpixelSprite {
@@ -743,12 +1418,12 @@ impl From<SubpixelSprite> for Primitive {
     }
 }
 
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, PartialEq)]
 #[repr(C)]
 #[expect(missing_docs)]
 pub struct PolychromeSprite {
     pub order: DrawOrder,
-    pub pad: u32,
+    pub nearest_neighbor: u32,
     pub tile: AtlasTile,
     pub grayscale: PaddedBool32,
     pub opacity: f32,
@@ -784,7 +1459,7 @@ impl From<PaintSurface> for Primitive {
 pub struct PathId(pub usize);
 
 /// A line made up of a series of vertices and control points.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 #[expect(missing_docs)]
 pub struct Path<P: Clone + Debug + Default + PartialEq> {
     pub id: PathId,
@@ -922,13 +1597,37 @@ where
     }
 }
 
+/// Pixel-aligned bounds of a path batch inside a render target.
+#[doc(hidden)]
+pub fn path_raster_bounds(
+    paths: &[Path<ScaledPixels>],
+    target: Size<ScaledPixels>,
+) -> Option<Bounds<ScaledPixels>> {
+    let bounds = paths
+        .iter()
+        .filter(|path| !path.vertices.is_empty())
+        .map(Path::clipped_bounds)
+        .filter(|bounds| !bounds.is_empty())
+        .reduce(|left, right| left.union(&right))?;
+    let left = bounds.left().0.floor().max(0.);
+    let top = bounds.top().0.floor().max(0.);
+    let right = bounds.right().0.ceil().min(target.width.0);
+    let bottom = bounds.bottom().0.ceil().min(target.height.0);
+    (right > left && bottom > top).then(|| {
+        Bounds::new(
+            point(ScaledPixels(left), ScaledPixels(top)),
+            crate::size(ScaledPixels(right - left), ScaledPixels(bottom - top)),
+        )
+    })
+}
+
 impl From<Path<ScaledPixels>> for Primitive {
     fn from(path: Path<ScaledPixels>) -> Self {
         Primitive::Path(path)
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 #[repr(C)]
 #[expect(missing_docs)]
 pub struct PathVertex<P: Clone + Debug + Default + PartialEq> {

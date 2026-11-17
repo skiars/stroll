@@ -16,8 +16,9 @@ pub(super) struct LastLayout {
     pub(super) visible_buffer_lines: Vec<usize>,
     pub(super) visible_line_byte_offsets: Vec<usize>,
     pub(super) visible_top: Pixels,
+    pub(super) visible_line_tops: Vec<Pixels>,
     pub(super) visible_range_offset: Range<usize>,
-    pub(super) lines: Rc<Vec<LineLayout>>,
+    pub(super) lines: Rc<Vec<Rc<LineLayout>>>,
     pub(super) line_height: Pixels,
     pub(super) wrap_width: Option<Pixels>,
     pub(super) wrapping_indent: WrappingIndent,
@@ -33,9 +34,13 @@ pub(super) struct LastLayout {
 }
 
 impl LastLayout {
+    pub(crate) fn line_top(&self, visible_index: usize) -> Pixels {
+        self.visible_line_tops[visible_index]
+    }
+
     pub(crate) fn line(&self, row: usize) -> Option<&LineLayout> {
         let pos = self.visible_buffer_lines.binary_search(&row).ok()?;
-        self.lines.get(pos)
+        self.lines.get(pos).map(Rc::as_ref)
     }
 
     pub(super) fn alignment_offset(&self, line_width: Pixels) -> Pixels {

@@ -1,11 +1,15 @@
 // Modified for gpui-pre (snapshot of zed@d2a4fb6): adapt device queues and sRGB detection to wgpu 30.0.1.
+use crate::partial_repaint::{RetainedFrame, RetainedFrameKey};
+use crate::scroll_repaint::device_rect;
 use crate::{CompositorGpuHint, DeviceErrorState, WgpuAtlas, WgpuContext};
 use anyhow::{Context as _, Result};
 use bytemuck::{Pod, Zeroable};
 use collections::FxHashMap;
 use gpui::{
-    AtlasTextureId, Background, Bounds, DevicePixels, GpuSpecs, Path, Point, PrimitiveBatch,
-    ScaledPixels, Scene, Size, get_gamma_correction_ratios,
+    AtlasTextureId, Background, Bounds, DevicePixels, DrawOrder, GpuSpecs, MonochromeSprite, Path,
+    Point, PolychromeSprite, PrimitiveBatch, Quad, ScaledPixels, Scene, SceneBatch, Shadow, Size,
+    SubpixelSprite, TransformationMatrix, Underline, get_gamma_correction_ratios,
+    path_raster_bounds,
 };
 use log::warn;
 #[cfg(not(target_family = "wasm"))]
@@ -57,7 +61,7 @@ fn least_common_multiple(left: u64, right: u64) -> u64 {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy, Pod, Zeroable)]
+#[derive(Clone, Copy, PartialEq, Pod, Zeroable)]
 struct GlobalParams {
     viewport_size: [f32; 2],
     premultiplied_alpha: u32,
@@ -88,7 +92,7 @@ struct SurfaceParams {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy, Pod, Zeroable)]
+#[derive(Clone, Copy, PartialEq, Pod, Zeroable)]
 struct GammaParams {
     gamma_ratios: [f32; 4],
     grayscale_enhanced_contrast: f32,
@@ -101,6 +105,7 @@ struct GammaParams {
 #[repr(C)]
 struct PathSprite {
     bounds: Bounds<ScaledPixels>,
+    raster_origin: Point<ScaledPixels>,
 }
 
 #[derive(Clone, Debug)]
@@ -110,6 +115,7 @@ struct PathRasterizationVertex {
     st_position: Point<f32>,
     color: Background,
     bounds: Bounds<ScaledPixels>,
+    raster: Bounds<ScaledPixels>,
 }
 
 pub struct WgpuSurfaceConfig {
@@ -146,6 +152,14 @@ struct InstanceBinding {
     /// shared instance texture absolutely, so draws must offset their
     /// instance (or vertex) ranges by this value.
     first_instance: u32,
+    scene_start: u32,
+}
+
+impl InstanceBinding {
+    fn range(&self, range: Range<u32>) -> Range<u32> {
+        self.first_instance + (range.start - self.scene_start)
+            ..self.first_instance + (range.end - self.scene_start)
+    }
 }
 
 struct InstanceBindings {
@@ -155,6 +169,143 @@ struct InstanceBindings {
     monochrome_sprites: InstanceBinding,
     subpixel_sprites: InstanceBinding,
     polychrome_sprites: InstanceBinding,
+}
+
+#[derive(Default)]
+struct OverlayInstances {
+    quads: CachedInstances<Quad>,
+    shadows: CachedInstances<Shadow>,
+    underlines: CachedInstances<Underline>,
+    monochrome_sprites: CachedInstances<MonochromeSprite>,
+    subpixel_sprites: CachedInstances<SubpixelSprite>,
+    polychrome_sprites: CachedInstances<PolychromeSprite>,
+}
+
+struct CachedInstances<T> {
+    paints: Vec<T>,
+    buffer: Option<wgpu::Buffer>,
+    binding: Option<InstanceBinding>,
+}
+
+impl<T> Default for CachedInstances<T> {
+    fn default() -> Self {
+        Self {
+            paints: Vec::new(),
+            buffer: None,
+            binding: None,
+        }
+    }
+}
+
+impl<T: Copy> CachedInstances<T> {
+    fn update(
+        &mut self,
+        resources: &WgpuResources,
+        label: &str,
+        paints: &[T],
+        scene_start: usize,
+        same_paint: impl Fn(&T, &T) -> bool,
+    ) -> Result<InstanceBinding> {
+        let unchanged = paints.len() == self.paints.len()
+            && paints
+                .iter()
+                .zip(&self.paints)
+                .all(|(a, b)| same_paint(a, b));
+        let data = unsafe { WgpuRendererCore::instance_bytes(paints) };
+        let size = (data.len() as u64).max(16);
+        let limits = resources.device.limits();
+        let max_size = limits
+            .max_buffer_size
+            .min(limits.max_storage_buffer_binding_size);
+        anyhow::ensure!(
+            size <= max_size,
+            "{label} needs {size} bytes, above the maximum of {max_size}"
+        );
+        if self
+            .buffer
+            .as_ref()
+            .is_none_or(|buffer| buffer.size() < size)
+        {
+            self.buffer = Some(resources.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(label),
+                size: size.next_power_of_two().min(max_size),
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }));
+            self.binding = None;
+        }
+        let buffer = self.buffer.as_ref().unwrap();
+        if !unchanged && !data.is_empty() {
+            resources.queue.write_buffer(buffer, 0, data);
+        }
+        if paints.len() != self.paints.len() {
+            self.binding = None;
+        }
+        if !unchanged {
+            self.paints.clear();
+            self.paints.extend_from_slice(paints);
+        }
+        let binding = self.binding.get_or_insert_with(|| InstanceBinding {
+            bind_group: resources
+                .device
+                .create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some(label),
+                    layout: &resources.bind_group_layouts.instances,
+                    entries: &[wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                            buffer,
+                            offset: 0,
+                            size: NonZeroU64::new(size),
+                        }),
+                    }],
+                }),
+            first_instance: 0,
+            scene_start: 0,
+        });
+        Ok(InstanceBinding {
+            bind_group: binding.bind_group.clone(),
+            first_instance: 0,
+            scene_start: scene_start as u32,
+        })
+    }
+}
+
+impl OverlayInstances {
+    fn update(
+        &mut self,
+        resources: &WgpuResources,
+        scene: &Scene,
+        order: DrawOrder,
+    ) -> Result<InstanceBindings> {
+        // 图元顺序由绘制批次决定。正文重排产生的新顺序编号无需重新上传浮层。
+        macro_rules! cached {
+            ($field:ident, $ty:ident) => {{
+                let start = scene.$field.partition_point(|item| item.order < order);
+                self.$field.update(
+                    resources,
+                    concat!("overlay ", stringify!($field)),
+                    &scene.$field[start..],
+                    start,
+                    |current, previous| {
+                        *current
+                            == $ty {
+                                order: current.order,
+                                ..*previous
+                            }
+                    },
+                )?
+            }};
+        }
+        Ok(InstanceBindings {
+            quads: cached!(quads, Quad),
+            shadows: cached!(shadows, Shadow),
+            underlines: cached!(underlines, Underline),
+            monochrome_sprites: cached!(monochrome_sprites, MonochromeSprite),
+            subpixel_sprites: cached!(subpixel_sprites, SubpixelSprite),
+            polychrome_sprites: cached!(polychrome_sprites, PolychromeSprite),
+        })
+    }
 }
 
 struct WgpuBindGroupLayouts {
@@ -188,13 +339,32 @@ struct WgpuResources {
     atlas_sampler: wgpu::Sampler,
     atlas_texture_bind_groups: FxHashMap<AtlasTextureId, CachedTextureBindGroup>,
     globals_buffer: wgpu::Buffer,
+    global_params: Option<GlobalParams>,
+    gamma_params: Option<GammaParams>,
     globals_bind_group: wgpu::BindGroup,
     path_globals_bind_group: wgpu::BindGroup,
     instance_data: InstanceData,
-    path_intermediate_texture: Option<wgpu::Texture>,
-    path_intermediate_view: Option<wgpu::TextureView>,
-    path_msaa_texture: Option<wgpu::Texture>,
-    path_msaa_view: Option<wgpu::TextureView>,
+    overlay_instances: OverlayInstances,
+    path_scratch: Vec<PathScratch>,
+    frame_timing: Option<crate::frame_timing::FrameTiming>,
+    backdrop: Option<crate::backdrop::BackdropRenderer>,
+    backdrop_target: Option<crate::backdrop::BackdropTarget>,
+    overlay_target: Option<crate::backdrop::BackdropTarget>,
+    retained: Option<RetainedFrame>,
+    retained_key: RetainedFrameKey,
+    retained_revision: u64,
+    base_batches: Option<Vec<SceneBatch>>,
+    repaint_bounds: Vec<Option<Bounds<ScaledPixels>>>,
+    overlay_batches: Option<Vec<SceneBatch>>,
+    partial_repaint: bool,
+}
+
+struct PathScratch {
+    width: u32,
+    height: u32,
+    view: wgpu::TextureView,
+    msaa: Option<wgpu::TextureView>,
+    binding: wgpu::BindGroup,
 }
 
 struct CachedTextureBindGroup {
@@ -204,10 +374,11 @@ struct CachedTextureBindGroup {
 
 impl WgpuResources {
     fn invalidate_intermediate_textures(&mut self) {
-        self.path_intermediate_texture = None;
-        self.path_intermediate_view = None;
-        self.path_msaa_texture = None;
-        self.path_msaa_view = None;
+        self.path_scratch.clear();
+        self.backdrop = None;
+        self.backdrop_target = None;
+        self.overlay_target = None;
+        self.retained = None;
     }
 }
 
@@ -462,7 +633,9 @@ impl WgpuRenderer {
         }
 
         let surface_config = wgpu::SurfaceConfiguration {
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                | (surface_caps.usages
+                    & (wgpu::TextureUsages::COPY_SRC | wgpu::TextureUsages::COPY_DST)),
             format: surface_format,
             color_space: wgpu::SurfaceColorSpace::Auto,
             width: clamped_width.max(1),
@@ -518,6 +691,79 @@ impl WgpuRenderer {
             needs_redraw: false,
         })
     }
+}
+
+// 保守估计批次覆盖范围。变换过的字形可能超出原始矩形。
+fn batch_bounds(scene: &Scene, batch: &PrimitiveBatch) -> Option<Bounds<ScaledPixels>> {
+    macro_rules! clipped {
+        ($field:ident, $range:ident, $bounds:expr) => {
+            scene.$field[$range.clone()]
+                .iter()
+                .map($bounds)
+                .filter(|bounds| !bounds.is_empty())
+                .reduce(|a, b| a.union(&b))
+        };
+    }
+    macro_rules! sprites {
+        ($field:ident, $range:ident, $type:ty) => {
+            clipped!($field, $range, |item: &$type| {
+                if item.transformation == TransformationMatrix::unit() {
+                    item.bounds.intersect(&item.content_mask.bounds)
+                } else {
+                    item.content_mask.bounds
+                }
+            })
+        };
+    }
+    match batch {
+        PrimitiveBatch::Quads(range) => clipped!(quads, range, |item: &Quad| item
+            .bounds
+            .intersect(&item.content_mask.bounds)),
+        PrimitiveBatch::Shadows(range) => clipped!(shadows, range, |item: &Shadow| {
+            if item.inset != 0 {
+                item.element_bounds.intersect(&item.content_mask.bounds)
+            } else {
+                item.bounds
+                    .dilate(item.blur_radius * 3.)
+                    .intersect(&item.content_mask.bounds)
+            }
+        }),
+        PrimitiveBatch::Paths(range) => clipped!(paths, range, Path::clipped_bounds),
+        PrimitiveBatch::Underlines(range) => clipped!(underlines, range, |item: &Underline| item
+            .bounds
+            .intersect(&item.content_mask.bounds)),
+        PrimitiveBatch::MonochromeSprites { range, .. } => {
+            sprites!(monochrome_sprites, range, MonochromeSprite)
+        }
+        PrimitiveBatch::SubpixelSprites { range, .. } => {
+            sprites!(subpixel_sprites, range, SubpixelSprite)
+        }
+        PrimitiveBatch::PolychromeSprites { range, .. } => {
+            clipped!(polychrome_sprites, range, |item: &PolychromeSprite| item
+                .bounds
+                .intersect(&item.content_mask.bounds))
+        }
+        PrimitiveBatch::Surfaces(_) => None,
+    }
+}
+
+fn resume_scene<'a>(
+    encoder: &'a mut wgpu::CommandEncoder,
+    view: &wgpu::TextureView,
+) -> wgpu::RenderPass<'a> {
+    encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+        label: Some("main_pass_continued"),
+        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+            view,
+            resolve_target: None,
+            depth_slice: None,
+            ops: wgpu::Operations {
+                load: wgpu::LoadOp::Load,
+                store: wgpu::StoreOp::Store,
+            },
+        })],
+        ..Default::default()
+    })
 }
 
 impl WgpuRendererCore {
@@ -829,7 +1075,7 @@ impl WgpuRendererCore {
             &layouts.globals,
             &layouts.instances,
             None,
-            wgpu::PrimitiveTopology::TriangleStrip,
+            wgpu::PrimitiveTopology::TriangleList,
             &[Some(color_target.clone())],
             1,
             &shader_module,
@@ -1055,14 +1301,6 @@ impl WgpuRenderer {
             timeout: None,
         }) {
             warn!("Failed to poll device during resize: {e:?}");
-        }
-
-        // Destroy old textures before allocating new ones to avoid GPU memory spikes
-        if let Some(ref texture) = resources.path_intermediate_texture {
-            texture.destroy();
-        }
-        if let Some(ref texture) = resources.path_msaa_texture {
-            texture.destroy();
         }
 
         // Invalidate intermediate textures - they will be lazily recreated
@@ -1362,6 +1600,7 @@ impl WgpuRendererCore {
         });
         let max_texture_size = device.limits().max_texture_dimension_2d;
 
+        let frame_timing = crate::frame_timing::FrameTiming::new(&device, &queue);
         Self {
             resources: WgpuResources {
                 device,
@@ -1371,13 +1610,25 @@ impl WgpuRendererCore {
                 atlas_sampler,
                 atlas_texture_bind_groups: FxHashMap::default(),
                 globals_buffer,
+                global_params: None,
+                gamma_params: None,
                 globals_bind_group,
                 path_globals_bind_group,
                 instance_data,
-                path_intermediate_texture: None,
-                path_intermediate_view: None,
-                path_msaa_texture: None,
-                path_msaa_view: None,
+                overlay_instances: OverlayInstances::default(),
+                path_scratch: Vec::new(),
+                frame_timing,
+                backdrop: None,
+                backdrop_target: None,
+                overlay_target: None,
+                retained: None,
+                retained_key: RetainedFrameKey::default(),
+                retained_revision: 0,
+                base_batches: None,
+                repaint_bounds: Vec::new(),
+                overlay_batches: None,
+                partial_repaint: !cfg!(target_family = "wasm")
+                    && !std::env::var_os("STROLL_PARTIAL_REPAINT").is_some_and(|v| v == "0"),
             },
             atlas,
             path_globals_offset,
@@ -1403,40 +1654,61 @@ impl WgpuRendererCore {
         &mut self.resources
     }
 
-    /// Path rendering goes through an intermediate texture that must match the frame
-    /// target's dimensions, so the textures are keyed by size and rebuilt on mismatch.
-    fn ensure_intermediate_textures(&mut self, size: Size<DevicePixels>) {
-        let width = size.width.0 as u32;
-        let height = size.height.0 as u32;
-        if self
+    /// Keep a small LRU of rounded scratch sizes for differently sized path batches.
+    fn prepare_path_scratch(&mut self, size: Size<ScaledPixels>) {
+        let width = (size.width.0 as u32)
+            .next_multiple_of(64)
+            .min(self.max_texture_size);
+        let height = (size.height.0 as u32)
+            .next_multiple_of(64)
+            .min(self.max_texture_size);
+        if let Some(index) = self
             .resources
-            .path_intermediate_texture
-            .as_ref()
-            .is_some_and(|texture| texture.width() == width && texture.height() == height)
+            .path_scratch
+            .iter()
+            .position(|scratch| scratch.width == width && scratch.height == height)
         {
+            let scratch = self.resources.path_scratch.remove(index);
+            self.resources.path_scratch.push(scratch);
             return;
         }
 
+        let device = &self.resources.device;
         let format = self.target_format;
-        let path_sample_count = self.rendering_params.path_sample_count;
-        let resources = &mut self.resources;
-
-        let (texture, view) =
-            Self::create_path_intermediate(&resources.device, format, width, height);
-        resources.path_intermediate_texture = Some(texture);
-        resources.path_intermediate_view = Some(view);
-
-        let (path_msaa_texture, path_msaa_view) = Self::create_msaa_if_needed(
-            &resources.device,
+        let (_, view) = Self::create_path_intermediate(device, format, width, height);
+        let msaa = Self::create_msaa_if_needed(
+            device,
             format,
             width,
             height,
-            path_sample_count,
+            self.rendering_params.path_sample_count,
         )
-        .map(|(texture, view)| (Some(texture), Some(view)))
-        .unwrap_or((None, None));
-        resources.path_msaa_texture = path_msaa_texture;
-        resources.path_msaa_view = path_msaa_view;
+        .map(|(_, view)| view);
+        let binding = self.create_texture_bind_group("path_intermediate_texture_bind_group", &view);
+        let cache = &mut self.resources.path_scratch;
+        // A full-window vector batch can exceed the budget by itself.
+        // Retain it alone instead of accumulating several large MSAA textures.
+        let bytes_per_pixel = 4 * u64::from(1 + self.rendering_params.path_sample_count);
+        let pixels = |width, height| u64::from(width) * u64::from(height);
+        while !cache.is_empty()
+            && (cache.len() >= 4
+                || bytes_per_pixel
+                    * (pixels(width, height)
+                        + cache
+                            .iter()
+                            .map(|entry| pixels(entry.width, entry.height))
+                            .sum::<u64>())
+                    > 64 * 1024 * 1024)
+        {
+            cache.remove(0);
+        }
+        cache.push(PathScratch {
+            width,
+            height,
+            view,
+            msaa,
+            binding,
+        });
     }
 
     fn render_frame(
@@ -1459,7 +1731,6 @@ impl WgpuRendererCore {
         );
 
         self.atlas.before_frame();
-        self.ensure_intermediate_textures(size);
 
         let gamma_params = GammaParams {
             gamma_ratios: self.rendering_params.gamma_ratios,
@@ -1473,27 +1744,33 @@ impl WgpuRendererCore {
             premultiplied_alpha: premultiplied_alpha as u32,
             pad: 0,
         };
-        let path_globals = GlobalParams {
-            premultiplied_alpha: 0,
-            ..globals
-        };
-        self.resources.queue.write_buffer(
-            &self.resources.globals_buffer,
-            0,
-            bytemuck::bytes_of(&globals),
-        );
-        self.resources.queue.write_buffer(
-            &self.resources.globals_buffer,
-            self.path_globals_offset,
-            bytemuck::bytes_of(&path_globals),
-        );
-        self.resources.queue.write_buffer(
-            &self.resources.globals_buffer,
-            self.gamma_offset,
-            bytemuck::bytes_of(&gamma_params),
-        );
+        if self.resources.global_params != Some(globals) {
+            let path_globals = GlobalParams {
+                premultiplied_alpha: 0,
+                ..globals
+            };
+            self.resources.queue.write_buffer(
+                &self.resources.globals_buffer,
+                0,
+                bytemuck::bytes_of(&globals),
+            );
+            self.resources.queue.write_buffer(
+                &self.resources.globals_buffer,
+                self.path_globals_offset,
+                bytemuck::bytes_of(&path_globals),
+            );
+            self.resources.global_params = Some(globals);
+        }
+        if self.resources.gamma_params != Some(gamma_params) {
+            self.resources.queue.write_buffer(
+                &self.resources.globals_buffer,
+                self.gamma_offset,
+                bytemuck::bytes_of(&gamma_params),
+            );
+            self.resources.gamma_params = Some(gamma_params);
+        }
 
-        self.record_frame(scene, target_view, clear_color)
+        self.record_frame(scene, target_view, clear_color, premultiplied_alpha)
             .inspect_err(|_| {
                 // Queue writes are staged before encoding; flush them even if the frame fails.
                 self.resources.queue.submit(std::iter::empty());
@@ -1505,24 +1782,115 @@ impl WgpuRendererCore {
         scene: &Scene,
         frame_view: &wgpu::TextureView,
         clear_color: wgpu::Color,
+        premultiplied_alpha: bool,
     ) -> Result<wgpu::SubmissionIndex> {
         let mut instance_offset = 0;
-        let instance_bindings = self
-            .write_instances(scene, &mut instance_offset)
-            .with_context(|| {
-                format!(
-                    "scene too large: {} paths, {} shadows, {} quads, {} underlines, {} monochrome sprites, {} subpixel sprites, {} polychrome sprites",
-                    scene.paths.len(),
-                    scene.shadows.len(),
-                    scene.quads.len(),
-                    scene.underlines.len(),
-                    scene.monochrome_sprites.len(),
-                    scene.subpixel_sprites.len(),
-                    scene.polychrome_sprites.len(),
-                )
-            })?;
-        self.prepare_texture_bind_groups(scene);
+        let surface = frame_view;
+        let can_blur = !scene.backdrop_blurs.is_empty();
+        let mut key = std::mem::take(&mut self.resources.retained_key);
+        let region = self
+            .resources
+            .partial_repaint
+            .then(|| scene.partial_frame(&mut key.scene))
+            .flatten()
+            .and_then(|(bounds, order, overlay)| {
+                Some((
+                    RetainedFrame::rect(bounds, surface.texture())?,
+                    order,
+                    overlay,
+                ))
+            });
+        let overlay = region.and_then(|(_, _, overlay)| overlay);
+        let needs_composite = overlay.is_some()
+            && !surface
+                .texture()
+                .usage()
+                .contains(wgpu::TextureUsages::COPY_SRC);
+        let needs_target = region.is_some()
+            || (can_blur
+                && !surface
+                    .texture()
+                    .usage()
+                    .contains(wgpu::TextureUsages::COPY_SRC));
+        let mut target = self.resources.backdrop_target.take();
+        if needs_target
+            && target
+                .as_ref()
+                .is_none_or(|target| !target.matches(surface))
+        {
+            target = Some(crate::backdrop::BackdropTarget::new(
+                &self.resources.device,
+                surface,
+            ));
+        }
+        let frame_view = target
+            .as_ref()
+            .filter(|_| needs_target)
+            .map_or(surface, |target| &target.view);
+        let mut composite = self.resources.overlay_target.take();
+        if needs_composite
+            && composite
+                .as_ref()
+                .is_none_or(|target| !target.matches(surface))
+        {
+            composite = Some(crate::backdrop::BackdropTarget::new(
+                &self.resources.device,
+                surface,
+            ));
+        }
+        let mut retained = self.resources.retained.take();
+        let mut reuse = false;
+        if let Some((rect, _, _)) = region {
+            self.atlas
+                .tile_generations(key.scene.atlas_tiles(), &mut key.tiles);
+            key.clear = clear_color;
+            key.premultiplied_alpha = premultiplied_alpha;
+            key.is_bgr = self.is_bgr;
+            match &retained {
+                Some(frame) if frame.matches(frame_view.texture(), rect) => {
+                    reuse = frame.reuse(&key)
+                }
+                _ => {
+                    retained = Some(RetainedFrame::new(
+                        &self.resources.device,
+                        frame_view.texture(),
+                        rect,
+                    ))
+                }
+            }
+        } else {
+            retained = None;
+        }
+        let is_scroll = region.is_some() && key.scene.scroll_offset().is_some();
+        let scroll_update = if reuse && is_scroll {
+            retained
+                .as_mut()
+                .unwrap()
+                .update_scroll(&mut key, &self.atlas)
+        } else {
+            None
+        };
+        if let Some(([_x, _y, width, height], _, _)) = region
+            && self.resources.frame_timing.is_some()
+        {
+            let shifted = scroll_update
+                .as_ref()
+                .map_or(0, |(_, _, _, pixels)| *pixels);
+            eprintln!(
+                "frame_timing_partial reuse={reuse} width={width} height={height} shifted_pixels={shifted}"
+            );
+        }
+        let mut backdrop = self.resources.backdrop.take();
+        if can_blur && backdrop.is_none() {
+            backdrop = Some(crate::backdrop::BackdropRenderer::new(
+                &self.resources.device,
+                self.target_format,
+            ));
+        }
 
+        if let Some(backdrop) = backdrop.as_mut() {
+            backdrop.begin_frame();
+        }
         let mut encoder =
             self.resources()
                 .device
@@ -1530,77 +1898,273 @@ impl WgpuRendererCore {
                     label: Some("main_encoder"),
                 });
 
-        {
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("main_pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: frame_view,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(clear_color),
-                        store: wgpu::StoreOp::Store,
-                    },
-                    depth_slice: None,
-                })],
-                depth_stencil_attachment: None,
-                ..Default::default()
-            });
+        let timing_sample = self
+            .resources
+            .frame_timing
+            .as_mut()
+            .and_then(|timing| timing.begin(&mut encoder));
 
-            for batch in scene.batches() {
+        let mut backdrop_timing = timing_sample
+            .and(self.resources.frame_timing.as_ref())
+            .and_then(|timing| timing.backdrop());
+        let mut sampled_backdrop = false;
+        let mut scissors = Vec::new();
+        if let Some((dy, damage, copy, _)) = scroll_update {
+            if let Some(copy) = copy {
+                retained
+                    .as_mut()
+                    .unwrap()
+                    .shift(&self.resources.device, &mut encoder, dy, copy);
+            }
+            scissors.extend(damage.into_iter().map(Some));
+        } else if reuse {
+            let rect = region.map(|(rect, _, _)| rect);
+            // Opaque scroll regions paint their base as the first primitive.
+            // Transparent regions restore the captured backdrop before replay.
+            if !retained.as_ref().unwrap().has_opaque_scroll() {
+                retained.as_ref().unwrap().restore(&mut encoder);
+            }
+            scissors.push(rect);
+        } else {
+            scissors.push(None);
+        }
+        let split = overlay.filter(|_| !self.uses_webgl_instance_data);
+        let instances = if scissors.is_empty() && split.is_some() {
+            None
+        } else {
+            Some(self.write_instances(scene, &mut instance_offset, split)?)
+        };
+        let overlay_instances = split
+            .map(|order| {
+                let mut cache = std::mem::take(&mut self.resources.overlay_instances);
+                let result = cache.update(&self.resources, scene, order);
+                self.resources.overlay_instances = cache;
+                result
+            })
+            .transpose()?;
+        let mut base_batches = self.resources.base_batches.take().unwrap_or_default();
+        let mut overlay_batches = self.resources.overlay_batches.take().unwrap_or_default();
+        base_batches.clear();
+        overlay_batches.clear();
+        let mut batches = scene.batches_with_capture(region.map(|(_, order, _)| order), overlay);
+        if !scissors.is_empty() {
+            base_batches
+                .extend((&mut batches).take_while(|batch| !matches!(batch, SceneBatch::Overlay)));
+        } else if overlay.is_some() {
+            let _ = (&mut batches).find(|batch| matches!(batch, SceneBatch::Overlay));
+        }
+        if overlay.is_some() {
+            overlay_batches.extend(batches);
+        }
+        self.prepare_texture_bind_groups(base_batches.iter().chain(&overlay_batches));
+        let mut repaint_bounds = std::mem::take(&mut self.resources.repaint_bounds);
+        repaint_bounds.clear();
+        if reuse && scissors.iter().any(Option::is_some) {
+            let mut after_capture = false;
+            repaint_bounds.extend(base_batches.iter().map(|batch| match batch {
+                SceneBatch::Capture => {
+                    after_capture = true;
+                    None
+                }
+                SceneBatch::Draw(batch) if after_capture => batch_bounds(scene, batch),
+                _ => None,
+            }));
+        }
+        let direct_blur = matches!(
+            overlay_batches.first(),
+            Some(SceneBatch::Backdrop(blur)) if blur.kernel_scale() > 1
+        );
+        if self.resources.frame_timing.is_some() && overlay.is_some() {
+            eprintln!(
+                "frame_timing_backdrop direct={direct_blur} base_passes={}",
+                scissors.len()
+            );
+        }
+        if !scissors.is_empty() {
+            self.resources.retained_revision = self.resources.retained_revision.wrapping_add(1);
+        }
+        let mut passes = scissors
+            .into_iter()
+            .map(|scissor| (false, scissor))
+            .collect::<SmallVec<[_; 12]>>();
+        if overlay.is_some() {
+            passes.push((true, None));
+        }
+        for (drawing_overlay, scissor) in passes {
+            let frame_view = if drawing_overlay {
+                let destination = composite
+                    .as_ref()
+                    .filter(|_| needs_composite)
+                    .map_or(surface, |target| &target.view);
+                if !direct_blur {
+                    target.as_ref().unwrap().present(&mut encoder, destination);
+                }
+                destination
+            } else {
+                frame_view
+            };
+            let instance_bindings = if drawing_overlay {
+                overlay_instances.as_ref().or(instances.as_ref()).unwrap()
+            } else {
+                instances.as_ref().unwrap()
+            };
+            // 首道模糊直接初始化呈现纹理，先开一个空 pass 会触发多余的清屏。
+            let mut pass = if drawing_overlay && direct_blur {
+                None
+            } else {
+                Some(encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("main_pass"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: frame_view,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: if reuse || drawing_overlay {
+                                wgpu::LoadOp::Load
+                            } else {
+                                wgpu::LoadOp::Clear(clear_color)
+                            },
+                            store: wgpu::StoreOp::Store,
+                        },
+                        depth_slice: None,
+                    })],
+                    depth_stencil_attachment: None,
+                    ..Default::default()
+                }))
+            };
+            if let (Some(pass), Some([x, y, width, height])) = (&mut pass, scissor) {
+                pass.set_scissor_rect(x, y, width, height);
+            }
+
+            let mut before_capture = reuse && !drawing_overlay;
+            let batches = if drawing_overlay {
+                &overlay_batches
+            } else {
+                &base_batches
+            };
+            let mut direct_source = (drawing_overlay && direct_blur).then(|| {
+                (
+                    &target.as_ref().unwrap().view,
+                    self.resources.retained_revision,
+                )
+            });
+            let dirty = scissor.map(device_rect);
+            for (index, batch) in batches.iter().enumerate() {
+                if let Some(dirty) = dirty
+                    && let Some(Some(bounds)) = repaint_bounds.get(index)
+                    && !bounds.dilate(ScaledPixels(1.)).intersects(&dirty)
+                {
+                    continue;
+                }
+                let batch = batch.clone();
+                if matches!(batch, SceneBatch::Capture) {
+                    if !reuse {
+                        drop(pass);
+                        let retained = retained.as_mut().unwrap();
+                        retained.capture(&mut encoder, &mut key);
+                        if is_scroll {
+                            retained.reset_scroll(&self.atlas);
+                        }
+                        pass = Some(resume_scene(&mut encoder, frame_view));
+                    }
+                    before_capture = false;
+                    continue;
+                }
+                if before_capture {
+                    continue;
+                }
+                let batch = match batch {
+                    SceneBatch::Draw(batch) => batch,
+                    SceneBatch::Capture => unreachable!(),
+                    SceneBatch::Overlay => break,
+                    SceneBatch::Backdrop(blur) => {
+                        if let Some(backdrop) = backdrop.as_mut().filter(|_| can_blur) {
+                            drop(pass);
+                            let source = direct_source.take();
+                            let timing = backdrop_timing.take();
+                            sampled_backdrop |= timing.is_some();
+                            let initialized = backdrop.draw(
+                                &self.resources.device,
+                                &mut encoder,
+                                frame_view,
+                                source,
+                                scene,
+                                blur,
+                                &self.atlas,
+                                clear_color,
+                                premultiplied_alpha,
+                                self.is_bgr,
+                                timing,
+                            );
+                            if source.is_some() && !initialized {
+                                target.as_ref().unwrap().present(&mut encoder, frame_view);
+                            }
+                            pass = Some(resume_scene(&mut encoder, frame_view));
+                        }
+                        continue;
+                    }
+                };
                 match batch {
                     PrimitiveBatch::Quads(range) => self.draw_instances(
                         &instance_bindings.quads,
                         &self.resources().pipelines.quads,
+                        4,
                         instance_range(range),
-                        &mut pass,
+                        pass.as_mut().unwrap(),
                     ),
                     PrimitiveBatch::Shadows(range) => self.draw_instances(
                         &instance_bindings.shadows,
                         &self.resources().pipelines.shadows,
+                        24,
                         instance_range(range),
-                        &mut pass,
+                        pass.as_mut().unwrap(),
                     ),
                     PrimitiveBatch::Paths(range) => {
                         let paths = &scene.paths[range];
-                        if paths.is_empty() {
+                        let target_size = gpui::size(
+                            ScaledPixels(frame_view.texture().width() as f32),
+                            ScaledPixels(frame_view.texture().height() as f32),
+                        );
+                        let Some(mut raster) = path_raster_bounds(paths, target_size) else {
                             continue;
+                        };
+                        if let Some([x, y, width, height]) = scissor {
+                            raster = raster.intersect(&Bounds::new(
+                                gpui::point(ScaledPixels(x as f32), ScaledPixels(y as f32)),
+                                gpui::size(ScaledPixels(width as f32), ScaledPixels(height as f32)),
+                            ));
+                            if raster.is_empty() {
+                                continue;
+                            }
                         }
-
                         drop(pass);
+                        self.prepare_path_scratch(raster.size);
                         let rasterized = self.draw_paths_to_intermediate(
                             &mut encoder,
                             paths,
+                            raster,
                             &mut instance_offset,
                         )?;
 
-                        pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                            label: Some("main_pass_continued"),
-                            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                                view: frame_view,
-                                resolve_target: None,
-                                ops: wgpu::Operations {
-                                    load: wgpu::LoadOp::Load,
-                                    store: wgpu::StoreOp::Store,
-                                },
-                                depth_slice: None,
-                            })],
-                            depth_stencil_attachment: None,
-                            ..Default::default()
-                        });
+                        pass = Some(resume_scene(&mut encoder, frame_view));
+                        if let Some([x, y, width, height]) = scissor {
+                            pass.as_mut().unwrap().set_scissor_rect(x, y, width, height);
+                        }
 
                         if rasterized {
                             self.draw_paths_from_intermediate(
                                 paths,
+                                raster.origin,
                                 &mut instance_offset,
-                                &mut pass,
+                                pass.as_mut().unwrap(),
                             )?;
                         }
                     }
                     PrimitiveBatch::Underlines(range) => self.draw_instances(
                         &instance_bindings.underlines,
                         &self.resources().pipelines.underlines,
+                        4,
                         instance_range(range),
-                        &mut pass,
+                        pass.as_mut().unwrap(),
                     ),
                     PrimitiveBatch::MonochromeSprites { texture_id, range } => {
                         self.draw_sprites(
@@ -1608,7 +2172,7 @@ impl WgpuRendererCore {
                             texture_id,
                             &self.resources().pipelines.mono_sprites,
                             instance_range(range),
-                            &mut pass,
+                            pass.as_mut().unwrap(),
                         )?;
                     }
                     PrimitiveBatch::SubpixelSprites { texture_id, range } => {
@@ -1622,7 +2186,7 @@ impl WgpuRendererCore {
                                 .as_ref()
                                 .unwrap_or(&resources.pipelines.mono_sprites),
                             instance_range(range),
-                            &mut pass,
+                            pass.as_mut().unwrap(),
                         )?;
                     }
                     PrimitiveBatch::PolychromeSprites { texture_id, range } => {
@@ -1631,7 +2195,7 @@ impl WgpuRendererCore {
                             texture_id,
                             &self.resources().pipelines.poly_sprites,
                             instance_range(range),
-                            &mut pass,
+                            pass.as_mut().unwrap(),
                         )?;
                     }
                     // Surfaces are macOS-only for video playback and are not
@@ -1641,10 +2205,38 @@ impl WgpuRendererCore {
             }
         }
 
+        if overlay.is_some() {
+            if let Some(composite) = composite.as_ref().filter(|_| needs_composite) {
+                composite.present(&mut encoder, surface);
+            }
+        } else if let Some(target) = target.as_ref().filter(|_| needs_target) {
+            target.present(&mut encoder, surface);
+        }
+        self.resources.base_batches = Some(base_batches);
+        self.resources.repaint_bounds = repaint_bounds;
+        self.resources.overlay_batches = Some(overlay_batches);
+        self.resources.backdrop = backdrop;
+        self.resources.backdrop_target = target;
+        self.resources.overlay_target = composite;
+        self.resources.retained = retained;
+        self.resources.retained_key = key;
+        let timing = self.resources.frame_timing.as_ref().zip(timing_sample);
+        if let Some((timing, index)) = timing {
+            timing.end(&mut encoder, index, sampled_backdrop);
+        }
         let submission = self
             .resources()
             .queue
             .submit(std::iter::once(encoder.finish()));
+        if let Some((timing, index)) = timing {
+            timing.read(
+                index,
+                surface.texture().width(),
+                surface.texture().height(),
+                sampled_backdrop,
+            );
+            let _ = self.resources.device.poll(wgpu::PollType::Poll);
+        }
         Ok(submission)
     }
 
@@ -1652,38 +2244,28 @@ impl WgpuRendererCore {
         &mut self,
         scene: &Scene,
         instance_offset: &mut u64,
+        before: Option<DrawOrder>,
     ) -> Result<InstanceBindings> {
+        macro_rules! write {
+            ($field:ident) => {{
+                let end = before.map_or(scene.$field.len(), |order| {
+                    scene.$field.partition_point(|item| item.order < order)
+                });
+                self.write_instance_binding(
+                    concat!(stringify!($field), "_bind_group"),
+                    instance_offset,
+                    &scene.$field[..end],
+                )
+                .with_context(|| format!("上传 {end} 个 {} 图元失败", stringify!($field)))?
+            }};
+        }
         Ok(InstanceBindings {
-            quads: self.write_instance_binding(
-                "quads_bind_group",
-                instance_offset,
-                &scene.quads,
-            )?,
-            shadows: self.write_instance_binding(
-                "shadows_bind_group",
-                instance_offset,
-                &scene.shadows,
-            )?,
-            underlines: self.write_instance_binding(
-                "underlines_bind_group",
-                instance_offset,
-                &scene.underlines,
-            )?,
-            monochrome_sprites: self.write_instance_binding(
-                "monochrome_sprites_bind_group",
-                instance_offset,
-                &scene.monochrome_sprites,
-            )?,
-            subpixel_sprites: self.write_instance_binding(
-                "subpixel_sprites_bind_group",
-                instance_offset,
-                &scene.subpixel_sprites,
-            )?,
-            polychrome_sprites: self.write_instance_binding(
-                "polychrome_sprites_bind_group",
-                instance_offset,
-                &scene.polychrome_sprites,
-            )?,
+            quads: write!(quads),
+            shadows: write!(shadows),
+            underlines: write!(underlines),
+            monochrome_sprites: write!(monochrome_sprites),
+            subpixel_sprites: write!(subpixel_sprites),
+            polychrome_sprites: write!(polychrome_sprites),
         })
     }
 
@@ -1711,17 +2293,20 @@ impl WgpuRendererCore {
             })
     }
 
-    fn prepare_texture_bind_groups(&mut self, scene: &Scene) {
+    fn prepare_texture_bind_groups<'a>(&mut self, batches: impl Iterator<Item = &'a SceneBatch>) {
         let mut texture_ids = SmallVec::<[AtlasTextureId; 8]>::new();
-        for batch in scene.batches() {
+        for batch in batches {
+            let SceneBatch::Draw(batch) = batch else {
+                continue;
+            };
             let texture_id = match batch {
                 PrimitiveBatch::MonochromeSprites { texture_id, .. }
                 | PrimitiveBatch::SubpixelSprites { texture_id, .. }
                 | PrimitiveBatch::PolychromeSprites { texture_id, .. } => texture_id,
                 _ => continue,
             };
-            if !texture_ids.contains(&texture_id) {
-                texture_ids.push(texture_id);
+            if !texture_ids.contains(texture_id) {
+                texture_ids.push(*texture_id);
             }
         }
 
@@ -1761,6 +2346,7 @@ impl WgpuRendererCore {
         &self,
         instances: &InstanceBinding,
         pipeline: &wgpu::RenderPipeline,
+        vertices: u32,
         range: Range<u32>,
         pass: &mut wgpu::RenderPass<'_>,
     ) {
@@ -1770,10 +2356,7 @@ impl WgpuRendererCore {
         pass.set_pipeline(pipeline);
         pass.set_bind_group(0, &self.resources().globals_bind_group, &[]);
         pass.set_bind_group(1, &instances.bind_group, &[]);
-        pass.draw(
-            0..4,
-            instances.first_instance + range.start..instances.first_instance + range.end,
-        );
+        pass.draw(0..vertices, instances.range(range));
     }
 
     fn draw_sprites(
@@ -1797,11 +2380,7 @@ impl WgpuRendererCore {
         pass.set_bind_group(0, &resources.globals_bind_group, &[]);
         pass.set_bind_group(1, &sprite_instances.bind_group, &[]);
         pass.set_bind_group(2, &texture.bind_group, &[]);
-        pass.draw(
-            0..4,
-            sprite_instances.first_instance + range.start
-                ..sprite_instances.first_instance + range.end,
-        );
+        pass.draw(0..4, sprite_instances.range(range));
         Ok(())
     }
 
@@ -1817,6 +2396,7 @@ impl WgpuRendererCore {
     fn draw_paths_from_intermediate(
         &mut self,
         paths: &[Path<ScaledPixels>],
+        raster_origin: Point<ScaledPixels>,
         instance_offset: &mut u64,
         pass: &mut wgpu::RenderPass<'_>,
     ) -> Result<()> {
@@ -1827,6 +2407,7 @@ impl WgpuRendererCore {
                 .iter()
                 .map(|p| PathSprite {
                     bounds: p.clipped_bounds(),
+                    raster_origin,
                 })
                 .collect()
         } else {
@@ -1834,23 +2415,23 @@ impl WgpuRendererCore {
             for path in paths.iter().skip(1) {
                 bounds = bounds.union(&path.clipped_bounds());
             }
-            vec![PathSprite { bounds }]
+            vec![PathSprite {
+                bounds,
+                raster_origin,
+            }]
         };
 
-        let Some(path_intermediate_view) = self.resources().path_intermediate_view.clone() else {
-            return Ok(());
-        };
         let instances =
             self.write_instance_binding("path_sprites_bind_group", instance_offset, &sprites)?;
-        let texture = self.create_texture_bind_group(
-            "path_intermediate_texture_bind_group",
-            &path_intermediate_view,
-        );
         let resources = self.resources();
+        let scratch = resources
+            .path_scratch
+            .last()
+            .expect("path scratch prepared");
         pass.set_pipeline(&resources.pipelines.paths);
         pass.set_bind_group(0, &resources.globals_bind_group, &[]);
         pass.set_bind_group(1, &instances.bind_group, &[]);
-        pass.set_bind_group(2, &texture, &[]);
+        pass.set_bind_group(2, &scratch.binding, &[]);
         pass.draw(
             0..4,
             instances.first_instance..instances.first_instance + sprites.len() as u32,
@@ -1862,6 +2443,7 @@ impl WgpuRendererCore {
         &mut self,
         encoder: &mut wgpu::CommandEncoder,
         paths: &[Path<ScaledPixels>],
+        raster: Bounds<ScaledPixels>,
         instance_offset: &mut u64,
     ) -> Result<bool> {
         let mut vertices = Vec::new();
@@ -1872,6 +2454,7 @@ impl WgpuRendererCore {
                 st_position: v.st_position,
                 color: path.color,
                 bounds,
+                raster,
             }));
         }
 
@@ -1886,14 +2469,13 @@ impl WgpuRendererCore {
         )?;
 
         let resources = self.resources();
-        let Some(path_intermediate_view) = resources.path_intermediate_view.as_ref() else {
-            return Ok(false);
-        };
-
-        let (target_view, resolve_target) = if let Some(ref msaa_view) = resources.path_msaa_view {
-            (msaa_view, Some(path_intermediate_view))
-        } else {
-            (path_intermediate_view, None)
+        let scratch = resources
+            .path_scratch
+            .last()
+            .expect("path scratch prepared");
+        let (target_view, resolve_target) = match &scratch.msaa {
+            Some(msaa) => (msaa, Some(&scratch.view)),
+            None => (&scratch.view, None),
         };
 
         {
@@ -1904,7 +2486,11 @@ impl WgpuRendererCore {
                     resolve_target,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
-                        store: wgpu::StoreOp::Store,
+                        store: if resolve_target.is_some() {
+                            wgpu::StoreOp::Discard
+                        } else {
+                            wgpu::StoreOp::Store
+                        },
                     },
                     depth_slice: None,
                 })],
@@ -1912,6 +2498,7 @@ impl WgpuRendererCore {
                 ..Default::default()
             });
 
+            pass.set_viewport(0., 0., raster.size.width.0, raster.size.height.0, 0., 1.);
             pass.set_pipeline(&resources.pipelines.path_rasterization);
             pass.set_bind_group(0, &resources.path_globals_bind_group, &[]);
             pass.set_bind_group(1, &vertex_binding.bind_group, &[]);
@@ -1998,6 +2585,7 @@ impl WgpuRendererCore {
         Ok(InstanceBinding {
             bind_group,
             first_instance,
+            scene_start: 0,
         })
     }
 
@@ -2184,6 +2772,7 @@ impl WgpuRenderer {
         self.surface_config.width = width;
         self.surface_config.height = height;
         self.surface_config.alpha_mode = alpha_mode;
+        self.surface_config.usage = wgpu::TextureUsages::RENDER_ATTACHMENT;
         if let Some(mode) = config.preferred_present_mode {
             self.surface_config.present_mode = mode;
         }
@@ -2832,8 +3421,8 @@ mod tests {
     fn webgl_record_sizes_match_shader_word_strides() {
         assert_eq!(std::mem::size_of::<Quad>(), 40 * 4);
         assert_eq!(std::mem::size_of::<Shadow>(), 28 * 4);
-        assert_eq!(std::mem::size_of::<PathRasterizationVertex>(), 26 * 4);
-        assert_eq!(std::mem::size_of::<PathSprite>(), 4 * 4);
+        assert_eq!(std::mem::size_of::<PathRasterizationVertex>(), 30 * 4);
+        assert_eq!(std::mem::size_of::<PathSprite>(), 6 * 4);
         assert_eq!(std::mem::size_of::<Underline>(), 16 * 4);
         assert_eq!(std::mem::size_of::<MonochromeSprite>(), 28 * 4);
         assert_eq!(std::mem::size_of::<SubpixelSprite>(), 28 * 4);

@@ -221,7 +221,7 @@ impl RenderOnce for Sheet {
                     // Body
                     v_flex()
                         .size_full()
-                        .overflow_y_scrollbar()
+                        .overflow_y_popup_scrollbar()
                         .pl(paddings.left)
                         .pr(paddings.right)
                         .children(self.children),

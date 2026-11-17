@@ -334,6 +334,7 @@ struct ViewElementCacheKey {
     content_mask: ContentMask<Pixels>,
     text_style: TextStyle,
     opacity: f32,
+    paint_only: bool,
 }
 
 #[cfg(not(gpui_hot_reload))]
@@ -554,6 +555,7 @@ fn prepaint_view(
                     && element_state.cache_key.content_mask == content_mask
                     && element_state.cache_key.text_style == text_style
                     && element_state.cache_key.opacity.to_bits() == opacity.to_bits()
+                    && element_state.cache_key.paint_only == window.is_paint_only()
                     && !window.dirty_views.contains(&entity_id)
                     && !window.refreshing
                 {
@@ -590,6 +592,7 @@ fn prepaint_view(
                             content_mask,
                             text_style,
                             opacity,
+                            paint_only: window.is_paint_only(),
                         },
                     },
                 )

@@ -4,8 +4,7 @@ use crate::input::{
     element::TextElement, layout::LastLayout, mode::LayoutMode,
 };
 use gpui::{
-    Bounds, Context, Hsla, Path, PathBuilder, Pixels, SharedString, TextRun, TextStyle, Window,
-    point, px,
+    Bounds, Context, Hsla, Pixels, SharedString, TextRun, TextStyle, Window, point, px, size,
 };
 use ropey::RopeSlice;
 
@@ -112,58 +111,31 @@ impl<M: InputModeKind> TextElement<M> {
         last_layout: &LastLayout,
         text_style: &TextStyle,
         window: &mut Window,
-    ) -> Option<Path<Pixels>> {
+    ) -> Vec<Bounds<Pixels>> {
         if !state.is_multi_line() || !state.mode.has_indent_guides() {
-            return None;
+            return Vec::new();
         }
-
-        let indent_width =
-            self.measure_indent_width(text_style, state.mode.tab_size().tab_size, window);
 
         let tab_size = state.mode.tab_size();
-        let line_height = last_layout.line_height;
-        let mut builder = PathBuilder::stroke(px(1.));
-        let mut offset_y = last_layout.visible_top;
-        let mut last_indents = vec![];
-
-        for (&buffer_line, line_layout) in last_layout
-            .visible_buffer_lines
-            .iter()
-            .zip(last_layout.lines.iter())
-        {
+        let indent_width = self.measure_indent_width(text_style, tab_size.tab_size, window);
+        let mut guides = Vec::new();
+        let mut previous_count = 0;
+        for (ix, &buffer_line) in last_layout.visible_buffer_lines.iter().enumerate() {
             let line = state.text.slice_line(buffer_line);
-            let mut current_indents = vec![];
             if line.len() > 0 {
-                let indent_count = tab_size.indent_count(&line);
-                for offset in (0..indent_count).step_by(tab_size.tab_size) {
-                    let x = if indent_count > 0 {
-                        indent_width * offset as f32 / tab_size.tab_size as f32
-                    } else {
-                        px(0.)
-                    };
-
-                    let pos = point(x + last_layout.line_number_width, offset_y);
-
-                    builder.move_to(pos);
-                    builder.line_to(point(pos.x, pos.y + line_height));
-                    current_indents.push(pos.x);
-                }
-            } else if last_indents.len() > 0 {
-                for x in &last_indents {
-                    let pos = point(*x, offset_y);
-                    builder.move_to(pos);
-                    builder.line_to(point(pos.x, pos.y + line_height));
-                }
-                current_indents = last_indents.clone();
+                previous_count = tab_size.indent_count(&line);
             }
-
-            offset_y += line_layout.wrapped_lines.len() * line_height;
-            last_indents = current_indents;
+            let y = last_layout.line_top(ix);
+            for column in (0..previous_count).step_by(tab_size.tab_size) {
+                let x = last_layout.line_number_width
+                    + indent_width * column as f32 / tab_size.tab_size as f32;
+                guides.push(Bounds::new(
+                    bounds.origin + point(x - px(0.5), y),
+                    size(px(1.), last_layout.line_height),
+                ));
+            }
         }
-
-        builder.translate(bounds.origin);
-        let path = builder.build().unwrap();
-        Some(path)
+        guides
     }
 }
 
@@ -206,7 +178,9 @@ impl<M: InputModeKind> InputBaseState<M> {
         cx: &mut Context<Self>,
     ) {
         // First, try to accept inline completion if present
+        let revision = self.document_revision;
         if M::accept_inline_completion(self, window, cx) {
+            self.reveal_after_interactive_edit(revision);
             return;
         }
         self.indent(false, window, cx);
@@ -278,6 +252,7 @@ impl<M: InputModeKind> InputBaseState<M> {
             return;
         }
 
+        let revision = self.document_revision;
         self.undo_manager.begin_transaction();
         self.replace_text_in_ranges(&edits, window, cx);
         self.selections.replace_all(new_selections);
@@ -285,7 +260,11 @@ impl<M: InputModeKind> InputBaseState<M> {
         self.undo_manager.record_selections(before, after);
         self.undo_manager.commit_transaction();
 
-        self.scroll_to(self.cursor(), None, cx);
+        if self.is_code_editor() {
+            self.reveal_after_interactive_edit(revision);
+        } else {
+            self.scroll_to(self.cursor(), None, cx);
+        }
         cx.notify();
     }
 

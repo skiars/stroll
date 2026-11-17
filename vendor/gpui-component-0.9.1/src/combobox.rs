@@ -710,23 +710,23 @@ where
                     window,
                     cx,
                 ))
-                .when(self.state.open, |this| {
-                    this.child(
-                        deferred(render_popup_shell(
-                            ("combobox-popup", cx.entity_id()),
-                            &self.state.list,
-                            self.state.menu_width,
-                            self.state.search_placeholder.clone(),
-                            self.state.size,
-                            self.state.menu_max_h,
-                            bounds,
-                            footer_el,
-                            dismiss_handler,
-                            cx,
-                        ))
-                        .with_priority(gpui_base::POPUP_PRIORITY),
-                    )
-                }),
+                .child(
+                    deferred(render_popup_shell(
+                        ("combobox-popup", cx.entity_id()),
+                        &self.state.list,
+                        self.state.menu_width,
+                        self.state.search_placeholder.clone(),
+                        self.state.size,
+                        self.state.menu_max_h,
+                        bounds,
+                        open,
+                        footer_el,
+                        dismiss_handler,
+                        window,
+                        cx,
+                    ))
+                    .with_priority(gpui_base::POPUP_PRIORITY),
+                ),
         )
     }
 }
@@ -1056,15 +1056,18 @@ fn render_popup_shell<D: SearchableListDelegate + 'static>(
     size: Size,
     menu_max_h: Length,
     bounds: Bounds<Pixels>,
+    open: bool,
     footer_el: Option<AnyElement>,
     dismiss_handler: Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App) + 'static>,
+    window: &mut Window,
     cx: &mut App,
 ) -> AnyElement {
     let has_footer = footer_el.is_some();
 
     crate::popover::dropdown_popup(
         id,
-        bounds,
+        crate::popover::dropdown_positioner(bounds),
+        open,
         v_flex()
             .occlude()
             .map(|this| match menu_width {
@@ -1074,6 +1077,7 @@ fn render_popup_shell<D: SearchableListDelegate + 'static>(
             .popover_style(cx)
             .child(
                 List::new(list)
+                    .popup_scrollbar()
                     .when_some(search_placeholder, |this, placeholder| {
                         this.search_placeholder(placeholder)
                     })
@@ -1091,6 +1095,7 @@ fn render_popup_shell<D: SearchableListDelegate + 'static>(
                 )
             })
             .on_mouse_down_out(dismiss_handler),
+        window,
         cx,
     )
     .into_any_element()

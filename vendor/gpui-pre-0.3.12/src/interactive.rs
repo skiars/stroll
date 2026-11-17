@@ -1,6 +1,6 @@
 use crate::{
     BackGestureEvent, Bounds, Capslock, Context, Empty, IntoElement, Keystroke, LongPressEvent,
-    Modifiers, Pixels, Point, Render, TouchDragEvent, Window, point, seal::Sealed,
+    Modifiers, Pixels, Point, Render, TouchDragEvent, Window, point, px, seal::Sealed,
 };
 use smallvec::SmallVec;
 use std::{any::Any, fmt::Debug, ops::Deref, path::PathBuf};
@@ -545,13 +545,26 @@ pub type ScrollWheelEvent = ScrollEvent;
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ScrollSource {
     /// A scroll the platform reported from a pointing device, such as a mouse
-    /// wheel or a trackpad. [`ScrollDelta::precise`] tells continuous devices
-    /// apart from wheel notches.
+    /// wheel. [`ScrollDelta::precise`] tells continuous devices apart from
+    /// wheel notches. Platforms that supply their own kinetic scrolling keep
+    /// this source, so GPUI does not add a second momentum phase.
     #[default]
     Pointer,
+    /// Raw finger movement on a touchpad: precise pixel deltas without the
+    /// platform's own inertia. GPUI resamples these at frame rate and
+    /// synthesizes momentum after the gesture ends.
+    Touchpad,
+    /// 触控板事件及平台提供的毫秒时间戳，计数器可以回绕。
+    TimedTouchpad(u32),
     /// A pan of a finger on a touchscreen, recognized by GPUI, including the
     /// momentum GPUI synthesizes after the finger lifts.
     Touch,
+}
+
+impl ScrollSource {
+    pub(crate) fn is_touchpad(self) -> bool {
+        matches!(self, Self::Touchpad | Self::TimedTouchpad(_))
+    }
 }
 
 impl Sealed for ScrollEvent {}
@@ -623,6 +636,12 @@ impl Deref for PinchEvent {
 }
 
 impl ScrollDelta {
+    /// Converts wheel lines using a common 20 logical pixels per line.
+    /// Precise pixel input keeps the displacement reported by the device.
+    pub fn content_delta(&self) -> Point<Pixels> {
+        self.pixel_delta(px(20.))
+    }
+
     /// Returns true if this is a precise scroll delta in pixels.
     pub fn precise(&self) -> bool {
         match self {

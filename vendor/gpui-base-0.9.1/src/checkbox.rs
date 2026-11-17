@@ -270,7 +270,7 @@ impl CheckboxIndicatorStyles {
 impl CheckboxIndicator {
     pub fn new() -> Self {
         Self {
-            base: div(),
+            base: div().debug_selector(|| "checkbox-indicator".into()),
             style: StyleRefinement::default(),
             semantic_styles: CheckboxIndicatorStyles::default(),
             state: CheckboxState::Unchecked,

@@ -1,11 +1,8 @@
-use std::{
-    cmp::Ordering,
-    ops::{Deref, Range},
-};
+use std::ops::{Deref, Range};
 
 use gpui::SharedString;
 use ropey::Rope;
-use sum_tree::{Bias, SeekTarget, SumTree};
+use sum_tree::SumTree;
 
 use crate::input::{Position, RopeExt as _};
 
@@ -157,28 +154,15 @@ impl sum_tree::Summary for DiagnosticSummary {
     fn zero(_: Self::Context<'_>) -> Self {
         DiagnosticSummary {
             count: 0,
-            start: usize::MIN,
+            start: usize::MAX,
             end: usize::MIN,
         }
     }
 
     fn add_summary(&mut self, other: &Self, _: Self::Context<'_>) {
-        self.start = other.start;
-        self.end = other.end;
+        self.start = self.start.min(other.start);
+        self.end = self.end.max(other.end);
         self.count += other.count;
-    }
-}
-
-/// For seeking by byte range.
-impl SeekTarget<'_, DiagnosticSummary, DiagnosticSummary> for usize {
-    fn cmp(&self, other: &DiagnosticSummary, _: &()) -> Ordering {
-        if *self < other.start {
-            Ordering::Less
-        } else if *self > other.end {
-            Ordering::Greater
-        } else {
-            Ordering::Equal
-        }
     }
 }
 
@@ -186,6 +170,7 @@ impl SeekTarget<'_, DiagnosticSummary, DiagnosticSummary> for usize {
 pub struct DiagnosticSet {
     text: Rope,
     diagnostics: SumTree<DiagnosticEntry>,
+    pub(crate) revision: u64,
 }
 
 impl DiagnosticSet {
@@ -193,6 +178,7 @@ impl DiagnosticSet {
         Self {
             text: text.clone(),
             diagnostics: SumTree::new(&()),
+            revision: 0,
         }
     }
 
@@ -202,6 +188,7 @@ impl DiagnosticSet {
     }
 
     pub fn push(&mut self, diagnostic: impl Into<Diagnostic>) {
+        self.revision = self.revision.wrapping_add(1);
         let diagnostic = diagnostic.into();
         let start = self.text.position_to_offset(&diagnostic.range.start);
         let end = self.text.position_to_offset(&diagnostic.range.end);
@@ -230,6 +217,7 @@ impl DiagnosticSet {
     }
 
     pub fn clear(&mut self) {
+        self.revision = self.revision.wrapping_add(1);
         self.diagnostics = SumTree::new(&());
     }
 
@@ -238,21 +226,24 @@ impl DiagnosticSet {
     }
 
     pub fn range(&self, range: Range<usize>) -> impl Iterator<Item = &DiagnosticEntry> {
-        let mut cursor = self.diagnostics.cursor::<DiagnosticSummary>(&());
-        cursor.seek(&range.start, Bias::Left);
-        std::iter::from_fn(move || {
-            if let Some(entry) = cursor.item() {
-                if entry.range.start < range.end {
-                    cursor.next();
-                    return Some(entry);
-                }
-            }
-            None
+        self.diagnostics.filter::<_, ()>(&(), move |summary| {
+            summary.start < range.end && summary.end >= range.start
         })
     }
 
     pub fn for_offset(&self, offset: usize) -> Option<&DiagnosticEntry> {
-        self.range(offset..offset + 1).next()
+        self.at_offset(offset).next()
+    }
+
+    pub(in crate::input) fn at_offset(
+        &self,
+        offset: usize,
+    ) -> impl Iterator<Item = &DiagnosticEntry> {
+        self.range(offset..offset.saturating_add(1))
+            .filter(move |entry| {
+                entry.range.contains(&offset)
+                    || (entry.range.is_empty() && entry.range.start == offset)
+            })
     }
 
     #[allow(unused)]

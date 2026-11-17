@@ -195,6 +195,11 @@ impl Icon {
         Self::default()
     }
 
+    pub(crate) fn with_default_size(mut self, size: Size) -> Self {
+        self.size.get_or_insert(size);
+        self
+    }
+
     /// Rotate the icon by the given angle
     ///
     /// Replaces any previous transformation or rotation.

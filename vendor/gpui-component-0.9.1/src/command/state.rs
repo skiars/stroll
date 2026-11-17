@@ -21,7 +21,7 @@ use crate::{
     h_flex,
     input::{Input, InputEvent, InputState},
     kbd::Kbd,
-    scroll::Scrollbar,
+    scroll::thin_scrollbar,
     v_flex, v_virtual_list,
 };
 
@@ -1046,7 +1046,7 @@ impl Render for CommandState {
                                 })
                             }),
                         )
-                        .child(Scrollbar::vertical(&self.scroll_handle))
+                        .child(thin_scrollbar(&self.scroll_handle))
                     }),
             )
             .when_some(self.options.footer.as_ref(), |this, footer| {

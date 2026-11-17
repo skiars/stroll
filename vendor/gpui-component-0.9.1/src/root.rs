@@ -5,13 +5,12 @@ use crate::{
     native_menu::FallbackMenuOverlay,
     notification::{Notification, NotificationList},
     sheet::Sheet,
-    tooltip::render_tooltip,
     touch_selection::WindowTouchSelectionOverlay,
     window_border,
 };
 use gpui::{
-    App, AppContext, Bounds, Context, DefiniteLength, DispatchPhase, ElementId, Entity,
-    FocusHandle, GlobalElementId, InteractiveElement, IntoElement, MouseMoveEvent,
+    App, AppContext, Bounds, Context, Decorations, DefiniteLength, DispatchPhase, ElementId,
+    Entity, FocusHandle, GlobalElementId, InteractiveElement, IntoElement, MouseMoveEvent,
     ParentElement as _, Pixels, Render, RenderOnce, Styled, WeakFocusHandle, Window, canvas, div,
     prelude::FluentBuilder as _,
 };
@@ -107,8 +106,7 @@ impl WindowState {
             active_dialogs: Vec::new(),
             focused_input: None,
             notification: cx.new(|cx| NotificationList::new(window, cx)),
-            tooltip_overlay: cx
-                .new(|_| gpui_base::TooltipOverlay::new().render_with(render_tooltip)),
+            tooltip_overlay: cx.new(|_| gpui_base::TooltipOverlay::new()),
             tooltip_hovered_trigger: None,
             tooltip_trigger_lifetime: std::rc::Weak::new(),
             tooltip_pressed_trigger: None,
@@ -140,6 +138,20 @@ impl WindowState {
                     .map(|sheet| sheet.selection_scope)
             })
             .unwrap_or_default()
+    }
+
+    pub(crate) fn select_popup_priority(window: &Window, cx: &App, trigger: &FocusHandle) -> usize {
+        Self::try_read(window, cx)
+            .and_then(|state| {
+                state.active_dialogs.iter().rev().find(|dialog| {
+                    !dialog.closing && dialog.focus_handle.contains(trigger, window)
+                })
+            })
+            // The dropdown is enqueued after its dialog, so it paints above that
+            // dialog at the same priority and below any newer dialog.
+            .map_or(gpui_base::POPUP_PRIORITY, |dialog| {
+                gpui_base::MODAL_POPUP_PRIORITY + dialog.id
+            })
     }
 
     pub fn update<F, R>(window: &mut Window, cx: &mut App, f: F) -> R
@@ -633,6 +645,16 @@ impl WindowState {
         })
     }
 
+    pub(crate) fn active_tooltip_for_trigger(
+        trigger: &GlobalElementId,
+        window: &Window,
+        cx: &App,
+    ) -> Option<Entity<gpui_base::TooltipOverlay>> {
+        let state = Self::entity(window, cx)?.read(cx);
+        (state.tooltip_hovered_trigger.as_ref() == Some(trigger))
+            .then(|| state.tooltip_overlay.clone())
+    }
+
     fn dismiss_removed_tooltip(&self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(trigger) = self.tooltip_hovered_trigger.clone() else {
             return;
@@ -717,18 +739,14 @@ impl gpui_base::RootPlugin for WindowState {
 
     fn style(&self, surface: &mut gpui::Stateful<gpui::Div>, window: &mut Window, cx: &mut App) {
         use gpui::Refineable as _;
-        // The surface's background must follow the window's rounded corners.
-        let radii = window_border::window_corner_radii(window, cx);
-        surface.style().refine(
-            &gpui::StyleRefinement::default()
-                .font_family(cx.theme().font_family.clone())
-                .bg(cx.theme().tokens.background)
-                .text_color(cx.theme().foreground)
-                .rounded_tl(radii.top_left)
-                .rounded_tr(radii.top_right)
-                .rounded_bl(radii.bottom_left)
-                .rounded_br(radii.bottom_right),
-        );
+        let mut style = gpui::StyleRefinement::default()
+            .font_family(cx.theme().font_family.clone())
+            .text_color(cx.theme().foreground);
+        if matches!(window.window_decorations(), Decorations::Server) {
+            style = style.bg(cx.theme().tokens.background);
+        }
+        style.text.font_fallbacks = cx.theme().font_fallbacks.clone();
+        surface.style().refine(&style);
     }
 
     fn decorate(
@@ -736,9 +754,12 @@ impl gpui_base::RootPlugin for WindowState {
         surface: gpui::AnyElement,
         _root: &gpui_base::Root,
         _window: &mut Window,
-        _cx: &mut App,
+        cx: &mut App,
     ) -> impl IntoElement {
-        window_border().child(surface)
+        // Paint the client background under the border's antialiasing.
+        window_border()
+            .background(cx.theme().tokens.background.into())
+            .child(surface)
     }
 }
 

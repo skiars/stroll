@@ -64,8 +64,15 @@ pub struct Positioner {
     strategy: Strategy,
     corner_position: Option<Rc<Cell<Point<Pixels>>>>,
     on_position: Option<Box<dyn Fn(ResolvedPosition)>>,
+    origin_motion: Option<(
+        crate::motion::TransitionState<Point<Pixels>>,
+        crate::motion::Transition,
+        Pixels,
+    )>,
     margin: Pixels,
+    boundary: Option<Bounds<Pixels>>,
     occlude: bool,
+    travel: Pixels,
     children: Vec<AnyElement>,
 }
 
@@ -86,8 +93,11 @@ impl Positioner {
             },
             corner_position: None,
             on_position: None,
+            origin_motion: None,
             margin: px(4.),
+            boundary: None,
             occlude: false,
+            travel: px(0.),
             children: Vec::new(),
         }
     }
@@ -102,8 +112,11 @@ impl Positioner {
             strategy: Strategy::Corner { anchor, position },
             corner_position: None,
             on_position: None,
+            origin_motion: None,
             margin: px(4.),
+            boundary: None,
             occlude: false,
+            travel: px(0.),
             children: Vec::new(),
         }
     }
@@ -157,6 +170,23 @@ impl Positioner {
         self
     }
 
+    /// Shift the surface toward the trigger after resolving its resting position.
+    #[doc(hidden)]
+    pub fn travel(mut self, travel: Pixels) -> Self {
+        self.travel = travel;
+        self
+    }
+
+    pub(crate) fn transition_origin(
+        mut self,
+        state: crate::motion::TransitionState<Point<Pixels>>,
+        policy: crate::motion::Transition,
+        enter_offset_y: Pixels,
+    ) -> Self {
+        self.origin_motion = Some((state, policy, enter_offset_y));
+        self
+    }
+
     /// Observe resolved geometry before children prepaint.
     pub fn on_position(mut self, callback: impl Fn(ResolvedPosition) + 'static) -> Self {
         self.on_position = Some(Box::new(callback));
@@ -178,6 +208,24 @@ impl Positioner {
     pub fn margin(mut self, margin: Pixels) -> Self {
         self.margin = margin;
         self
+    }
+
+    /// Keep placement inside this region as well as the window viewport.
+    pub fn within(mut self, bounds: Bounds<Pixels>) -> Self {
+        self.boundary = Some(bounds);
+        self
+    }
+
+    /// The region available to a popup after accounting for window decorations and margins.
+    pub fn viewport_bounds(window: &Window, margin: Pixels) -> Bounds<Pixels> {
+        let insets = viewport_insets(window, margin);
+        let viewport = window.viewport_size();
+        let origin = point(insets.left, insets.top);
+        let end = point(
+            viewport.width - insets.right,
+            viewport.height - insets.bottom,
+        );
+        Bounds::from_corners(origin, end.max(&origin))
     }
 }
 
@@ -201,6 +249,14 @@ fn frame_insets(decorations: Decorations, client_inset: Pixels) -> Edges<Pixels>
             left: if tiling.left { px(0.) } else { client_inset },
         },
     }
+}
+
+fn viewport_insets(window: &Window, margin: Pixels) -> Edges<Pixels> {
+    frame_insets(
+        window.window_decorations(),
+        window.client_inset().unwrap_or(px(0.)),
+    )
+    .map(|inset| *inset + margin)
 }
 
 /// Resolves the bounds of a popup of `popup_size`.
@@ -389,22 +445,52 @@ impl Element for Positioner {
         }
 
         let popup_size = (child_max - child_min).into();
-        let frame = frame_insets(
-            window.window_decorations(),
-            window.client_inset().unwrap_or(px(0.)),
-        );
         let mut strategy = self.strategy;
         if let (Strategy::Corner { position, .. }, Some(tracked)) =
             (&mut strategy, &self.corner_position)
         {
             *position = tracked.get();
         }
-        let position = resolve(
-            strategy,
-            popup_size,
-            window.viewport_size(),
-            frame.map(|inset| *inset + self.margin),
-        );
+        let viewport = window.viewport_size();
+        let mut insets = viewport_insets(window, self.margin);
+        if let Some(bounds) = self.boundary {
+            insets.left = insets.left.max(bounds.left() + self.margin);
+            insets.top = insets.top.max(bounds.top() + self.margin);
+            insets.right = insets.right.max(viewport.width - bounds.right() + self.margin);
+            insets.bottom = insets.bottom.max(viewport.height - bounds.bottom() + self.margin);
+        }
+        let mut position = resolve(strategy, popup_size, viewport, insets);
+        if let Some((state, policy, enter_offset_y)) = &self.origin_motion {
+            let initial = Bounds::new(
+                position.bounds.origin + point(px(0.), *enter_offset_y),
+                position.bounds.size,
+            );
+            position.bounds.origin = state
+                .sample_from(
+                    Some(clamp(initial, viewport, insets).origin),
+                    position.bounds.origin,
+                    policy.clone(),
+                    window,
+                    cx,
+                )
+                .value;
+            position.bounds = clamp(position.bounds, viewport, insets);
+        }
+        let side = position.placement.unwrap_or_else(|| match strategy {
+            Strategy::Corner { anchor, .. } => match anchor {
+                Anchor::TopLeft | Anchor::TopCenter | Anchor::TopRight => Placement::Bottom,
+                Anchor::BottomLeft | Anchor::BottomCenter | Anchor::BottomRight => Placement::Top,
+                Anchor::LeftCenter => Placement::Right,
+                Anchor::RightCenter => Placement::Left,
+            },
+            Strategy::Side { .. } => Placement::Bottom,
+        });
+        position.bounds.origin += match side {
+            Placement::Bottom => point(px(0.), -self.travel),
+            Placement::Top => point(px(0.), self.travel),
+            Placement::Left => point(self.travel, px(0.)),
+            Placement::Right => point(-self.travel, px(0.)),
+        };
         if let Some(callback) = &self.on_position {
             callback(position);
         }

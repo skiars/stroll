@@ -2,7 +2,7 @@ use crate::ThemeStyled as _;
 use crate::actions::{Cancel, Confirm, SelectDown, SelectUp};
 use crate::actions::{SelectLeft, SelectRight};
 use crate::menu::menu_item::MenuItemElement;
-use crate::scroll::ScrollableElement;
+use crate::scroll::ScrollbarViewport;
 use crate::{ActiveTheme, ElementExt, Icon, IconName, Sizable as _, h_flex, v_flex};
 use crate::{Side, Size, kbd::Kbd};
 use gpui::{
@@ -12,11 +12,12 @@ use gpui::{
     StatefulInteractiveElement, Styled, WeakEntity, Window, anchored, deferred, div,
     prelude::FluentBuilder, px, rems,
 };
-use gpui::{ClickEvent, Half, MouseDownEvent, OwnedMenuItem, Point, Subscription};
+use gpui::{ClickEvent, MouseDownEvent, OwnedMenuItem, Point, Subscription};
 use gpui_base::TestSupportExt as _;
 
+use gpui_base::{PopupFrame, PopupMotion, PopupMotionKind};
 use std::collections::HashSet;
-use std::rc::Rc;
+use std::{rc::Rc, time::Instant};
 
 const CONTEXT: &str = "PopupMenu";
 
@@ -338,6 +339,9 @@ pub struct PopupMenu {
     /// content mask, so the items container's `overflow_y_scroll` clip never
     /// reaches it, while the scroll offset is still baked into its anchor.
     priority: usize,
+    motion: PopupMotion,
+    closing: bool,
+    in_dropdown: bool,
 
     _subscriptions: Vec<Subscription>,
 }
@@ -365,6 +369,9 @@ impl PopupMenu {
             size: Size::default(),
             submenu_anchor: (Anchor::TopLeft, Pixels::ZERO),
             priority: gpui_base::POPUP_PRIORITY,
+            motion: PopupMotion::new(PopupMotionKind::Menu, Instant::now()),
+            closing: false,
+            in_dropdown: false,
             _subscriptions: vec![],
         }
     }
@@ -375,6 +382,21 @@ impl PopupMenu {
         f: impl FnOnce(Self, &mut Window, &mut Context<PopupMenu>) -> Self,
     ) -> Entity<Self> {
         cx.new(|cx| f(Self::new(cx), window, cx))
+    }
+
+    /// Show a context menu in the window's shared menu layer.
+    pub fn show_at(
+        menu: Entity<Self>,
+        position: gpui::Point<Pixels>,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let Some(overlay) = crate::root::WindowState::native_menu_overlay(window, cx) else {
+            return;
+        };
+        overlay.update(cx, |overlay, cx| {
+            overlay.show_popup(menu, position, window, cx)
+        });
     }
 
     /// Set the focus handle of Entity to handle actions.
@@ -1151,10 +1173,34 @@ impl PopupMenu {
         }
     }
 
+    pub(crate) fn in_dropdown(mut self) -> Self {
+        self.in_dropdown = true;
+        self
+    }
+
+    pub(crate) fn begin_open(&mut self) {
+        self.closing = false;
+        self.motion = PopupMotion::new(PopupMotionKind::Menu, Instant::now());
+    }
+
+    pub(crate) fn closing(&self) -> bool {
+        self.closing
+    }
+
+    pub(crate) fn visible(&self, window: &Window, cx: &App) -> bool {
+        !self.closing || self.motion.opacity(window, cx) > 0.
+    }
+
     /// Dismiss the menu and the entire parent chain.
     ///
     /// The submenu is closed together with its parent, same as macOS menus.
     fn dismiss(&mut self, _: &Cancel, window: &mut Window, cx: &mut Context<Self>) {
+        if self.closing {
+            return;
+        }
+        self.closing = true;
+        self.motion.retarget(false, Instant::now());
+        cx.notify();
         self.selected_index = None;
         cx.emit(DismissEvent);
 
@@ -1170,6 +1216,8 @@ impl PopupMenu {
                 .or(self.action_context.as_ref())
             {
                 window.focus(handle, cx);
+            } else {
+                window.blur(cx);
             }
         }
 
@@ -1272,7 +1320,7 @@ impl PopupMenu {
             Icon::empty()
         };
 
-        Some(icon.xsmall())
+        Some(icon.with_default_size(Size::XSmall))
     }
 
     /// Calculate the anchor corner and left offset for child submenu
@@ -1330,13 +1378,18 @@ impl PopupMenu {
         let is_submenu = matches!(item, PopupMenuItem::Submenu { .. });
 
         let (item_height, radius) = match self.size {
-            Size::Small => (rems(1.25), options.radius.half()),
-            _ => (rems(1.625), options.radius),
+            Size::Small => (px(23.), options.radius),
+            _ => (px(29.), options.radius),
         };
 
         let this = MenuItemElement::new(ix)
             .relative()
-            .text_sm()
+            .text_size(cx.theme().control_font_size)
+            .text_color(if cx.theme().is_dark() {
+                gpui::rgb(0xeceef3)
+            } else {
+                gpui::rgb(0x202632)
+            })
             .py_0()
             .px(INNER_PADDING)
             .rounded(radius)
@@ -1578,10 +1631,15 @@ impl Render for PopupMenu {
         let view = cx.entity().clone();
         let items_count = self.menu_items.len();
 
-        let max_height = self.max_height.unwrap_or_else(|| {
-            let window_half_height = window.window_bounds().get_bounds().size.height * 0.5;
-            window_half_height.min(rems(28.125).to_pixels(window.rem_size()))
-        });
+        let available_height = (window.viewport_size().height - px(18.)).max(px(0.));
+        let max_height = self
+            .max_height
+            .or_else(|| {
+                self.scrollable
+                    .then(|| (window.viewport_size().height * 0.5).min(px(450.)))
+            })
+            .unwrap_or(available_height)
+            .min(available_height);
 
         let has_left_icon = self
             .menu_items
@@ -1591,10 +1649,10 @@ impl Render for PopupMenu {
         let options = RenderOptions {
             has_left_icon,
             check_side: self.check_side,
-            radius: cx.theme().radius.min(px(8.)),
+            radius: px(4.),
         };
 
-        v_flex()
+        let element = v_flex()
             .id("popup-menu")
             .test_support()
             .role(Role::Menu)
@@ -1608,25 +1666,25 @@ impl Render for PopupMenu {
             .on_action(cx.listener(Self::dismiss))
             .on_mouse_down_out(cx.listener(Self::on_mouse_down_out))
             .popover_style(cx)
-            .text_color(cx.theme().popover_foreground)
+            .rounded(px(9.))
+            .when(!self.in_dropdown, |this| {
+                this.opacity(self.motion.opacity(window, cx))
+            })
             .relative()
             .occlude()
             .child(
                 v_flex()
                     .id("items")
                     .p_1()
-                    .gap_y_0p5()
-                    .min_w(rems(8.))
+                    .min_w(px(200.))
                     .when_some(self.min_width, |this, min_width| this.min_w(min_width))
                     .map(|this| match self.max_width {
                         Some(max_width) => this.max_w(max_width),
                         None => this.max_w(rems(31.25)),
                     })
-                    .when(self.scrollable, |this| {
-                        this.max_h(max_height)
-                            .overflow_y_scroll()
-                            .track_scroll(&self.scroll_handle)
-                    })
+                    .max_h(max_height)
+                    .overflow_y_scroll()
+                    .track_scroll(&self.scroll_handle)
                     .children(
                         self.menu_items
                             .iter()
@@ -1651,9 +1709,8 @@ impl Render for PopupMenu {
                         });
                     }),
             )
-            .when(self.scrollable, |this| {
-                this.vertical_scrollbar(&self.scroll_handle)
-            })
+            .vertical_popup_scrollbar(&self.scroll_handle);
+        PopupFrame::new(element, self.closing)
     }
 }
 

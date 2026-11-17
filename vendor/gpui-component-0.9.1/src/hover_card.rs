@@ -3,12 +3,14 @@ use std::rc::Rc;
 use gpui::{
     Anchor, AnyElement, App, Context, ElementId, InteractiveElement as _, IntoElement,
     ParentElement, RenderOnce, StyleRefinement, Styled, Window, div, prelude::FluentBuilder as _,
+    px,
 };
 use gpui_base::HoverCard as BaseHoverCard;
 pub use gpui_base::HoverCardState;
 use instant::Duration;
 
 use crate::{StyledExt as _, popover::Popover};
+use crate::{scroll::ScrollableElement as _, v_flex};
 
 /// A hover card element that displays content when hovering over a trigger element.
 ///
@@ -151,13 +153,17 @@ impl RenderOnce for HoverCard {
             .close_delay(self.close_delay)
             .trigger((trigger)(window, cx))
             .content(move |state, window, cx| {
-                Popover::render_popover_content(anchor, appearance, window, cx)
-                    .overflow_hidden()
-                    .when_some(content, |this, content| {
-                        this.child((content)(state, window, cx))
+                let body = v_flex()
+                    .when_some(content, |body, content| {
+                        body.child((content)(state, window, cx))
                     })
                     .children(children)
+                    .max_h((window.viewport_size().height - px(64.)).max(px(0.)))
+                    .overflow_y_popup_scrollbar();
+                Popover::render_popover_content(anchor, appearance, window, cx)
+                    .overflow_hidden()
                     .refine_style(&style)
+                    .child(body)
             })
             .when_some(self.on_open_change, |this, callback| {
                 this.on_open_change(move |open, window, cx| callback(open, window, cx))

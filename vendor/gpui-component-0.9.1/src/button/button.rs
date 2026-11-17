@@ -221,6 +221,7 @@ pub struct Button {
     )>,
     tooltip_placement: Option<Placement>,
     tooltip_show_delay: Option<Duration>,
+    tooltip_restart_delay: bool,
     tooltip_builder: Option<Rc<dyn Fn(&mut Window, &mut App) -> gpui::AnyView>>,
     on_click: Option<Rc<dyn Fn(&ClickEvent, &mut Window, &mut App)>>,
     on_hover: Option<Rc<dyn Fn(&bool, &mut Window, &mut App)>>,
@@ -270,6 +271,7 @@ impl Button {
             tooltip: None,
             tooltip_placement: None,
             tooltip_show_delay: None,
+            tooltip_restart_delay: false,
             tooltip_builder: None,
             on_click: None,
             focus_ring_enabled: true,
@@ -307,6 +309,18 @@ impl Button {
     pub(crate) fn content_style(mut self, style: StyleRefinement, icon_size: Size) -> Self {
         self.content_style = style;
         self.icon_size = Some(icon_size);
+        self
+    }
+
+    /// Sets the gap between the button's icon, label and other content.
+    pub fn content_gap(mut self, gap: Pixels) -> Self {
+        self.content_style = self.content_style.gap(gap);
+        self
+    }
+
+    /// Sets the label's font size independently of the button's hit area.
+    pub fn label_size(mut self, size: Pixels) -> Self {
+        self.content_style = self.content_style.text_size(size);
         self
     }
 
@@ -403,6 +417,12 @@ impl Button {
         self
     }
 
+    /// Sets the icon size independently of the button's hit area.
+    pub fn icon_size(mut self, size: Pixels) -> Self {
+        self.icon_size = Some(size.into());
+        self
+    }
+
     /// Set the tooltip of the button.
     pub fn tooltip(mut self, tooltip: impl Into<SharedString>) -> Self {
         self.tooltip = Some((tooltip.into(), None));
@@ -423,6 +443,16 @@ impl Button {
     /// Defaults to [`gpui_base::TooltipDefaults::show_delay`].
     pub fn tooltip_show_delay(mut self, delay: Duration) -> Self {
         self.tooltip_show_delay = Some(delay);
+        self
+    }
+
+    /// Waits out a full show delay on every hover entry.
+    ///
+    /// By default a tooltip switches immediately when another trigger is
+    /// entered while one is visible. Use this for dense rows of buttons whose
+    /// tooltips would otherwise flash as the pointer crosses them.
+    pub fn tooltip_restart_delay(mut self) -> Self {
+        self.tooltip_restart_delay = true;
         self
     }
 
@@ -627,6 +657,7 @@ impl RenderOnce for Button {
         let loading = self.loading;
         let tooltip_placement = self.tooltip_placement;
         let tooltip_show_delay = self.tooltip_show_delay;
+        let tooltip_restart_delay = self.tooltip_restart_delay;
         let hover_group = self.hover_group;
         let hover_group_held = self.hover_group_held;
         let mut base = self.base;
@@ -673,7 +704,7 @@ impl RenderOnce for Button {
             .justify_center()
             .cursor_default()
             .when(
-                interactive && (self.variant.is_link() || self.variant.is_text()),
+                interactive && (style.is_ghost() || style.is_link() || style.is_text()),
                 |this| this.cursor_pointer(),
             )
             .when(
@@ -708,6 +739,9 @@ impl RenderOnce for Button {
                             .when(self.compact, |this| this.min_w_8().px_2()),
                     }
                 }
+            })
+            .when(self.dropdown_caret && !style.no_padding(), |this| {
+                this.h(self.size.control_height())
             })
             .when(self.border_corners.top_left, |this| {
                 this.rounded_tl(rounding)
@@ -780,6 +814,7 @@ impl RenderOnce for Button {
             .items_center()
             .justify_center()
             .button_text_size(self.size)
+            .when(self.dropdown_caret, |this| this.text_size(cx.theme().control_font_size))
             .map(|this| match self.size {
                 Size::XSmall => this.gap_1(),
                 Size::Small => this.gap_1(),
@@ -893,15 +928,17 @@ impl RenderOnce for Button {
         })
         .map(|this| {
             if let Some(builder) = self.tooltip_builder {
-                this.managed_tooltip_with(
+                this.managed_tooltip_with_options(
                     tooltip_placement,
                     tooltip_show_delay,
+                    tooltip_restart_delay,
                     move |window, cx| builder(window, cx),
                 )
             } else if let Some((tooltip, action)) = self.tooltip {
-                this.managed_tooltip_with(
+                this.managed_tooltip_with_options(
                     tooltip_placement,
                     tooltip_show_delay,
+                    tooltip_restart_delay,
                     move |window, cx| {
                         Tooltip::new(tooltip.clone())
                             .when_some(action.clone(), |this, (action, context)| {
@@ -1207,14 +1244,7 @@ impl ButtonVariant {
                 }
             }
             Self::Custom(colors) => colors.hover.into(),
-            Self::Ghost => {
-                let accent: Background = cx.theme().tokens.accent.into();
-                if cx.theme().mode.is_dark() {
-                    accent.opacity(0.5)
-                } else {
-                    accent
-                }
-            }
+            Self::Ghost => cx.theme().tokens.secondary_hover.into(),
             Self::Link => cx.theme().transparent.into(),
             Self::Text => cx.theme().transparent.into(),
         };
@@ -1223,7 +1253,7 @@ impl ButtonVariant {
         let fg = match self {
             Self::Link => cx.theme().link_hover,
             Self::Text => cx.theme().foreground,
-            Self::Ghost => cx.theme().accent_foreground,
+            Self::Ghost => cx.theme().foreground,
             _ => self.text_color(outline, cx),
         };
 

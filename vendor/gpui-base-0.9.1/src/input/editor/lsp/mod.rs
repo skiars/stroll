@@ -68,7 +68,9 @@ pub struct Lsp {
     /// Cached semantic tokens as absolute position ranges + theme token-type
     /// names. Color is resolved from the name at paint time so theme switches
     /// take effect without a refetch.
+    pub(crate) semantic_revision: Option<u64>,
     pub(crate) semantic_tokens: Vec<(lsp_types::Range, SharedString)>,
+    pub(crate) code_action_probe: CodeActionProbe,
     pub(crate) _hover_task: Task<Result<()>>,
     pub(crate) _definition_task: Task<Result<()>>,
     pub(crate) _document_color_task: Task<()>,
@@ -88,7 +90,9 @@ impl Default for Lsp {
             semantic_tokens_provider: None,
             show_document: None,
             document_colors: vec![],
+            semantic_revision: None,
             semantic_tokens: vec![],
+            code_action_probe: CodeActionProbe::default(),
             _hover_task: Task::ready(Ok(())),
             _definition_task: Task::ready(Ok(())),
             _document_color_task: Task::ready(()),
@@ -120,16 +124,19 @@ impl Lsp {
     pub(crate) fn update(
         &mut self,
         text: &Rope,
+        revision: u64,
         window: &mut Window,
         cx: &mut Context<InputBaseState<EditorMode>>,
     ) {
         self.update_document_colors(text, window, cx);
-        self.update_semantic_tokens(text, window, cx);
+        self.update_semantic_tokens(text, revision, window, cx);
     }
 
     /// Reset all LSP states.
     pub(crate) fn reset(&mut self) {
         self.document_colors.clear();
+        self.code_action_probe = CodeActionProbe::default();
+        self.semantic_revision = None;
         self.semantic_tokens.clear();
         self._hover_task = Task::ready(Ok(()));
         self._definition_task = Task::ready(Ok(()));

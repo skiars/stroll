@@ -48,11 +48,6 @@ name = "gpui_wgpu"
 path = "src/gpui_wgpu.rs"
 doctest = false
 
-[[bench]]
-name = "layout_line"
-path = "benches/layout_line.rs"
-harness = false
-
 [dependencies.anyhow]
 version = "1.0.86"
 

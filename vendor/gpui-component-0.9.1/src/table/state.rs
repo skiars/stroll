@@ -9,7 +9,7 @@ use crate::{
     },
     h_flex,
     menu::{ContextMenuExt, PopupMenu},
-    scroll::{ScrollableMask, Scrollbar},
+    scroll::{ScrollableMask, Scrollbar, thin_scrollbar},
     v_flex,
 };
 use gpui::{
@@ -2742,7 +2742,7 @@ where
                 .bottom_0()
                 .w(Scrollbar::width())
                 .child(
-                    Scrollbar::vertical(&self.vertical_scroll_handle)
+                    thin_scrollbar(&self.vertical_scroll_handle)
                         .viewport_from_layout()
                         .max_fps(60),
                 ),
@@ -2760,7 +2760,7 @@ where
             .right(self.fixed_right_head_cols_bounds.size.width)
             .bottom_0()
             .h(Scrollbar::width())
-            .child(Scrollbar::horizontal(&self.horizontal_scroll_handle).viewport_from_layout())
+            .child(thin_scrollbar(&self.horizontal_scroll_handle).viewport_from_layout())
     }
 }
 

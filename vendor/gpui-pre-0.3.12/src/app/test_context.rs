@@ -1026,8 +1026,7 @@ impl VisualTestContext {
 
     /// Returns the bounds of the element with the given debug selector.
     ///
-    /// Returns `None` in builds without `debug_assertions`, which don't record
-    /// selectors; see [`crate::InteractiveElement::debug_selector`].
+    /// 只查询当前帧记录的选择器，见 [`crate::InteractiveElement::debug_selector`]。
     pub fn debug_bounds(&mut self, selector: &'static str) -> Option<Bounds<Pixels>> {
         self.update(|window, _| window.rendered_frame.debug_bounds.get(selector).copied())
     }

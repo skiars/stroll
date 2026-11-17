@@ -1,10 +1,11 @@
 use std::rc::Rc;
 
 use gpui::{
-    App, DefiniteLength, Entity, IntoElement, RenderOnce, SharedString, StyleRefinement, Styled,
-    Window, prelude::FluentBuilder as _, relative,
+    AnyElement, App, DefiniteLength, Entity, IntoElement, RenderOnce, SharedString,
+    StyleRefinement, Styled, Window, prelude::FluentBuilder as _, relative,
 };
 
+use super::input::ContextMenuBuilder;
 use super::{EditorState, Input};
 use crate::native_menu::NativeMenu;
 use crate::{ActiveTheme as _, RoleOverride, Sizable, Size, StyledExt as _};
@@ -24,14 +25,13 @@ pub struct Editor {
     bordered: bool,
     disabled: bool,
     readonly: bool,
+    preview: bool,
+    external_search_panel: bool,
     tab_index: isize,
     role: RoleOverride,
     aria_label: Option<SharedString>,
 
-    /// An optional context menu builder to allow a custom context menu.
-    ///
-    /// If set, this overrides the built-in context menu.
-    context_menu_builder: Option<Rc<dyn Fn(NativeMenu, &mut Window, &mut App) -> NativeMenu>>,
+    context_menu_builder: Option<ContextMenuBuilder>,
 
     paste_handler: Option<Rc<dyn Fn(&gpui::ClipboardItem, &mut Window, &mut App) -> bool>>,
 }
@@ -47,12 +47,33 @@ impl Editor {
             bordered: true,
             disabled: false,
             readonly: false,
+            preview: false,
+            external_search_panel: false,
             tab_index: 0,
             role: RoleOverride::default(),
             aria_label: None,
             context_menu_builder: None,
             paste_handler: None,
         }
+    }
+
+    /// Mount the built-in search panel outside this editor's text viewport.
+    /// Use this for groups of editors that share vertical alignment.
+    pub fn external_search_panel(mut self) -> Self {
+        self.external_search_panel = true;
+        self
+    }
+
+    pub fn search_has_focus(state: &Entity<EditorState>, window: &Window, cx: &App) -> bool {
+        super::overlay::search_has_focus(state, window, cx)
+    }
+
+    pub fn search_panel(
+        state: &Entity<EditorState>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Option<AnyElement> {
+        super::overlay::render_overlays(state, window, cx).search
     }
 
     pub fn h(mut self, height: impl Into<DefiniteLength>) -> Self {
@@ -85,6 +106,15 @@ impl Editor {
         self
     }
 
+    /// Draw selectable source over the surrounding surface.
+    pub fn preview(mut self) -> Self {
+        self.preview = true;
+        self.appearance = false;
+        self.bordered = false;
+        self.readonly = true;
+        self
+    }
+
     pub fn tab_index(mut self, index: isize) -> Self {
         self.tab_index = index;
         self
@@ -110,7 +140,16 @@ impl Editor {
         mut self,
         f: impl Fn(NativeMenu, &mut Window, &mut App) -> NativeMenu + 'static,
     ) -> Self {
-        self.context_menu_builder = Some(Rc::new(f));
+        self.context_menu_builder = Some(ContextMenuBuilder::Replace(Rc::new(f)));
+        self
+    }
+
+    /// Extend the built-in right-click menu. The last menu builder set is used.
+    pub fn extend_context_menu(
+        mut self,
+        f: impl Fn(NativeMenu, &mut Window, &mut App) -> NativeMenu + 'static,
+    ) -> Self {
+        self.context_menu_builder = Some(ContextMenuBuilder::Extend(Rc::new(f)));
         self
     }
 
@@ -153,6 +192,10 @@ impl RenderOnce for Editor {
             // this editor refines over them: `.text_sm()` and `.font_family()`
             // keep working.
             .font_family(cx.theme().mono_font_family.clone())
+            .when_some(
+                cx.theme().highlight_theme.style.editor_foreground,
+                |input, color| input.text_color(color),
+            )
             .text_size(cx.theme().mono_font_size)
             .line_height(relative(EDITOR_LINE_HEIGHT))
             .with_size(self.size)
@@ -161,12 +204,14 @@ impl RenderOnce for Editor {
             .focus_bordered(false)
             .disabled(self.disabled)
             .readonly(self.readonly)
+            .preview_style(self.preview)
+            .external_search_panel(self.external_search_panel)
             .tab_index(self.tab_index)
             .role(self.role)
             .when_some(self.height, |this, height| this.h(height))
             .when_some(self.aria_label, |this, label| this.aria_label(label))
             .when_some(self.context_menu_builder, |this, build| {
-                this.context_menu(move |menu, window, cx| build(menu, window, cx))
+                this.with_context_menu_builder(build)
             })
             .when_some(self.paste_handler, |this, handler| {
                 this.on_paste(move |item, window, cx| handler(item, window, cx))

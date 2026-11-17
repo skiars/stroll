@@ -69,10 +69,11 @@ impl Lsp {
     pub(crate) fn semantic_tokens_for_range(
         &self,
         text: &Rope,
+        revision: u64,
         visible_range: &Range<usize>,
         theme: &dyn HighlightStyleResolver,
     ) -> Vec<(Range<usize>, HighlightStyle)> {
-        if self.semantic_tokens.is_empty() {
+        if self.semantic_tokens.is_empty() || self.semantic_revision != Some(revision) {
             return Vec::new();
         }
 
@@ -108,6 +109,7 @@ impl Lsp {
     pub(crate) fn update_semantic_tokens(
         &mut self,
         text: &Rope,
+        revision: u64,
         window: &mut Window,
         cx: &mut Context<InputBaseState<EditorMode>>,
     ) {
@@ -138,7 +140,13 @@ impl Lsp {
                 if let Ok(tokens) = task.await {
                     let decoded = decode_semantic_tokens(&tokens, &legend);
                     let _ = input_state.update(cx, |input_state, cx| {
-                        if decoded != input_state.extras.lsp.semantic_tokens {
+                        if input_state.document_revision != revision {
+                            return;
+                        }
+                        if decoded != input_state.extras.lsp.semantic_tokens
+                            || input_state.extras.lsp.semantic_revision != Some(revision)
+                        {
+                            input_state.extras.lsp.semantic_revision = Some(revision);
                             input_state.extras.lsp.semantic_tokens = decoded;
                             cx.notify();
                         }
@@ -291,7 +299,8 @@ mod tests {
         ];
 
         // Visible range covering only line 0 (bytes 0..19).
-        let styles = lsp.semantic_tokens_for_range(&text, &(0..19), &theme);
+        lsp.semantic_revision = Some(0);
+        let styles = lsp.semantic_tokens_for_range(&text, 0, &(0..19), &theme);
         assert_eq!(
             styles.len(),
             1,
@@ -328,13 +337,14 @@ mod tests {
         // window must return exactly that one token out of 100.
         let line_bytes = "foo bar\n".len();
         let start = 50 * line_bytes;
-        let styles = lsp.semantic_tokens_for_range(&text, &(start..start + 3), &theme);
+        lsp.semantic_revision = Some(0);
+        let styles = lsp.semantic_tokens_for_range(&text, 0, &(start..start + 3), &theme);
         assert_eq!(styles.len(), 1);
         assert_eq!(styles[0].0, start..start + 3);
 
         // Empty viewport before all tokens windows nothing in.
         assert!(
-            lsp.semantic_tokens_for_range(&text, &(0..0), &theme)
+            lsp.semantic_tokens_for_range(&text, 0, &(0..0), &theme)
                 .is_empty()
         );
     }

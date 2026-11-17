@@ -604,7 +604,16 @@ impl TextSystem {
             if let Some(font_id) = lookup_font(font) {
                 Some(font_id)
             } else {
-                let font_id = self.fallback_font_stack.iter().find_map(lookup_font);
+                let font_id = self.fallback_font_stack.iter().find_map(|fallback| {
+                    if font.fallbacks.is_none() {
+                        lookup_font(fallback)
+                    } else {
+                        lookup_font(&Font {
+                            fallbacks: font.fallbacks.clone(),
+                            ..fallback.clone()
+                        })
+                    }
+                });
                 if let Some(font_id) = font_id {
                     font_ids.with_upgraded(|font_ids| {
                         font_ids.insert(font.clone(), CachedFont::Fallback(font_id));
@@ -639,6 +648,11 @@ pub struct WindowTextSystem {
 }
 
 impl WindowTextSystem {
+    /// Changes when newly registered fonts can alter fallback or shaping.
+    pub fn font_generation(&self) -> usize {
+        self.text_system.font_generation.load(Ordering::Acquire)
+    }
+
     /// Create a new WindowTextSystem with the given TextSystem.
     pub fn new(text_system: Arc<TextSystem>) -> Self {
         Self {
@@ -1096,10 +1110,33 @@ impl TextRun {
 #[repr(C)]
 pub struct GlyphId(pub u32);
 
+/// Selects a glyph rendering policy for the Linux and Windows text backends.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TextRenderingPreference {
+    /// Hint outlines below 200% window scale and use horizontal fractional positioning.
+    #[default]
+    Auto,
+    /// Fit outlines to the device pixel grid.
+    PixelAligned,
+    /// Preserve outlines and position glyphs at quarter-pixel steps on both axes.
+    HighPrecision,
+}
+
+impl TextRenderingPreference {
+    pub(crate) fn uses_hinting(self, scale_factor: f32) -> bool {
+        match self {
+            Self::Auto => scale_factor < 2.,
+            Self::PixelAligned => true,
+            Self::HighPrecision => false,
+        }
+    }
+}
+
 /// Parameters for rendering a glyph, used as cache keys for raster bounds.
 ///
 /// This struct identifies a specific glyph rendering configuration including
-/// font, size, subpixel positioning, and scale factor. It's used to look up
+/// font, size, subpixel positioning, scale factor, and hinting. It's used to look up
 /// cached raster bounds and sprite atlas entries.
 #[derive(Clone, Debug, PartialEq)]
 #[expect(missing_docs)]
@@ -1108,9 +1145,11 @@ pub struct RenderGlyphParams {
     pub glyph_id: GlyphId,
     pub font_size: Pixels,
     pub subpixel_variant: Point<u8>,
+    pub subpixel_steps: Point<u8>,
     pub scale_factor: f32,
     pub is_emoji: bool,
     pub subpixel_rendering: bool,
+    pub hinting: bool,
     pub dilation: u8,
 }
 
@@ -1122,9 +1161,11 @@ impl Hash for RenderGlyphParams {
         self.glyph_id.0.hash(state);
         self.font_size.0.to_bits().hash(state);
         self.subpixel_variant.hash(state);
+        self.subpixel_steps.hash(state);
         self.scale_factor.to_bits().hash(state);
         self.is_emoji.hash(state);
         self.subpixel_rendering.hash(state);
+        self.hinting.hash(state);
         self.dilation.hash(state);
     }
 }

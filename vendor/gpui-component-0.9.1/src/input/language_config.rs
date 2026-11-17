@@ -13,6 +13,9 @@ struct ComponentLanguages {
 
 impl gpui_base::input::LanguageProvider for ComponentLanguages {
     fn language_name(&self, name: &str) -> gpui::SharedString {
+        if name.eq_ignore_ascii_case("jsonc") {
+            return "jsonc".into();
+        }
         crate::highlighter::LanguageRegistry::singleton().editing_language_name(name)
     }
 
@@ -31,10 +34,24 @@ impl gpui_base::input::LanguageProvider for ComponentLanguages {
 pub(crate) fn init(cx: &mut gpui::App) {
     gpui_base::input::set_language_provider(
         std::rc::Rc::new(ComponentLanguages {
-            defaults: ["text", "json", "python"]
-                .into_iter()
-                .map(|name| (name, std::rc::Rc::new(default_language_config(name))))
-                .collect(),
+            defaults: [
+                "text",
+                "json",
+                "jsonc",
+                "python",
+                "bash",
+                "toml",
+                "yaml",
+                "rust",
+                "c",
+                "cpp",
+                "javascript",
+                "typescript",
+                "tsx",
+            ]
+            .into_iter()
+            .map(|name| (name, std::rc::Rc::new(default_language_config(name))))
+            .collect(),
             fallback: std::rc::Rc::new(LanguageConfig::default()),
         }),
         cx,
@@ -51,11 +68,11 @@ fn default_language_config(language: &str) -> LanguageConfig {
             Regex::new(r"^\s*[\}\)\]]").unwrap(),
         )
     });
-    match language.to_lowercase().as_str() {
+    let rules = match language {
         "text" => LanguageConfig::default()
             .brackets([])
             .auto_closing_pairs([]),
-        "json" => LanguageConfig::default()
+        "json" | "jsonc" => LanguageConfig::default()
             .brackets([BracketPair::new("{", "}"), BracketPair::new("[", "]")])
             .auto_closing_pairs(
                 [
@@ -68,6 +85,13 @@ fn default_language_config(language: &str) -> LanguageConfig {
             ),
         "python" => LanguageConfig::default().indentation_rules(PYTHON_INDENT.clone()),
         _ => LanguageConfig::default(),
+    };
+    match language {
+        "python" | "bash" | "toml" | "yaml" => rules.line_comment("#"),
+        "rust" | "c" | "cpp" | "javascript" | "typescript" | "tsx" | "jsonc" => {
+            rules.line_comment("//")
+        }
+        _ => rules,
     }
 }
 

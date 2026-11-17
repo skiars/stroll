@@ -1,4 +1,8 @@
+mod backdrop;
 mod cosmic_text_system;
+mod frame_timing;
+mod partial_repaint;
+mod scroll_repaint;
 mod wgpu_atlas;
 mod wgpu_context;
 mod wgpu_renderer;

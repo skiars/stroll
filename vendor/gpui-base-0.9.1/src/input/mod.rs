@@ -32,6 +32,9 @@ mod element;
 mod highlighting;
 #[path = "editor/indent.rs"]
 mod indent;
+#[path = "editor/inlay_hints.rs"]
+mod inlay_hints;
+pub use inlay_hints::InlayHint;
 #[path = "base/inline_tokens.rs"]
 mod inline_tokens;
 mod input;
@@ -51,6 +54,8 @@ mod language;
 pub mod language_config;
 #[path = "base/layout.rs"]
 mod layout;
+#[path = "editor/line_editing.rs"]
+mod line_editing;
 #[path = "editor/lsp/mod.rs"]
 mod lsp;
 #[path = "base/mask_pattern.rs"]
@@ -81,6 +86,7 @@ mod undo_manager;
 
 pub(crate) fn init(cx: &mut App) {
     state::init(cx);
+    line_editing::init(cx);
 }
 
 pub use crate::number_input::{NumberInputEvent, NumberStep};
@@ -88,9 +94,10 @@ pub use base::{InputBase, InputContextMenuCapabilities, InputStyles};
 pub use blink_cursor::CursorBlink;
 pub use cursor::Selection;
 pub use decorations::{
-    GutterDecoration, GutterDecorationCollection, OverviewRulerDecoration,
-    OverviewRulerDecorationCollection, OverviewRulerLane, RangeDecoration,
-    RangeDecorationCollection, RangeDecorationStyle, TextDecoration, TextDecorationCollection,
+    GutterDecoration, GutterDecorationCollection, GutterHunk, GutterHunkSection,
+    HUNK_TOOLBAR_HEIGHT, OverviewRulerDecoration, OverviewRulerDecorationCollection,
+    OverviewRulerLane, RangeDecoration, RangeDecorationCollection, RangeDecorationStyle,
+    TextDecoration, TextDecorationCollection, hovered_hunk_top,
 };
 pub use diagnostics::{
     Diagnostic, DiagnosticEntry, DiagnosticRelatedInformation, DiagnosticSet, DiagnosticSeverity,
@@ -114,10 +121,10 @@ pub(crate) use language_config::LanguageConfig;
 pub use language_config::{AutoClosingPair, BracketPair, IndentationRules};
 pub use lsp::{
     CodeActionItem, CodeActionMenuState, CodeActionProvider, CompletionHighlighter,
-    CompletionMenuOptions, CompletionMenuState, CompletionProvider, DefinitionProvider,
-    DocumentColorProvider, DocumentRangeSemanticTokensProvider, HoverPopoverState, HoverProvider,
-    InputOverlayKind, Lsp, ShowDocumentHandler, highlight_characters, highlight_contains,
-    highlight_prefix,
+    CompletionInput, CompletionMenuOptions, CompletionMenuState, CompletionProvider,
+    DefinitionProvider, DocumentColorProvider, DocumentRangeSemanticTokensProvider,
+    HoverDocumentation, HoverParagraph, HoverPopoverState, HoverProvider, InputOverlayKind, Lsp,
+    ShowDocumentHandler, highlight_characters, highlight_contains, highlight_prefix,
 };
 pub use lsp_types::Position;
 pub use mask_pattern::MaskPattern;

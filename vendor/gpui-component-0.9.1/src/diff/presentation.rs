@@ -3,7 +3,7 @@
 //! and inline changes between paired lines.
 use std::{collections::HashMap, ops::Range, sync::Arc};
 
-use gpui::{HighlightStyle, SharedString};
+use gpui::{HighlightStyle, Hsla, SharedString};
 use gpui_base::input::HighlightStyleResolver;
 use similar::{ChangeTag, TextDiff};
 
@@ -170,6 +170,27 @@ impl FilePresentation {
             .collect()
     }
 
+    pub(crate) fn editor_highlights(
+        &self,
+        side: DiffSide,
+        ix: usize,
+        changed: Hsla,
+    ) -> Vec<(Range<usize>, HighlightStyle)> {
+        self.inline[side as usize]
+            .line(ix)
+            .iter()
+            .map(|(range, _)| {
+                (
+                    range.start as usize..range.end as usize,
+                    HighlightStyle {
+                        background_color: Some(changed),
+                        ..Default::default()
+                    },
+                )
+            })
+            .collect()
+    }
+
     /// Changed runs within one line, as display ranges.
     pub(crate) fn inline_changes<'a>(
         &'a self,
@@ -192,12 +213,25 @@ fn syntax_spans(
     max_line_length: usize,
     highlight: &mut dyn FnMut(&SharedString, &str) -> Vec<(Range<usize>, SyntaxPaint)>,
 ) -> Vec<Vec<(Range<u32>, SyntaxPaint)>> {
+    if max_line_length == 0 {
+        return Vec::new();
+    }
     let lines = file.lines(side);
     let mut per_line: Vec<Vec<(Range<u32>, SyntaxPaint)>> =
         (0..lines.len()).map(|_| Vec::new()).collect();
-    let language = match (file.language_override(), file.side_path(side)) {
+    let language = match (file.language_override(side), file.side_path(side)) {
         (Some(language), _) => language.clone(),
-        (None, Some(path)) => detected_language(path),
+        (None, Some(path)) => {
+            let first_line = lines.first().filter(|line| line.line_number() == 1);
+            if crate::highlighter::is_bash_source(
+                path.rsplit(['/', '\\']).next().unwrap_or_default(),
+                first_line.map(|line| line.text().trim_start_matches('\u{feff}')),
+            ) {
+                "bash".into()
+            } else {
+                detected_language(path)
+            }
+        }
         (None, None) => return per_line,
     };
     if language.as_str() == "text" || lines.is_empty() {
@@ -325,6 +359,9 @@ fn push_run(runs: &mut Vec<Range<u32>>, range: Range<usize>, text: &str, unit: D
 /// determines the language; dots in a directory are not extensions.
 pub(crate) fn detected_language(path: &str) -> SharedString {
     let name = path.rsplit(['/', '\\']).next().unwrap_or("").to_lowercase();
+    if crate::highlighter::is_bash_source(&name, None) {
+        return "bash".into();
+    }
     let language = match name.as_str() {
         "makefile" | "gnumakefile" => "make",
         "cmakelists.txt" => "cmake",
@@ -334,15 +371,16 @@ pub(crate) fn detected_language(path: &str) -> SharedString {
             Some("cc" | "cxx" | "hpp" | "hxx") => "cpp",
             Some("h") => "c",
             Some("htm") => "html",
+            Some("markdown") => "markdown",
             Some("gql") => "graphql",
             Some("exs") => "elixir",
             Some(
-                extension @ ("astro" | "sh" | "bash" | "c" | "cmake" | "cs" | "cpp" | "css"
-                | "scss" | "diff" | "ejs" | "ex" | "erb" | "go" | "graphql" | "html"
-                | "java" | "js" | "json" | "jsonc" | "kt" | "kts" | "lua" | "md"
-                | "mdx" | "php" | "php3" | "php4" | "php5" | "phtml" | "proto" | "py"
-                | "pyi" | "rb" | "rs" | "scala" | "sql" | "svelte" | "swift" | "toml"
-                | "tsx" | "ts" | "yaml" | "yml" | "zig"),
+                extension @ ("astro" | "c" | "cmake" | "cs" | "cpp" | "css" | "scss" | "diff"
+                | "ejs" | "ex" | "erb" | "go" | "graphql" | "html" | "java" | "js"
+                | "json" | "jsonc" | "kt" | "kts" | "lua" | "md" | "mdx" | "php"
+                | "php3" | "php4" | "php5" | "phtml" | "proto" | "py" | "pyi" | "rb"
+                | "rs" | "scala" | "sql" | "svelte" | "swift" | "toml" | "tsx" | "ts"
+                | "yaml" | "yml" | "zig"),
             ) => extension,
             _ => "text",
         },
@@ -379,6 +417,26 @@ mod tests {
             .remove(0);
         assert_eq!(file.language().as_str(), "text");
         assert_eq!(file.with_language("rust").language().as_str(), "rust");
+    }
+
+    #[cfg(feature = "tree-sitter-bash")]
+    #[test]
+    fn bash_diff_detects_an_extensionless_script_from_line_one() {
+        let file = DiffFile::parse(
+            "--- a/run\n+++ b/run\n@@ -1,2 +1,2 @@\n #!/bin/bash\n-if true; then echo old; fi\n+if true; then echo new; fi\n",
+        ).unwrap().remove(0);
+        let presentation =
+            FilePresentation::prepare(&file, OPTIONS, &mut SyntaxHighlighters::default(), None);
+        let theme = crate::highlighter::HighlightTheme::default_dark();
+        for side in [DiffSide::Original, DiffSide::Modified] {
+            let line = &file.lines(side)[1];
+            let spans = presentation.syntax_highlights(line, side, 1, theme.as_ref());
+            assert!(
+                spans.iter().any(
+                    |(range, style)| *range == (0..2) && Some(*style) == theme.style("keyword")
+                )
+            );
+        }
     }
 
     #[test]

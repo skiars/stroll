@@ -135,6 +135,7 @@ pub struct WaylandWindowState {
     hovered: bool,
     redraw_requested: bool,
     presentation: PresentationState,
+    feedback_frame: u64,
     pending_frame_callback: Option<wl_callback::WlCallback>,
     in_progress_configure: Option<InProgressConfigure>,
     resize_throttle: bool,
@@ -639,6 +640,7 @@ impl WaylandWindowState {
             hovered: false,
             redraw_requested: false,
             presentation: PresentationState::Unpresented,
+            feedback_frame: 0,
             pending_frame_callback: None,
             in_progress_window_controls: None,
             window_controls: WindowControls::default(),
@@ -1019,7 +1021,19 @@ impl WaylandWindowStatePtr {
     pub fn frame_callback_fired(&self, signal_at: Option<Instant>) {
         // Another wl_surface commit may have carried this callback while a retry
         // timer owned the render-loop wakeup.
-        self.state.borrow_mut().pending_frame_callback = None;
+        {
+            let mut state = self.state.borrow_mut();
+            state.pending_frame_callback = None;
+            if state.globals.presentation_feedback.is_some()
+                && let Some(at_ns) = monotonic_ns()
+            {
+                eprintln!(
+                    "wayland_callback window={:?} last_submit_frame={} at_ns={at_ns}",
+                    state.handle.window_id(),
+                    state.feedback_frame
+                );
+            }
+        }
         if self.frame_loop.get() == FrameLoop::AwaitingCallback {
             self.frame(signal_at, FrameRequestSource::NativeCallback);
         }
@@ -2056,7 +2070,29 @@ impl PlatformWindow for WaylandWindow {
             let callback = state.surface.frame(&state.globals.qh, state.surface.id());
             state.pending_frame_callback = Some(callback);
         }
+        if let Some(presentation) = &state.globals.presentation_feedback {
+            state.feedback_frame += 1;
+            presentation.feedback(
+                &state.surface,
+                &state.globals.qh,
+                (state.handle.window_id(), state.feedback_frame),
+            );
+            eprintln!(
+                "wayland_submit window={:?} frame={}",
+                state.handle.window_id(),
+                state.feedback_frame
+            );
+        }
         if renderer.draw(scene) {
+            if state.globals.presentation_feedback.is_some()
+                && let Some(at_ns) = monotonic_ns()
+            {
+                eprintln!(
+                    "wayland_present_return window={:?} frame={} at_ns={at_ns}",
+                    state.handle.window_id(),
+                    state.feedback_frame
+                );
+            }
             state.presentation = PresentationState::Presented;
             self.0.frame_loop.set(FrameLoop::AwaitingCallback);
         } else {
@@ -2278,6 +2314,16 @@ impl PlatformWindow for WaylandWindow {
     fn a11y_update_window_bounds(&self) {
         // Wayland doesn't expose window position, so this is a no-op
     }
+}
+
+fn monotonic_ns() -> Option<u128> {
+    let mut time = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // CLOCK_MONOTONIC 在 Wayland 返回相同时钟 ID 时可与呈现时间直接比较。
+    let result = unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut time) };
+    (result == 0).then(|| time.tv_sec as u128 * 1_000_000_000 + time.tv_nsec as u128)
 }
 
 struct TrivialActivationHandler {

@@ -1,9 +1,9 @@
 use std::rc::Rc;
 
 use gpui::{
-    Anchor, AnyElement, App, Context, DismissEvent, Element, ElementId, Entity, FocusHandle,
+    Anchor, AnyElement, App, Context, DismissEvent, Element, ElementId, Empty, Entity, FocusHandle,
     Focusable, GlobalElementId, InspectorElementId, InteractiveElement, IntoElement, LayoutId,
-    RenderOnce, SharedString, Styled, Window, prelude::FluentBuilder,
+    RenderOnce, SharedString, Styled, Window,
 };
 
 use crate::{Selectable, button::Button, menu::PopupMenu, popover::Popover};
@@ -81,6 +81,7 @@ where
 #[derive(Default)]
 struct DropdownMenuState {
     menu: Option<Entity<PopupMenu>>,
+    rebuild: bool,
 }
 
 impl<T> RenderOnce for DropdownMenuPopover<T>
@@ -108,67 +109,64 @@ where
         let builder = self.builder.clone();
         let menu_state =
             window.use_keyed_state(self.id.clone(), cx, |_, _| DropdownMenuState::default());
+        let state_on_close = menu_state.downgrade();
+        let on_open_change = self.on_open_change;
 
         Popover::new(SharedString::from(format!("popover:{}", self.id)))
             .appearance(false)
+            .dropdown_motion()
             .overlay_closable(false)
             .trigger(self.trigger)
             .anchor(self.anchor)
-            .when_some(self.on_open_change, |this, callback| {
-                this.on_open_change(move |open, window, cx| callback(open, window, cx))
+            .on_open_change(move |open, window, cx| {
+                if !open {
+                    _ = state_on_close.update(cx, |state, _| state.rebuild = true);
+                }
+                if let Some(callback) = &on_open_change {
+                    callback(open, window, cx);
+                }
             })
-            .content(move |_, window, cx| {
-                // Here is special logic to only create the PopupMenu once and reuse it.
-                // Because this `content` will called in every time render, so we need to store the menu
-                // in state to avoid recreating at every render.
-                //
-                // And we also need to rebuild the menu when it is dismissed, to rebuild menu items
-                // dynamically for support `dropdown_menu` method, so we listen for DismissEvent below.
-                let menu = match menu_state.read(cx).menu.clone() {
+            .content(move |popover, window, cx| {
+                let state = menu_state.read(cx);
+                // The popover still renders during its exit fade. Keep its current
+                // menu through that fade, and only build and focus a menu on open.
+                if !popover.is_open() {
+                    return state
+                        .menu
+                        .clone()
+                        .map_or_else(|| Empty.into_any_element(), IntoElement::into_any_element);
+                }
+                let menu = match state.menu.clone().filter(|_| !state.rebuild) {
                     Some(menu) => menu,
                     None => {
                         let builder = builder.clone();
                         let menu = PopupMenu::build(window, cx, move |menu, window, cx| {
-                            builder(menu, window, cx)
+                            builder(menu.in_dropdown(), window, cx)
                         });
+                        let popover_focus = popover.focus_handle(cx);
                         menu.update(cx, |menu, cx| {
-                            menu.set_trigger_focus(Some(trigger_focus.clone()), cx)
+                            menu.set_trigger_focus(Some(trigger_focus.clone()), cx);
+                            menu.set_previous_focus(Some(popover_focus), cx);
                         });
                         menu_state.update(cx, |state, _| {
                             state.menu = Some(menu.clone());
+                            state.rebuild = false;
                         });
                         menu.focus_handle(cx).focus(window, cx);
 
-                        // Listen for dismiss events from the PopupMenu to close the popover.
-                        //
-                        // Hold Weak handles here, not strong clones: the listener
-                        // lives as long as `menu`, which `menu_state` owns, so a
-                        // strong capture would close the cycle
-                        // `menu_state -> menu -> listener -> menu_state` and leak
-                        // the `PopupMenu` and `DropdownMenuState` when the trigger
-                        // stops being rendered while the menu is open.
+                        // Keep the popover weak so the menu cannot retain its owner.
                         let popover_state = cx.entity().downgrade();
                         window
-                            .subscribe(&menu, cx, {
-                                let menu_state = menu_state.downgrade();
-                                move |_, _: &DismissEvent, window, cx| {
-                                    if let Some(popover_state) = popover_state.upgrade() {
-                                        popover_state.update(cx, |state, cx| {
-                                            state.dismiss(window, cx);
-                                        });
-                                    }
-                                    _ = menu_state.update(cx, |state, _| {
-                                        state.menu = None;
-                                    });
-                                }
+                            .subscribe(&menu, cx, move |_, _: &DismissEvent, window, cx| {
+                                _ = popover_state.update(cx, |state, cx| state.dismiss(window, cx));
                             })
                             .detach();
 
-                        menu.clone()
+                        menu
                     }
                 };
 
-                menu.clone()
+                menu.into_any_element()
             })
     }
 }

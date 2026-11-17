@@ -16,6 +16,7 @@ pub(crate) enum EditIntent {
 
 #[derive(Debug)]
 struct UndoTransaction {
+    group: Option<u64>,
     intent: EditIntent,
     changes: Vec<Change>,
     /// How many changes the most recently appended batch contributed. A batch
@@ -32,6 +33,49 @@ struct UndoTransaction {
     selections_after: Option<Vec<CursorSelection>>,
     auto_closed_pairs_before: Option<AutoClosedPairs>,
     auto_closed_pairs_after: Option<AutoClosedPairs>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct SavedChange<T> {
+    old_start: usize,
+    new_start: usize,
+    before: T,
+    after: T,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct SavedTransaction<T> {
+    group: Option<u64>,
+    changes: Vec<SavedChange<T>>,
+}
+
+impl From<SavedTransaction<String>> for UndoTransaction {
+    fn from(saved: SavedTransaction<String>) -> Self {
+        let changes: Vec<_> = saved
+            .changes
+            .into_iter()
+            .map(|change| Change {
+                token_delta: None,
+                old_range: (change.old_start..change.old_start.saturating_add(change.before.len()))
+                    .into(),
+                new_range: (change.new_start..change.new_start.saturating_add(change.after.len()))
+                    .into(),
+                old_text: change.before,
+                new_text: change.after,
+            })
+            .collect();
+        Self {
+            group: saved.group,
+            intent: EditIntent::Atomic,
+            last_batch_len: changes.len(),
+            recorded_changes: changes.len(),
+            changes,
+            selections_before: None,
+            selections_after: None,
+            auto_closed_pairs_before: None,
+            auto_closed_pairs_after: None,
+        }
+    }
 }
 
 /// A batch of changes being collected between `begin_transaction` and the
@@ -84,6 +128,45 @@ impl UndoManager {
             pending_intent: None,
             coalescing_boundary: false,
         }
+    }
+
+    pub(super) fn snapshot(&self) -> serde_json::Result<Option<Vec<u8>>> {
+        if self.transaction_depth != 0 {
+            return Ok(None);
+        }
+        fn transactions(entries: &[UndoTransaction]) -> Vec<SavedTransaction<&str>> {
+            entries
+                .iter()
+                .map(|entry| SavedTransaction {
+                    group: entry.group,
+                    changes: entry
+                        .changes
+                        .iter()
+                        .map(|change| SavedChange {
+                            old_start: change.old_range.start,
+                            new_start: change.new_range.start,
+                            before: change.old_text.as_str(),
+                            after: change.new_text.as_str(),
+                        })
+                        .collect(),
+                })
+                .collect()
+        }
+        serde_json::to_vec(&(
+            transactions(&self.undo_transactions),
+            transactions(&self.redo_transactions),
+        ))
+        .map(Some)
+    }
+
+    pub(super) fn restore(&mut self, bytes: &[u8]) -> serde_json::Result<()> {
+        let (undo, redo): (Vec<SavedTransaction<String>>, Vec<SavedTransaction<String>>) =
+            serde_json::from_slice(bytes)?;
+        self.clear();
+        self.undo_transactions = undo.into_iter().map(Into::into).collect();
+        self.redo_transactions = redo.into_iter().map(Into::into).collect();
+        self.break_transaction_coalescing();
+        Ok(())
     }
 
     /// The intent requested for the next recorded change, taken by the edit
@@ -219,10 +302,8 @@ impl UndoManager {
             return;
         }
 
-        if self.undo_transactions.len() >= MAX_UNDO_TRANSACTIONS {
-            self.undo_transactions.remove(0);
-        }
-        self.undo_transactions.push(UndoTransaction {
+        self.push_transaction(UndoTransaction {
+            group: None,
             intent,
             last_batch_len: changes.len(),
             recorded_changes: changes.len(),
@@ -233,6 +314,33 @@ impl UndoManager {
             auto_closed_pairs_after: None,
         });
         self.coalescing_boundary = intent == EditIntent::Atomic;
+    }
+
+    fn push_transaction(&mut self, transaction: UndoTransaction) {
+        if self.undo_transactions.len() >= MAX_UNDO_TRANSACTIONS {
+            self.undo_transactions.remove(0);
+        }
+        self.undo_transactions.push(transaction);
+    }
+
+    pub(super) fn record_group(&mut self, group: u64) {
+        if self.ignoring {
+            return;
+        }
+        self.commit_all_transactions();
+        self.redo_transactions.clear();
+        self.push_transaction(UndoTransaction {
+            group: Some(group),
+            intent: EditIntent::Atomic,
+            changes: Vec::new(),
+            last_batch_len: 0,
+            recorded_changes: 0,
+            selections_before: None,
+            selections_after: None,
+            auto_closed_pairs_before: None,
+            auto_closed_pairs_after: None,
+        });
+        self.coalescing_boundary = true;
     }
 
     /// Record the cursors around the transaction being built, or around the
@@ -336,6 +444,47 @@ impl UndoManager {
         self.pending = None;
         self.pending_intent = None;
         self.coalescing_boundary = false;
+    }
+
+    pub(super) fn set_group(&mut self, group: u64) {
+        if let Some(transaction) = self.undo_transactions.last_mut() {
+            transaction.group = Some(group);
+        }
+    }
+
+    pub(super) fn group(&self, undo: bool) -> Option<u64> {
+        if self.transaction_depth != 0 {
+            return None;
+        }
+        let transactions = if undo {
+            &self.undo_transactions
+        } else {
+            &self.redo_transactions
+        };
+        transactions.last()?.group
+    }
+
+    pub(super) fn has_history(&self, undo: bool) -> bool {
+        if undo {
+            !self.undo_transactions.is_empty()
+                || self
+                    .pending
+                    .as_ref()
+                    .is_some_and(|entry| !entry.changes.is_empty())
+        } else {
+            !self.redo_transactions.is_empty()
+        }
+    }
+
+    pub(super) fn is_group_marker(&self, undo: bool) -> bool {
+        let transactions = if undo {
+            &self.undo_transactions
+        } else {
+            &self.redo_transactions
+        };
+        transactions
+            .last()
+            .is_some_and(|entry| entry.group.is_some() && entry.changes.is_empty())
     }
 
     pub(super) fn undo(&mut self) -> Option<Replay> {

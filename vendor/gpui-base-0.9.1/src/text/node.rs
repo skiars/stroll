@@ -19,8 +19,8 @@ use crate::{
     GlobalState, ScrollableMask, Scrollbar, StyledExt, h_flex,
     scrollable_mask::horizontal_scroll_area,
     text::{
-        CodeBlockActionsFn, CodeBlockHighlighterFn, LinkClickHandlerFn, MarkdownExtensions,
-        MarkdownNode, TableActionsFn, TaskToggleEvent, TaskToggleHandlerFn,
+        CodeBlockActionsFn, CodeBlockHighlighterFn, ImageClickHandlerFn, LinkClickHandlerFn,
+        MarkdownExtensions, MarkdownNode, TableActionsFn, TaskToggleEvent, TaskToggleHandlerFn,
         document::{NodeRenderOptions, PrevBlock, flow_position},
         inline::{
             Inline, InlineHighlight, InlineState, code_insets, combine_highlights, fade_highlights,
@@ -2721,7 +2721,10 @@ impl CodeBlock {
                     div()
                         .absolute()
                         .inset_0()
-                        .child(Scrollbar::vertical(&scroll_handle)),
+                        .child(
+                            Scrollbar::vertical(&scroll_handle)
+                                .mode(crate::ScrollbarMode::Always),
+                        ),
                 )
                 .children(actions)
                 .children(lang_label)
@@ -2751,13 +2754,14 @@ pub(crate) struct NodeContext {
     /// The byte offset of the node in the original markdown text.
     /// Used for incremental updates.
     pub(crate) offset: usize,
-    pub(crate) link_refs: HashMap<SharedString, LinkMark>,
+    pub(crate) link_refs: Arc<HashMap<SharedString, LinkMark>>,
     pub(crate) style: Arc<TextViewStyle>,
     pub(crate) code_block_actions: Option<Arc<CodeBlockActionsFn>>,
     pub(crate) code_block_highlighter: Option<Arc<CodeBlockHighlighterFn>>,
     pub(crate) table_actions: Option<Arc<TableActionsFn>>,
     pub(crate) image_source: Option<Arc<super::text_view::ImageSourceFn>>,
     pub(crate) link_click_handler: Option<Arc<LinkClickHandlerFn>>,
+    pub(crate) image_click_handler: Option<Arc<ImageClickHandlerFn>>,
     pub(crate) task_toggle_handler: Option<Arc<TaskToggleHandlerFn>>,
     pub(crate) markdown_extensions: Arc<MarkdownExtensions>,
     /// This frame's streamed fade-in, when any text is still fading.
@@ -2787,7 +2791,7 @@ impl NodeContext {
     }
 
     pub(super) fn add_ref(&mut self, identifier: SharedString, link: LinkMark) {
-        self.link_refs.insert(identifier, link);
+        Arc::make_mut(&mut self.link_refs).insert(identifier, link);
     }
 
     /// The fade ranges of the text leaf `key`, in its rendered byte space.
@@ -2848,7 +2852,9 @@ fn mark_text_color(highlight: Hsla, background: Hsla) -> Hsla {
 fn mark_highlight(mark: &TextMark, node_cx: &NodeContext, cx: &App) -> InlineHighlight {
     let mut highlight = HighlightStyle::default();
     if mark.bold {
-        highlight.font_weight = Some(FontWeight::BOLD);
+        // Reading text is semibold, matching the document's heading weight, so
+        // emphasis does not jump a whole weight above its surroundings.
+        highlight.font_weight = Some(FontWeight::SEMIBOLD);
     }
     if mark.italic {
         highlight.font_style = Some(FontStyle::Italic);
@@ -2968,6 +2974,7 @@ impl Paragraph {
                 self.element_id(fade_key),
                 self.inline_flow_items(fade_key, fades, backgrounds, node_cx, cx),
                 node_cx.link_click_handler.clone(),
+                node_cx.image_click_handler.clone(),
             )
             .editor_key(self.leaf_key())
             .into_any_element();
@@ -3046,42 +3053,48 @@ impl Paragraph {
                     );
                 }
                 let link_click_handler = node_cx.link_click_handler.clone();
-                child_nodes.push(
-                    img(node_cx.image_source(image))
-                        .id(ix)
-                        .object_fit(ObjectFit::Contain)
-                        .max_w(relative(1.))
-                        .when_some(image.width, |this, width| this.w(width))
-                        .when_some(image.link.clone(), |this, link| {
-                            let link_click_handler = link_click_handler.clone();
-                            let aux_link = link.clone();
-                            let aux_link_click_handler = link_click_handler.clone();
-                            this.cursor_pointer()
-                                .on_click(move |event, window, cx| {
-                                    crate::TextSelection::end(window, cx);
-                                    cx.stop_propagation();
-                                    handle_link_click(
-                                        &link_click_handler,
-                                        link.url.clone(),
-                                        event.clone(),
-                                        window,
-                                        cx,
-                                    );
-                                })
-                                .on_aux_click(move |event, window, cx| {
-                                    crate::TextSelection::end(window, cx);
-                                    cx.stop_propagation();
-                                    handle_link_click(
-                                        &aux_link_click_handler,
-                                        aux_link.url.clone(),
-                                        event.clone(),
-                                        window,
-                                        cx,
-                                    );
-                                })
+                let image_click_handler = node_cx.image_click_handler.clone();
+                let mut element = img(node_cx.image_source(image))
+                    .id(ix)
+                    .object_fit(ObjectFit::Contain)
+                    .max_w(relative(1.))
+                    .when_some(image.width, |this, width| this.w(width));
+                if let Some(image_click_handler) = image_click_handler {
+                    let url: SharedString = image.url.as_ref().into();
+                    element = element.cursor_pointer().on_click(move |event, window, cx| {
+                        crate::TextSelection::end(window, cx);
+                        cx.stop_propagation();
+                        image_click_handler(&url, &event, window, cx);
+                    });
+                } else if let Some(link) = image.link.clone() {
+                    let aux_link = link.clone();
+                    let aux_link_click_handler = link_click_handler.clone();
+                    element = element
+                        .cursor_pointer()
+                        .on_click(move |event, window, cx| {
+                            crate::TextSelection::end(window, cx);
+                            cx.stop_propagation();
+                            handle_link_click(
+                                &link_click_handler,
+                                link.url.clone(),
+                                event.clone(),
+                                window,
+                                cx,
+                            );
                         })
-                        .into_any_element(),
-                );
+                        .on_aux_click(move |event, window, cx| {
+                            crate::TextSelection::end(window, cx);
+                            cx.stop_propagation();
+                            handle_link_click(
+                                &aux_link_click_handler,
+                                aux_link.url.clone(),
+                                event.clone(),
+                                window,
+                                cx,
+                            );
+                        });
+                }
+                child_nodes.push(element.into_any_element());
 
                 consumed += text.len();
                 text.clear();
@@ -3287,6 +3300,7 @@ impl Paragraph {
 
                 items.push(InlineFlowItem::Image {
                     source: node_cx.image_source(image),
+                    url: image.url.as_ref().into(),
                     link: image.link.clone(),
                     title: image.title(),
                     width: image.width,
@@ -3437,11 +3451,6 @@ fn heading_size(level: u8, node_cx: &NodeContext, window: &Window) -> Pixels {
         || body_font_size(node_cx, window) * heading_metrics(level).0,
         |size| size.to_pixels(window.rem_size()),
     )
-}
-
-/// The room above and below a horizontal rule.
-fn rule_space(body_font_size: Pixels) -> Pixels {
-    body_font_size * 1.6
 }
 
 /// The gap below a block: a paragraph gap, unless nothing follows it.
@@ -4420,6 +4429,7 @@ impl BlockNode {
                     .when(row_ix == 0, |this| {
                         this.bg(style.code_background())
                             .text_color(style.foreground())
+                            .font_weight(FontWeight::SEMIBOLD)
                             .when_some(top_left, |this, radius| this.rounded_tl(radius))
                             .when_some(top_right, |this, radius| this.rounded_tr(radius))
                             .refine_style(&style.table_head())
@@ -4494,14 +4504,33 @@ impl BlockNode {
                 // only the rest of the section gap is added here -- the two
                 // collapse like CSS margins. A heading right after another one
                 // belongs to the same section and stays close. Nested in a
-                // list item, a heading sits flush with the item.
-                let top = if options.is_first || options.depth > 0 {
+                // list item, a heading sits flush with the item. A caller that
+                // pins the space above replaces the derived section gap, and
+                // the space already left by the previous block is still
+                // subtracted, so the pinned value is the whole gap.
+                let top = if options.is_first {
+                    px(0.)
+                } else if let Some(gap) = node_cx.style.heading_top_gap() {
+                    let previous = match options.prev {
+                        PrevBlock::Heading(_) => node_cx
+                            .style
+                            .heading_bottom_gap()
+                            .unwrap_or(text_size * 0.25),
+                        PrevBlock::Rule => {
+                            node_cx.style.rule_spacing(body_font_size(node_cx, window))
+                        }
+                        PrevBlock::Other => {
+                            node_cx.style.paragraph_gap().to_pixels(window.rem_size())
+                        }
+                    };
+                    (gap - previous).max(px(0.))
+                } else if options.depth > 0 {
                     px(0.)
                 } else {
                     match options.prev {
                         PrevBlock::Heading(_) => text_size * 0.25,
                         PrevBlock::Rule => (text_size * section_gap
-                            - rule_space(body_font_size(node_cx, window)))
+                            - node_cx.style.rule_spacing(body_font_size(node_cx, window)))
                         .max(px(0.)),
                         PrevBlock::Other => (text_size * section_gap
                             - node_cx.style.paragraph_gap().to_pixels(window.rem_size()))
@@ -4510,6 +4539,8 @@ impl BlockNode {
                 };
                 let bottom = if options.is_last {
                     px(0.)
+                } else if let Some(gap) = node_cx.style.heading_bottom_gap() {
+                    gap
                 } else {
                     text_size * HEADING_BOTTOM_GAP
                 };
@@ -4688,7 +4719,7 @@ impl BlockNode {
                 // A section break: a hairline with more room around it than
                 // a paragraph gap. The previous block's own gap counts toward
                 // the space above, as with headings.
-                let space = rule_space(body_font_size(node_cx, window));
+                let space = node_cx.style.rule_spacing(body_font_size(node_cx, window));
                 let top = if options.is_first || options.depth > 0 {
                     px(0.)
                 } else {
@@ -4764,12 +4795,12 @@ mod tests {
                     vec![0..1, 1..4, 4..8, 8..11, 11..12]
                 );
                 for ix in [1, 2] {
-                    assert_eq!(spans[ix].1.style.font_weight, Some(FontWeight::BOLD));
+                    assert_eq!(spans[ix].1.style.font_weight, Some(FontWeight::SEMIBOLD));
                     assert_eq!(spans[ix].1.style.font_style, Some(FontStyle::Italic));
                 }
                 assert!(spans[2].1.code_style.is_some());
                 assert_eq!(spans[2].1.font_size_scale, Some(0.875));
-                assert_eq!(spans[3].1.style.font_weight, Some(FontWeight::BOLD));
+                assert_eq!(spans[3].1.style.font_weight, Some(FontWeight::SEMIBOLD));
                 assert_eq!(spans[3].1.style.font_style, None);
                 assert!(spans[3].1.code_style.is_none());
                 assert_eq!(spans[4].1.style.font_weight, None);
@@ -4810,7 +4841,10 @@ mod tests {
                     .collect::<Vec<_>>(),
                 vec![0..1, 1..2, 2..3]
             );
-            assert_eq!(highlights[1].1.style.font_weight, Some(FontWeight::BOLD));
+            assert_eq!(
+                highlights[1].1.style.font_weight,
+                Some(FontWeight::SEMIBOLD)
+            );
             assert_eq!(highlights[1].1.style.font_style, Some(FontStyle::Italic));
             assert_eq!(highlights[2].1.style.font_weight, None);
         });
@@ -4883,7 +4917,7 @@ mod tests {
                 assert!(
                     highlights
                         .iter()
-                        .all(|(_, h)| h.style.font_weight == Some(FontWeight::BOLD))
+                        .all(|(_, h)| h.style.font_weight == Some(FontWeight::SEMIBOLD))
                 );
                 assert!(
                     highlights
@@ -5266,7 +5300,7 @@ mod tests {
                 identifier: Some("ref".into()),
                 ..Default::default()
             });
-            node_cx.link_refs.insert(
+            node_cx.add_ref(
                 "ref".into(),
                 LinkMark {
                     url: "https://example.com".into(),
@@ -5284,7 +5318,7 @@ mod tests {
             let InlineFlowItem::Object { style, link, .. } = &items[0] else {
                 panic!()
             };
-            assert_eq!(style.font_weight, Some(FontWeight::BOLD));
+            assert_eq!(style.font_weight, Some(FontWeight::SEMIBOLD));
             assert_eq!(style.font_style, Some(FontStyle::Italic));
             assert!(style.strikethrough.is_some());
             assert_eq!(link.as_ref().unwrap().url.as_ref(), "https://example.com");

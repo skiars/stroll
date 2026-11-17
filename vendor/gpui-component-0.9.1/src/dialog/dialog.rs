@@ -4,10 +4,9 @@ use gpui_base::TestSupportExt as _;
 use std::{rc::Rc, sync::LazyLock, time::Duration};
 
 use gpui::{
-    Action, Anchor, AnyElement, App, BoxShadow, ClickEvent, Edges, FocusHandle, Hsla,
-    InteractiveElement, IntoElement, ParentElement, Pixels, RenderOnce, SharedString,
-    StyleRefinement, Styled, Window, WindowControlArea, anchored, div, hsla, point,
-    prelude::FluentBuilder, px,
+    Action, Anchor, AnyElement, App, ClickEvent, Edges, FocusHandle, Hsla, InteractiveElement,
+    IntoElement, ParentElement, Pixels, RenderOnce, SharedString, StyleRefinement, Styled, Window,
+    WindowControlArea, anchored, div, hsla, point, prelude::FluentBuilder, px,
 };
 use gpui_base::{ElementExt as _, TextSelectionScopeId, motion::Transition};
 use rust_i18n::t;
@@ -338,25 +337,6 @@ pub(crate) fn overlay_color(overlay: bool, cx: &App) -> Hsla {
     }
 
     cx.theme().overlay
-}
-
-fn dialog_shadow(delta: f32) -> Vec<BoxShadow> {
-    vec![
-        BoxShadow {
-            color: hsla(0., 0., 0., 0.1 * delta),
-            offset: point(px(0.), px(20.)),
-            blur_radius: px(25.),
-            spread_radius: px(-5.),
-            inset: false,
-        },
-        BoxShadow {
-            color: hsla(0., 0., 0., 0.1 * delta),
-            offset: point(px(0.), px(8.)),
-            blur_radius: px(10.),
-            spread_radius: px(-6.),
-            inset: false,
-        },
-    ]
 }
 
 impl Dialog {
@@ -776,10 +756,10 @@ impl RenderOnce for Dialog {
                                         .id("surface")
                                         .test_support()
                                         .debug_selector(move || format!("dialog-{layer_ix}"))
-                                        .bg(cx.theme().tokens.background)
-                                        .border_1()
-                                        .border_color(cx.theme().border)
-                                        .rounded(cx.theme().radius_lg)
+                                        .map(|surface| {
+                                            crate::ThemeStyled::popover_style(surface, cx)
+                                        })
+                                        .rounded(px(12.))
                                         .min_h_24()
                                         .pt(paddings.top)
                                         .pb(paddings.bottom)
@@ -811,29 +791,34 @@ impl RenderOnce for Dialog {
                                                             .child(title),
                                                     )
                                                 })
-                                                .when_some(self.content_builder, |this, builder| {
-                                                    this.child(builder(
-                                                        DialogContent::new()
-                                                            .gap(paddings.bottom)
-                                                            .pl(paddings.left)
-                                                            .pr(paddings.right),
-                                                        window,
-                                                        cx,
-                                                    ))
-                                                })
-                                                .when(!self.children.is_empty(), |this| {
-                                                    this.child(
-                                                        div().flex_1().overflow_hidden().child(
-                                                            // Body
-                                                            v_flex()
-                                                                .size_full()
-                                                                .overflow_y_scrollbar()
-                                                                .pl(paddings.left)
-                                                                .pr(paddings.right)
-                                                                .children(self.children),
-                                                        ),
-                                                    )
-                                                }),
+                                                .when(
+                                                    self.content_builder.is_some() || !self.children.is_empty(),
+                                                    |this| {
+                                                        this.child(
+                                                            div().flex_1().overflow_hidden().child(
+                                                                v_flex()
+                                                                    .size_full()
+                                                                    .overflow_y_popup_scrollbar()
+                                                                    .when_some(self.content_builder, |body, builder| {
+                                                                        body.child(builder(
+                                                                            DialogContent::new()
+                                                                                .gap(paddings.bottom)
+                                                                                .pl(paddings.left)
+                                                                                .pr(paddings.right),
+                                                                            window,
+                                                                            cx,
+                                                                        ))
+                                                                    })
+                                                                    .when(!self.children.is_empty(), |body| {
+                                                                        body.child(v_flex()
+                                                                            .pl(paddings.left)
+                                                                            .pr(paddings.right)
+                                                                            .children(self.children))
+                                                                    }),
+                                                            ),
+                                                        )
+                                                    },
+                                                ),
                                         )
                                         .when_some(self.footer, |this, footer| {
                                             this.child(
@@ -891,7 +876,7 @@ impl RenderOnce for Dialog {
                                         // Base paints its popup in a deferred pass; the
                                         // surface must apply opacity itself.
                                         .opacity(visibility)
-                                        .shadow(dialog_shadow(visibility))
+                                        .shadow(crate::styled::popover_shadow(visibility))
                                         .text_selection_scope(selection_scope)
                                         .map(|surface| {
                                             if entrance == DialogEntrance::FadeSlide {

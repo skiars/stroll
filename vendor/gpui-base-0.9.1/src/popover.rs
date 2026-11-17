@@ -1,4 +1,5 @@
 use std::rc::Rc;
+use std::time::Instant;
 
 use gpui::{
     Anchor, AnyElement, App, Context, DismissEvent, ElementId, EventEmitter, FocusHandle,
@@ -8,7 +9,8 @@ use gpui::{
 };
 
 use crate::{
-    DeferredPopover, GlobalState, Popup, ResolvedPosition, Selectable, StyledExt as _,
+    DROPDOWN_TRAVEL, DeferredPopover, GlobalState, Popup, PopupFrame, PopupMotion, PopupMotionKind,
+    ResolvedPosition, Selectable, StyledExt as _,
     actions::{Cancel, Confirm},
 };
 
@@ -41,6 +43,8 @@ pub struct PopoverState {
     tracked_focus_handle: Option<FocusHandle>,
     previous_focus_handle: Option<FocusHandle>,
     open: bool,
+    motion: Option<PopupMotion>,
+    motion_kind: PopupMotionKind,
     on_open_change: Option<OpenChangeHandler>,
     dismiss_subscription: Option<Subscription>,
     /// Held while open, so that a state collected without being closed — this
@@ -50,11 +54,17 @@ pub struct PopoverState {
 
 impl PopoverState {
     pub fn new(default_open: bool, cx: &mut App) -> Self {
+        Self::with_motion(default_open, PopupMotionKind::Popover, cx)
+    }
+
+    fn with_motion(default_open: bool, motion_kind: PopupMotionKind, cx: &mut App) -> Self {
         Self {
             focus_handle: cx.focus_handle(),
             tracked_focus_handle: None,
             previous_focus_handle: None,
             open: default_open,
+            motion: default_open.then(|| PopupMotion::new(motion_kind, Instant::now())),
+            motion_kind,
             on_open_change: None,
             dismiss_subscription: None,
             deferred_context: None,
@@ -80,6 +90,12 @@ impl PopoverState {
     #[doc(hidden)]
     pub fn set_open(&mut self, open: bool, cx: &mut Context<Self>) {
         self.open = open;
+        if open || self.motion.is_some() {
+            let now = Instant::now();
+            self.motion
+                .get_or_insert_with(|| PopupMotion::new(self.motion_kind, now))
+                .retarget(open, now);
+        }
         self.deferred_context = open.then(|| GlobalState::register_deferred_popover(cx));
     }
 
@@ -192,6 +208,7 @@ pub struct Popover {
     offset: gpui::Pixels,
     on_position: Option<Box<dyn Fn(ResolvedPosition, gpui::Bounds<gpui::Pixels>)>>,
     default_open: bool,
+    motion_kind: PopupMotionKind,
     open: Option<bool>,
     tracked_focus_handle: Option<FocusHandle>,
     trigger: Option<TriggerBuilder>,
@@ -210,6 +227,7 @@ impl Popover {
             offset: gpui::px(0.),
             on_position: None,
             default_open: false,
+            motion_kind: PopupMotionKind::Popover,
             open: None,
             tracked_focus_handle: None,
             trigger: None,
@@ -218,6 +236,11 @@ impl Popover {
             overlay_closable: true,
             on_open_change: None,
         }
+    }
+
+    pub fn motion_kind(mut self, kind: PopupMotionKind) -> Self {
+        self.motion_kind = kind;
+        self
     }
 
     pub fn anchor(mut self, anchor: impl Into<Anchor>) -> Self {
@@ -317,7 +340,7 @@ impl Styled for Popover {
 impl RenderOnce for Popover {
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
         let state = window.use_keyed_state(self.id.clone(), cx, |_, cx| {
-            PopoverState::new(self.default_open, cx)
+            PopoverState::with_motion(self.default_open, self.motion_kind, cx)
         });
         state.update(cx, |state, cx| {
             state.track_focus(self.tracked_focus_handle);
@@ -328,6 +351,11 @@ impl RenderOnce for Popover {
         });
 
         let open = state.read(cx).is_open();
+        let opacity = state
+            .read(cx)
+            .motion
+            .as_ref()
+            .map_or(0., |motion| motion.opacity(window, cx));
         let focus_handle = state.read(cx).focus_handle(cx);
         let Some(trigger) = self.trigger else {
             return div().id("empty").into_any_element();
@@ -337,6 +365,10 @@ impl RenderOnce for Popover {
             .refine_style(&self.style)
             .anchor(self.anchor)
             .offset(self.offset)
+            .occlude(open)
+            .when(self.motion_kind == PopupMotionKind::Dropdown, |popup| {
+                popup.travel(DROPDOWN_TRAVEL * (1. - opacity))
+            })
             .when_some(self.on_position, |this, callback| {
                 this.on_position(callback)
             })
@@ -360,7 +392,8 @@ impl RenderOnce for Popover {
                     cx.notify(parent_view_id);
                 }
             });
-        if !open {
+        if !open && opacity <= 0. {
+            state.update(cx, |state, _| state.motion = None);
             return popup.into_any_element();
         }
 
@@ -387,7 +420,9 @@ impl RenderOnce for Popover {
                     }
                 })
             });
-        popup.content(content).into_any_element()
+        popup
+            .content(PopupFrame::new(content.opacity(opacity), !open))
+            .into_any_element()
     }
 }
 

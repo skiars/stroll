@@ -1,66 +1,407 @@
-use std::{ops::Range, rc::Rc};
+use gpui_base::{PopupFrame, PopupMotion, PopupMotionKind};
+use rust_i18n::t;
+use std::{cell::Cell, ops::Range, rc::Rc, time::Instant};
 
 use gpui::{
     AnyElement, App, AppContext as _, AvailableSpace, Bounds, Element, ElementId, Entity,
-    InteractiveElement, IntoElement, MouseDownEvent, MouseMoveEvent, ParentElement as _, Pixels,
-    Render, StatefulInteractiveElement as _, StyleRefinement, Styled, Window, deferred, div, point,
-    px,
+    InteractiveElement, IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
+    ParentElement as _, Pixels, Point, Render, ScrollHandle, StatefulInteractiveElement as _,
+    StyleRefinement, Styled, Window, deferred, div, linear_color_stop, linear_gradient, point,
+    prelude::FluentBuilder as _, px, relative, rems,
 };
 
 use crate::{
-    StyledExt, ThemeStyled as _,
-    input::{EditorState, popovers::render_markdown},
+    ActiveTheme as _, Icon, StyledExt, ThemeStyled as _,
+    highlighter::{DiagnosticEntry, diagnostic_foreground},
+    input::{
+        EditorState, HoverPopoverState,
+        popovers::{CodeActionMenu, QUICK_FIX_BUTTON_SIZE, quick_fix_button, render_markdown},
+    },
+    scroll::{ScrollbarMode, popup_scrollbar},
+    text::{MarkdownExtensions, MarkdownNode, TextView},
 };
 
 pub struct HoverPopover {
     editor: Entity<EditorState>,
-    /// The symbol range byte of the hover trigger.
-    pub(crate) symbol_range: Range<usize>,
-    pub(crate) hover: Rc<lsp_types::Hover>,
+    content: HoverPopoverState,
+    motion: PopupMotion,
+    scroll: ScrollHandle,
+    pointer_down: Rc<Cell<bool>>,
+    last_trigger_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
+    closing: bool,
+    actions: Option<Entity<CodeActionMenu>>,
+    position: Rc<Cell<Option<Point<Pixels>>>>,
+    documentation: MarkdownExtensions,
 }
 
 impl HoverPopover {
-    pub fn new(
+    pub(crate) fn new(
         editor: Entity<EditorState>,
-        symbol_range: Range<usize>,
-        hover: &lsp_types::Hover,
+        content: HoverPopoverState,
         cx: &mut App,
     ) -> Entity<Self> {
-        let hover = Rc::new(hover.clone());
-
         cx.new(|_| Self {
+            documentation: documentation_extensions(&content),
             editor,
-            symbol_range,
-            hover,
+            content,
+            motion: PopupMotion::new(PopupMotionKind::Hover, Instant::now()),
+            scroll: ScrollHandle::new(),
+            pointer_down: Rc::default(),
+            last_trigger_bounds: Rc::default(),
+            closing: false,
+            actions: None,
+            position: Rc::default(),
         })
+    }
+
+    pub(crate) fn scroll_handle(&self) -> &ScrollHandle {
+        &self.scroll
+    }
+
+    pub(crate) fn set_code_actions(
+        &mut self,
+        actions: Option<Entity<CodeActionMenu>>,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        if self.actions != actions {
+            self.actions = actions;
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn needs_update(&self, content: &HoverPopoverState) -> bool {
+        self.closing
+            || ((!self.content.diagnostics.is_empty() || !content.diagnostics.is_empty())
+                && !Rc::ptr_eq(&self.content.diagnostics, &content.diagnostics))
+            || self.content.symbol_range != content.symbol_range
+            || self.content.hover != content.hover
+            || self.content.documentation != content.documentation
+    }
+
+    pub(crate) fn update_hover(
+        &mut self,
+        content: HoverPopoverState,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        let appended_documentation = !content.diagnostics.is_empty()
+            && Rc::ptr_eq(&self.content.diagnostics, &content.diagnostics)
+            && self.content.symbol_range == content.symbol_range
+            && self.content.hover.is_none();
+        let enriched = self.content.hover.is_some()
+            && self.content.hover == content.hover
+            && self.content.symbol_range == content.symbol_range
+            && self.content.documentation != content.documentation;
+        if self.content.documentation != content.documentation {
+            self.documentation = documentation_extensions(&content);
+        }
+        if !appended_documentation && !enriched {
+            self.scroll.set_offset(point(px(0.), px(0.)));
+            self.position.set(None);
+        }
+        self.content = content;
+        self.closing = false;
+        self.motion.retarget(true, Instant::now());
+        cx.notify();
+    }
+
+    pub(crate) fn close(&mut self, cx: &mut gpui::Context<Self>) {
+        self.closing = true;
+        self.motion.retarget(false, Instant::now());
+        cx.notify();
+    }
+
+    pub(crate) fn closing(&self) -> bool {
+        self.closing
+    }
+
+    pub(crate) fn visible(&self, window: &Window, cx: &App) -> bool {
+        !self.closing || self.motion.opacity(window, cx) > 0.
     }
 }
 
 impl Render for HoverPopover {
-    fn render(&mut self, _: &mut Window, _: &mut gpui::Context<Self>) -> impl IntoElement {
-        let contents = match self.hover.contents.clone() {
-            lsp_types::HoverContents::Scalar(scalar) => match scalar {
-                lsp_types::MarkedString::String(s) => s,
-                lsp_types::MarkedString::LanguageString(ls) => ls.value,
-            },
-            lsp_types::HoverContents::Array(arr) => arr
-                .into_iter()
-                .map(|item| match item {
-                    lsp_types::MarkedString::String(s) => s,
-                    lsp_types::MarkedString::LanguageString(ls) => ls.value,
-                })
-                .collect::<Vec<_>>()
-                .join("\n\n"),
-            lsp_types::HoverContents::Markup(markup) => markup.value,
-        };
+    fn render(&mut self, window: &mut Window, cx: &mut gpui::Context<Self>) -> impl IntoElement {
+        let documentation = self
+            .content
+            .hover
+            .as_ref()
+            .map(|hover| match &hover.contents {
+                lsp_types::HoverContents::Scalar(scalar) => match scalar {
+                    lsp_types::MarkedString::String(s) => s.clone(),
+                    lsp_types::MarkedString::LanguageString(ls) => ls.value.clone(),
+                },
+                lsp_types::HoverContents::Array(arr) => arr
+                    .iter()
+                    .map(|item| match item {
+                        lsp_types::MarkedString::String(s) => s.as_str(),
+                        lsp_types::MarkedString::LanguageString(ls) => ls.value.as_str(),
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n\n"),
+                lsp_types::HoverContents::Markup(markup)
+                    if markup.kind == lsp_types::MarkupKind::PlainText =>
+                {
+                    let mut fence = "```".to_owned();
+                    while markup.value.contains(&fence) {
+                        fence.push('`');
+                    }
+                    format!("{fence}\n{}\n{fence}", markup.value)
+                }
+                lsp_types::HoverContents::Markup(markup) => markup.value.clone(),
+            });
+        let extensions = self.documentation.clone();
+        let plaintext = self
+            .content
+            .documentation
+            .as_ref()
+            .and_then(|doc| doc.plaintext.clone());
+        let diagnostics = self.content.diagnostics.clone();
+        let actions = self.actions.clone();
+        let has_actions = actions.is_some();
+        let code_languages = self
+            .editor
+            .read(cx)
+            .lsp()
+            .hover_provider
+            .as_ref()
+            .and_then(|provider| provider.code_languages());
+        let editor = self.editor.downgrade();
+        let can_fix = self.editor.read(cx).can_open_code_actions();
 
-        Popover::new(
+        let mut popover = Popover::new(
             "hover-popover",
             self.editor.clone(),
-            self.symbol_range.clone(),
-            move |window, cx| render_markdown("message", contents.clone(), window, cx),
-        )
+            self.content.symbol_range.clone(),
+            move |window, cx| {
+                let mut content = div().flex().flex_col();
+                for (index, diagnostic) in diagnostics.iter().enumerate() {
+                    let last =
+                        index + 1 == diagnostics.len() && documentation.is_none() && !has_actions;
+                    content = content.child(render_diagnostic(
+                        index,
+                        last,
+                        diagnostic,
+                        (can_fix && index == 0).then(|| editor.clone()),
+                        cx,
+                    ));
+                }
+                if let Some(actions) = &actions {
+                    content = content.child(actions.clone());
+                }
+                if let Some(documentation) = &documentation {
+                    if has_actions {
+                        content = content.child(div().mx(px(12.)).h(px(1.)).bg(cx.theme().border));
+                    }
+                    content = content.child(
+                        div()
+                            .px(px(12.))
+                            .py(px(8.))
+                            .child(
+                                render_markdown("message", documentation.clone(), window, cx)
+                                    .code_languages(code_languages.clone())
+                                    .markdown_extensions(extensions.clone()),
+                            )
+                            .when_some(plaintext.clone(), |view, text| {
+                                view.child(
+                                    div()
+                                        .text_color(cx.theme().muted_foreground)
+                                        .whitespace_normal()
+                                        .child(text),
+                                )
+                            }),
+                    );
+                }
+                content
+            },
+        );
+        popover = popover.track_scroll(&self.scroll);
+        popover.pointer_down = self.pointer_down.clone();
+        popover.last_trigger_bounds = self.last_trigger_bounds.clone();
+        popover.closing = self.closing;
+        popover.actions = has_actions;
+        popover.prefers_natural_width = self
+            .content
+            .documentation
+            .as_ref()
+            .is_some_and(|doc| !doc.paragraphs.is_empty());
+        if has_actions || (can_fix && !self.content.diagnostics.is_empty()) {
+            popover.width_limit = px(480.)..px(480.);
+        }
+        if self.content.hover.is_some() || !self.content.diagnostics.is_empty() {
+            popover.position = Some(self.position.clone());
+        }
+        popover.style.opacity = Some(self.motion.opacity(window, cx));
+        PopupFrame::new(popover, self.closing)
+    }
+}
+
+fn documentation_extensions(content: &HoverPopoverState) -> MarkdownExtensions {
+    use crate::input::HoverParagraph;
+    use crate::text::markdown_ast::Node;
+
+    let Some(documentation) = content
+        .documentation
+        .as_ref()
+        .filter(|doc| !doc.paragraphs.is_empty())
+    else {
+        return MarkdownExtensions::default();
+    };
+    const PAIRED: &str = "hover-enriched-paragraph";
+    let paragraphs = documentation.paragraphs.clone();
+    MarkdownExtensions::default()
+        .block_parser(move |node, cx| {
+            let Node::Paragraph(paragraph) = node else {
+                return None;
+            };
+            let offset = cx.offset() + paragraph.position.as_ref()?.start.offset;
+            let pair = paragraphs.get(&offset)?.clone();
+            Some(
+                MarkdownNode::new(PAIRED, (offset, pair))
+                    .text(node.to_string())
+                    .markdown(cx.node_source(node)?),
+            )
+        })
+        .block_renderer(PAIRED, |node, window, cx| {
+            let (offset, pair) = node.data::<(usize, HoverParagraph)>().unwrap();
+            div()
+                .id(("hover-paragraph", *offset))
+                .flex()
+                .flex_wrap()
+                .gap_x(rems(0.8))
+                .gap_y(rems(0.35))
+                .child(hover_prose(
+                    "hover-original-paragraph",
+                    *offset,
+                    pair.original.clone(),
+                    None,
+                    window,
+                    cx,
+                ))
+                .child(hover_prose(
+                    "hover-translated-paragraph",
+                    *offset,
+                    pair.translation.clone(),
+                    Some(cx.theme().muted_foreground),
+                    window,
+                    cx,
+                ))
+        })
+}
+
+/// Give the flex item its natural width. The regular TextView fills its
+/// containing block, which would otherwise give both items the entire row.
+fn hover_prose(
+    id: &'static str,
+    offset: usize,
+    text: gpui::SharedString,
+    color: Option<gpui::Hsla>,
+    window: &mut Window,
+    cx: &mut App,
+) -> impl IntoElement {
+    let width = render_markdown(format!("{id}-measure-{offset}"), text.clone(), window, cx)
         .into_any_element()
+        .layout_as_root(
+            gpui::size(AvailableSpace::MaxContent, AvailableSpace::MaxContent),
+            window,
+            cx,
+        )
+        .width;
+    div()
+        .debug_selector(move || id.into())
+        .w(width)
+        .max_w_full()
+        .flex_none()
+        .child(
+            render_markdown((id, offset), text, window, cx)
+                .when_some(color, |view, color| view.text_color(color)),
+        )
+}
+
+fn render_diagnostic(
+    index: usize,
+    last: bool,
+    diagnostic: &DiagnosticEntry,
+    editor: Option<gpui::WeakEntity<EditorState>>,
+    cx: &App,
+) -> impl IntoElement {
+    let tone = diagnostic_foreground(diagnostic.severity, cx);
+    let icon = Icon::new(gpui_kit_assets::IconName::CircleAlert)
+        .size(px(16.))
+        .text_color(tone);
+    // LSP messages are plain text. Escape markup while keeping the TextView
+    // used for selection elsewhere in this surface.
+    let message = diagnostic
+        .message
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('\n', "<br>");
+    let mut row = div()
+        .id(("hover-diagnostic", index))
+        .flex()
+        .flex_col()
+        .flex_none()
+        .px(px(12.))
+        .py(px(10.))
+        .bg(linear_gradient(
+            90.,
+            linear_color_stop(tone.alpha(0.12), 0.),
+            linear_color_stop(tone.alpha(0.), 0.75),
+        ))
+        .child(
+            div()
+                .flex()
+                .items_start()
+                .gap(px(8.))
+                .child(div().flex_none().pt(px(2.)).child(icon))
+                .child(
+                    TextView::html(("diagnostic-message", index), message)
+                        .w_full()
+                        .min_w(px(0.))
+                        .flex_1()
+                        .text_size(px(12.5))
+                        .line_height(relative(1.6))
+                        .selectable(true),
+                )
+                .children(editor.map(|editor| {
+                    let range = diagnostic.range.clone();
+                    div()
+                        .flex_none()
+                        .debug_selector(|| "diagnostic-quick-fix-button".into())
+                        .child(
+                            quick_fix_button(
+                                ("diagnostic-quick-fix", index),
+                                t!("Input.Quick Fix").into(),
+                                tone,
+                                cx,
+                            )
+                            .on_click(move |_, window, cx| {
+                                let _ = editor.update(cx, |editor, cx| {
+                                    editor.focus(window, cx);
+                                    editor.open_code_actions(range.clone(), window, cx);
+                                });
+                            }),
+                        )
+                })),
+        );
+    // The scroll viewport clips to a rectangle. Keep the filled corners
+    // within the popup's ten-pixel radius and one-pixel border.
+    if index == 0 {
+        row = row.rounded_tl(px(9.)).rounded_tr(px(9.));
+    }
+    if last {
+        row = row.rounded_bl(px(9.)).rounded_br(px(9.));
+    }
+    if let Some(source) = &diagnostic.source {
+        row.child(
+            div()
+                .pl(px(24.))
+                .text_size(px(11.))
+                .text_color(cx.theme().muted_foreground)
+                .child(source.clone()),
+        )
+    } else {
+        row
     }
 }
 
@@ -69,6 +410,13 @@ pub(crate) struct Popover {
     style: StyleRefinement,
     editor: Entity<EditorState>,
     range: Range<usize>,
+    scroll: ScrollHandle,
+    pointer_down: Rc<Cell<bool>>,
+    last_trigger_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
+    closing: bool,
+    actions: bool,
+    prefers_natural_width: bool,
+    position: Option<Rc<Cell<Option<Point<Pixels>>>>>,
     width_limit: Range<Pixels>,
     content_builder: Box<dyn Fn(&mut Window, &mut App) -> AnyElement>,
 }
@@ -94,16 +442,33 @@ impl Popover {
             id: id.into(),
             editor,
             range,
+            scroll: ScrollHandle::new(),
+            pointer_down: Rc::default(),
+            last_trigger_bounds: Rc::default(),
+            closing: false,
+            actions: false,
+            prefers_natural_width: false,
+            position: None,
             style: StyleRefinement::default(),
-            width_limit: px(200.)..px(500.),
+            width_limit: px(440.)..px(560.),
             content_builder: Box::new(move |window, cx| (f)(window, cx).into_any_element()),
         }
+    }
+
+    pub(crate) fn track_scroll(mut self, scroll: &ScrollHandle) -> Self {
+        self.scroll = scroll.clone();
+        self
     }
 
     /// Get the bounds of the range in the editor, if it is visible.
     fn trigger_bounds(&self, cx: &App) -> Option<Bounds<Pixels>> {
         let editor = self.editor.read(cx);
-        editor.range_to_bounds(&self.range)
+        if self.closing || (!self.actions && editor.hover_popover().is_none()) {
+            return self.last_trigger_bounds.get();
+        }
+        let bounds = editor.range_to_bounds(&self.range)?;
+        self.last_trigger_bounds.set(Some(bounds));
+        Some(bounds)
     }
 }
 
@@ -152,45 +517,77 @@ impl Element for Popover {
             }
         };
 
+        const SNAP_TO_EDGE: Pixels = px(8.);
+        let viewport = window.viewport_size();
         let max_width = self
             .width_limit
             .end
-            .min(window.bounds().size.width - SNAP_TO_EDGE * 2)
-            .max(px(200.));
-        let max_height = (window.bounds().size.height - SNAP_TO_EDGE * 2).min(px(320.));
+            .min(viewport.width - SNAP_TO_EDGE * 2)
+            .max(px(0.));
+        let above = (trigger_bounds.top() - SNAP_TO_EDGE).max(px(0.));
+        let below = (viewport.height - trigger_bounds.bottom() - SNAP_TO_EDGE).max(px(0.));
+        // Leave room for the two one-pixel borders around the viewport.
+        let pinned = self
+            .position
+            .as_ref()
+            .and_then(|position| self.actions.then(|| position.get()).flatten());
+        let max_height = (viewport.height * 0.5)
+            .min(px(360.))
+            .min((above.max(below) - px(2.)).max(px(0.)))
+            .min(pinned.map_or(viewport.height, |pos| {
+                (viewport.height - pos.y - SNAP_TO_EDGE).max(px(0.))
+            }));
 
         let mut popover = deferred(
             div()
                 .id("hover-popover-content")
                 .flex_none()
                 .occlude()
-                .p_1()
-                .text_xs()
                 .popover_style(cx)
-                .shadow_md()
                 .max_w(max_width)
-                .max_h(max_height)
-                .overflow_y_scroll()
+                .min_w(self.width_limit.start.min(max_width))
                 .refine_style(&self.style)
-                .child((self.content_builder)(window, cx)),
+                .child(
+                    div()
+                        .id("hover-documentation")
+                        .max_h(max_height)
+                        .overflow_y_scroll()
+                        .track_scroll(&self.scroll)
+                        .text_size(px(12.5))
+                        .line_height(relative(1.6))
+                        .child((self.content_builder)(window, cx)),
+                )
+                .relative()
+                .child(popup_scrollbar(&self.scroll).mode(ScrollbarMode::Always)),
         )
         .with_priority(gpui_base::POPUP_PRIORITY)
         .into_any_element();
 
-        let popover_size = popover.layout_as_root(AvailableSpace::min_size(), window, cx);
-        const SNAP_TO_EDGE: Pixels = px(8.);
-        let top_space = trigger_bounds.top() - SNAP_TO_EDGE;
-        let right_space = window.bounds().size.width - trigger_bounds.left() - SNAP_TO_EDGE;
-
-        let mut pos = point(
-            trigger_bounds.left(),
-            trigger_bounds.top() - popover_size.height,
-        );
-        if popover_size.height > top_space {
-            pos.y = trigger_bounds.bottom();
-        }
-        if popover_size.width > right_space {
-            pos.x = trigger_bounds.right() - popover_size.width;
+        let available = if self.prefers_natural_width {
+            gpui::size(AvailableSpace::MaxContent, AvailableSpace::MinContent)
+        } else {
+            AvailableSpace::min_size()
+        };
+        let popover_size = popover.layout_as_root(available, window, cx);
+        let y = if popover_size.height <= above {
+            trigger_bounds.top() - popover_size.height
+        } else {
+            trigger_bounds.bottom()
+        };
+        let pos = pinned.unwrap_or_else(|| {
+            point(
+                trigger_bounds.left().clamp(
+                    SNAP_TO_EDGE,
+                    (viewport.width - popover_size.width - SNAP_TO_EDGE).max(SNAP_TO_EDGE),
+                ),
+                y.clamp(
+                    SNAP_TO_EDGE,
+                    (viewport.height - popover_size.height - SNAP_TO_EDGE).max(SNAP_TO_EDGE),
+                ),
+            )
+        });
+        if let Some(position) = &self.position {
+            position.set(Some(pos));
         }
 
         let mut empty = div().into_any_element();
@@ -244,25 +641,69 @@ impl Element for Popover {
         popover.paint(window, cx);
 
         let editor = self.editor.clone();
-        // Mouse down out to hide.
-        window.on_mouse_event(move |event: &MouseDownEvent, _, _, cx| {
+        let pointer_down = self.pointer_down.clone();
+        let actions = self.actions;
+        window.on_mouse_event(move |event: &MouseDownEvent, phase, _, cx| {
+            if !phase.capture() {
+                return;
+            }
             if !bounds.contains(&event.position) {
-                let _ = editor.update(cx, |editor, cx| {
+                if actions
+                    && editor
+                        .read(cx)
+                        .code_action_indicator_bounds(QUICK_FIX_BUTTON_SIZE)
+                        .is_some_and(|bulb| bulb.contains(&event.position))
+                {
+                    return;
+                }
+                editor.update(cx, |editor, cx| {
+                    editor.dismiss_code_action_overlay(cx);
                     editor.clear_hover_state(cx);
                 });
+            } else if event.button == MouseButton::Left {
+                pointer_down.set(true);
             }
         });
 
-        // Mouse out of trigger + popover bounds
-        let editor = self.editor.clone();
+        if self.actions {
+            let editor = self.editor.clone();
+            window.on_mouse_event(move |event: &gpui::ScrollEvent, phase, _, cx| {
+                if phase.capture()
+                    && !bounds.contains(&event.position)
+                    && editor.read(cx).input_bounds().contains(&event.position)
+                {
+                    editor.update(cx, |editor, cx| editor.dismiss_code_action_overlay(cx));
+                }
+            });
+        }
         let trigger_bounds = self.trigger_bounds(cx).unwrap_or(bounds);
         let keep_open_region = trigger_bounds.union(&bounds);
-        window.on_mouse_event(move |event: &MouseMoveEvent, _, _, cx| {
-            if !keep_open_region.contains(&event.position) {
-                let _ = editor.update(cx, |editor, cx| {
-                    editor.clear_hover_state(cx);
-                });
+        let editor = self.editor.clone();
+        let pointer_down = self.pointer_down.clone();
+        window.on_mouse_event(move |event: &MouseMoveEvent, phase, _, cx| {
+            if !phase.capture() {
+                return;
             }
-        })
+            if !event.dragging() {
+                pointer_down.set(false);
+            }
+            if !pointer_down.get() && !keep_open_region.contains(&event.position) {
+                editor.update(cx, |editor, cx| editor.clear_hover_state(cx));
+            }
+        });
+
+        // Keep the scroll viewport mounted while dragging the thumb, even if
+        // the pointer travels outside the popup before the button is released.
+        let pointer_down = self.pointer_down.clone();
+        let editor = self.editor.clone();
+        window.on_mouse_event(move |event: &MouseUpEvent, phase, _, cx| {
+            if phase.capture()
+                && event.button == MouseButton::Left
+                && pointer_down.replace(false)
+                && !keep_open_region.contains(&event.position)
+            {
+                editor.update(cx, |editor, cx| editor.clear_hover_state(cx));
+            }
+        });
     }
 }

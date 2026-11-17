@@ -1,7 +1,8 @@
 use std::rc::Rc;
 
 use crate::{
-    ActiveTheme, Icon, IconName, InteractiveElementExt as _, Sizable as _, StyledExt, h_flex,
+    ActiveTheme, Colorize as _, Icon, IconName, InteractiveElementExt as _, Sizable as _, StyledExt,
+    h_flex,
 };
 use gpui::{
     AnyElement, App, Background, ClickEvent, Context, Decorations, Hsla, InteractiveElement,
@@ -104,10 +105,10 @@ impl TitleBar {
     }
 }
 
-// The Windows control buttons have a fixed width of 35px.
-//
-// We don't need implementation the click event for the control buttons.
-// If user clicked in the bounds, the window event will be triggered.
+const WINDOW_CONTROL_WIDTH: Pixels = px(34.);
+const WINDOW_CONTROL_HIGHLIGHT_SIZE: Pixels = px(22.);
+
+// Windows dispatches caption actions from the full window control area.
 #[derive(IntoElement, Clone)]
 enum ControlIcon {
     Minimize,
@@ -166,29 +167,22 @@ impl ControlIcon {
     }
 
     #[inline]
-    fn hover_fg(&self, cx: &App) -> Hsla {
-        if self.is_close() {
-            cx.theme().danger_foreground
-        } else {
-            cx.theme().secondary_foreground
-        }
-    }
-
-    #[inline]
     fn hover_bg(&self, cx: &App) -> Hsla {
         if self.is_close() {
             cx.theme().danger
+        } else if cx.theme().mode.is_dark() {
+            cx.theme().title_bar.darken(0.45)
         } else {
-            cx.theme().secondary_hover
+            cx.theme().secondary_hover.darken(0.06)
         }
     }
 
     #[inline]
-    fn active_bg(&self, cx: &mut App) -> Hsla {
+    fn active_bg(&self, cx: &App) -> Hsla {
         if self.is_close() {
             cx.theme().danger_active
         } else {
-            cx.theme().secondary_active
+            self.hover_bg(cx).darken(0.10)
         }
     }
 }
@@ -197,9 +191,14 @@ impl RenderOnce for ControlIcon {
     fn render(self, _: &mut Window, cx: &mut App) -> impl IntoElement {
         let is_linux = cfg!(target_os = "linux");
         let is_windows = cfg!(target_os = "windows");
-        let hover_fg = self.hover_fg(cx);
         let hover_bg = self.hover_bg(cx);
         let active_bg = self.active_bg(cx);
+        let interaction_fg = if self.is_close() && cx.theme().mode.is_dark() {
+            cx.theme().background
+        } else {
+            cx.theme().foreground
+        };
+        let id = self.id();
         let icon = self.clone();
         let on_close_window = match &self {
             ControlIcon::Close { on_close_window } => on_close_window.clone(),
@@ -207,18 +206,17 @@ impl RenderOnce for ControlIcon {
         };
 
         div()
-            .id(self.id())
+            .id(id)
+            .group(id)
             .test_support()
             .flex()
-            .w(TITLE_BAR_HEIGHT)
+            .w(WINDOW_CONTROL_WIDTH)
             .h_full()
             .flex_shrink_0()
             .justify_center()
             .content_center()
             .items_center()
             .text_color(cx.theme().foreground)
-            .hover(|style| style.bg(hover_bg).text_color(hover_fg))
-            .active(|style| style.bg(active_bg).text_color(hover_fg))
             .when(is_windows, |this| {
                 this.window_control_area(self.window_control_area())
             })
@@ -242,7 +240,18 @@ impl RenderOnce for ControlIcon {
                     }
                 })
             })
-            .child(Icon::new(self.icon()).small())
+            .child(
+                // Style the centered circle from the full column's pointer state.
+                h_flex()
+                    .id("highlight")
+                    .size(WINDOW_CONTROL_HIGHLIGHT_SIZE)
+                    .justify_center()
+                    .items_center()
+                    .rounded_full()
+                    .group_hover(id, |style| style.bg(hover_bg).text_color(interaction_fg))
+                    .group_active(id, |style| style.bg(active_bg).text_color(interaction_fg))
+                    .child(Icon::new(self.icon()).small()),
+            )
     }
 }
 

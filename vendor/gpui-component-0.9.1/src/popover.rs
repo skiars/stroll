@@ -1,106 +1,95 @@
 use gpui::{
-    Anchor, Animation, AnimationExt as _, AnyElement, App, Bounds, Context, Div, ElementId,
-    FocusHandle, InteractiveElement as _, IntoElement, MouseButton, ParentElement, PathBuilder,
-    Pixels, Point, RenderOnce, Stateful, StyleRefinement, Styled, Window, canvas, point,
-    prelude::FluentBuilder as _, px,
+    Anchor, AnyElement, App, Background, Bounds, Context, Div, ElementId, FocusHandle, Hsla,
+    InteractiveElement as _, IntoElement, MouseButton, ParentElement, PathBuilder, Pixels, Point,
+    Refineable as _, RenderOnce, Stateful, Style, StyleRefinement, Styled, Window, canvas, point,
+    prelude::FluentBuilder as _, px, transparent_black,
 };
-use std::{cell::Cell, rc::Rc, time::Duration};
+use std::{cell::Cell, rc::Rc};
 
-use crate::{ActiveTheme as _, ThemeStyled as _};
+use crate::ThemeStyled as _;
 use crate::{
-    Selectable, StyledExt as _,
-    animation::ease_out_cubic,
-    styled::{popover_ring, popover_shadow},
-    v_flex,
+    Selectable, StyledExt as _, scroll::ScrollableElement as _, styled::popover_shadow, v_flex,
 };
-use gpui_base::Placement;
 use gpui_base::Popover as BasePopover;
 pub use gpui_base::PopoverState;
+use gpui_base::{Placement, Positioner};
 
 pub(crate) fn init(_: &mut App) {}
 
-/// How long a dropdown takes to settle into place after it opens.
-///
-/// This is shadcn/ui's figure: its popup surfaces carry `animate-in`, whose
-/// duration is 150ms.
-const DROPDOWN_ENTER_DURATION: Duration = Duration::from_millis(150);
+const DROPDOWN_GAP: Pixels = px(6.);
+const DROPDOWN_MARGIN: Pixels = px(8.);
 
-/// Where a dropdown starts out, relative to where it comes to rest.
-///
-/// Negative is above, so the surface slides *down* out of the trigger's edge —
-/// what shadcn/ui expresses as `data-[side=bottom]:slide-in-from-top-2`. Its
-/// `2` is `0.5rem`, which is 8px at the default root size.
-const DROPDOWN_ENTER_OFFSET: Pixels = px(-8.);
-
-fn dropdown_positioner(bounds: Bounds<Pixels>) -> gpui_base::Positioner {
-    gpui_base::Positioner::side(bounds)
-        .placement(gpui_base::Placement::Bottom)
+pub(crate) fn dropdown_positioner(bounds: Bounds<Pixels>) -> Positioner {
+    Positioner::side(bounds)
+        .placement(Placement::Bottom)
         .align(gpui_base::Align::Start)
-        .offset(px(6.))
-        .margin(px(8.))
+        .offset(DROPDOWN_GAP)
+        .margin(DROPDOWN_MARGIN)
 }
 
-/// Positions a dropdown surface under its trigger and animates it in.
-///
-/// This is the shared open motion for Select, Combobox and DatePicker, modelled
-/// on shadcn/ui: over 150ms the surface fades up from nothing while sliding the
-/// last 8px out of the trigger's edge, on an ease-out curve so it decelerates
-/// into place.
-///
-/// `surface` must be the panel itself — the element carrying
-/// [`ThemeStyled::popover_style`] — and not a wrapper around it. GPUI takes a
-/// shadow's shape from the element it is set on, so a wrapper of a different
-/// size would throw the shadow out of register with the panel.
-///
-/// # Why the shadow is animated too
-///
-/// GPUI has no group compositing: `opacity` multiplies into each primitive's
-/// alpha separately rather than fading a composited subtree. A drop shadow is
-/// painted as a full blurred rect *under* the element — the shader only cuts the
-/// element out of `inset` shadows — so a translucent panel does not hide its own
-/// shadow, and mid-fade the shadow shows straight through the panel as a dark
-/// slab. Ramping the ink by the cube of the fade keeps it out of sight until the
-/// panel is opaque enough to cover it, and still lands on the resting shadow
-/// [`popover_shadow`] gives every other popup.
-///
-/// # Departures from shadcn
-///
-/// - shadcn also scales the surface up from 95% (`zoom-in-95`). GPUI has no
-///   element transform — only images and SVGs take a `TransformationMatrix` —
-///   so there is nothing to scale a subtree with, and the fade and slide carry
-///   the motion on their own.
-/// - There is no exit motion. A closing dropdown stops being rendered in the
-///   same frame its state flips, so playing one would mean keeping the surface
-///   mounted past the close, which is a change to how each of these components
-///   tracks `open`.
-/// - The slide always comes from above. [`gpui_base::Positioner`] resolves the
-///   side the surface actually lands on during layout and does not report it
-///   back, so a dropdown that flips above its trigger for want of room below
-///   slides the opposite way — 8px over 150ms, in the rare case where it
-///   happens.
-///
-/// Reduced motion needs no handling here: GPUI's animation element adopts the
-/// final value on the first frame when the system asks for it.
+/// Choose a side from the space needed for the fixed controls and one row.
+/// The full height of the filtered list must not influence this decision.
+pub(crate) fn dropdown_list_positioner(
+    bounds: Bounds<Pixels>,
+    minimum_height: Pixels,
+    window: &Window,
+) -> (Positioner, Pixels) {
+    let viewport = Positioner::viewport_bounds(window, DROPDOWN_MARGIN);
+    let below = bounds.bottom() + DROPDOWN_GAP;
+    let above = bounds.top() - DROPDOWN_GAP;
+    let below_height = (viewport.bottom() - below).max(px(0.));
+    let above_height = (above - viewport.top()).max(px(0.));
+    let (anchor, y, height) = if below_height < minimum_height && above_height > below_height {
+        (Anchor::BottomLeft, above, above_height)
+    } else {
+        (Anchor::TopLeft, below, below_height)
+    };
+
+    (
+        Positioner::corner(anchor, point(bounds.left(), y)).margin(DROPDOWN_MARGIN),
+        height,
+    )
+}
+
+/// Places a searchable dropdown and keeps its surface paintable during exit.
 pub(crate) fn dropdown_popup(
     id: impl Into<ElementId>,
-    bounds: Bounds<Pixels>,
+    positioner: Positioner,
+    open: bool,
     surface: impl IntoElement + Styled + 'static,
-    cx: &App,
-) -> gpui_base::Positioner {
-    let travel: f32 = DROPDOWN_ENTER_OFFSET.into();
-    // Read out here: the animation runs long after `cx` is gone.
-    let ring = popover_ring(cx);
+    window: &mut Window,
+    cx: &mut App,
+) -> Positioner {
+    use gpui_base::{DROPDOWN_TRAVEL, PopupFrame, PopupMotion, PopupMotionKind};
+    use std::time::Instant;
 
-    dropdown_positioner(bounds).child(surface.with_animation(
-        id,
-        Animation::new(DROPDOWN_ENTER_DURATION).with_easing(ease_out_cubic),
-        move |surface, delta| {
-            surface
-                .top(px(travel * (1. - delta)))
-                .opacity(delta)
-                .shadow(popover_shadow(ring, delta * delta * delta))
-        },
-    ))
+    let motion = window.use_keyed_state(id, cx, |_, _| None::<PopupMotion>);
+    let opacity = motion.update(cx, |motion, cx| {
+        if open {
+            motion
+                .get_or_insert_with(|| PopupMotion::new(PopupMotionKind::Dropdown, Instant::now()));
+        }
+        let Some(active) = motion else {
+            return 0.;
+        };
+        active.retarget(open, Instant::now());
+        let opacity = active.opacity(window, cx);
+        if !open && opacity == 0. {
+            *motion = None;
+        }
+        opacity
+    });
+
+    positioner
+        .travel(DROPDOWN_TRAVEL * (1. - opacity))
+        .when(open || opacity > 0., |positioner| {
+            positioner.child(PopupFrame::new(
+                surface
+                    .opacity(opacity)
+                    .shadow(popover_shadow(opacity.powi(3))),
+                !open,
+            ))
+        })
 }
 
 /// A popover element that can be triggered by a button or any other element.
@@ -112,6 +101,7 @@ pub struct Popover {
     offset: Option<Pixels>,
     arrow: bool,
     default_open: bool,
+    motion_kind: gpui_base::PopupMotionKind,
     open: Option<bool>,
     tracked_focus_handle: Option<FocusHandle>,
     trigger: Option<Box<dyn FnOnce(bool, &Window, &App) -> AnyElement + 'static>>,
@@ -127,6 +117,7 @@ pub struct Popover {
     trigger_style: Option<StyleRefinement>,
     mouse_button: MouseButton,
     appearance: bool,
+    scrollable: bool,
     overlay_closable: bool,
     on_open_change: Option<Rc<dyn Fn(&bool, &mut Window, &mut App)>>,
 }
@@ -147,11 +138,85 @@ impl Popover {
             children: vec![],
             mouse_button: MouseButton::Left,
             appearance: true,
+            scrollable: true,
             overlay_closable: true,
             default_open: false,
+            motion_kind: gpui_base::PopupMotionKind::Popover,
             open: None,
             on_open_change: None,
         }
+    }
+
+    /// The standard Popover surface with an arrow, for passive surfaces such as tooltips.
+    pub fn surface_with_arrow(
+        side: Placement,
+        target: Point<Pixels>,
+        window: &Window,
+        cx: &App,
+    ) -> Div {
+        let depth = Self::arrow_depth(window);
+        Self::with_surface_arrow(
+            Self::style_surface(v_flex(), cx),
+            move || Some((side, target, depth)),
+            window,
+            cx,
+        )
+    }
+
+    fn arrow_depth(window: &Window) -> Pixels {
+        window.rem_size() * 0.375
+    }
+
+    fn style_surface<E: Styled>(surface: E, cx: &App) -> E {
+        surface.popover_style(cx).p_3()
+    }
+
+    /// Give a Popover surface a continuous outline pointing at its resolved anchor.
+    fn with_surface_arrow<E: Styled + ParentElement>(
+        mut surface: E,
+        arrow: impl Fn() -> Option<(Placement, Point<Pixels>, Pixels)> + 'static,
+        window: &Window,
+        cx: &App,
+    ) -> E {
+        let mut style = Style::default();
+        style.refine(surface.style());
+        let rem = window.rem_size();
+        let background = style
+            .background
+            .and_then(|fill| fill.color())
+            .unwrap_or_else(|| crate::styled::popup_color(cx).into());
+        let radius = style.corner_radii.top_left.to_pixels(rem);
+        let widths = style.border_widths.to_pixels(rem);
+        let border = style.border_color.unwrap_or_else(transparent_black);
+        // Absolute children start inside the border. Extend the decoration back
+        // to the same outer box as the backdrop and fill.
+        surface.border_color(transparent_black()).child(
+            canvas(
+                |_, _, _| (),
+                move |bounds, (), window, _| {
+                    paint_arrow_outline(
+                        bounds,
+                        arrow(),
+                        radius,
+                        background.into(),
+                        border,
+                        widths.top,
+                        window,
+                    );
+                },
+            )
+            .absolute()
+            .inset_0()
+            .top(-widths.top)
+            .right(-widths.right)
+            .bottom(-widths.bottom)
+            .left(-widths.left),
+        )
+    }
+
+    pub fn dropdown_motion(mut self) -> Self {
+        self.motion_kind = gpui_base::PopupMotionKind::Dropdown;
+        self
     }
 
     /// Set the anchor corner of the popover, default is [`Anchor::TopLeft`].
@@ -240,6 +305,12 @@ impl Popover {
         self
     }
 
+    /// Let the content use its own scrolling, for example a virtualized list.
+    pub fn scrollable(mut self, scrollable: bool) -> Self {
+        self.scrollable = scrollable;
+        self
+    }
+
     /// Set whether clicking outside the popover will dismiss it, default is `true`.
     pub fn overlay_closable(mut self, closable: bool) -> Self {
         self.overlay_closable = closable;
@@ -305,7 +376,7 @@ impl Popover {
             .id("content")
             .occlude()
             .tab_group()
-            .when(appearance, |this| this.popover_style(cx).p_3())
+            .when(appearance, |this| Self::style_surface(this, cx))
             .map(|this| match anchor {
                 Anchor::TopLeft | Anchor::TopCenter | Anchor::TopRight => this.top_1(),
                 Anchor::BottomLeft | Anchor::BottomCenter | Anchor::BottomRight => this.bottom_1(),
@@ -315,10 +386,10 @@ impl Popover {
 }
 
 impl RenderOnce for Popover {
-    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
+    fn render(self, window: &mut Window, _: &mut App) -> impl IntoElement {
         let anchor = self.anchor;
         let arrow_size = if self.arrow {
-            window.rem_size() * 0.375
+            Self::arrow_depth(window)
         } else {
             px(0.)
         };
@@ -326,21 +397,15 @@ impl RenderOnce for Popover {
         let resolved = Rc::new(Cell::new(None));
         let arrow_position = resolved.clone();
         let arrow = self.arrow;
-        let background = self
-            .style
-            .background
-            .as_ref()
-            .and_then(gpui::Fill::color)
-            .unwrap_or_else(|| cx.theme().popover.into());
-        let ring = popover_ring(cx);
-        let radius = cx.theme().radius;
         let appearance = self.appearance;
+        let scrollable = appearance && self.scrollable;
         let style = self.style;
         let children = self.children;
         let content = self.content;
         let trigger_style = self.trigger_style;
 
         BasePopover::new(self.id)
+            .motion_kind(self.motion_kind)
             .anchor(self.anchor)
             .offset(offset)
             .on_position(move |position, trigger| resolved.set(Some((position, trigger))))
@@ -348,59 +413,41 @@ impl RenderOnce for Popover {
             .default_open(self.default_open)
             .overlay_closable(self.overlay_closable)
             .content(move |state, window, cx| {
-                v_flex()
-                    .id("content")
-                    .occlude()
-                    .tab_group()
-                    .when(appearance, |this| this.popover_style(cx).p_3())
+                let body = v_flex()
                     .when_some(content, |this, content| {
                         this.child((content)(state, window, cx))
                     })
-                    .children(children)
+                    .children(children);
+                let mut surface = v_flex()
+                    .id("content")
+                    .occlude()
+                    .tab_group()
+                    .when(appearance, |this| Self::style_surface(this, cx))
                     .refine_style(&style)
-                    .when(arrow, |this| {
-                        this.child(
-                            canvas(
-                                |_, _, _| {},
-                                move |bounds, _, window, _| {
-                                    let Some((_, trigger)) = arrow_position.get() else {
-                                        return;
-                                    };
-                                    let (side, target) = arrow_anchor(anchor, trigger);
-                                    let trigger = Bounds::new(target, gpui::size(px(0.), px(0.)));
-                                    let points =
-                                        arrow_points(bounds, trigger, side, arrow_size, radius);
-                                    let mut fill = PathBuilder::fill();
-                                    fill.move_to(points[0]);
-                                    fill.line_to(points[1]);
-                                    fill.line_to(points[2]);
-                                    fill.close();
-                                    if let Ok(path) = fill.build() {
-                                        window.paint_path(path, background);
-                                    }
-                                    // The triangle ends exactly at the surface edge.
-                                    // Cover the ring and the antialiased base on both
-                                    // sides of that edge before drawing its two slopes.
-                                    window.paint_quad(gpui::fill(
-                                        arrow_join_bounds(points, side, px(1.)),
-                                        background,
-                                    ));
-                                    if appearance {
-                                        let mut outline = PathBuilder::stroke(px(1.));
-                                        outline.move_to(points[0]);
-                                        outline.line_to(points[1]);
-                                        outline.line_to(points[2]);
-                                        if let Ok(path) = outline.build() {
-                                            window.paint_path(path, ring);
-                                        }
-                                    }
-                                },
-                            )
-                            .absolute()
-                            .inset_0()
-                            .size_full(),
-                        )
-                    })
+                    .child(if scrollable {
+                        body.max_h((window.viewport_size().height - px(64.)).max(px(0.)))
+                            .overflow_y_popup_scrollbar()
+                            .into_any_element()
+                    } else {
+                        body.into_any_element()
+                    });
+                if arrow {
+                    surface = Self::with_surface_arrow(
+                        surface,
+                        move || {
+                            let (position, trigger) = arrow_position.get()?;
+                            let (legacy_side, target) = arrow_anchor(anchor, trigger);
+                            Some((
+                                position.placement.unwrap_or(legacy_side),
+                                target,
+                                arrow_size,
+                            ))
+                        },
+                        window,
+                        cx,
+                    );
+                }
+                surface
             })
             .when_some(self.trigger, |this, trigger| this.trigger_with(trigger))
             .when_some(trigger_style, |this, style| this.refine_style(&style))
@@ -429,67 +476,143 @@ fn arrow_anchor(anchor: Anchor, trigger: Bounds<Pixels>) -> (Placement, Point<Pi
     }
 }
 
-/// Clamp the arrow base clear of rounded corners while aiming at the trigger.
-fn arrow_points(
-    surface: Bounds<Pixels>,
-    trigger: Bounds<Pixels>,
-    side: Placement,
-    depth: Pixels,
+fn paint_arrow_outline(
+    bounds: Bounds<Pixels>,
+    arrow: Option<(Placement, Point<Pixels>, Pixels)>,
     radius: Pixels,
-) -> [Point<Pixels>; 3] {
-    let horizontal = side.is_horizontal();
-    let (start, end, target) = if horizontal {
-        (surface.top(), surface.bottom(), trigger.center().y)
-    } else {
-        (surface.left(), surface.right(), trigger.center().x)
-    };
-    let half = depth.min((end - start) * 0.5);
-    let inset = (radius + half).min((end - start) * 0.5);
-    let center = target.clamp(start + inset, end - inset);
-    match side {
-        Placement::Bottom => [
-            point(center - half, surface.top()),
-            point(center, surface.top() - depth),
-            point(center + half, surface.top()),
-        ],
-        Placement::Top => [
-            point(center - half, surface.bottom()),
-            point(center, surface.bottom() + depth),
-            point(center + half, surface.bottom()),
-        ],
-        Placement::Right => [
-            point(surface.left(), center - half),
-            point(surface.left() - depth, center),
-            point(surface.left(), center + half),
-        ],
-        Placement::Left => [
-            point(surface.right(), center - half),
-            point(surface.right() + depth, center),
-            point(surface.right(), center + half),
-        ],
+    background: Background,
+    border_color: Hsla,
+    border_width: Pixels,
+    window: &mut Window,
+) {
+    let bounds = Bounds::from_corners(
+        window.pixel_snap_point(bounds.origin),
+        window.pixel_snap_point(bounds.bottom_right()),
+    );
+    if bounds.is_empty() {
+        return;
+    }
+
+    let radius = radius.min(bounds.size.width.min(bounds.size.height) / 2.);
+    let arrow = arrow.and_then(|(side, target, depth)| {
+        let points = arrow_points(bounds, side, target, depth, radius, border_width)?;
+        Some((side, points))
+    });
+    if let Some((_, [start, tip, end])) = arrow {
+        // Meet the popup material exactly at its snapped edge. Overlapping it
+        // would apply the translucent tint twice, leaving a seam at the join.
+        let mut fill = PathBuilder::fill();
+        fill.move_to(start);
+        fill.line_to(tip);
+        fill.line_to(end);
+        fill.close();
+        paint_path(window, fill, background);
+    }
+    if border_width > px(0.) && border_color.a > 0. {
+        let mut border = PathBuilder::stroke(border_width);
+        outline(&mut border, bounds, radius, arrow);
+        paint_path(window, border, border_color);
     }
 }
 
-fn arrow_join_bounds(
-    points: [Point<Pixels>; 3],
-    side: Placement,
-    stroke: Pixels,
-) -> Bounds<Pixels> {
-    // Inset by the stroke width so the patch remains inside the triangle's
-    // slopes at the outer edge of the ring, including on very small surfaces.
-    if side.is_horizontal() {
-        let inset = stroke.min((points[2].y - points[0].y) * 0.5);
-        Bounds::from_corners(
-            point(points[0].x - stroke, points[0].y + inset),
-            point(points[2].x + stroke, points[2].y - inset),
-        )
-    } else {
-        let inset = stroke.min((points[2].x - points[0].x) * 0.5);
-        Bounds::from_corners(
-            point(points[0].x + inset, points[0].y - stroke),
-            point(points[2].x - inset, points[2].y + stroke),
-        )
+fn paint_path(window: &mut Window, builder: PathBuilder, color: impl Into<Background>) {
+    if let Ok(mut path) = builder.build() {
+        // Retain the partially covered pixels at the tip and perimeter.
+        path.bounds = path.bounds.dilate(px(1. / window.scale_factor()));
+        window.paint_path(path, color);
     }
+}
+
+fn arrow_points(
+    bounds: Bounds<Pixels>,
+    side: Placement,
+    target: Point<Pixels>,
+    depth: Pixels,
+    radius: Pixels,
+    stroke: Pixels,
+) -> Option<[Point<Pixels>; 3]> {
+    let (start, end, target) = if side.is_horizontal() {
+        (bounds.top(), bounds.bottom(), target.y)
+    } else {
+        (bounds.left(), bounds.right(), target.x)
+    };
+    let half = depth.min((end - start) / 2. - radius - stroke);
+    if half <= px(0.) {
+        return None;
+    }
+    let inset = radius + half + stroke;
+    let center = target.clamp(start + inset, end - inset);
+    let a = center - half;
+    let b = center + half;
+    Some(match side {
+        Placement::Bottom => [
+            point(a, bounds.top()),
+            point(center, bounds.top() - depth),
+            point(b, bounds.top()),
+        ],
+        Placement::Left => [
+            point(bounds.right(), a),
+            point(bounds.right() + depth, center),
+            point(bounds.right(), b),
+        ],
+        Placement::Top => [
+            point(b, bounds.bottom()),
+            point(center, bounds.bottom() + depth),
+            point(a, bounds.bottom()),
+        ],
+        Placement::Right => [
+            point(bounds.left(), b),
+            point(bounds.left() - depth, center),
+            point(bounds.left(), a),
+        ],
+    })
+}
+
+/// Trace clockwise. On the arrow edge, the two slopes replace the straight base.
+fn outline(
+    path: &mut PathBuilder,
+    bounds: Bounds<Pixels>,
+    radius: Pixels,
+    arrow: Option<(Placement, [Point<Pixels>; 3])>,
+) {
+    let (left, top, right, bottom) = (bounds.left(), bounds.top(), bounds.right(), bounds.bottom());
+    let control = radius * 0.552_284_8;
+    let edge = |path: &mut PathBuilder, side, end| {
+        if let Some((placement, points)) = arrow
+            && placement == side
+        {
+            for point in points {
+                path.line_to(point);
+            }
+        }
+        path.line_to(end);
+    };
+    path.move_to(point(left + radius, top));
+    edge(path, Placement::Bottom, point(right - radius, top));
+    path.cubic_bezier_to(
+        point(right, top + radius),
+        point(right - radius + control, top),
+        point(right, top + radius - control),
+    );
+    edge(path, Placement::Left, point(right, bottom - radius));
+    path.cubic_bezier_to(
+        point(right - radius, bottom),
+        point(right, bottom - radius + control),
+        point(right - radius + control, bottom),
+    );
+    edge(path, Placement::Top, point(left + radius, bottom));
+    path.cubic_bezier_to(
+        point(left, bottom - radius),
+        point(left + radius - control, bottom),
+        point(left, bottom - radius + control),
+    );
+    edge(path, Placement::Right, point(left, top + radius));
+    path.cubic_bezier_to(
+        point(left + radius, top),
+        point(left, top + radius - control),
+        point(left + radius - control, top),
+    );
+    path.close();
 }
 
 #[cfg(test)]
@@ -499,6 +622,21 @@ mod tests {
     use gpui::{Bounds, Context, MouseButton, Point, Render, div, point, px, size};
     use gpui_base::Popup as BasePopup;
     use std::{cell::RefCell, rc::Rc};
+
+    #[test]
+    fn arrows_stay_on_the_straight_edges() {
+        let bounds = Bounds::new(point(px(100.), px(100.)), size(px(80.), px(60.)));
+        let target = point(px(0.), px(0.));
+        for (side, expected) in [
+            (Placement::Right, point(px(94.), px(111.))),
+            (Placement::Left, point(px(186.), px(111.))),
+            (Placement::Bottom, point(px(111.), px(94.))),
+            (Placement::Top, point(px(111.), px(166.))),
+        ] {
+            let points = arrow_points(bounds, side, target, px(6.), px(4.), px(1.)).unwrap();
+            assert_eq!(points[1], expected);
+        }
+    }
 
     #[test]
     fn test_popover_builder_chaining() {
@@ -809,71 +947,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn arrows_point_toward_the_trigger_on_every_resolved_side() {
-        let surface = Bounds::new(point(px(100.), px(100.)), size(px(80.), px(60.)));
-        for (side, trigger, tip) in [
-            (
-                Placement::Bottom,
-                Bounds::new(point(px(120.), px(50.)), size(px(40.), px(20.))),
-                point(px(140.), px(94.)),
-            ),
-            (
-                Placement::Top,
-                Bounds::new(point(px(120.), px(180.)), size(px(40.), px(20.))),
-                point(px(140.), px(166.)),
-            ),
-            (
-                Placement::Right,
-                Bounds::new(point(px(40.), px(120.)), size(px(40.), px(20.))),
-                point(px(94.), px(130.)),
-            ),
-            (
-                Placement::Left,
-                Bounds::new(point(px(200.), px(120.)), size(px(40.), px(20.))),
-                point(px(186.), px(130.)),
-            ),
-        ] {
-            assert_eq!(arrow_points(surface, trigger, side, px(6.), px(4.))[1], tip);
-        }
-        let clamped = arrow_points(
-            surface,
-            Bounds::new(point(px(0.), px(50.)), size(px(20.), px(20.))),
-            Placement::Bottom,
-            px(6.),
-            px(4.),
-        );
-        assert_eq!(clamped[0], point(px(104.), px(100.)));
-        assert_eq!(clamped[1], point(px(110.), px(94.)));
-    }
-
-    #[test]
-    fn arrow_join_covers_both_sides_of_the_surface_edge() {
-        let surface = Bounds::new(point(px(100.), px(100.)), size(px(80.), px(60.)));
-        let trigger = Bounds::new(point(px(120.), px(120.)), size(px(40.), px(20.)));
-        for (side, expected) in [
-            (
-                Placement::Bottom,
-                Bounds::new(point(px(135.), px(99.)), size(px(10.), px(2.))),
-            ),
-            (
-                Placement::Top,
-                Bounds::new(point(px(135.), px(159.)), size(px(10.), px(2.))),
-            ),
-            (
-                Placement::Right,
-                Bounds::new(point(px(99.), px(125.)), size(px(2.), px(10.))),
-            ),
-            (
-                Placement::Left,
-                Bounds::new(point(px(179.), px(125.)), size(px(2.), px(10.))),
-            ),
-        ] {
-            let points = arrow_points(surface, trigger, side, px(6.), px(4.));
-            assert_eq!(arrow_join_bounds(points, side, px(1.)), expected);
-        }
-    }
-
     impl Render for PopoverHarness {
         fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
             let changes = self.changes.clone();
@@ -948,33 +1021,30 @@ mod tests {
     }
 
     impl Render for Harness {
-        fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-            div().size_full().when(self.open, |this| {
-                this.child(dropdown_popup(
-                    "dropdown",
-                    Bounds::new(point(px(0.), px(100.)), size(px(120.), px(30.))),
-                    div().debug_selector(|| "surface".into()).size(px(50.)),
-                    cx,
-                ))
-            })
+        fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            div().size_full().child(dropdown_popup(
+                "dropdown",
+                dropdown_positioner(Bounds::new(
+                    point(px(0.), px(100.)),
+                    size(px(120.), px(30.)),
+                )),
+                self.open,
+                div().debug_selector(|| "surface".into()).size(px(50.)),
+                window,
+                cx,
+            ))
         }
     }
 
-    /// A dropdown that reused one animation key across opens would play its
-    /// enter motion the first time and then appear already settled on every
-    /// open after that. That is invisible in any single frame and easy to
-    /// reintroduce by giving the animation a constant id, so it is pinned here.
     #[gpui::test]
-    fn the_enter_motion_starts_over_every_time_the_dropdown_opens(cx: &mut gpui::TestAppContext) {
+    fn dropdown_keeps_its_surface_during_exit_and_restarts_after_it(cx: &mut gpui::TestAppContext) {
         cx.update(crate::init);
-        let executor = cx.executor();
         let (view, window) = cx.add_window_view(|_, _| Harness { open: true });
 
         window.update(|window, cx| crate::test_redraw(window, cx));
         let opening = window.debug_bounds("surface").unwrap().origin;
 
-        // The animation runs on the test clock, so settling is stepped.
-        executor.advance_clock(DROPDOWN_ENTER_DURATION * 4);
+        std::thread::sleep(std::time::Duration::from_millis(90));
         window.update(|window, cx| crate::test_redraw(window, cx));
         let settled = window.debug_bounds("surface").unwrap().origin;
 
@@ -983,7 +1053,7 @@ mod tests {
             "the surface should slide down into place, from {opening:?} to {settled:?}",
         );
 
-        for open in [false, true] {
+        let set_open = |open| {
             window.update(|window, cx| {
                 view.update(cx, |this, cx| {
                     this.open = open;
@@ -991,7 +1061,13 @@ mod tests {
                 });
                 crate::test_redraw(window, cx);
             });
-        }
+        };
+        set_open(false);
+        assert!(window.debug_bounds("surface").is_some());
+        std::thread::sleep(std::time::Duration::from_millis(90));
+        window.update(|window, cx| crate::test_redraw(window, cx));
+        assert!(window.debug_bounds("surface").is_none());
+        set_open(true);
 
         let reopening = window.debug_bounds("surface").unwrap().origin;
         assert!(

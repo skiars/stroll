@@ -23,6 +23,9 @@ use crate::directx_renderer::shader_resources::{RawShaderBytes, ShaderModule, Sh
 use crate::*;
 use gpui::*;
 
+mod backdrop;
+use backdrop::BackdropRenderer;
+
 pub(crate) const DISABLE_DIRECT_COMPOSITION: &str = "GPUI_DISABLE_DIRECT_COMPOSITION";
 const RENDER_TARGET_FORMAT: DXGI_FORMAT = DXGI_FORMAT_B8G8R8A8_UNORM;
 // This configuration is used for MSAA rendering on paths only, and it's guaranteed to be supported by DirectX 11.
@@ -43,6 +46,7 @@ pub(crate) struct DirectXRenderer {
     resources: Option<DirectXResources>,
     globals: DirectXGlobalElements,
     pipelines: DirectXRenderPipelines,
+    backdrop: Option<BackdropRenderer>,
     direct_composition: Option<DirectComposition>,
     font_info: &'static FontInfo,
 
@@ -73,14 +77,19 @@ struct DirectXResources {
     render_target: Option<ID3D11Texture2D>,
     render_target_view: Option<ID3D11RenderTargetView>,
 
-    // Path intermediate textures (with MSAA)
-    path_intermediate_texture: ID3D11Texture2D,
-    path_intermediate_srv: Option<ID3D11ShaderResourceView>,
-    path_intermediate_msaa_texture: ID3D11Texture2D,
-    path_intermediate_msaa_view: Option<ID3D11RenderTargetView>,
+    path_scratch: Vec<PathScratch>,
 
     // Cached viewport
     viewport: D3D11_VIEWPORT,
+}
+
+struct PathScratch {
+    width: u32,
+    height: u32,
+    texture: ID3D11Texture2D,
+    srv: Option<ID3D11ShaderResourceView>,
+    msaa: ID3D11Texture2D,
+    msaa_view: Option<ID3D11RenderTargetView>,
 }
 
 struct DirectXRenderPipelines {
@@ -189,6 +198,7 @@ impl DirectXRenderer {
             resources: Some(resources),
             globals,
             pipelines,
+            backdrop: None,
             direct_composition,
             font_info: Self::get_font_info(),
             width: 1,
@@ -272,6 +282,7 @@ impl DirectXRenderer {
             }
 
             self.resources.take();
+            self.backdrop.take();
             if let Some(devices) = &self.devices {
                 devices.device_context.OMSetRenderTargets(None, None);
                 devices.device_context.ClearState();
@@ -351,10 +362,19 @@ impl DirectXRenderer {
         scene: &Scene,
         background_appearance: WindowBackgroundAppearance,
     ) -> Result<()> {
-        self.pre_draw(&match background_appearance {
+        let clear = match background_appearance {
             WindowBackgroundAppearance::Opaque => [1.0f32; 4],
             _ => [0.0f32; 4],
-        })?;
+        };
+        self.pre_draw(&clear)?;
+        if let Some(backdrop) = self.backdrop.as_mut() {
+            backdrop.begin_frame();
+        }
+        let atlas_revision = if scene.backdrop_blurs.is_empty() {
+            0
+        } else {
+            self.atlas.revision()
+        };
         self.upload_scene_buffers(scene)?;
 
         let annotation = self
@@ -362,7 +382,28 @@ impl DirectXRenderer {
             .as_ref()
             .and_then(|devices| devices.annotation.clone())
             .filter(|annotation| unsafe { annotation.GetStatus().as_bool() });
-        for batch in scene.batches() {
+        for batch in scene.batches_with_backdrop() {
+            let batch = match batch {
+                SceneBatch::Draw(batch) => batch,
+                SceneBatch::Capture | SceneBatch::Overlay => continue,
+                SceneBatch::Backdrop(blur) => {
+                    let devices = self.devices.as_ref().context("devices missing")?;
+                    let resources = self.resources.as_ref().context("resources missing")?;
+                    if self.backdrop.is_none() {
+                        self.backdrop = Some(BackdropRenderer::new(&devices.device)?);
+                    }
+                    self.backdrop.as_mut().unwrap().draw(
+                        devices,
+                        resources,
+                        &self.globals.sampler,
+                        scene,
+                        blur,
+                        atlas_revision,
+                        clear,
+                    )?;
+                    continue;
+                }
+            };
             let _annotation = annotation
                 .as_ref()
                 .map(|annotation| Annotation::new(annotation, HSTRING::from(batch.label())));
@@ -371,8 +412,13 @@ impl DirectXRenderer {
                 PrimitiveBatch::Quads(range) => self.draw_quads(range.start, range.len()),
                 PrimitiveBatch::Paths(range) => {
                     let paths = &scene.paths[range];
-                    self.draw_paths_to_intermediate(paths)?;
-                    self.draw_paths_from_intermediate(paths)
+                    let size = gpui::size(ScaledPixels(self.width as f32), ScaledPixels(self.height as f32));
+                    if let Some(raster) = gpui::path_raster_bounds(paths, size) {
+                        self.draw_paths_to_intermediate(paths, raster)?;
+                        self.draw_paths_from_intermediate(paths, raster.origin)
+                    } else {
+                        Ok(())
+                    }
                 }
                 PrimitiveBatch::Underlines(range) => self.draw_underlines(range.start, range.len()),
                 PrimitiveBatch::MonochromeSprites { texture_id, range } => {
@@ -612,24 +658,33 @@ impl DirectXRenderer {
         )
     }
 
-    fn draw_paths_to_intermediate(&mut self, paths: &[Path<ScaledPixels>]) -> Result<()> {
-        if paths.is_empty() {
-            return Ok(());
-        }
-
+    fn draw_paths_to_intermediate(
+        &mut self,
+        paths: &[Path<ScaledPixels>],
+        raster: Bounds<ScaledPixels>,
+    ) -> Result<()> {
         let devices = self.devices.as_ref().context("devices missing")?;
-        let resources = self.resources.as_ref().context("resources missing")?;
-        // Clear intermediate MSAA texture
+        let resources = self.resources.as_mut().context("resources missing")?;
+        resources.prepare_path_scratch(&devices.device, raster.size)?;
+        let scratch = resources
+            .path_scratch
+            .last()
+            .expect("path scratch prepared");
+        let viewport = D3D11_VIEWPORT {
+            Width: raster.size.width.0,
+            Height: raster.size.height.0,
+            ..resources.viewport
+        };
         unsafe {
-            devices.device_context.ClearRenderTargetView(
-                resources.path_intermediate_msaa_view.as_ref().unwrap(),
-                &[0.0; 4],
-            );
-            // Set intermediate MSAA texture as render target
-            devices.device_context.OMSetRenderTargets(
-                Some(slice::from_ref(&resources.path_intermediate_msaa_view)),
-                None,
-            );
+            devices
+                .device_context
+                .ClearRenderTargetView(scratch.msaa_view.as_ref().unwrap(), &[0.0; 4]);
+            devices
+                .device_context
+                .OMSetRenderTargets(Some(slice::from_ref(&scratch.msaa_view)), None);
+            devices
+                .device_context
+                .RSSetViewports(Some(slice::from_ref(&viewport)));
         }
 
         // Collect all vertices and sprites for a single draw call
@@ -641,6 +696,7 @@ impl DirectXRenderer {
                 st_position: v.st_position,
                 color: path.color,
                 bounds: path.clipped_bounds(),
+                raster,
             }));
         }
 
@@ -660,9 +716,9 @@ impl DirectXRenderer {
         // Resolve MSAA to non-MSAA intermediate texture
         unsafe {
             devices.device_context.ResolveSubresource(
-                &resources.path_intermediate_texture,
+                &scratch.texture,
                 0,
-                &resources.path_intermediate_msaa_texture,
+                &scratch.msaa,
                 0,
                 RENDER_TARGET_FORMAT,
             );
@@ -670,12 +726,19 @@ impl DirectXRenderer {
             devices
                 .device_context
                 .OMSetRenderTargets(Some(slice::from_ref(&resources.render_target_view)), None);
+            devices
+                .device_context
+                .RSSetViewports(Some(slice::from_ref(&resources.viewport)));
         }
 
         Ok(())
     }
 
-    fn draw_paths_from_intermediate(&mut self, paths: &[Path<ScaledPixels>]) -> Result<()> {
+    fn draw_paths_from_intermediate(
+        &mut self,
+        paths: &[Path<ScaledPixels>],
+        raster_origin: Point<ScaledPixels>,
+    ) -> Result<()> {
         let Some(first_path) = paths.first() else {
             return Ok(());
         };
@@ -692,6 +755,7 @@ impl DirectXRenderer {
                 .iter()
                 .map(|path| PathSprite {
                     bounds: path.clipped_bounds(),
+                    raster_origin,
                 })
                 .collect::<Vec<_>>()
         } else {
@@ -699,7 +763,10 @@ impl DirectXRenderer {
             for path in paths.iter().skip(1) {
                 bounds = bounds.union(&path.clipped_bounds());
             }
-            vec![PathSprite { bounds }]
+            vec![PathSprite {
+                bounds,
+                raster_origin,
+            }]
         };
 
         let devices = self.devices.as_ref().context("devices missing")?;
@@ -713,7 +780,13 @@ impl DirectXRenderer {
         // Draw the sprites with the path texture
         self.pipelines.path_sprite_pipeline.draw_with_texture(
             &devices.device_context,
-            slice::from_ref(&resources.path_intermediate_srv),
+            slice::from_ref(
+                &resources
+                    .path_scratch
+                    .last()
+                    .expect("path scratch prepared")
+                    .srv,
+            ),
             slice::from_ref(&self.globals.sampler),
             sprites.len() as u32,
         )
@@ -889,27 +962,62 @@ impl DirectXResources {
             )?
         };
 
-        let (
-            render_target,
-            render_target_view,
-            path_intermediate_texture,
-            path_intermediate_srv,
-            path_intermediate_msaa_texture,
-            path_intermediate_msaa_view,
-            viewport,
-        ) = create_resources(devices, &swap_chain, width, height)?;
+        let (render_target, render_target_view, viewport) =
+            create_resources(devices, &swap_chain, width, height)?;
         set_rasterizer_state(&devices.device, &devices.device_context)?;
 
         Ok(Self {
             swap_chain,
             render_target: Some(render_target),
             render_target_view,
-            path_intermediate_texture,
-            path_intermediate_msaa_texture,
-            path_intermediate_msaa_view,
-            path_intermediate_srv,
+            path_scratch: Vec::new(),
             viewport,
         })
+    }
+
+    fn prepare_path_scratch(
+        &mut self,
+        device: &ID3D11Device,
+        size: gpui::Size<ScaledPixels>,
+    ) -> Result<()> {
+        let width = (size.width.0 as u32).next_multiple_of(64);
+        let height = (size.height.0 as u32).next_multiple_of(64);
+        if let Some(index) = self
+            .path_scratch
+            .iter()
+            .position(|scratch| scratch.width == width && scratch.height == height)
+        {
+            let scratch = self.path_scratch.remove(index);
+            self.path_scratch.push(scratch);
+            return Ok(());
+        }
+        let (texture, srv) = create_sampled_render_texture(device, width, height)?;
+        let (msaa, msaa_view) =
+            create_path_intermediate_msaa_texture_and_view(device, width, height)?;
+        let pixels = |width, height| u64::from(width) * u64::from(height);
+        let bytes_per_pixel = 4 * u64::from(1 + PATH_MULTISAMPLE_COUNT);
+        while !self.path_scratch.is_empty()
+            && (self.path_scratch.len() >= 4
+                || bytes_per_pixel
+                    * (pixels(width, height)
+                        + self
+                            .path_scratch
+                            .iter()
+                            .map(|entry| pixels(entry.width, entry.height))
+                            .sum::<u64>())
+                    > 64 * 1024 * 1024)
+        {
+            self.path_scratch.remove(0);
+        }
+        self.path_scratch.push(PathScratch {
+            width,
+            height,
+            texture,
+            srv,
+            msaa,
+            msaa_view,
+        });
+        Ok(())
     }
 
     #[inline]
@@ -919,21 +1027,11 @@ impl DirectXResources {
         width: u32,
         height: u32,
     ) -> Result<()> {
-        let (
-            render_target,
-            render_target_view,
-            path_intermediate_texture,
-            path_intermediate_srv,
-            path_intermediate_msaa_texture,
-            path_intermediate_msaa_view,
-            viewport,
-        ) = create_resources(devices, &self.swap_chain, width, height)?;
+        let (render_target, render_target_view, viewport) =
+            create_resources(devices, &self.swap_chain, width, height)?;
         self.render_target = Some(render_target);
         self.render_target_view = render_target_view;
-        self.path_intermediate_texture = path_intermediate_texture;
-        self.path_intermediate_msaa_texture = path_intermediate_msaa_texture;
-        self.path_intermediate_msaa_view = path_intermediate_msaa_view;
-        self.path_intermediate_srv = path_intermediate_srv;
+        self.path_scratch.clear();
         self.viewport = viewport;
         Ok(())
     }
@@ -1273,12 +1371,14 @@ struct PathRasterizationSprite {
     st_position: Point<f32>,
     color: Background,
     bounds: Bounds<ScaledPixels>,
+    raster: Bounds<ScaledPixels>,
 }
 
 #[derive(Clone, Copy)]
 #[repr(C)]
 struct PathSprite {
     bounds: Bounds<ScaledPixels>,
+    raster_origin: Point<ScaledPixels>,
 }
 
 impl Drop for DirectXRenderer {
@@ -1361,18 +1461,10 @@ fn create_resources(
 ) -> Result<(
     ID3D11Texture2D,
     Option<ID3D11RenderTargetView>,
-    ID3D11Texture2D,
-    Option<ID3D11ShaderResourceView>,
-    ID3D11Texture2D,
-    Option<ID3D11RenderTargetView>,
     D3D11_VIEWPORT,
 )> {
     let (render_target, render_target_view) =
         create_render_target_and_its_view(swap_chain, &devices.device)?;
-    let (path_intermediate_texture, path_intermediate_srv) =
-        create_path_intermediate_texture(&devices.device, width, height)?;
-    let (path_intermediate_msaa_texture, path_intermediate_msaa_view) =
-        create_path_intermediate_msaa_texture_and_view(&devices.device, width, height)?;
     let viewport = D3D11_VIEWPORT {
         TopLeftX: 0.0,
         TopLeftY: 0.0,
@@ -1381,15 +1473,7 @@ fn create_resources(
         MinDepth: 0.0,
         MaxDepth: 1.0,
     };
-    Ok((
-        render_target,
-        render_target_view,
-        path_intermediate_texture,
-        path_intermediate_srv,
-        path_intermediate_msaa_texture,
-        path_intermediate_msaa_view,
-        viewport,
-    ))
+    Ok((render_target, render_target_view, viewport))
 }
 
 #[inline]
@@ -1404,7 +1488,7 @@ fn create_render_target_and_its_view(
 }
 
 #[inline]
-fn create_path_intermediate_texture(
+fn create_sampled_render_texture(
     device: &ID3D11Device,
     width: u32,
     height: u32,
@@ -1708,6 +1792,7 @@ pub(crate) mod shader_resources {
 
     #[derive(Copy, Clone, Debug, Eq, PartialEq)]
     pub(crate) enum ShaderModule {
+        Backdrop,
         Quad,
         Shadow,
         Underline,
@@ -1757,6 +1842,10 @@ pub(crate) mod shader_resources {
         #[cfg(not(debug_assertions))]
         fn from_bytes(module: ShaderModule, target: ShaderTarget) -> Self {
             let bytes = match module {
+                ShaderModule::Backdrop => match target {
+                    ShaderTarget::Vertex => BACKDROP_VERTEX_BYTES,
+                    ShaderTarget::Fragment => BACKDROP_FRAGMENT_BYTES,
+                },
                 ShaderModule::Quad => match target {
                     ShaderTarget::Vertex => QUAD_VERTEX_BYTES,
                     ShaderTarget::Fragment => QUAD_FRAGMENT_BYTES,
@@ -1861,6 +1950,7 @@ pub(crate) mod shader_resources {
     impl ShaderModule {
         pub fn as_str(self) -> &'static str {
             match self {
+                ShaderModule::Backdrop => "backdrop",
                 ShaderModule::Quad => "quad",
                 ShaderModule::Shadow => "shadow",
                 ShaderModule::Underline => "underline",

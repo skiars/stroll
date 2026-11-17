@@ -284,7 +284,7 @@ fn parse_table_cell(
 ) {
     let mut paragraph = HtmlParagraph::default();
     for child in node.children.borrow().iter() {
-        parse_paragraph(&mut paragraph, child);
+        parse_cell_content(&mut paragraph, child);
     }
     let width = attr_width_height(attrs).0;
     let table_cell = node::TableCell {
@@ -292,6 +292,46 @@ fn parse_table_cell(
         width,
     };
     row.children.push(table_cell);
+}
+
+fn parse_cell_content(paragraph: &mut HtmlParagraph, node: &Rc<Node>) {
+    match &node.data {
+        NodeData::Element { name, .. }
+            if matches!(
+                name.local,
+                local_name!("p")
+                    | local_name!("div")
+                    | local_name!("figure")
+                    | local_name!("figcaption")
+            ) =>
+        {
+            let mut block = HtmlParagraph::default();
+            for child in node.children.borrow().iter() {
+                parse_cell_content(&mut block, child);
+            }
+            if block.content.is_empty() {
+                return;
+            }
+
+            // Cells use one inline flow. Keep the block boundaries as hard
+            // breaks so pictures and captions still occupy separate lines.
+            if !paragraph.content.is_empty() && !paragraph.ends_with_break {
+                paragraph.push_break();
+            }
+            paragraph.content.merge(block.content);
+            paragraph.ends_with_break = block.ends_with_break;
+            if !paragraph.ends_with_break {
+                paragraph.push_break();
+            }
+        }
+        NodeData::Text { contents }
+            if (paragraph.content.is_empty() || paragraph.ends_with_break)
+                && contents
+                    .borrow()
+                    .trim_matches(|c: char| c.is_ascii_whitespace())
+                    .is_empty() => {}
+        _ => parse_paragraph(paragraph, node),
+    }
 }
 
 /// Trim text but leave at least one space.

@@ -6,7 +6,7 @@ use crate::{
 };
 use crate::{StyleSized as _, StyledExt as _, ThemeStyled as _};
 use gpui::{
-    AnyElement, App, ElementId, InteractiveElement, IntoElement, MouseButton, ParentElement,
+    AnyElement, App, ElementId, Hsla, InteractiveElement, IntoElement, MouseButton, ParentElement,
     RenderOnce, SharedString, StatefulInteractiveElement, StyleRefinement, Styled, Window, div,
     prelude::FluentBuilder as _, px, relative, rems, svg,
 };
@@ -24,6 +24,7 @@ pub struct Checkbox {
     accessibility_label: Option<SharedString>,
     children: Vec<AnyElement>,
     checked: bool,
+    indeterminate: bool,
     disabled: bool,
     size: Size,
     tab_stop: bool,
@@ -32,6 +33,8 @@ pub struct Checkbox {
     tooltip: ComponentTooltip,
     role: RoleOverride,
     focus_ring_enabled: bool,
+    indicator_border: Option<Hsla>,
+    keep_indicator_color: bool,
 }
 
 impl Checkbox {
@@ -46,6 +49,7 @@ impl Checkbox {
             accessibility_label: None,
             children: Vec::new(),
             checked: false,
+            indeterminate: false,
             disabled: false,
             size: Size::default(),
             on_click: None,
@@ -54,6 +58,8 @@ impl Checkbox {
             tooltip: ComponentTooltip::default(),
             role: RoleOverride::default(),
             focus_ring_enabled: true,
+            indicator_border: None,
+            keep_indicator_color: false,
         }
     }
 
@@ -95,6 +101,29 @@ impl Checkbox {
     /// Set the checked state for the checkbox.
     pub fn checked(mut self, checked: bool) -> Self {
         self.checked = checked;
+        self
+    }
+
+    /// Show a mixed state. Activating it requests the checked state.
+    pub fn indeterminate(mut self, indeterminate: bool) -> Self {
+        self.indeterminate = indeterminate;
+        self
+    }
+
+    /// Overrides the border color of the unchecked indicator.
+    ///
+    /// Defaults to `Theme::input`, the border color of text fields. A field's
+    /// border sits next to its own background, while an unchecked box is an
+    /// outline on the surrounding surface, so a panel that is close in
+    /// lightness to `input` needs a stronger color here.
+    pub fn indicator_border_color(mut self, color: Hsla) -> Self {
+        self.indicator_border = Some(color);
+        self
+    }
+
+    /// Keep the indicator's normal colors while temporarily blocking activation.
+    pub fn keep_indicator_color_when_disabled(mut self, keep: bool) -> Self {
+        self.keep_indicator_color = keep;
         self
     }
 
@@ -225,7 +254,7 @@ pub(crate) fn checkbox_check_icon(
 
 impl RenderOnce for Checkbox {
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
-        let checked = self.checked;
+        let checked = self.checked && !self.indeterminate;
         let has_content = self.label.is_some() || !self.children.is_empty();
         let indicator_size = rems(match self.size {
             Size::XSmall => 0.75,
@@ -246,9 +275,17 @@ impl RenderOnce for Checkbox {
             .clone();
         let is_focused = focus_handle.is_focused(window);
 
-        let unchecked_border = cx.theme().input;
+        let unchecked_border = self.indicator_border.unwrap_or(cx.theme().input);
         let checked_color = cx.theme().primary;
-        let disabled_indicator_color = if checked {
+        let dim = self.disabled && !self.keep_indicator_color;
+        let border_color = if checked || self.indeterminate {
+            checked_color
+        } else {
+            unchecked_border
+        };
+        let disabled_indicator_color = if !dim {
+            border_color
+        } else if checked {
             checked_color.opacity(0.5)
         } else {
             unchecked_border.opacity(0.5)
@@ -258,6 +295,7 @@ impl RenderOnce for Checkbox {
         let instance_style = self.style.clone();
         base.role(self.role)
             .checked(checked)
+            .indeterminate(self.indeterminate)
             .disabled(self.disabled)
             .styles(|styles| {
                 styles.disabled(|style| {
@@ -305,7 +343,15 @@ impl RenderOnce for Checkbox {
                     .rounded(radius)
                     .when(!checked, |this| {
                         this.bg(cx.theme().input_background())
-                            .when(!self.disabled, |this| this.border_color(unchecked_border))
+                            .when(!self.disabled, |this| {
+                                // A mixed box keeps the unchecked fill but uses the
+                                // highlight border so it reads as active at a glance.
+                                this.border_color(if self.indeterminate {
+                                    checked_color
+                                } else {
+                                    unchecked_border
+                                })
+                            })
                     })
                     .styles(|styles| {
                         styles
@@ -317,17 +363,33 @@ impl RenderOnce for Checkbox {
                             .disabled(|style| {
                                 style
                                     .border_color(disabled_indicator_color)
-                                    .when(checked, |style| style.bg(disabled_indicator_color))
+                                    .when(checked, |style| {
+                                        if dim {
+                                            style.bg(disabled_indicator_color)
+                                        } else {
+                                            style.bg(cx.theme().tokens.primary)
+                                        }
+                                    })
                             })
                     })
                     .child(checkbox_check_icon(
                         self.id,
                         self.size,
                         checked,
-                        self.disabled,
+                        dim,
                         window,
                         cx,
-                    )),
+                    ))
+                    .when(self.indeterminate, |indicator| {
+                        indicator.flex().items_center().justify_center().child(
+                            div()
+                                .debug_selector(|| "checkbox-indeterminate-mark".into())
+                                .w_2()
+                                .h(px(2.))
+                                .rounded_full()
+                                .bg(checked_color.opacity(if dim { 0.5 } else { 1. })),
+                        )
+                    }),
             )
             .when(self.label.is_some() || !children.is_empty(), |this| {
                 this.child(

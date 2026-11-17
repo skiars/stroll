@@ -1,10 +1,10 @@
 use crate::{
-    AnyWindowHandle, Bounds, DevicePixels, DispatchEventResult, DisplayId, GpuSpecs, HeadlessAtlas,
-    Pixels, PlatformAtlas, PlatformDisplay, PlatformHeadlessRenderer, PlatformInput,
+    AnyWindowHandle, Bounds, Decorations, DevicePixels, DispatchEventResult, DisplayId, GpuSpecs,
+    HeadlessAtlas, Pixels, PlatformAtlas, PlatformDisplay, PlatformHeadlessRenderer, PlatformInput,
     PlatformInputHandler, PlatformWindow, Point, PromptButton, RequestFrameOptions, Scene, Size,
     TestDisplay, TestPlatform, TextInputConfiguration, TextInputStateChange, WindowAppearance,
-    WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowInsets, WindowParams,
-    WindowVisibility,
+    WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowDecorations, WindowInsets,
+    WindowParams, WindowVisibility,
 };
 use gpui_util::ResultExt as _;
 #[cfg(any(test, feature = "test-support"))]
@@ -55,6 +55,7 @@ pub(crate) struct TestWindowState {
     text_input_configurations: Vec<TextInputConfiguration>,
     text_input_state_changes: Vec<TextInputStateChange>,
     is_fullscreen: bool,
+    decorations: Decorations,
     scale_factor: f32,
     appearance: WindowAppearance,
     external_drag_files: Vec<(PathBuf, bool)>,
@@ -130,6 +131,7 @@ impl TestWindow {
             text_input_configurations: Vec::new(),
             text_input_state_changes: Vec::new(),
             is_fullscreen: false,
+            decorations: Decorations::Server,
             // Preserve the test platform's historical 2x default.
             scale_factor: 2.0,
             appearance: WindowAppearance::Light,
@@ -315,6 +317,19 @@ impl TestWindow {
 }
 
 impl PlatformWindow for TestWindow {
+    fn request_decorations(&self, decorations: WindowDecorations) {
+        self.0.lock().decorations = match decorations {
+            WindowDecorations::Server => Decorations::Server,
+            WindowDecorations::Client => Decorations::Client {
+                tiling: Default::default(),
+            },
+        };
+    }
+
+    fn window_decorations(&self) -> Decorations {
+        self.0.lock().decorations
+    }
+
     fn visual_viewport_bounds(&self) -> Bounds<Pixels> {
         let state = self.0.lock();
         state

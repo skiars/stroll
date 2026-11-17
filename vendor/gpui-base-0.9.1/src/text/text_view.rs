@@ -109,6 +109,9 @@ pub(crate) type ImageSourceFn = dyn Fn(&gpui::SharedUri) -> gpui::ImageSource + 
 pub(crate) type LinkClickHandlerFn =
     dyn Fn(&SharedString, &ClickEvent, &mut Window, &mut App) + Send + Sync;
 
+pub(crate) type ImageClickHandlerFn =
+    dyn Fn(&SharedString, &ClickEvent, &mut Window, &mut App) + Send + Sync;
+
 pub(crate) type LinkTooltipFn =
     dyn Fn(&SharedString, &mut Window, &mut App) -> AnyView + Send + Sync;
 pub(crate) type TaskToggleHandlerFn = dyn Fn(&TaskToggleEvent, &mut Window, &mut App) + Send + Sync;
@@ -205,11 +208,13 @@ pub struct TextView {
     selectable: bool,
     selection_format: SelectionFormat,
     scrollable: bool,
+    wheel_line_height: Option<Pixels>,
     max_lines: Option<usize>,
     code_block_actions: Option<Arc<CodeBlockActionsFn>>,
     code_block_highlighter: Option<Arc<CodeBlockHighlighterFn>>,
     table_actions: Option<Arc<TableActionsFn>>,
     link_click_handler: Option<Arc<LinkClickHandlerFn>>,
+    image_click_handler: Option<Arc<ImageClickHandlerFn>>,
     link_tooltip: Option<Arc<LinkTooltipFn>>,
     task_toggle_handler: Option<Arc<TaskToggleHandlerFn>>,
     image_source: Option<Arc<ImageSourceFn>>,
@@ -257,11 +262,13 @@ impl TextView {
             selectable: true,
             selection_format: SelectionFormat::default(),
             scrollable: false,
+            wheel_line_height: None,
             max_lines: None,
             code_block_actions: None,
             code_block_highlighter: None,
             table_actions: None,
             link_click_handler: None,
+            image_click_handler: None,
             link_tooltip: None,
             task_toggle_handler: None,
             image_source: None,
@@ -286,11 +293,13 @@ impl TextView {
             selectable: true,
             selection_format: SelectionFormat::default(),
             scrollable: false,
+            wheel_line_height: None,
             max_lines: None,
             code_block_actions: None,
             code_block_highlighter: None,
             table_actions: None,
             link_click_handler: None,
+            image_click_handler: None,
             link_tooltip: None,
             task_toggle_handler: None,
             image_source: None,
@@ -315,11 +324,13 @@ impl TextView {
             selectable: true,
             selection_format: SelectionFormat::default(),
             scrollable: false,
+            wheel_line_height: None,
             max_lines: None,
             code_block_actions: None,
             code_block_highlighter: None,
             table_actions: None,
             link_click_handler: None,
+            image_click_handler: None,
             link_tooltip: None,
             task_toggle_handler: None,
             image_source: None,
@@ -401,6 +412,12 @@ impl TextView {
     /// This mode is suitable for small content, such as a few lines of text, a label, etc.
     pub fn scrollable(mut self, scrollable: bool) -> Self {
         self.scrollable = scrollable;
+        self
+    }
+
+    /// Sets the displacement per mouse wheel line when this view scrolls.
+    pub fn wheel_line_height(mut self, height: Pixels) -> Self {
+        self.wheel_line_height = Some(height);
         self
     }
 
@@ -495,6 +512,19 @@ impl TextView {
         F: Fn(&SharedString, &ClickEvent, &mut Window, &mut App) + Send + Sync + 'static,
     {
         self.link_click_handler = Some(Arc::new(handler));
+        self
+    }
+
+    /// Handle pointer events on rendered images.
+    ///
+    /// The handler receives the image URL and the original GPUI click event.
+    /// When this handler is installed, image clicks take priority over a link
+    /// wrapped around the image; the link handler is not called for the image.
+    pub fn on_image_click<F>(mut self, handler: F) -> Self
+    where
+        F: Fn(&SharedString, &ClickEvent, &mut Window, &mut App) + Send + Sync + 'static,
+    {
+        self.image_click_handler = Some(Arc::new(handler));
         self
     }
 
@@ -832,6 +862,7 @@ impl Element for TextView {
             state.code_block_highlighter = code_block_highlighter;
             state.table_actions = self.table_actions.clone();
             state.link_click_handler = self.link_click_handler.clone();
+            state.image_click_handler = self.image_click_handler.clone();
             state.link_tooltip = self.link_tooltip.clone();
             state.task_toggle_handler = self.task_toggle_handler.clone();
             state.image_source = self.image_source.clone();
@@ -882,11 +913,15 @@ impl Element for TextView {
             .on_action(window.listener_for(&state, TextViewState::on_action_select_all))
             .map(|this| {
                 if self.scrollable {
-                    this.child(crate::ScrollBounce::new(
+                    let scroll = crate::ScrollBounce::new(
                         ("text-view-bounce", state.entity_id()),
                         &list_state,
                         state.clone(),
-                    ))
+                    );
+                    this.child(match self.wheel_line_height {
+                        Some(height) => scroll.wheel_line_height(height),
+                        None => scroll,
+                    })
                 } else {
                     this.child(state.clone())
                 }
@@ -898,6 +933,9 @@ impl Element for TextView {
                     div().absolute().inset_0().child(
                         crate::Scrollbar::vertical(&list_state)
                             .id(("text-view-scrollbar", state.entity_id()))
+                            // A document is a content reader: its scrollbar
+                            // stays visible instead of fading after idle.
+                            .mode(crate::ScrollbarMode::Always)
                             .viewport_from_layout(),
                     ),
                 )
@@ -4075,6 +4113,78 @@ mod tests {
         assert!(!clicks[0].1.is_right_click() && !clicks[0].1.is_middle_click());
         assert!(clicks[1].1.is_middle_click());
         assert!(clicks[2].1.is_right_click());
+        assert_eq!(cx.opened_url(), None);
+    }
+
+    #[gpui::test]
+    fn image_handler_takes_priority_over_an_image_link(cx: &mut TestAppContext) {
+        use std::sync::{Arc, Mutex};
+
+        struct ImageRoot {
+            text_view: Entity<TextViewState>,
+            images: Arc<Mutex<Vec<SharedString>>>,
+            links: Arc<Mutex<Vec<SharedString>>>,
+        }
+
+        impl Render for ImageRoot {
+            fn render(
+                &mut self,
+                _window: &mut Window,
+                _cx: &mut Context<Self>,
+            ) -> impl IntoElement {
+                let images = self.images.clone();
+                let links = self.links.clone();
+                div().w(px(180.)).child(
+                    TextView::new(&self.text_view)
+                        .on_image_click(move |url, _, _, _| {
+                            images.lock().unwrap().push(url.clone());
+                        })
+                        .on_link_click(move |url, _, _, _| {
+                            links.lock().unwrap().push(url.clone());
+                        }),
+                )
+            }
+        }
+
+        cx.update(crate::init);
+        let images = Arc::new(Mutex::new(Vec::new()));
+        let links = Arc::new(Mutex::new(Vec::new()));
+        let captured_images = images.clone();
+        let captured_links = links.clone();
+        let (content, cx) = cx.add_window_view(move |_, cx| ImageRoot {
+            text_view: cx.new(|cx| {
+                TextViewState::markdown(
+                    r#"Before [<img src="https://example.com/image.svg" width="32" height="32">](https://example.com/image-link) after."#,
+                    cx,
+                )
+            }),
+            images: captured_images,
+            links: captured_links,
+        });
+        let cx: &mut VisualTestContext = cx;
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+
+        let inline_bounds = content.read_with(cx, |content, cx| {
+            content.text_view.read(cx).selection_adapter.text_bounds()
+        });
+        assert!(
+            inline_bounds.len() >= 2,
+            "linked image needs text bounds on both sides: {inline_bounds:?}"
+        );
+        let position = point(
+            inline_bounds[0].right() + (inline_bounds[1].left() - inline_bounds[0].right()) * 0.5,
+            inline_bounds[0].top() + px(8.),
+        );
+        cx.simulate_click(position, Modifiers::default());
+
+        assert_eq!(
+            *captured_images.lock().unwrap(),
+            vec!["https://example.com/image.svg".into()]
+        );
+        assert!(captured_links.lock().unwrap().is_empty());
         assert_eq!(cx.opened_url(), None);
     }
 

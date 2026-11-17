@@ -22,9 +22,9 @@ use crate::{
     async_util::{Receiver, Sender, unbounded},
     input::{self, SelectAll},
     text::{
-        CodeBlockActionsFn, CodeBlockHighlighterFn, LinkClickHandlerFn, MarkdownExtensions,
-        RangeHighlight, RangeHighlightError, RenderedText, TableActionsFn, TaskToggleHandlerFn,
-        TextViewStyle,
+        CodeBlockActionsFn, CodeBlockHighlighterFn, ImageClickHandlerFn, LinkClickHandlerFn,
+        MarkdownExtensions, RangeHighlight, RangeHighlightError, RenderedText, TableActionsFn,
+        TaskToggleHandlerFn, TextViewStyle,
         document::ParsedDocument,
         format,
         node::{self, NodeContext},
@@ -132,6 +132,7 @@ pub struct TextViewState {
     pub(super) table_actions: Option<std::sync::Arc<TableActionsFn>>,
     pub(super) image_source: Option<std::sync::Arc<super::text_view::ImageSourceFn>>,
     pub(super) link_click_handler: Option<std::sync::Arc<LinkClickHandlerFn>>,
+    pub(super) image_click_handler: Option<std::sync::Arc<ImageClickHandlerFn>>,
     pub(super) link_tooltip: Option<std::sync::Arc<super::text_view::LinkTooltipFn>>,
     pub(super) hovered_link_tooltip: Option<(SharedString, gpui::AnyView)>,
     pub(super) link_tooltip_target: Option<(usize, SharedString)>,
@@ -179,16 +180,29 @@ pub struct TextViewState {
 impl TextViewState {
     /// Create a Markdown TextViewState.
     pub fn markdown(text: &str, cx: &mut Context<Self>) -> Self {
-        Self::new(TextViewFormat::Markdown, text, cx)
+        Self::markdown_with_extensions(text, MarkdownExtensions::default(), cx)
+    }
+
+    /// Create a Markdown TextViewState with extensions installed before the first parse.
+    pub fn markdown_with_extensions(
+        text: &str,
+        extensions: MarkdownExtensions,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        Self::new(TextViewFormat::Markdown, text, Arc::new(extensions), cx)
     }
 
     /// Create a HTML TextViewState.
     pub fn html(text: &str, cx: &mut Context<Self>) -> Self {
-        Self::new(TextViewFormat::Html, text, cx)
+        Self::new(TextViewFormat::Html, text, Arc::default(), cx)
     }
 
-    /// Create a new TextViewState.
-    fn new(format: TextViewFormat, text: &str, cx: &mut Context<Self>) -> Self {
+    fn new(
+        format: TextViewFormat,
+        text: &str,
+        markdown_extensions: Arc<MarkdownExtensions>,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let focus_handle = cx.focus_handle();
         let selection_adapter = TextViewSelectionAdapter::new(cx.entity().downgrade(), cx);
 
@@ -241,12 +255,13 @@ impl TextViewState {
             code_block_highlighter: None,
             table_actions: None,
             link_click_handler: None,
+            image_click_handler: None,
             link_tooltip: None,
             hovered_link_tooltip: None,
             link_tooltip_target: None,
             task_toggle_handler: None,
             image_source: None,
-            markdown_extensions: Arc::default(),
+            markdown_extensions,
             is_selecting: false,
             preserve_inline_selection: false,
             auto_scroll: AutoScroll::default(),
@@ -848,6 +863,30 @@ impl TextViewState {
         &self.list_state
     }
 
+    /// Byte offset in the Markdown source at the start of a rendered list item.
+    pub fn source_offset_for_block(&self, block: usize) -> Option<usize> {
+        self.parsed_content
+            .document
+            .blocks
+            .get(block)?
+            .span()
+            .map(|span| span.start)
+    }
+
+    /// List item containing or immediately preceding a Markdown source offset.
+    pub fn block_for_source_offset(&self, offset: usize) -> Option<usize> {
+        self.parsed_content
+            .document
+            .blocks
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(index, block)| {
+                let span = block.span()?;
+                (span.start <= offset).then_some(index)
+            })
+    }
+
     #[doc(hidden)]
     pub fn is_selecting(&self) -> bool {
         self.is_selecting
@@ -1144,6 +1183,7 @@ impl Render for TextViewState {
             code_block_highlighter: self.code_block_highlighter.clone(),
             table_actions: self.table_actions.clone(),
             link_click_handler: self.link_click_handler.clone(),
+            image_click_handler: self.image_click_handler.clone(),
             task_toggle_handler: self.task_toggle_handler.clone(),
             image_source: self.image_source.clone(),
             markdown_extensions: self.markdown_extensions.clone(),

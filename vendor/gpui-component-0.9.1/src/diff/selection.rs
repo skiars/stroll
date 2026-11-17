@@ -212,7 +212,6 @@ pub(crate) struct CodeText {
     line_ix: usize,
     range: Range<usize>,
     highlights: Vec<(Range<usize>, HighlightStyle)>,
-    selection: TextSelectionHandle,
     geometry: Rc<RefCell<SelectionGeometry>>,
     styled_text: Option<StyledText>,
 }
@@ -227,7 +226,6 @@ impl CodeText {
         line_ix: usize,
         range: Range<usize>,
         highlights: Vec<(Range<usize>, HighlightStyle)>,
-        selection: TextSelectionHandle,
         geometry: Rc<RefCell<SelectionGeometry>>,
     ) -> Self {
         Self {
@@ -238,7 +236,6 @@ impl CodeText {
             line_ix,
             range,
             highlights,
-            selection,
             geometry,
             styled_text: None,
         }
@@ -269,32 +266,14 @@ impl Element for CodeText {
         cx: &mut App,
     ) -> (LayoutId, ()) {
         let line = &self.document.lines(self.side)[self.line_ix];
-        let mut layers = self.highlights.clone();
-        if let Some((file, side, range)) = selected_source_range(&self.selection, cx)
-            && file == self.file
-            && side == self.side
-        {
-            let start = range.start.max(line.source().start);
-            let end = range.end.min(line.content_end());
-            if start < end {
-                layers.push((
-                    line.display_range(start - line.source().start..end - line.source().start),
-                    HighlightStyle {
-                        background_color: Some(crate::ActiveTheme::theme(cx).selection),
-                        ..Default::default()
-                    },
-                ));
-            }
-        }
-        let layers = layers
-            .into_iter()
-            .filter_map(|(range, style)| {
-                clip_highlight(range, &self.range).map(|range| (range, style))
-            })
-            .collect();
         let text = line.chunk_text(&self.range);
-        self.styled_text =
-            Some(StyledText::new(text).with_highlights(merge_highlights(self.range.len(), layers)));
+        let highlights = std::mem::take(&mut self.highlights);
+        let text = StyledText::new(text);
+        self.styled_text = Some(if highlights.is_empty() {
+            text
+        } else {
+            text.with_highlights(highlights)
+        });
         self.styled_text
             .as_mut()
             .unwrap()
@@ -347,18 +326,24 @@ impl Element for CodeText {
 /// when inline and selection backgrounds overlap it.
 pub(crate) fn merge_highlights(
     len: usize,
-    layers: Vec<(Range<usize>, HighlightStyle)>,
+    mut layers: Vec<(Range<usize>, HighlightStyle)>,
 ) -> Vec<(Range<usize>, HighlightStyle)> {
+    layers.retain_mut(|(range, _)| {
+        range.end = range.end.min(len);
+        range.start < range.end
+    });
+    if layers
+        .windows(2)
+        .all(|pair| pair[0].0.end <= pair[1].0.start)
+    {
+        return layers;
+    }
     // Sweep range edges while retaining precedence separately for each field.
     // Syntax token counts can grow with a line; never rescan all layers per edge.
     let mut events = Vec::with_capacity(layers.len() * 2 + 2);
     for (ix, (range, _)) in layers.iter().enumerate() {
-        let start = range.start.min(len);
-        let end = range.end.min(len);
-        if start < end {
-            events.push((start, ix, true));
-            events.push((end, ix, false));
-        }
+        events.push((range.start, ix, true));
+        events.push((range.end, ix, false));
     }
     events.sort_unstable();
     let mut active: [BTreeSet<usize>; 7] = Default::default();
@@ -405,7 +390,9 @@ pub(crate) fn merge_highlights(
         resolve!(underline, 4);
         resolve!(strikethrough, 5);
         resolve!(fade_out, 6);
-        output.push((position..end, style));
+        if style != HighlightStyle::default() {
+            output.push((position..end, style));
+        }
         position = end;
     }
     output

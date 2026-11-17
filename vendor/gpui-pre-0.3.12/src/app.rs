@@ -54,9 +54,9 @@ use crate::{
     PlatformKeyboardLayout, PlatformKeyboardMapper, Point, PowerMode, Priority, PromptBuilder,
     PromptButton, PromptHandle, PromptLevel, Render, RenderImage, RenderablePromptHandle,
     Reservation, ScreenCaptureSource, SharedString, SubscriberSet, Subscription, SvgRenderer,
-    SystemNotification, SystemNotificationResponse, Task, TextRenderingMode, TextSystem,
-    ThermalState, Window, WindowAppearance, WindowButtonLayout, WindowHandle, WindowId,
-    WindowInvalidator, WindowingRequest,
+    SystemNotification, SystemNotificationResponse, Task, TextRenderingMode,
+    TextRenderingPreference, TextSystem, ThermalState, Window, WindowAppearance,
+    WindowButtonLayout, WindowHandle, WindowId, WindowInvalidator, WindowingRequest,
     colors::{Colors, GlobalColors},
     hash, init_app_menus,
 };
@@ -970,11 +970,13 @@ pub struct App {
     #[cfg(any(test, feature = "test-support", debug_assertions))]
     pub(crate) name: Option<&'static str>,
     pub(crate) text_rendering_mode: Rc<Cell<TextRenderingMode>>,
+    pub(crate) text_rendering_preference: Rc<Cell<TextRenderingPreference>>,
 
     pub(crate) window_update_stack: Vec<WindowId>,
     pub(crate) mode: GpuiMode,
     pub(crate) cursor_hide_mode: CursorHideMode,
     pub(crate) reduce_motion: bool,
+    smooth_scrolling: bool,
     /// Origin of the shared clock that phase-locks synced repeating animations.
     pub(crate) synced_animation_epoch: Instant,
     power_mode: PowerMode,
@@ -1024,6 +1026,7 @@ impl App {
                 platform: platform.clone(),
                 text_system,
                 text_rendering_mode: Rc::new(Cell::new(TextRenderingMode::default())),
+                text_rendering_preference: Rc::new(Cell::new(TextRenderingPreference::default())),
                 mode: GpuiMode::Production,
                 actions: Rc::new(ActionRegistry::default()),
                 pending_updates: 0,
@@ -1087,6 +1090,7 @@ impl App {
                 quitting: false,
                 cursor_hide_mode: CursorHideMode::default(),
                 reduce_motion: false,
+                smooth_scrolling: false,
                 synced_animation_epoch,
                 power_mode,
                 accessibility_force_disabled: false,
@@ -1413,6 +1417,19 @@ impl App {
             self.reduce_motion = reduce_motion;
             self.refresh_windows();
         }
+    }
+
+    /// Enables short scroll animations for discrete mouse wheel input.
+    pub fn set_smooth_scrolling(&mut self, enabled: bool) {
+        if self.smooth_scrolling != enabled {
+            self.smooth_scrolling = enabled;
+            self.refresh_windows();
+        }
+    }
+
+    /// Whether the application enables smooth wheel scrolling.
+    pub fn smooth_scrolling(&self) -> bool {
+        self.smooth_scrolling
     }
 
     /// Schedules all windows in the application to be redrawn. This can be called
@@ -1856,6 +1873,13 @@ impl App {
     /// Returns the current text rendering mode for the application.
     pub fn text_rendering_mode(&self) -> TextRenderingMode {
         self.text_rendering_mode.get()
+    }
+
+    /// Sets the Linux and Windows glyph rendering policy and schedules a redraw if it changed.
+    pub fn set_text_rendering_preference(&mut self, preference: TextRenderingPreference) {
+        if self.text_rendering_preference.replace(preference) != preference {
+            self.refresh_windows();
+        }
     }
 
     /// Returns the operating system's power mode, or [`PowerMode::Unknown`]
@@ -3022,6 +3046,17 @@ impl App {
             true
         } else {
             false
+        }
+    }
+
+    pub(crate) fn cancel_internal_drag(&mut self, window: &mut Window) {
+        if self.platform_owned_drag.is_none()
+            && self
+                .active_drag
+                .as_ref()
+                .is_some_and(|drag| !drag.value.is::<crate::ExternalPaths>())
+        {
+            self.stop_active_drag(window);
         }
     }
 
