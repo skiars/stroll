@@ -1997,7 +1997,8 @@ impl GitPanel {
         };
         let file_path = review.detail.files[ix].path.clone();
         let key = (path.to_owned(), index);
-        let confirm = self.confirm_restore.as_ref() == Some(&key);
+        let whole_file = patch.whole_file;
+        let confirm = whole_file && self.confirm_restore.as_ref() == Some(&key);
         let version = operations.version.clone();
         let owner = cx.weak_entity();
         let cancel_owner = owner.clone();
@@ -2020,13 +2021,14 @@ impl GitPanel {
             super::super::editor_git::hunk_toolbar(
                 &actions,
                 confirm,
-                patch.whole_file,
+                whole_file,
                 None,
                 None,
                 available,
                 move |action, window, cx| {
                     _ = owner.update(cx, |panel, cx| {
-                        if action == git::FileAction::Restore
+                        if whole_file
+                            && action == git::FileAction::Restore
                             && panel.confirm_restore.as_ref() != Some(&key)
                         {
                             panel.confirm_restore = Some(key.clone());
@@ -2064,6 +2066,18 @@ impl GitPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.edit_worktree_files(vec![edit], window, cx);
+    }
+
+    pub(super) fn edit_worktree_files(
+        &mut self,
+        edits: Vec<git::FileEdit>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(action) = edits.first().map(|edit| edit.action) else {
+            return;
+        };
         if self.writes_busy(cx)
             || !self.current_worktree()
             || self
@@ -2073,17 +2087,20 @@ impl GitPanel {
         {
             return;
         }
-        let path = PathBuf::from(&edit.path);
+        let paths = edits
+            .iter()
+            .map(|edit| edit.path.clone())
+            .collect::<Vec<_>>();
         let repo = self.workspace.update(cx, |workspace, cx| {
             let repo = workspace
                 .repository
                 .clone()
                 .filter(|repo| repo.root == self.root)
                 .ok_or_else(|| anyhow::anyhow!(t!("git.worktree_changed")))?;
-            if edit.action == git::FileAction::Restore {
+            if action == git::FileAction::Restore {
                 workspace.flush_drafts(cx)?;
             }
-            workspace.begin_git_edit([path.clone()], edit.action, cx)?;
+            workspace.begin_git_edit(paths.iter().map(PathBuf::from), action, cx)?;
             Ok::<_, anyhow::Error>(repo)
         });
         let repo = match repo {
@@ -2100,15 +2117,54 @@ impl GitPanel {
         self.staging = true;
         self.stage_error = None;
         self.focus.focus(window, cx);
-        let changed_path = edit.path.clone();
-        let target = path.clone();
         let origin = repo.clone();
-        let task =
-            cx.background_spawn(async move { Workspace::run_git_edit(&repo, &target, edit) });
+        let work_paths = paths.clone();
+        let task = cx.background_spawn(async move {
+            let mut completed = Vec::new();
+            let total = edits.len();
+            let result = (|| {
+                if total > 1 {
+                    let versions = repo.git_backend().file_versions(&work_paths);
+                    for (edit, version) in edits.iter().zip(versions) {
+                        anyhow::ensure!(
+                            version.as_ref() == Some(&edit.version),
+                            "{}: {}",
+                            edit.path,
+                            t!("git.worktree_changed")
+                        );
+                    }
+                }
+                for edit in edits {
+                    let path = PathBuf::from(&edit.path);
+                    let outcome = Workspace::run_git_edit(&repo, &path, edit).map_err(|error| {
+                        if total > 1 {
+                            anyhow::anyhow!("{}: {error}", path.display())
+                        } else {
+                            error
+                        }
+                    })?;
+                    completed.push((path, outcome));
+                }
+                Ok::<_, anyhow::Error>(())
+            })();
+            let error = result.err().map(|error| {
+                if total > 1 {
+                    t!(
+                        "git.restore_batch_failed",
+                        completed = completed.len(),
+                        total = total,
+                        error = error.to_string()
+                    )
+                    .into_owned()
+                } else {
+                    error.to_string()
+                }
+            });
+            (completed, error)
+        });
         let workspace = self.workspace.clone();
         cx.spawn_in(window, async move |this, cx| {
-            let result = task.await;
-            let error = result.as_ref().err().map(ToString::to_string);
+            let (completed, error) = task.await;
             let _ = cx.update(|window, cx| {
                 _ = workspace.update(cx, |workspace, cx| {
                     if workspace
@@ -2116,10 +2172,12 @@ impl GitPanel {
                         .as_ref()
                         .is_some_and(|repo| Arc::ptr_eq(repo, &origin))
                     {
-                        match result {
-                            Ok(result) => workspace
-                                .finish_recorded_git_edit(&origin, &path, result, window, cx),
-                            Err(_) => workspace.finish_git_edit(&path, None, false, window, cx),
+                        let remaining = &paths[completed.len()..];
+                        for (path, outcome) in completed {
+                            workspace.finish_recorded_git_edit(&origin, &path, outcome, window, cx);
+                        }
+                        for path in remaining {
+                            workspace.finish_git_edit(Path::new(path), None, false, window, cx);
                         }
                     }
                 });
@@ -2130,7 +2188,7 @@ impl GitPanel {
                 if let Some(error) = panel.stage_error.as_deref() {
                     super::super::toast::error(window, cx, error.to_owned());
                 }
-                panel.refresh_changed_paths([changed_path], window, cx);
+                panel.refresh_changed_paths(paths, window, cx);
             });
         })
         .detach();

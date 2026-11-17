@@ -62,6 +62,12 @@ pub(crate) struct FileVersion {
 
 #[cfg(feature = "desktop")]
 impl FileVersion {
+    pub(crate) fn has_restorable_index_entry(&self) -> bool {
+        [b"100644 ", b"100755 ", b"120000 "]
+            .iter()
+            .any(|mode| self.index.starts_with(*mode))
+    }
+
     pub fn blame_path<'a>(&'a self, path: &'a str) -> Option<&'a str> {
         if let Some(status) = &self.status {
             if status.conflict || status.untracked {

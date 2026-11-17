@@ -2846,13 +2846,11 @@ mod tests {
         });
         visual.simulate_mouse_move(hover, None, Modifiers::default());
         visual.update(|window, cx| window.draw(cx).clear(cx));
-        for _ in 0..2 {
-            let restore = visual.debug_bounds("git-hunk-action:2").unwrap().center();
-            visual.simulate_mouse_move(restore, None, Modifiers::default());
-            visual.simulate_click(restore, Modifiers::default());
-            visual.run_until_parked();
-            visual.update(|window, cx| window.draw(cx).clear(cx));
-        }
+        let restore = visual.debug_bounds("git-hunk-action:2").unwrap().center();
+        visual.simulate_mouse_move(restore, None, Modifiers::default());
+        visual.simulate_click(restore, Modifiers::default());
+        visual.run_until_parked();
+        visual.update(|window, cx| window.draw(cx).clear(cx));
         assert_eq!(fs::read_to_string(root.join(path)).unwrap(), "before\n");
         visual.update(|_, cx| {
             assert_eq!(

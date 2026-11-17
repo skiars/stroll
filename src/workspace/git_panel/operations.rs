@@ -290,28 +290,130 @@ impl GitPanel {
             action: FileAction::Restore,
             block: None,
         };
+        self.confirm_restore_edits(path.to_owned(), vec![edit], None, window, cx);
+    }
+
+    pub(super) fn prepare_tree_restore(
+        &mut self,
+        path: String,
+        targets: Vec<(String, git::WorktreeFile, bool)>,
+        directory: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.writes_busy(cx)
+            || !self.current_worktree()
+            || !matches!(
+                self.selection,
+                Some(Selection::Worktree(Mode::All | Mode::Unstaged))
+            )
+            || !self.backend.supports_git_operations()
+        {
+            return;
+        }
+        let selection = self.selection.clone();
+        let backend = self.backend.clone();
+        let work = cx.background_spawn(async move {
+            let paths = targets
+                .iter()
+                .map(|(path, _, _)| path.clone())
+                .collect::<Vec<_>>();
+            let versions = backend.file_versions(&paths);
+            let mut edits = Vec::new();
+            let mut hidden = 0;
+            for ((path, status, is_hidden), version) in targets.into_iter().zip(versions) {
+                let version = version
+                    .filter(|version| version.status.as_ref() == Some(&status))
+                    .ok_or_else(|| anyhow::anyhow!("{path}: {}", t!("git.worktree_changed")))?;
+                if version.has_restorable_index_entry() {
+                    hidden += usize::from(is_hidden);
+                    edits.push(git::FileEdit {
+                        path,
+                        version,
+                        action: FileAction::Restore,
+                        block: None,
+                    });
+                }
+            }
+            anyhow::ensure!(!edits.is_empty(), t!("git.cannot_edit"));
+            Ok::<_, anyhow::Error>((edits, directory.then_some(hidden)))
+        });
+        self.stage_task = cx.spawn_in(window, async move |this, cx| {
+            let result = work.await;
+            _ = this.update_in(cx, |this, window, cx| {
+                if this.selection != selection || !this.current_worktree() || this.writes_busy(cx) {
+                    return;
+                }
+                match result {
+                    Ok((edits, hidden)) => {
+                        this.confirm_restore_edits(path, edits, hidden, window, cx)
+                    }
+                    Err(error) => {
+                        this.report_operation_error(error, window, cx);
+                        cx.notify();
+                    }
+                }
+            });
+        });
+    }
+
+    fn confirm_restore_edits(
+        &self,
+        path: String,
+        edits: Vec<git::FileEdit>,
+        hidden: Option<usize>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let check = self.workspace.read_with(cx, |workspace, _| {
-            workspace.check_git_file(Path::new(path), FileAction::Restore)
+            edits.iter().try_for_each(|edit| {
+                workspace.check_git_file(Path::new(&edit.path), FileAction::Restore)
+            })
         });
         if let Ok(Err(error)) = check {
             super::super::toast::error(window, cx, error.to_string());
             return;
         }
         let panel = cx.weak_entity();
+        let selection = self.selection.clone();
         window.open_dialog(cx, move |dialog, _, _| {
             let panel = panel.clone();
-            let edit = edit.clone();
+            let selection = selection.clone();
+            let title = if hidden.is_some() {
+                t!("git.restore_directory_title")
+            } else {
+                t!("git.restore_file_title")
+            };
+            let count = edits.len();
+            let detail = if hidden.is_some() {
+                t!("git.restore_directory_detail", path = &path, count = count)
+            } else {
+                t!("git.restore_file_detail", path = &path)
+            };
+            let edits = edits.clone();
             dialog
                 .centered()
                 .width(px(440.))
-                .title(t!("git.restore_file_question"))
-                .child(div().child(edit.path.clone()))
+                .title(title)
+                .child(
+                    div()
+                        .debug_selector(|| format!("git-restore-count:{count}"))
+                        .child(detail),
+                )
+                .when_some(hidden, |dialog, hidden| {
+                    dialog.child(
+                        div()
+                            .debug_selector(|| format!("git-restore-hidden:{hidden}"))
+                            .child(t!("git.restore_directory_hidden", count = hidden)),
+                    )
+                })
                 .footer(
                     h_flex()
                         .justify_end()
                         .gap_2()
                         .child(
                             action_button("git-cancel-file-restore")
+                                .debug_selector(|| "git-cancel-file-restore".into())
                                 .secondary()
                                 .label_size(GIT_TEXT_SIZE)
                                 .label(t!("common.cancel"))
@@ -319,13 +421,16 @@ impl GitPanel {
                         )
                         .child(
                             action_button("git-confirm-file-restore")
+                                .debug_selector(|| "git-confirm-file-restore".into())
                                 .danger()
                                 .label_size(GIT_TEXT_SIZE)
                                 .label(t!("git.restore"))
                                 .on_click(move |_, window, cx| {
                                     window.close_dialog(cx);
                                     _ = panel.update(cx, |this, cx| {
-                                        this.edit_worktree_file(edit.clone(), window, cx)
+                                        if this.selection == selection {
+                                            this.edit_worktree_files(edits.clone(), window, cx);
+                                        }
                                     });
                                 }),
                         ),

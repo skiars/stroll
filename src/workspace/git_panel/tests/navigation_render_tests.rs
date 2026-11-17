@@ -17,6 +17,180 @@ fn settle(visual: &mut VisualTestContext) {
 }
 
 #[::core::prelude::v1::test]
+fn tree_restore_confirms_files_and_filtered_directories() {
+    let fixture = tempfile::tempdir().unwrap();
+    let root = fixture.path().join("repo");
+    fs::create_dir_all(root.join("folder/nested")).unwrap();
+    let visible = "folder/visible.txt";
+    let hidden = "folder/nested/hidden.txt";
+    let untracked = "folder/untracked.txt";
+    let deleted = "deleted.txt";
+    for path in [visible, hidden, deleted] {
+        fs::write(root.join(path), "original\n").unwrap();
+    }
+    git(&root, &["init", "-qb", "main"]);
+    git(&root, &["add", "."]);
+    git(
+        &root,
+        &[
+            "-c",
+            "user.name=Reviewer",
+            "-c",
+            "user.email=reviewer@example.invalid",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-qm",
+            "initial",
+        ],
+    );
+    fs::write(root.join(visible), "staged\n").unwrap();
+    git(&root, &["add", visible]);
+    fs::write(root.join(visible), "unstaged\n").unwrap();
+    fs::write(root.join(hidden), "changed\n").unwrap();
+    fs::write(root.join(untracked), "keep\n").unwrap();
+    fs::remove_file(root.join(deleted)).unwrap();
+
+    let platform = gpui_platform::current_platform(true);
+    let mut cx = TestAppContext::build_with_text_system(
+        TestDispatcher::new(0),
+        None,
+        platform.text_system(),
+    );
+    cx.update(gpui_component::init);
+    let store = Arc::new(Store::new(fixture.path().join("state")).unwrap());
+    let config = crate::config::ConfigFile::load(Some(fixture.path().join("config.toml")));
+    let mut workspace = None;
+    let (_, visual) = cx.add_window_view(|window, cx| {
+        let view =
+            cx.new(|cx| Workspace::with_config(store, config, WorkspaceView::Git, window, cx));
+        workspace = Some(view.clone());
+        gpui_component::Root::new(view, window, cx)
+    });
+    let workspace = workspace.unwrap();
+    visual.simulate_resize(size(px(1280.), px(850.)));
+    visual.update(|window, cx| {
+        workspace.update(cx, |workspace, cx| {
+            workspace.open_repository(
+                Location {
+                    root: root.clone(),
+                    file: None,
+                },
+                window,
+                cx,
+            );
+        });
+    });
+    settle(visual);
+    let panel = visual.update(|window, cx| {
+        let panel = workspace.read(cx).git.clone().unwrap();
+        panel.update(cx, |panel, cx| {
+            panel.show_history = false;
+            panel.show_tree = true;
+            panel.load_review(Selection::Worktree(Mode::All), false, window, cx);
+        });
+        panel
+    });
+    settle(visual);
+
+    let open_restore = |visual: &mut VisualTestContext, row| {
+        let pos = visual.debug_bounds(row).unwrap().center();
+        visual.simulate_mouse_down(pos, MouseButton::Right, Modifiers::default());
+        visual.simulate_mouse_up(pos, MouseButton::Right, Modifiers::default());
+        settle(visual);
+        visual.simulate_keystrokes("up enter");
+        settle(visual);
+        assert!(visual.debug_bounds("git-confirm-file-restore").is_some());
+    };
+    let click_dialog = |visual: &mut VisualTestContext, button| {
+        let pos = visual.debug_bounds(button).unwrap().center();
+        visual.simulate_mouse_move(pos, None, Modifiers::default());
+        visual.simulate_click(pos, Modifiers::default());
+        settle(visual);
+    };
+    open_restore(visual, "git-tree-row:file:deleted.txt");
+    click_dialog(visual, "git-cancel-file-restore");
+    assert!(!root.join(deleted).exists());
+    open_restore(visual, "git-tree-row:file:deleted.txt");
+    click_dialog(visual, "git-confirm-file-restore");
+    assert_eq!(
+        fs::read_to_string(root.join(deleted)).unwrap(),
+        "original\n"
+    );
+
+    visual.update(|window, cx| {
+        panel.update(cx, |panel, cx| {
+            panel.filter_input.update(cx, |input, cx| {
+                input.set_value("visible", window, cx);
+            });
+            panel.filter = "visible".into();
+            cx.notify();
+        });
+    });
+    settle(visual);
+    assert!(
+        visual
+            .debug_bounds("git-tree-row:file:folder/nested/hidden.txt")
+            .is_none()
+    );
+    open_restore(visual, "git-tree-row:folder:folder");
+    assert!(visual.debug_bounds("git-restore-count:2").is_some());
+    assert!(visual.debug_bounds("git-restore-hidden:1").is_some());
+
+    fs::write(root.join(visible), "changed after confirmation opened\n").unwrap();
+    click_dialog(visual, "git-confirm-file-restore");
+    assert_eq!(
+        fs::read_to_string(root.join(visible)).unwrap(),
+        "changed after confirmation opened\n"
+    );
+    assert_eq!(fs::read_to_string(root.join(hidden)).unwrap(), "changed\n");
+    visual.update(|_, cx| {
+        assert!(
+            panel
+                .read(cx)
+                .stage_error
+                .as_deref()
+                .unwrap()
+                .contains(visible)
+        );
+    });
+
+    open_restore(visual, "git-tree-row:folder:folder");
+    click_dialog(visual, "git-confirm-file-restore");
+    assert_eq!(fs::read_to_string(root.join(visible)).unwrap(), "staged\n");
+    assert_eq!(fs::read_to_string(root.join(hidden)).unwrap(), "original\n");
+    assert_eq!(fs::read_to_string(root.join(untracked)).unwrap(), "keep\n");
+    visual.update(|_, cx| {
+        let status = panel
+            .read(cx)
+            .backend
+            .file_version(visible)
+            .unwrap()
+            .status
+            .unwrap();
+        assert!(status.staged);
+        assert!(!status.unstaged);
+    });
+    let undo = if cfg!(target_os = "macos") {
+        "cmd-z"
+    } else {
+        "ctrl-z"
+    };
+    for (path, before) in [
+        (visible, "changed after confirmation opened\n"),
+        (hidden, "changed\n"),
+    ] {
+        visual.simulate_keystrokes(undo);
+        settle(visual);
+        visual.update(|_, cx| {
+            let file = &workspace.read(cx).files[Path::new(path)];
+            assert_eq!(file.editor.read(cx).text().to_string(), before);
+            assert!(file.is_dirty());
+        });
+    }
+}
+
+#[::core::prelude::v1::test]
 fn worktree_panel_preferences_survive_compact_layout_switching_and_reopen() {
     use crate::{config::ConfigFile, repository::Repository, session::PanelPreferences};
     use gpui_component::Root;

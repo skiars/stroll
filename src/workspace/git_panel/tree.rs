@@ -469,15 +469,15 @@ impl GitPanel {
                                 });
                             })
                             .context_menu(move |mut menu, _, cx| {
-                                let path = directory.clone();
                                 menu = append_system_menu(
                                     menu,
-                                    Path::new(&path),
+                                    Path::new(&directory),
                                     true,
                                     historical,
                                     &system_workspace,
                                     cx,
                                 );
+                                let path = directory.clone();
                                 menu = menu.item(
                                     PopupMenuItem::new(t!("git.copy_directory")).on_click(
                                         move |_, _, cx| {
@@ -511,6 +511,16 @@ impl GitPanel {
                                         );
                                     }
                                 }
+                                if let Some(item) = tree_restore_item(
+                                    &context_view,
+                                    &menu_detail,
+                                    &files,
+                                    &directory,
+                                    true,
+                                    cx,
+                                ) {
+                                    menu = menu.item(item);
+                                }
                                 menu
                             })
                     }
@@ -523,6 +533,7 @@ impl GitPanel {
                         let select_view = view.clone();
                         let select_path = path.clone();
                         let menu_view = view.clone();
+                        let menu_detail = detail.clone();
                         let system_workspace = workspace.clone();
                         let stage = stage_paths(&detail, &[ix], true, stage_allowed);
                         let unstage = stage_paths(&detail, &[ix], false, stage_allowed);
@@ -596,7 +607,6 @@ impl GitPanel {
                                         ),
                                     );
                                 }
-                                let path = path.clone();
                                 menu = append_system_menu(
                                     menu,
                                     Path::new(&path),
@@ -605,11 +615,12 @@ impl GitPanel {
                                     &system_workspace,
                                     cx,
                                 );
+                                let copy_path = path.clone();
                                 menu = menu.item(
                                     PopupMenuItem::new(t!("git.copy_file_path")).on_click(
                                         move |_, _, cx| {
                                             cx.write_to_clipboard(ClipboardItem::new_string(
-                                                path.clone(),
+                                                copy_path.clone(),
                                             ));
                                         },
                                     ),
@@ -636,6 +647,16 @@ impl GitPanel {
                                                 }),
                                         );
                                     }
+                                }
+                                if let Some(item) = tree_restore_item(
+                                    &menu_view,
+                                    &menu_detail,
+                                    &[ix],
+                                    &path,
+                                    false,
+                                    cx,
+                                ) {
+                                    menu = menu.item(item);
                                 }
                                 menu
                             })
@@ -1018,4 +1039,72 @@ fn stage_paths(detail: &Changes, files: &[usize], staged: bool, allowed: bool) -
             .then(|| file.path.clone())
         })
         .collect()
+}
+
+fn tree_restore_item(
+    owner: &WeakEntity<GitPanel>,
+    detail: &Changes,
+    files: &[usize],
+    path: &str,
+    directory: bool,
+    cx: &App,
+) -> Option<PopupMenuItem> {
+    if !matches!(
+        detail.comparison.worktree_mode(),
+        Some(Mode::All | Mode::Unstaged)
+    ) {
+        return None;
+    }
+    let (targets, busy) = owner
+        .read_with(cx, |panel, cx| {
+            if !panel.current_worktree() || !panel.backend.supports_git_operations() {
+                return (Vec::new(), false);
+            }
+            let targets = files
+                .iter()
+                .filter_map(|&ix| {
+                    let file = &detail.files[ix];
+                    let status = file.worktree.as_ref()?;
+                    // An intent-to-add file has an unstaged A status and no staged contents to restore.
+                    (!file.submodule()
+                        && !status.untracked
+                        && status.code != 'A'
+                        && git::FileAction::Restore.available(status))
+                    .then(|| {
+                        (
+                            file.path.clone(),
+                            status.clone(),
+                            !matches(file, &panel.filter),
+                        )
+                    })
+                })
+                .collect::<Vec<_>>();
+            (targets, panel.writes_busy(cx))
+        })
+        .ok()?;
+    if targets.is_empty() {
+        return None;
+    }
+    let label = if directory {
+        t!("git.restore_directory")
+    } else {
+        t!("git.restore_file")
+    };
+    let path = path.to_owned();
+    let owner = owner.clone();
+    Some(
+        PopupMenuItem::new(format!("{label}…"))
+            .disabled(busy)
+            .on_click(move |_, window, cx| {
+                _ = owner.update(cx, |panel, cx| {
+                    panel.prepare_tree_restore(
+                        path.clone(),
+                        targets.clone(),
+                        directory,
+                        window,
+                        cx,
+                    );
+                });
+            }),
+    )
 }
