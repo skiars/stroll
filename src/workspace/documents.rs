@@ -573,6 +573,7 @@ mod tests {
         visual.run_until_parked();
         draw(visual);
         visual.run_until_parked();
+        let other = other.canonicalize()?;
         visual.update(|_, cx| {
             assert_eq!(workspace.read(cx).repository.as_ref().unwrap().root, other)
         });

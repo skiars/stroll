@@ -221,6 +221,15 @@ pub(crate) struct Terminal {
     pub shell: String,
 }
 
+impl Terminal {
+    pub(crate) fn executable(&self) -> &str {
+        #[cfg(windows)]
+        return crate::paths::unquote_windows_path(self.shell.trim());
+        #[cfg(not(windows))]
+        &self.shell
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(default)]
 pub(crate) struct Lsp {
@@ -306,12 +315,22 @@ impl Config {
                 t!("config.control_characters", key = key)
             );
         }
-        let shell = &self.terminal.shell;
+        let shell = self.terminal.executable();
+        #[cfg(windows)]
         ensure!(
             shell.is_empty()
-                || (Path::new(shell).is_absolute()
-                    && !shell.contains(char::is_control)
-                    && (!cfg!(windows) || !shell.contains('"'))),
+                || (!self.terminal.shell.contains(char::is_control)
+                    && !shell.contains('"')
+                    && (Path::new(shell).is_absolute()
+                        || (!shell.contains(char::is_whitespace)
+                            && !shell.contains(['\\', '/', ':', '<', '>', '|', '*', '?'])
+                            && Path::new(shell).file_name().is_some()))),
+            t!("config.invalid_windows_shell")
+        );
+        #[cfg(not(windows))]
+        ensure!(
+            shell.is_empty()
+                || (Path::new(shell).is_absolute() && !shell.contains(char::is_control)),
             t!("config.invalid_shell")
         );
         for (key, command) in [
@@ -722,7 +741,7 @@ mod tests {
             "version = 2",
             "[editor\n",
             "[editor]\nfont_size = nan",
-            "[terminal]\nshell = 'relative'",
+            "[terminal]\nshell = './relative'",
             "[lsp.typescript]\ncommand = 'tsc \"--lsp --stdio'",
         ] {
             fs::write(&path, invalid)?;
@@ -753,6 +772,29 @@ mod tests {
         config.editor.line_numbers = false;
         second.save(config.clone())?;
         assert_eq!(ConfigFile::load(Some(path)).current(), &config);
+        Ok(())
+    }
+    #[cfg(windows)]
+    #[test]
+    fn windows_shell_accepts_executable_names_and_copied_paths() -> Result<()> {
+        let mut config = Config::default();
+        for (value, executable) in [
+            ("pwsh.exe", "pwsh.exe"),
+            ("powershell", "powershell"),
+            (
+                r#""D:\Program Files\PowerShell\pwsh.exe""#,
+                r"D:\Program Files\PowerShell\pwsh.exe",
+            ),
+            ("", ""),
+        ] {
+            config.terminal.shell = value.into();
+            config.validate()?;
+            assert_eq!(config.terminal.executable(), executable);
+        }
+        for value in ["pwsh.exe -NoProfile", r".\pwsh.exe", r"D:pwsh.exe"] {
+            config.terminal.shell = value.into();
+            assert!(config.validate().is_err(), "{value}");
+        }
         Ok(())
     }
 }

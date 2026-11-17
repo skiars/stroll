@@ -56,7 +56,18 @@ impl Pty {
         let mut command = vec![b'"' as u16];
         command.extend(shell.encode_wide());
         command.extend([b'"' as u16, 0]);
-        let directory: Vec<_> = root.as_os_str().encode_wide().chain([0]).collect();
+        // Shells may treat a verbatim path as a device path. Use the conventional
+        // form when it still names the same directory and fits in MAX_PATH.
+        let conventional = crate::paths::simplified(root);
+        let directory = if conventional != root
+            && conventional.as_os_str().encode_wide().count() < 260
+            && conventional.canonicalize().is_ok_and(|path| path == root)
+        {
+            conventional.as_path()
+        } else {
+            root
+        };
+        let directory: Vec<_> = directory.as_os_str().encode_wide().chain([0]).collect();
         let error = unsafe {
             reader_conpty_open(
                 &mut handles,

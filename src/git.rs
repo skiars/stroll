@@ -47,7 +47,7 @@ pub(crate) fn spawn_count() -> usize {
 fn command(root: &Path, args: impl IntoIterator<Item = impl AsRef<OsStr>>) -> Command {
     #[cfg(test)]
     GIT_SPAWNS.with(|count| count.set(count.get() + 1));
-    let mut command = Command::new("git");
+    let mut command = crate::process::background("git");
     command
         .args([
             "--no-pager",

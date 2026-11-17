@@ -79,7 +79,7 @@ impl LanguageServer {
         if !configured.is_empty() {
             let words = parse_command_line(configured)?;
             let (program, args) = words.split_first()?;
-            let mut command = Command::new(program);
+            let mut command = crate::process::background(program);
             command.args(args);
             return Some((command, CommandSource::Config));
         }
@@ -96,7 +96,7 @@ impl LanguageServer {
     }
 
     pub(crate) fn command_for(self, executable: OsString) -> Command {
-        let mut command = Command::new(executable);
+        let mut command = crate::process::background(executable);
         if self == Self::TypeScript {
             command.arg("--stdio");
         }
@@ -106,7 +106,7 @@ impl LanguageServer {
     fn default_command(self) -> Command {
         match self {
             Self::TypeScript => typescript_command(if cfg!(windows) { "tsc.cmd" } else { "tsc" }),
-            _ => Command::new(self.name()),
+            _ => crate::process::background(self.name()),
         }
     }
 
@@ -130,7 +130,7 @@ impl LanguageServer {
             None => std::env::var_os("PATH"),
         };
         let executable = find_typescript(path.as_deref(), project, |program| {
-            typescript_version(prepare(Command::new(program)))
+            typescript_version(prepare(crate::process::background(program)))
         })?;
         Ok(prepare(typescript_command(executable)))
     }
@@ -175,7 +175,7 @@ impl LanguageServer {
 }
 
 fn typescript_command(executable: impl AsRef<OsStr>) -> Command {
-    let mut command = Command::new(executable);
+    let mut command = crate::process::background(executable);
     command.args(["--lsp", "--stdio"]);
     command
 }

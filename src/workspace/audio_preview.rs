@@ -121,7 +121,7 @@ impl Drop for Player {
 }
 
 fn playback_command(path: &Path, format: AudioFormat) -> Command {
-    let mut command = Command::new("mpv");
+    let mut command = crate::process::background("mpv");
     command
         .args([
             "--no-config",
@@ -141,12 +141,6 @@ fn playback_command(path: &Path, format: AudioFormat) -> Command {
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt as _;
-        const CREATE_NO_WINDOW: u32 = 0x08000000;
-        command.creation_flags(CREATE_NO_WINDOW);
-    }
     command
 }
 

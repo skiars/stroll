@@ -2371,6 +2371,13 @@ impl Workspace {
 }
 
 fn resolve_typed_path(value: &str, home: Option<&Path>) -> PathBuf {
+    #[cfg(windows)]
+    let value = paths::unquote_windows_path(value);
+    #[cfg(windows)]
+    if is_windows_drive(value) {
+        return PathBuf::from(format!("{value}\\"));
+    }
+
     let tilde = value
         .strip_prefix('~')
         .filter(|tail| tail.is_empty() || tail.starts_with(std::path::is_separator));
@@ -2381,7 +2388,9 @@ fn resolve_typed_path(value: &str, home: Option<&Path>) -> PathBuf {
 }
 
 fn completion_query(value: &str, home: Option<&Path>) -> (PathBuf, String) {
-    if value == "~" {
+    #[cfg(windows)]
+    let value = paths::unquote_windows_path(value);
+    if value == "~" || is_windows_drive(value) {
         return (resolve_typed_path(value, home), String::new());
     }
     if let Some(index) = value.rfind(std::path::is_separator) {
@@ -2392,6 +2401,31 @@ fn completion_query(value: &str, home: Option<&Path>) -> (PathBuf, String) {
         env::current_dir().unwrap_or_else(|_| home.unwrap_or(Path::new(".")).to_owned()),
         value.to_owned(),
     )
+}
+
+fn is_windows_drive(value: &str) -> bool {
+    cfg!(windows) && matches!(value.as_bytes(), [letter, b':'] if letter.is_ascii_alphabetic())
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::{PathBuf, completion_query, resolve_typed_path};
+
+    #[test]
+    fn local_repository_picker_resolves_windows_drive_and_copied_path() {
+        assert_eq!(
+            completion_query("D:", None),
+            (PathBuf::from(r"D:\"), String::new())
+        );
+        assert_eq!(
+            completion_query(r#""D:\Work Trees\str""#, None),
+            (PathBuf::from(r"D:\Work Trees\"), "str".into())
+        );
+        assert_eq!(
+            resolve_typed_path(r#""D:\Work Trees\stroll""#, None),
+            PathBuf::from(r"D:\Work Trees\stroll")
+        );
+    }
 }
 
 fn menu_section(colors: Palette) -> Div {

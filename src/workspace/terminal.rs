@@ -220,7 +220,7 @@ impl Workspace {
         }
         let number = panel.next_number;
         panel.next_number += 1;
-        let shell = &self.config.current().terminal.shell;
+        let shell = self.config.current().terminal.executable();
         let shell = if shell.is_empty() {
             crate::terminal::shell()
         } else {

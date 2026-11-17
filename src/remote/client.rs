@@ -103,7 +103,7 @@ pub(crate) fn helper_command(target: &SshTarget, arguments: &str) -> Command {
     let remote_command = format!(
         "if command -v stroll-remote >/dev/null 2>&1; then exec stroll-remote {arguments}; else exec \"$HOME/.local/bin/stroll-remote\" {arguments}; fi"
     );
-    let mut command = Command::new("ssh");
+    let mut command = crate::process::background("ssh");
     command.args([
         "-T",
         "-o",
@@ -302,7 +302,7 @@ impl GitHelper {
 #[cfg(feature = "desktop")]
 fn helper_process() -> Result<Command> {
     if let Some(path) = std::env::var_os("STROLL_GIT_HELPER_PATH") {
-        return Ok(Command::new(path));
+        return Ok(crate::process::background(path));
     }
     let executable = std::env::current_exe().context(t!("git.helper_start_failed"))?;
     let sibling = executable.with_file_name(if cfg!(windows) {
@@ -310,31 +310,12 @@ fn helper_process() -> Result<Command> {
     } else {
         "stroll-remote"
     });
-    let command = if sibling.is_file() {
-        Command::new(sibling)
-    } else {
-        let mut command = Command::new(&executable);
-        command.arg("--git-helper");
-        command
-    };
-    // `Connection::open` configures the pipes.
-    // Suppress the helper's console window when the desktop process has no console.
-    #[cfg(windows)]
-    if !has_console() {
-        use std::os::windows::process::CommandExt as _;
-        command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    if sibling.is_file() {
+        return Ok(crate::process::background(sibling));
     }
+    let mut command = crate::process::background(executable);
+    command.arg("--git-helper");
     Ok(command)
-}
-
-#[cfg(all(feature = "desktop", windows))]
-fn has_console() -> bool {
-    #[link(name = "kernel32")]
-    unsafe extern "system" {
-        fn GetConsoleWindow() -> isize;
-    }
-    // SAFETY: This only queries the current process's console window handle.
-    unsafe { GetConsoleWindow() != 0 }
 }
 
 impl Connection {

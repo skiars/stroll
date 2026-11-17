@@ -3,7 +3,7 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{Read, Seek, SeekFrom, Write},
     path::{Component, Path, PathBuf},
-    process::{Command, Stdio},
+    process::Stdio,
 };
 
 use anyhow::{Context, Result, ensure};
@@ -423,7 +423,7 @@ pub(crate) fn check_ignored_paths(
         input.write_all(&[0])?;
     }
     input.rewind()?;
-    let output = Command::new("git")
+    let output = crate::process::background("git")
         .args(["--no-optional-locks", "-c", "core.fsmonitor=false"])
         .arg("-C")
         .arg(root)

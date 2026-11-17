@@ -6,6 +6,14 @@
 
 use std::path::{Path, PathBuf};
 
+#[cfg(all(windows, feature = "desktop"))]
+pub(crate) fn unquote_windows_path(value: &str) -> &str {
+    value
+        .strip_prefix('"')
+        .and_then(|value| value.strip_suffix('"'))
+        .unwrap_or(value)
+}
+
 /// Convert extended-length paths to familiar forms for display and the clipboard.
 pub(crate) fn display(path: &Path) -> String {
     let text = path.to_string_lossy();

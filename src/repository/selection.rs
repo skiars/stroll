@@ -60,10 +60,7 @@ pub(crate) fn repository_root(path: &Path) -> Result<PathBuf> {
 }
 
 pub(super) fn common_dir(root: &Path) -> Result<PathBuf> {
-    let dir = git(
-        root,
-        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
-    )?;
+    let dir = git(root, &["rev-parse", "--git-common-dir"])?;
     let dir = dir.strip_suffix(b"\n").unwrap_or(&dir);
     Ok(root.join(path_from_git(dir)?).canonicalize()?)
 }

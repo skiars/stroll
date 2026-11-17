@@ -48,6 +48,27 @@ Use `xdg-mime` to set Stroll as the default Markdown reader.
 xdg-mime default io.stroll.Stroll.desktop text/markdown
 ```
 
+## Install on Windows
+
+Install the x64 Rust MSVC toolchain, Visual Studio C++ Build Tools with the
+Visual C++ Redistributable files, and [Inno Setup 6.3 or later](https://jrsoftware.org/isdl.php).
+From the repository root, run:
+
+```powershell
+.\scripts\package-windows.ps1
+```
+
+The script builds the release binaries and writes `Stroll-Setup-<version>-x64.exe`
+to `target\windows` by default. For a custom Inno Setup installation, pass
+`-InnoSetupCompiler 'C:\path\to\ISCC.exe'`.
+
+Setup installs Stroll and its app-local Visual C++ runtime for the current user.
+Its optional Explorer integrations add
+**Open with Stroll** to folder context menus and make Stroll available under
+**Open with** for `.md` files. On Windows 11, find the folder action under
+**Show more options**. To make Stroll the default Markdown app, use the
+Windows **Open with** dialog.
+
 ## SSH helper (optional)
 
 Stroll uses system OpenSSH and connects by key to hosts in `known_hosts`. On the Linux server, install Git and build the helper from the same version of Stroll as the desktop app.

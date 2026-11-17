@@ -167,7 +167,7 @@ impl ExternalLsp {
     }
 
     pub(crate) fn command(&self) -> Command {
-        let mut command = Command::new(&self.server.command);
+        let mut command = crate::process::background(&self.server.command);
         command.args(&self.server.args).envs(&self.server.env);
         command
     }

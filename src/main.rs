@@ -1,3 +1,5 @@
+#![cfg_attr(windows, windows_subsystem = "windows")]
+
 use std::{env, path::PathBuf, process::ExitCode, sync::Arc};
 
 use anyhow::{Result, ensure};

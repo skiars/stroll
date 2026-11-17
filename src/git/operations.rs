@@ -218,13 +218,10 @@ pub(crate) fn staged_commit_context(
 }
 
 fn index_path(root: &Path) -> Result<PathBuf> {
-    let path = read(
-        root,
-        ["rev-parse", "--path-format=absolute", "--git-path", "index"],
-    )?;
-    Ok(PathBuf::from(
-        std::str::from_utf8(&path)?.trim_end_matches(['\r', '\n']),
-    ))
+    let path = read(root, ["rev-parse", "--git-path", "index"])?;
+    let path = root.join(std::str::from_utf8(&path)?.trim_end_matches(['\r', '\n']));
+    // Git also uses this directory for its scratch index and lock file.
+    Ok(crate::paths::simplified(&path))
 }
 
 pub(crate) fn create_commit(root: &Path, expected: &CommitState, message: &str) -> Result<String> {
@@ -1282,9 +1279,12 @@ fn restore_index_flags(
             ],
             &input,
         )?;
-        git.env("GIT_DIR", git_dir(root).canonicalize()?)
-            .env("GIT_WORK_TREE", &worktree)
-            .env("GIT_INDEX_FILE", &scratch);
+        git.env(
+            "GIT_DIR",
+            crate::paths::simplified(&git_dir(root).canonicalize()?),
+        )
+        .env("GIT_WORK_TREE", &worktree)
+        .env("GIT_INDEX_FILE", &scratch);
         capture_repository(git)?;
     }
     for (flag, option) in [

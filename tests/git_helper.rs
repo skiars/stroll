@@ -93,6 +93,7 @@ fn fixture() -> tempfile::TempDir {
     let repo = tempfile::tempdir().unwrap();
     let root = repo.path();
     git(root, &["init", "-q", "-b", "main"]);
+    git(root, &["config", "core.autocrlf", "false"]);
     git(root, &["config", "user.name", "Test"]);
     git(root, &["config", "user.email", "test@example.invalid"]);
     git(root, &["config", "commit.gpgsign", "false"]);
@@ -434,7 +435,9 @@ fn workspace_file_protocol_lists_mutates_and_reads_large_files() {
 
 #[test]
 fn workspace_file_protocol_lists_nested_repository_contents() {
-    use std::fs;
+    use std::{collections::BTreeMap, fs, path::PathBuf};
+
+    use stroll::repository::Entry;
 
     let repo = fixture();
     let root = repo.path();
@@ -450,63 +453,58 @@ fn workspace_file_protocol_lists_nested_repository_contents() {
     let mut helper = Helper::start();
     assert_eq!(helper.ok(json!({"Hello": 8})), json!(8));
     let open = helper.ok(json!({"Open":root}));
-    let children = open["children"][""].as_array().unwrap();
+    let children: BTreeMap<PathBuf, Vec<Entry>> =
+        serde_json::from_value(open["children"].clone()).unwrap();
+    let top_level = &children[Path::new("")];
     assert!(
-        children.iter().any(|entry| {
-            Path::new(entry["path"].as_str().unwrap()) == Path::new("nested")
-                && entry["directory"] == true
-        }),
-        "{children:?}"
+        top_level
+            .iter()
+            .any(|entry| entry.path == Path::new("nested") && entry.directory),
+        "{top_level:?}"
     );
 
-    let nested_children = open["children"]["nested"].as_array().unwrap();
+    let nested_children = &children[Path::new("nested")];
     assert!(
-        nested_children.iter().any(|entry| {
-            Path::new(entry["path"].as_str().unwrap()) == Path::new("nested/assets")
-                && entry["directory"] == true
-        }),
-        "{nested_children:?}"
-    );
-    assert!(
-        nested_children.iter().any(|entry| {
-            Path::new(entry["path"].as_str().unwrap()) == Path::new("nested/notes.md")
-                && entry["directory"] == false
-        }),
+        nested_children
+            .iter()
+            .any(|entry| entry.path == Path::new("nested/assets") && entry.directory),
         "{nested_children:?}"
     );
     assert!(
         nested_children
             .iter()
-            .all(|entry| !entry["path"].as_str().unwrap().contains(".git"))
+            .any(|entry| entry.path == Path::new("nested/notes.md") && !entry.directory),
+        "{nested_children:?}"
+    );
+    assert!(
+        nested_children
+            .iter()
+            .all(|entry| !entry.path.to_string_lossy().contains(".git"))
     );
 
     // Files below the nested repository root are listed from disk, not from Git.
     assert!(
-        open["children"]["nested/assets"]
-            .as_array()
-            .unwrap()
+        children[Path::new("nested/assets")]
             .iter()
-            .any(|entry| entry["path"] == "nested/assets/hero.png"),
+            .any(|entry| entry.path == Path::new("nested/assets/hero.png")),
         "{open}"
     );
 
     // Expanding the folder also lists its contents instead of returning an empty directory.
-    let listing = helper.ok(json!({"TreeDirectories": ["nested", "nested/assets"]}));
+    let listing: BTreeMap<PathBuf, Vec<Entry>> =
+        serde_json::from_value(helper.ok(json!({"TreeDirectories": ["nested", "nested/assets"]})))
+            .unwrap();
     assert!(
-        listing["nested"]
-            .as_array()
-            .unwrap()
+        listing[Path::new("nested")]
             .iter()
-            .any(|entry| entry["path"] == "nested/notes.md"),
-        "{listing}"
+            .any(|entry| entry.path == Path::new("nested/notes.md")),
+        "{listing:?}"
     );
     assert!(
-        listing["nested/assets"]
-            .as_array()
-            .unwrap()
+        listing[Path::new("nested/assets")]
             .iter()
-            .any(|entry| entry["path"] == "nested/assets/hero.png"),
-        "{listing}"
+            .any(|entry| entry.path == Path::new("nested/assets/hero.png")),
+        "{listing:?}"
     );
 }
 

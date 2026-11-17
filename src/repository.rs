@@ -16,7 +16,6 @@ use std::{
     fs::{self, File},
     io::{ErrorKind, Read, Write},
     path::{Component, Path, PathBuf},
-    process::Command,
 };
 
 use anyhow::{Context, Result, bail, ensure};
@@ -475,7 +474,7 @@ pub(crate) fn worktree_paths(root: &Path) -> Result<Vec<PathBuf>> {
 }
 
 fn git(path: &Path, args: &[&str]) -> Result<Vec<u8>> {
-    let mut command = Command::new("git");
+    let mut command = crate::process::background("git");
     command
         .env("LC_ALL", "C")
         .arg("-C")

@@ -19,6 +19,7 @@ mod locator;
 #[cfg(feature = "desktop")]
 pub mod lsp;
 mod paths;
+mod process;
 #[path = "terminal/pty.rs"]
 mod pty;
 pub mod remote;

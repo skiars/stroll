@@ -912,7 +912,14 @@ impl SettingsPage {
                 t!("settings.default_shell"),
                 self.input(|c| &mut c.terminal.shell),
             )
-            .description(t!("settings.shell_description").into_owned()),
+            .description(
+                if cfg!(windows) {
+                    t!("settings.windows_shell_description")
+                } else {
+                    t!("settings.shell_description")
+                }
+                .into_owned(),
+            ),
         );
         let mut lsp = SettingGroup::new().item(setting_item(
             t!("settings.enable_lsp"),
