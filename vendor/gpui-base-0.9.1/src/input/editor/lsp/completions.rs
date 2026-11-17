@@ -532,8 +532,9 @@ impl InputBaseState<EditorMode> {
             return false;
         }
 
-        let closes_overlay =
-            crate::input::Enter::is_primary(&*action) || action.partial_eq(&crate::input::Escape);
+        let closes_overlay = crate::input::Enter::is_primary(&*action)
+            || action.partial_eq(&crate::input::Escape)
+            || action.partial_eq(&crate::input::IndentInline);
         let kind = if self.extras.context_menu_content.completion.open {
             Some(super::InputOverlayKind::Completion)
         } else if self.extras.context_menu_content.code_action.open {

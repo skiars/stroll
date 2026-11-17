@@ -13,6 +13,8 @@ use gpui::{
 
 use crate::input::{EditorState, PrepaintCaretGeometry};
 
+pub(super) const CARET_POPUP_MARGIN: Pixels = px(8.);
+
 /// Computes the caret-anchored popup origin from fresh prepaint geometry.
 ///
 /// Shared by the completion and code-action menus so both anchor to the
@@ -28,13 +30,6 @@ pub(crate) fn caret_popup_anchor(geometry: PrepaintCaretGeometry) -> Point<Pixel
     )
 }
 
-/// Available vertical room on the side of the caret with the most space.
-pub(crate) fn caret_popup_height(anchor: Point<Pixels>, window: &Window) -> Pixels {
-    let above = anchor.y - px(8.);
-    let below = window.viewport_size().height - anchor.y - px(8.);
-    above.max(below).max(px(0.))
-}
-
 /// A popup positioned at the caret from the input's current-frame prepaint.
 ///
 /// The content is built in prepaint (not render) from the resolved anchor,
@@ -43,14 +38,14 @@ pub(crate) fn caret_popup_height(anchor: Point<Pixels>, window: &Window) -> Pixe
 /// `deferred()` so the prepaint runs after the input's prepaint.
 pub(crate) struct CaretAnchoredPopup {
     editor: WeakEntity<EditorState>,
-    build: Box<dyn Fn(Point<Pixels>, &mut Window, &mut App) -> AnyElement>,
+    build: Box<dyn Fn(Point<Pixels>, Pixels, &mut Window, &mut App) -> AnyElement>,
     content: Option<AnyElement>,
 }
 
 impl CaretAnchoredPopup {
     pub(crate) fn new(
         editor: WeakEntity<EditorState>,
-        build: impl Fn(Point<Pixels>, &mut Window, &mut App) -> AnyElement + 'static,
+        build: impl Fn(Point<Pixels>, Pixels, &mut Window, &mut App) -> AnyElement + 'static,
     ) -> Self {
         Self {
             editor,
@@ -100,8 +95,12 @@ impl Element for CaretAnchoredPopup {
             return;
         };
         let anchor = caret_popup_anchor(geometry);
-        let mut content = (self.build)(anchor, window, cx);
         let viewport = window.viewport_size();
+        let margin = CARET_POPUP_MARGIN;
+        let above_anchor = anchor.y - geometry.line_height() - px(8.);
+        let above = above_anchor - margin;
+        let below = viewport.height - anchor.y - margin;
+        let mut content = (self.build)(anchor, above.max(below).max(px(0.)), window, cx);
         let size = content.layout_as_root(
             Size {
                 width: AvailableSpace::Definite(viewport.width),
@@ -110,13 +109,12 @@ impl Element for CaretAnchoredPopup {
             window,
             cx,
         );
-        let margin = px(8.);
         let bottom = (viewport.height - size.height - margin).max(margin);
         let right = (viewport.width - size.width - margin).max(margin);
-        let y = if anchor.y + size.height <= viewport.height - margin {
+        let y = if size.height <= below {
             anchor.y
         } else {
-            anchor.y - geometry.line_height() - px(8.) - size.height
+            above_anchor - size.height
         };
         content.prepaint_at(
             Point::new(anchor.x.clamp(margin, right), y.clamp(margin, bottom)),

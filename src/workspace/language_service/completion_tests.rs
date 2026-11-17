@@ -259,10 +259,11 @@ fn workspace_completion_triggers_filters_applies_and_drops_stale_replies() -> Re
             "#include <widget.h>\n{}",
             source.replace("object", "object.member")
         );
-        visual.simulate_keystrokes("enter");
-        wait(visual, "completion and auto-import", |visual| {
+        visual.simulate_keystrokes("tab");
+        wait(visual, "Tab completion and auto-import", |visual| {
             visual.update(|_, cx| editor.read(cx).text().to_string() == completed)
         })?;
+        assert!(labels(visual, editor).is_empty());
         visual.update(|window, cx| {
             editor.update(cx, |state, cx| {
                 let at = state.text().to_string().find(';').unwrap();
@@ -288,6 +289,16 @@ fn workspace_completion_triggers_filters_applies_and_drops_stale_replies() -> Re
             std::thread::sleep(Duration::from_millis(10));
         }
         assert!(labels(visual, editor).is_empty());
+        visual.simulate_keystrokes("tab");
+        frame(visual);
+        visual.update(|_, cx| {
+            let editor = editor.read(cx);
+            let inserted = editor.cursor();
+            assert!(inserted > 0, "Tab with no menu should indent");
+            let text = editor.text().to_string();
+            assert!(text[..inserted].chars().all(|ch| matches!(ch, ' ' | '\t')));
+            assert_eq!(&text[inserted..], completed);
+        });
         Ok(())
     })
 }

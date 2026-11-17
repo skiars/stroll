@@ -156,3 +156,13 @@ dialogs in a Wayland window after changes to paint order or focus handling.
   renderer and wrap independently. Run
   `cargo test --release --locked --test popups editor_hover_enrichment` to
   verify the delayed update, layout and cancellation.
+
+- Tab accepts the selected item in the shared editor completion menu through
+  the same edit path as Enter. With no list candidate it retains inline
+  completion and indentation. Candidate rows use completion kind icons and
+  separately truncate the label and detail. The scrollable documentation pane
+  stacks below the list when horizontal space is limited. Run
+  `cargo test --release --locked workspace_completion` for the workspace
+  fixture and `cargo test --release --locked --test popups completion_popup`
+  for offscreen geometry and selection coverage. Set
+  `STROLL_COMPLETION_SCREENSHOTS` to save the popup screenshots.

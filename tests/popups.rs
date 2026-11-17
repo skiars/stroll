@@ -1580,6 +1580,184 @@ fn popover_arrow_joins_the_material_at_fractional_scales() -> anyhow::Result<()>
 
 #[cfg(target_os = "linux")]
 #[test]
+fn completion_popup_stays_in_view_and_tab_accepts_the_selected_row() -> anyhow::Result<()> {
+    use std::{path::PathBuf, sync::Arc};
+
+    use gpui::{
+        AppContext as _, Context, Entity, HeadlessAppContext, Keystroke, Render, Styled as _,
+        Window, px,
+    };
+    use gpui_component::{
+        ActiveTheme as _, Root, ThemeMode,
+        input::{Editor, EditorState},
+    };
+    use gpui_wgpu::WgpuHeadlessRenderer;
+    use lsp_types::{CompletionItem, CompletionItemKind, Documentation, MarkupContent, MarkupKind};
+
+    struct Probe(Entity<EditorState>);
+    impl Render for Probe {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl gpui::IntoElement {
+            Editor::new(&self.0).size_full()
+        }
+    }
+
+    const SOURCE: &str = concat!(
+        "#include <optional>\n",
+        "#include \"records.h\"\n",
+        "\n",
+        "namespace app {\n",
+        "\n",
+        "void load(RecordLibrary &library) {\n",
+        "    const std::size_t id = 42;\n",
+        "    if (!library.isOpen())\n",
+        "        return;\n",
+        "\n",
+        "    const auto record = library.ge;\n",
+        "}\n",
+        "\n",
+        "} // namespace app\n",
+    );
+    const LONG_NAME: &str = "getRecordWithAnExplicitScopeAndAccessPolicy";
+    let documentation = Documentation::MarkupContent(MarkupContent {
+        kind: MarkupKind::Markdown,
+        value: concat!(
+            "**Find a record by its identifier.**\n\n",
+            "Returns an empty result if the record is missing or the library is closed.\n\n",
+            "```cpp\n",
+            "library.getRecord(id);\n",
+            "```\n\n",
+            "This lookup leaves the caller's current selection intact.",
+        )
+        .to_owned(),
+    });
+    let items = vec![
+        CompletionItem {
+            label: "getRecord".into(),
+            kind: Some(CompletionItemKind::METHOD),
+            detail: Some("std::optional<Record>".into()),
+            documentation: Some(documentation),
+            ..Default::default()
+        },
+        CompletionItem {
+            label: LONG_NAME.into(),
+            kind: Some(CompletionItemKind::FUNCTION),
+            detail: Some("std::optional<ScopedRecordWithAccessPolicy>".into()),
+            ..Default::default()
+        },
+        CompletionItem {
+            label: "generation".into(),
+            kind: Some(CompletionItemKind::FIELD),
+            detail: Some("std::size_t".into()),
+            ..Default::default()
+        },
+        CompletionItem {
+            label: "genericLookup".into(),
+            kind: Some(CompletionItemKind::METHOD),
+            deprecated: Some(true),
+            ..Default::default()
+        },
+    ];
+    let output = std::env::var_os("STROLL_COMPLETION_SCREENSHOTS").map(PathBuf::from);
+    if let Some(output) = &output {
+        std::fs::create_dir_all(output)?;
+    }
+    let mut cx = HeadlessAppContext::with_platform(
+        gpui_platform::current_platform(true).text_system(),
+        Arc::new(gpui_kit_assets::AllAssets),
+        || Ok(Some(Box::new(WgpuHeadlessRenderer::new()?))),
+    );
+    cx.update(|cx| {
+        gpui_component::init(cx);
+        cx.set_reduce_motion(true);
+    });
+
+    for (mode, width, height, stacked, name) in [
+        (ThemeMode::Light, 950., 420., false, "light"),
+        (ThemeMode::Dark, 950., 420., false, "dark"),
+        (ThemeMode::Dark, 344., 300., true, "narrow-dark"),
+    ] {
+        cx.update(|cx| stroll::workspace::apply_theme(mode, cx));
+        let mut editor = None;
+        let window = cx.open_window(size(px(width), px(height)), |window, cx| {
+            let state = cx.new(|cx| {
+                EditorState::new(window, cx)
+                    .language("cpp")
+                    .default_value(SOURCE)
+            });
+            editor = Some(state.clone());
+            let view = cx.new(|_| Probe(state));
+            cx.new(|cx| Root::new(view, window, cx))
+        })?;
+        let window = window.into();
+        let editor = editor.unwrap();
+        let caret = SOURCE.find("ge;").unwrap() + 2;
+        cx.update_window(window, |_, window, cx| {
+            editor.update(cx, |editor, cx| {
+                editor.focus(window, cx);
+                editor.set_selected_range(caret..caret, cx);
+                editor.present_completion_items(caret - 2, "ge", items.clone(), cx);
+            });
+            window.draw(cx).clear(cx);
+        })?;
+        cx.run_until_parked();
+        cx.update_window(window, |_, window, cx| {
+            window.draw(cx).clear(cx);
+            let scale = window.scale_factor();
+            let material = cx.theme().popover.alpha(0.5).into();
+            let mut shells = window
+                .painted_quads()
+                .into_iter()
+                .filter(|quad| quad.background == material && quad.corner_radii.top_left.0 > 0.)
+                .map(|quad| quad.bounds)
+                .collect::<Vec<_>>();
+            let start = |area: &Bounds<ScaledPixels>| {
+                if stacked { area.top().0 } else { area.left().0 }
+            };
+            shells.sort_by(|a, b| start(a).total_cmp(&start(b)));
+            shells.dedup();
+            assert_eq!(
+                shells.len(),
+                2,
+                "completion list and documentation in {name}: {shells:?}"
+            );
+            for shell in &shells {
+                assert!(shell.left().0 >= 7. * scale && shell.top().0 >= 7. * scale);
+                assert!(shell.right().0 <= (width - 7.) * scale);
+                assert!(shell.bottom().0 <= (height - 7.) * scale);
+            }
+            let (list, docs) = (shells[0], shells[1]);
+            if stacked {
+                assert_eq!(list.left(), docs.left());
+                assert!(list.bottom() < docs.top());
+            } else {
+                assert_eq!(list.top(), docs.top());
+                assert!(list.right() < docs.left());
+            }
+            assert!(docs.size.height.0 > 48. * scale);
+        })?;
+        if let Some(output) = &output {
+            cx.capture_screenshot(window)?
+                .save(output.join(format!("completion-{name}.png")))?;
+        }
+        cx.update_window(window, |_, window, cx| {
+            window.dispatch_keystroke(Keystroke::parse("down").unwrap(), cx);
+            window.dispatch_keystroke(Keystroke::parse("tab").unwrap(), cx);
+        })?;
+        cx.run_until_parked();
+        cx.update(|cx| {
+            let editor = editor.read(cx);
+            assert!(!editor.completion_menu_state().open);
+            assert_eq!(
+                editor.text().to_string(),
+                SOURCE.replace(".ge;", &format!(".{LONG_NAME};"))
+            );
+        });
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn editor_hover_appends_documentation_to_web_diagnostics() -> anyhow::Result<()> {
     use std::{rc::Rc, sync::Arc};
 

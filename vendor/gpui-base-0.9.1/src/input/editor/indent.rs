@@ -173,13 +173,17 @@ impl InputBaseState<crate::input::EditorMode> {
 impl<M: InputModeKind> InputBaseState<M> {
     pub(super) fn indent_inline(
         &mut self,
-        _: &IndentInline,
+        action: &IndentInline,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // First, try to accept inline completion if present
         let revision = self.document_revision;
-        if M::accept_inline_completion(self, window, cx) {
+        if (M::CODE_EDITOR
+            && self.is_editable()
+            && !self.is_composing()
+            && M::handle_context_menu_action(self, Box::new(action.clone()), window, cx))
+            || M::accept_inline_completion(self, window, cx)
+        {
             self.reveal_after_interactive_edit(revision);
             return;
         }
