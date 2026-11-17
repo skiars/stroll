@@ -339,14 +339,19 @@ impl Session {
         }));
     }
 
+    fn grid_font(window: &Window) -> (Font, Pixels) {
+        let style = window.text_style();
+        let mut font = style.font();
+        font.features = FontFeatures::disable_ligatures();
+        (font, style.font_size.to_pixels(window.rem_size()))
+    }
+
     fn layout_grid(&mut self, bounds: Bounds<Pixels>, window: &mut Window, cx: &mut Context<Self>) {
         let theme = cx.theme();
         let appearance = Appearance::new(theme.mode == ThemeMode::Dark);
-        let size = theme.mono_font_size;
-        let font_id = window
-            .text_system()
-            .resolve_font(&font(theme.mono_font_family.clone()));
+        let (font, size) = Self::grid_font(window);
         let text = window.text_system();
+        let font_id = text.resolve_font(&font);
         let scale = window.scale_factor();
         let line_height =
             (text.ascent(font_id, size) + text.descent(font_id, size).abs()).max(size);
@@ -1148,10 +1153,10 @@ mod tests {
     use gpui::{
         AppContext as _, ClipboardItem, Context, Entity, EntityInputHandler as _, FocusHandle,
         Hsla, InteractiveElement as _, IntoElement, KeyBinding, Modifiers, MouseButton,
-        ParentElement as _, Render, Styled, TestAppContext, TestDispatcher, VisualTestContext,
-        Window, div, point, px, rgb, size,
+        ParentElement as _, Pixels, Render, Styled, TestAppContext, TestDispatcher,
+        VisualTestContext, Window, div, point, px, rgb, size,
     };
-    use gpui_component::{ActiveTheme as _, Root, Theme};
+    use gpui_component::{ActiveTheme as _, Root};
 
     use super::{Command, Emulator, Event, Fade, PtySize, Session};
     use crate::{
@@ -1712,11 +1717,23 @@ mod tests {
 
     #[gpui::test]
     fn fractional_terminal_columns_align_cursor_selection_mouse_and_pty(cx: &mut TestAppContext) {
-        cx.update(|cx| {
-            gpui_component::init(cx);
-            Theme::update(cx, |theme| theme.mono_font_size = px(13.5));
-        });
-        let mut terminal = None;
+        struct TerminalView {
+            session: Entity<Session>,
+            font_size: Pixels,
+        }
+
+        impl Render for TerminalView {
+            fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+                div()
+                    .size_full()
+                    .font_family(cx.theme().mono_font_family.clone())
+                    .text_size(self.font_size)
+                    .child(self.session.clone())
+            }
+        }
+
+        cx.update(gpui_component::init);
+        let mut terminal_view = None;
         let (commands, requests) = mpsc::channel();
         let (_, cx) = cx.add_window_view(|window, cx| {
             let session = cx.new(|cx| {
@@ -1734,10 +1751,15 @@ mod tests {
                 ));
                 session
             });
-            terminal = Some(session.clone());
-            Root::new(session, window, cx)
+            let view = cx.new(|_| TerminalView {
+                session,
+                font_size: px(13.5),
+            });
+            terminal_view = Some(view.clone());
+            Root::new(view, window, cx)
         });
-        let terminal = terminal.unwrap();
+        let terminal_view = terminal_view.unwrap();
+        let terminal = cx.update(|_, cx| terminal_view.read(cx).session.clone());
         while requests.try_recv().is_ok() {}
         cx.simulate_scale_factor_change(2.);
         cx.simulate_resize(size(px(694.), px(140.)));
@@ -1819,6 +1841,19 @@ mod tests {
             assert!(matches!(requests.try_recv(), Ok(Command::Input(bytes)) if bytes == press));
             assert!(matches!(requests.try_recv(), Ok(Command::Input(bytes)) if bytes == release));
         }
+
+        let resized = cx.update(|window, cx| {
+            terminal_view.update(cx, |view, cx| {
+                view.font_size = px(20.);
+                cx.notify();
+            });
+            window.draw(cx).clear(cx);
+            let resized = terminal.read(cx).geometry;
+            assert!((resized.cell.width.as_f32() - 12.).abs() < 0.001);
+            assert!(resized.cols < geometry.cols && resized.rows < geometry.rows);
+            resized
+        });
+        assert!(matches!(requests.try_recv(), Ok(Command::Resize(size)) if size == resized.size()));
     }
 
     #[gpui::test]

@@ -91,10 +91,7 @@ impl Session {
             return;
         }
         let frame = &self.frame;
-        let theme = cx.theme();
-        let mut base = font(theme.mono_font_family.clone());
-        base.features = FontFeatures::disable_ligatures();
-        let font_size = theme.mono_font_size;
+        let (base, font_size) = Self::grid_font(window);
         let physical_scale = window.scale_factor();
         let font_id = window.text_system().resolve_font(&base);
         let ascent = window.text_system().ascent(font_id, font_size);

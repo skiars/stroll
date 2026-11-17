@@ -627,6 +627,8 @@ impl Workspace {
                         .min_h_0()
                         .w_full()
                         .pt(px(2.))
+                        .font_family(self.editor_font_family(cx))
+                        .text_size(px(self.config.current().editor.font_size as f32))
                         .child(active.session.clone()),
                 )
                 .when(!panel.maximized, |el| el.child(resizer))

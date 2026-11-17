@@ -3619,6 +3619,12 @@ impl Workspace {
             ))
     }
 
+    fn editor_font_family(&self, cx: &App) -> SharedString {
+        self.editor_font
+            .clone()
+            .unwrap_or_else(|| cx.theme().mono_font_family.clone())
+    }
+
     fn content(&self, window: &Window, cx: &Context<Self>, colors: Palette) -> impl IntoElement {
         let editor_background =
             code_theme::surface(self.config.current().appearance.code_theme, cx.theme().mode);
@@ -3668,9 +3674,7 @@ impl Workspace {
                         .child(
                             Editor::new(&file.editor)
                                 .text_size(px(self.config.current().editor.font_size as f32))
-                                .when_some(self.editor_font.clone(), |editor, font| {
-                                    editor.font_family(font)
-                                })
+                                .font_family(self.editor_font_family(cx))
                                 .appearance(false)
                                 .bordered(false)
                                 .readonly(locked)
@@ -3698,9 +3702,7 @@ impl Workspace {
                             file,
                             cx.weak_entity(),
                             px(self.config.current().editor.font_size as f32),
-                            self.editor_font
-                                .clone()
-                                .unwrap_or_else(|| cx.theme().mono_font_family.clone()),
+                            self.editor_font_family(cx),
                             colors,
                             cx,
                         ))
@@ -4549,8 +4551,6 @@ mod tests {
                 let theme = Theme::global(cx);
                 assert_eq!(theme.font_family, "Configured UI");
                 assert_eq!(theme.font_fallbacks.as_ref(), Some(&fallbacks));
-                // The code font is not the theme's monospace font: the
-                // terminal keeps the system one.
                 assert_eq!(theme.mono_font_family, default_mono);
                 assert_eq!(ui_code_font(cx), "Configured code");
             }
