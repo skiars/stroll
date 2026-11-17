@@ -747,6 +747,16 @@ impl GitPanel {
                                 }
                             })
                             .collect();
+                        let directories =
+                            if matches!(detail.comparison, Comparison::Worktree { base: None, .. })
+                            {
+                                this.worktree_directories.clone()
+                            } else {
+                                previous
+                                    .as_ref()
+                                    .map(|review| review.directories.clone())
+                                    .unwrap_or_default()
+                            };
                         this.review = Some(Review {
                             patch_display: vec![PatchDisplay::default(); detail.files.len()],
                             openable: vec![false; detail.files.len()],
@@ -780,10 +790,7 @@ impl GitPanel {
                             tree_motion: Default::default(),
                             summary_layout: None,
                             active,
-                            directories: previous
-                                .as_ref()
-                                .map(|review| review.directories.clone())
-                                .unwrap_or_default(),
+                            directories,
                             collapsed: previous
                                 .as_ref()
                                 .map(|review| review.collapsed.clone())

@@ -87,11 +87,18 @@ dialogs in a Wayland window after changes to paint order or focus handling.
   equal top, bottom, and right insets for the preview button in a single-line row,
   draft edits, and grouped undo and redo.
   Current-line probes use the same request trigger as the explicitly opened menu.
+- Atomic editor batches accept a selection offset mapper and record the results
+  alongside the original selections for undo and redo.
+  Run `cargo test --release --locked --lib language_actions` to verify code
+  actions, grouped rename, and a formatting edit distant from the selection.
 - The editor exposes current-frame line-end space and the shaped text baseline of
   the cursor's final wrapped row for paint-only line decorations. Interactive tooltips can restart their delay on pointer
   motion, hold while the pointer is over the popup, and position within an editor viewport.
   Run `cargo test --release --locked editor_blame` for first-frame scrolling and baseline alignment,
   pending edits, hover timing, popup handoff, and clipboard actions.
+- The editor can reveal a caret with context once the target row has been wrapped and
+  laid out. Inline hunk jumps can anchor to the virtual deletion block. The workspace
+  definition jump test covers a newly opened buffer, soft wrapping, and EOF.
 - Mouse-triggered tooltips and editor hovers validate their original target after layout.
   A target moved under a stationary pointer waits for a pointer move. The release tests
   `editor_hover_waits_for_pointer_motion_after_scrolling` and

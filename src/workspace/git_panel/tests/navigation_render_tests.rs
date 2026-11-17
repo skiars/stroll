@@ -127,6 +127,124 @@ fn commit_drafts_survive_worktree_switch_and_restart_until_committed() {
     cx.quit();
 }
 
+#[::core::prelude::v1::test]
+fn uncommitted_tree_folds_survive_modes_history_worktree_switch_and_restart() {
+    let fixture = tempfile::tempdir().unwrap();
+    let root = fixture.path().join("repo");
+    let linked = fixture.path().join("linked");
+    let path = "folder/file.txt";
+    fs::create_dir_all(root.join("folder")).unwrap();
+    git(&root, &["init", "-qb", "main"]);
+    git(&root, &["config", "user.name", "Reviewer"]);
+    git(&root, &["config", "user.email", "reviewer@example.invalid"]);
+    git(&root, &["config", "commit.gpgsign", "false"]);
+    fs::write(root.join(path), "initial\n").unwrap();
+    git(&root, &["add", path]);
+    git(&root, &["commit", "-qm", "Initial"]);
+    git(
+        &root,
+        &["worktree", "add", "-qb", "linked", linked.to_str().unwrap()],
+    );
+    fs::write(root.join(path), "staged\n").unwrap();
+    git(&root, &["add", path]);
+    fs::write(root.join(path), "unstaged\n").unwrap();
+    fs::write(linked.join(path), "linked change\n").unwrap();
+
+    let new_app = || {
+        let cx = TestAppContext::build_with_text_system(
+            TestDispatcher::new(0),
+            None,
+            gpui_platform::current_platform(true).text_system(),
+        );
+        cx.update(gpui_component::init);
+        cx
+    };
+    let build_workspace = |window: &mut Window, cx: &mut Context<Workspace>| {
+        let store = Arc::new(Store::new(fixture.path().join("state")).unwrap());
+        let config = crate::config::ConfigFile::load(Some(fixture.path().join("config.toml")));
+        Workspace::with_startup_view(store, config, Some(WorkspaceView::Git), window, cx)
+    };
+    let open = |visual: &mut VisualTestContext, workspace: &Entity<Workspace>, root: &Path| {
+        visual.update(|window, cx| {
+            workspace.update(cx, |workspace, cx| {
+                workspace.open_repository(
+                    Location {
+                        root: root.to_owned(),
+                        file: None,
+                    },
+                    window,
+                    cx,
+                );
+            });
+        });
+        settle(visual);
+    };
+    let select = |visual: &mut VisualTestContext, workspace: &Entity<Workspace>, selection| {
+        visual.update(|window, cx| {
+            workspace
+                .read(cx)
+                .git
+                .clone()
+                .unwrap()
+                .update(cx, |panel, cx| {
+                    panel.load_review(selection, false, window, cx);
+                });
+        });
+        settle(visual);
+    };
+    let assert_fold = |visual: &mut VisualTestContext, workspace: &Entity<Workspace>, folded| {
+        visual.update(|_, cx| {
+            let panel = workspace.read(cx).git.as_ref().unwrap().read(cx);
+            let review = panel.review.as_ref().unwrap();
+            let rows = review.tree_rows.borrow();
+            let file_row = rows.as_ref().unwrap().file_row(review.by_path[path]);
+            assert_eq!(file_row.is_none(), folded, "{:?}", panel.selection);
+            assert!(review.collapsed.is_empty(), "the diff body stays open");
+        });
+    };
+
+    {
+        let mut cx = new_app();
+        let (workspace, visual) = cx.add_window_view(build_workspace);
+        visual.simulate_resize(size(px(1280.), px(720.)));
+        open(visual, &workspace, &root);
+        assert_fold(visual, &workspace, false);
+        let (folder, history) = visual.update(|_, cx| {
+            let panel = workspace.read(cx).git.as_ref().unwrap().read(cx);
+            let viewport = panel.tree_scroll.0.borrow().base_handle.bounds();
+            let folder = point(viewport.center().x, viewport.top() + ROW_HEIGHT.half());
+            let head = panel.history.as_ref().unwrap().head.clone().unwrap();
+            (folder, Selection::Commit(head, None))
+        });
+        visual.simulate_click(folder, Modifiers::default());
+        settle(visual);
+        assert_fold(visual, &workspace, true);
+        for mode in [Mode::Staged, Mode::Unstaged] {
+            select(visual, &workspace, Selection::Worktree(mode));
+            assert_fold(visual, &workspace, true);
+        }
+        select(visual, &workspace, history.clone());
+        assert_fold(visual, &workspace, false);
+
+        open(visual, &workspace, &linked);
+        assert_fold(visual, &workspace, false);
+        open(visual, &workspace, &root);
+        select(visual, &workspace, Selection::Worktree(Mode::All));
+        assert_fold(visual, &workspace, true);
+        select(visual, &workspace, history);
+        cx.quit();
+    }
+
+    let mut cx = new_app();
+    let (workspace, visual) = cx.add_window_view(build_workspace);
+    visual.simulate_resize(size(px(1280.), px(720.)));
+    open(visual, &workspace, &root);
+    assert_fold(visual, &workspace, false);
+    select(visual, &workspace, Selection::Worktree(Mode::All));
+    assert_fold(visual, &workspace, true);
+    cx.quit();
+}
+
 fn check_file_tree_navigation(split: bool) {
     let fixture = tempfile::tempdir().unwrap();
     let root = fixture.path().join("repo");

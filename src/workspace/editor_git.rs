@@ -9,7 +9,6 @@ use gpui_component::input::{
 use std::ops::Range;
 
 const HUNK_TOOLBAR_RADIUS: Pixels = px(8.);
-const HUNK_NAV_CONTEXT_LINES: usize = 5;
 const GIT_GUTTER_WIDTH: Pixels = px(16.);
 
 pub(super) struct EditorGit {
@@ -795,46 +794,14 @@ impl Workspace {
             return;
         };
         let line = hunk_line(changes, patch.layer, block);
-        let current = file.git.selected.and_then(|selected| {
-            editor_hunks(changes).nth(selected).map(|(patch, block)| {
-                (
-                    hunk_line(changes, patch.layer, block),
-                    block
-                        .changes
-                        .iter()
-                        .map(|change| change.removed)
-                        .sum::<usize>(),
-                )
-            })
-        });
         file.git.pending_hunk = None;
         self.expand_editor_git(path, target, cx);
         if let Some(file) = self.files.get(path) {
             file.editor.update(cx, |editor, cx| {
                 use gpui_component::input::RopeExt as _;
-                let line = line.min(editor.text().lines_len().saturating_sub(1));
-                let line_height = editor.line_height().unwrap_or_default();
-                let viewport_top = editor.input_bounds().top();
-                let scroll = editor.scroll_offset();
-                let current_top = editor
-                    .projected_line_bounds(line)
-                    .map(|bounds| bounds.top());
-                let removed_rows = current
-                    .filter(|(current_line, _)| *current_line <= line)
-                    .map_or(0, |(_, removed)| removed);
-                editor.set_cursor_position(
-                    gpui_component::input::Position::new(line as u32, 0),
-                    window,
-                    cx,
-                );
-                if let Some(current_top) = current_top {
-                    let target_top = current_top - line_height * removed_rows as f32;
-                    let desired_top = viewport_top + line_height * HUNK_NAV_CONTEXT_LINES as f32;
-                    editor.set_scroll_offset(
-                        point(scroll.x, scroll.y + desired_top - target_top),
-                        cx,
-                    );
-                }
+                let caret_line = line.min(editor.text().lines_len().saturating_sub(1));
+                let offset = editor.text().line_start_offset(caret_line);
+                reveal_editor_range(editor, offset..offset, Some(line), window, cx);
             });
         }
         cx.notify();
@@ -1390,16 +1357,18 @@ fn editing_below_an_inline_hunk_preserves_the_source_viewport() -> Result<()> {
     Ok(())
 }
 
-#[cfg(all(test, target_os = "linux", debug_assertions))]
+#[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
     use std::process::Command;
 
+    #[cfg(debug_assertions)]
     #[::core::prelude::v1::test]
     fn gutter_expands_in_place_and_restore_keeps_the_staged_hunk() {
         check_gutter_toolbar("disk\nkeep this line\n", 1, true);
     }
 
+    #[cfg(debug_assertions)]
     #[::core::prelude::v1::test]
     fn added_only_hunk_toolbar_does_not_move_the_text() {
         check_gutter_toolbar("index\nadded\nkeep this line\n", 0, false);
@@ -1529,7 +1498,7 @@ mod tests {
                 .map(|quad| px(quad.bounds.top().0 / scale))
                 .min()
                 .expect("the next hunk is expanded");
-            let expected = viewport.top() + line_height * HUNK_NAV_CONTEXT_LINES as f32;
+            let expected = viewport.top() + line_height * EDITOR_JUMP_CONTEXT_LINES as f32;
             assert!(
                 (target_top - expected).abs() < px(1.),
                 "the hunk starts {target_top:?} instead of five rows below {expected:?}"
@@ -1549,6 +1518,7 @@ mod tests {
         });
     }
 
+    #[cfg(debug_assertions)]
     fn check_gutter_toolbar(unstaged_text: &str, deleted_rows: usize, check_staging: bool) {
         let fixture = tempfile::tempdir().unwrap();
         let root = fixture.path().join("repo");

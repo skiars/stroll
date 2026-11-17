@@ -93,7 +93,7 @@ impl Directory {
         &self,
         prefix: &str,
         depth: usize,
-        closed: &HashSet<String>,
+        closed: &BTreeSet<String>,
         force_open: bool,
         matching: &[usize],
         rows: &mut Vec<Row>,
@@ -458,13 +458,12 @@ impl GitPanel {
                             .on_click(move |_, _, cx| {
                                 _ = view.update(cx, |this, cx| {
                                     if let Some(review) = &mut this.review {
-                                        if !review.directories.remove(&path) {
-                                            review.directories.insert(path.clone());
+                                        let directories = Arc::make_mut(&mut review.directories);
+                                        if !directories.remove(&path) {
+                                            directories.insert(path.clone());
                                         }
-                                        review.tree_rows.get_mut().take();
-                                        review.tree_motion.get_mut().start();
+                                        this.directories_changed(cx);
                                     }
-                                    cx.notify();
                                 });
                             })
                             .context_menu(move |mut menu, _, _| {
@@ -868,22 +867,34 @@ impl GitPanel {
         let Some(review) = &mut self.review else {
             return;
         };
-        review.tree_motion.get_mut().start();
-        review.directories.clear();
-        review.tree_rows.get_mut().take();
+        let directories = Arc::make_mut(&mut review.directories);
         if closed {
             let matching = (0..review.detail.files.len()).collect::<Vec<_>>();
             let root = Directory::from_files(&review.detail.files, &matching);
             let mut rows = Vec::new();
-            root.rows("", 0, &HashSet::new(), true, &matching, &mut rows);
-            review
-                .directories
-                .extend(rows.into_iter().filter_map(|row| match row {
-                    Row::Folder { path, .. } => Some(path),
-                    Row::File { .. } => None,
-                }));
+            root.rows("", 0, &BTreeSet::new(), true, &matching, &mut rows);
+            directories.extend(rows.into_iter().filter_map(|row| match row {
+                Row::Folder { path, .. } => Some(path),
+                Row::File { .. } => None,
+            }));
+        } else {
+            directories.clear();
         }
-        cx.notify();
+        self.directories_changed(cx);
+    }
+
+    fn directories_changed(&mut self, cx: &mut Context<Self>) {
+        if let Some(review) = &mut self.review {
+            review.tree_rows.get_mut().take();
+            review.tree_motion.get_mut().start();
+            if matches!(
+                review.detail.comparison,
+                Comparison::Worktree { base: None, .. }
+            ) {
+                self.worktree_directories.clone_from(&review.directories);
+            }
+            cx.notify();
+        }
     }
 }
 

@@ -1,6 +1,7 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 use serde::{Deserialize, Serialize};
@@ -98,6 +99,8 @@ pub(crate) struct GitSession {
     pub selection: Option<GitSelection>,
     pub history: Option<HistoryPosition>,
     pub diff: Option<DiffPosition>,
+    #[serde(skip_serializing_if = "BTreeSet::is_empty")]
+    pub worktree_directories: Arc<BTreeSet<String>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

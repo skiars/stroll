@@ -56,6 +56,15 @@ pub(crate) enum ScrollPadding {
     SurroundingLines,
 }
 
+#[derive(Clone, Copy)]
+pub(super) enum ProjectedScroll {
+    Line { line: usize, inset: Pixels },
+    Caret {
+        context_lines: usize,
+        leading_block: Option<usize>,
+    },
+}
+
 const LINE_CLIPBOARD_METADATA: &str = "gpui-editor:whole-lines";
 
 #[derive(Clone, Copy)]
@@ -469,7 +478,7 @@ pub struct InputBaseState<M: InputModeKind> {
     history_handler: Option<HistoryHandler>,
     grouped_history_handler: Option<GroupedHistoryHandler>,
     pub(super) projected_block_heights: std::rc::Rc<Vec<(usize, Pixels)>>,
-    pub(super) pending_projected_scroll: Option<(usize, Pixels)>,
+    pub(super) pending_projected_scroll: Option<ProjectedScroll>,
     pub(super) projected_min_rows: std::rc::Rc<Vec<usize>>,
     pub(super) projected_rows: Option<std::rc::Rc<Vec<(Option<usize>, Option<gpui::Hsla>)>>>,
     pub(super) display_map: DisplayMap,
@@ -4040,13 +4049,61 @@ impl<M: InputModeKind> InputBaseState<M> {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.edit_ranges_with_selection(edits, Some(group), EditSelection::PerEdit, window, cx);
+    }
+
+    /// Apply an atomic edit with a caller-provided mapping from old selection
+    /// endpoints to UTF-8 offsets in the resulting text.
+    pub fn edit_ranges_mapping_selections(
+        &mut self,
+        edits: &[(Range<usize>, String)],
+        group: Option<u64>,
+        map_offset: impl Fn(&Rope, usize) -> usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let selections = self.selections.iter().copied().collect::<Vec<_>>();
+        let map = |text: &Rope| {
+            selections
+                .iter()
+                .map(|&selection| {
+                    let start = map_offset(text, selection.start);
+                    let end = map_offset(text, selection.end);
+                    CursorSelection {
+                        start,
+                        end,
+                        reversed: selection.reversed && start != end,
+                        column_anchor: None,
+                        ..selection
+                    }
+                })
+                .collect()
+        };
+        self.edit_ranges_with_selection(edits, group, EditSelection::Mapped(&map), window, cx);
+    }
+
+    fn edit_ranges_with_selection(
+        &mut self,
+        edits: &[(Range<usize>, String)],
+        group: Option<u64>,
+        selection: EditSelection<'_>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if edits.is_empty() {
-            self.undo_manager.record_group(group);
+            if let Some(group) = group {
+                self.undo_manager.record_group(group);
+            }
             return;
         }
         let revision = self.document_revision;
-        self.edit_ranges(edits, window, cx);
-        if self.document_revision != revision {
+        self.with_edits_allowed(|this| {
+            this.undo_manager.set_pending_intent(EditIntent::Atomic);
+            this.replace_text_in_ranges_with_selection(edits, selection, window, cx);
+        });
+        if let Some(group) = group
+            && self.document_revision != revision
+        {
             self.undo_manager.set_group(group);
         }
     }
@@ -4101,7 +4158,24 @@ impl<M: InputModeKind> InputBaseState<M> {
     }
 
     pub fn scroll_to_projected_line(&mut self, line: usize, inset: Pixels, cx: &mut Context<Self>) {
-        self.pending_projected_scroll = Some((line, inset));
+        self.pending_projected_scroll = Some(ProjectedScroll::Line { line, inset });
+        cx.notify();
+    }
+
+    /// Scroll to the caret's wrapped row after layout, with context above it.
+    ///
+    /// A leading block can instead anchor the scroll to the virtual rows inserted
+    /// at that buffer-line boundary.
+    pub fn scroll_to_caret_with_context(
+        &mut self,
+        context_lines: usize,
+        leading_block: Option<usize>,
+        cx: &mut Context<Self>,
+    ) {
+        self.pending_projected_scroll = Some(ProjectedScroll::Caret {
+            context_lines,
+            leading_block,
+        });
         cx.notify();
     }
 
@@ -4979,7 +5053,8 @@ impl<M: InputModeKind> InputBaseState<M> {
         )
         .then_some(EditIntent::Atomic));
         let selection_before = *self.active_selection();
-        let original_selections: Vec<CursorSelection> = self.selections.iter().copied().collect();
+        let original_selections: Vec<CursorSelection> =
+            self.selections.iter().copied().collect();
         let line_edit_source =
             matches!(selection_after_edit, EditSelection::WholeLines).then(|| self.text.clone());
         // Snapshot the cursors before applying, so undo can restore them. A
@@ -9535,6 +9610,52 @@ mod tests {
 
                 s.redo(&Redo, window, cx);
                 assert_eq!(s.value(), "HELLO world");
+            });
+        });
+    }
+
+    #[gpui::test]
+    fn test_programmatic_replacement_records_mapped_selections(cx: &mut TestAppContext) {
+        let original = "top\n😀 word\nlast\n";
+        let replacement = "header\n文 word\nfinish\n";
+        let view = InputView::build_textarea(cx, |state| state.default_value(original));
+        let mut cx = VisualTestContext::from_window(view.window_handle.into(), cx);
+        cx.update(|window, cx| {
+            view.input.update(cx, |state, cx| {
+                let word = original.find("word").unwrap();
+                let cursor = original.find("last").unwrap() + 2;
+                state.set_selected_range_with_direction(word..word + 4, true, cx);
+                state.add_selection(cursor..cursor, cx);
+                let assert_selections = |state: &InputBaseState<_>, word, cursor| {
+                    assert_eq!(state.selected_range(), word..word + 4);
+                    assert!(state.is_selection_reversed());
+                    assert_eq!(state.selections.len(), 2);
+                    assert_eq!(
+                        state.selections.iter().nth(1).unwrap().cursor_offset(),
+                        cursor
+                    );
+                };
+
+                let before = state.text().clone();
+                state.edit_ranges_mapping_selections(
+                    &[(0..original.len(), replacement.into())],
+                    None,
+                    |text, offset| text.position_to_offset(&before.offset_to_position(offset)),
+                    window,
+                    cx,
+                );
+                let new_word = replacement.find("word").unwrap();
+                let new_cursor = replacement.find("finish").unwrap() + 2;
+                assert_eq!(state.text(), replacement);
+                assert_selections(state, new_word, new_cursor);
+
+                state.undo(&Undo, window, cx);
+                assert_eq!(state.text(), original);
+                assert_selections(state, word, cursor);
+
+                state.redo(&Redo, window, cx);
+                assert_eq!(state.text(), replacement);
+                assert_selections(state, new_word, new_cursor);
             });
         });
     }

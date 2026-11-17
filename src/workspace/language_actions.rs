@@ -700,6 +700,59 @@ impl EditPlan {
     }
 }
 
+fn apply_language_text_edits(
+    editor: &mut EditorState,
+    edits: &TextEdits,
+    group: Option<u64>,
+    window: &mut Window,
+    cx: &mut Context<EditorState>,
+) {
+    let before = editor.text().clone();
+    editor.edit_ranges_mapping_selections(
+        edits,
+        group,
+        |after, offset| map_language_edit_offset(&before, after, edits, offset),
+        window,
+        cx,
+    );
+}
+
+fn map_language_edit_offset(
+    before: &Rope,
+    after: &Rope,
+    edits: &TextEdits,
+    offset: usize,
+) -> usize {
+    let mut old_end = 0;
+    let mut new_end = 0;
+    // Validated LSP edits are sorted and disjoint.
+    for (range, replacement) in edits {
+        if offset <= range.start {
+            break;
+        }
+        let new_start = new_end + range.start - old_end;
+        new_end = new_start + replacement.len();
+        old_end = range.end;
+        if offset < range.end {
+            // A formatter can replace an entire file. Keep the relative line
+            // and column inside the replacement where its text permits it.
+            let old_start = before.offset_to_position(range.start);
+            let old_position = before.offset_to_position(offset);
+            let new_position = after.offset_to_position(new_start);
+            let row = old_position.line - old_start.line;
+            let column = if row == 0 {
+                new_position.character + old_position.character - old_start.character
+            } else {
+                old_position.character
+            };
+            return after
+                .position_to_offset(&Position::new(new_position.line + row, column))
+                .min(new_end);
+        }
+    }
+    new_end + offset - old_end
+}
+
 impl Workspace {
     pub(super) fn indent_source_newline(
         &mut self,
@@ -806,9 +859,9 @@ impl Workspace {
                 }
                 match result {
                     Ok(Some(edits)) if !edits.is_empty() => {
-                        editor
-                            .editor
-                            .update(cx, |editor, cx| editor.edit_ranges(&edits, window, cx));
+                        editor.editor.update(cx, |editor, cx| {
+                            apply_language_text_edits(editor, &edits, None, window, cx)
+                        });
                     }
                     Ok(Some(_)) => {}
                     Ok(None) => toast::info(window, cx, t!("lsp.format_unavailable")),
@@ -858,11 +911,7 @@ impl Workspace {
         }
         for (path, target) in &plan.targets {
             self.files[path].editor.update(cx, |editor, cx| {
-                if let Some(group) = group {
-                    editor.edit_ranges_in_group(&target.edits, group, window, cx);
-                } else {
-                    editor.edit_ranges(&target.edits, window, cx);
-                }
+                apply_language_text_edits(editor, &target.edits, group, window, cx);
             });
         }
         if let Some(group) = group {
@@ -1232,6 +1281,35 @@ mod tests {
         time::{Duration, Instant},
     };
 
+    #[::core::prelude::v1::test]
+    fn language_edits_map_offsets_through_an_earlier_insert_and_unicode_replacement() {
+        let before = Rope::from("let x = 😀old\nvery long\nunchanged\n");
+        let after = Rope::from("// Header\nlet x = 文new\nshort\nunchanged\n");
+        let original = before.to_string();
+        let updated = after.to_string();
+        let edits = vec![
+            (0..0, "// Header\n".into()),
+            (
+                original.find('😀').unwrap()..original.find("\nunchanged").unwrap(),
+                "文new\nshort".into(),
+            ),
+        ];
+        let map = |offset| map_language_edit_offset(&before, &after, &edits, offset);
+        assert_eq!(map(0), 0);
+        assert_eq!(
+            map(original.find("old").unwrap()),
+            updated.find("new").unwrap()
+        );
+        assert_eq!(
+            map(original.find("long").unwrap() + 2),
+            updated.find("\nunchanged").unwrap()
+        );
+        assert_eq!(
+            map(original.find("unchanged").unwrap()),
+            updated.find("unchanged").unwrap()
+        );
+    }
+
     fn pump(
         visual: &mut VisualTestContext,
         step: &str,
@@ -1431,7 +1509,18 @@ mod tests {
         })?;
         assert_eq!(fs::read_to_string(root.join(&main))?, original);
         visual.update(|window, cx| window.dispatch_action(Box::new(Undo), cx));
-        assert!(visual.update(|_, cx| editor.read(cx).text() == original));
+        visual.update(|window, cx| {
+            let editor = editor.read(cx);
+            assert_eq!(editor.text(), original);
+            assert_eq!(editor.selected_range(), 5..5);
+            assert!(editor.focus_handle(cx).is_focused(window));
+        });
+        visual.update(|window, cx| window.dispatch_action(Box::new(Redo), cx));
+        visual.update(|_, cx| {
+            assert_eq!(editor.read(cx).text(), "int fixed = 0;\n");
+            assert_eq!(editor.read(cx).selected_range(), 5..5);
+        });
+        visual.update(|window, cx| window.dispatch_action(Box::new(Undo), cx));
 
         // The local run enters via F2. The SSH run exercises the special clangd
         // action and the remote host timestamp checks.
@@ -1482,6 +1571,7 @@ mod tests {
             assert_eq!(workspace.tabs.active(), Some(main.as_path()));
             assert!(editor.read(cx).focus_handle(cx).is_focused(window));
             assert_eq!(editor.read(cx).text(), "int renamed = 0;\n");
+            assert_eq!(editor.read(cx).selected_range(), 5..5);
             assert!(workspace.tab_is_dirty(&main) && workspace.tab_is_dirty(&other));
         });
         assert_eq!(fs::read_to_string(root.join(&main))?, original);
@@ -1505,8 +1595,10 @@ mod tests {
             window.dispatch_action(Box::new(Undo), cx);
         });
         visual.run_until_parked();
-        visual.update(|_, cx| {
+        visual.update(|window, cx| {
             assert_eq!(editor.read(cx).text(), original);
+            assert_eq!(editor.read(cx).selected_range(), 5..5);
+            assert!(editor.read(cx).focus_handle(cx).is_focused(window));
             assert_eq!(
                 workspace.read(cx).files[&other].editor.read(cx).text(),
                 original
@@ -1514,8 +1606,10 @@ mod tests {
         });
         visual.update(|window, cx| window.dispatch_action(Box::new(Redo), cx));
         visual.run_until_parked();
-        visual.update(|_, cx| {
+        visual.update(|window, cx| {
             assert_eq!(editor.read(cx).text(), "int renamed = 0;\n");
+            assert_eq!(editor.read(cx).selected_range(), 5..5);
+            assert!(editor.read(cx).focus_handle(cx).is_focused(window));
             assert_eq!(
                 workspace.read(cx).files[&other].editor.read(cx).text(),
                 "int renamed = 0;\n"
@@ -1729,6 +1823,75 @@ mod tests {
     #[::core::prelude::v1::test]
     fn formats_only_the_active_draft_with_atomic_undo() -> Result<()> {
         formatting_workflow(None)
+    }
+
+    #[::core::prelude::v1::test]
+    fn formatting_undo_and_redo_keep_the_selected_line_in_view() -> Result<()> {
+        let mut app = test_app();
+        let tail = (0..160)
+            .map(|line| format!("// unchanged {line}\n"))
+            .collect::<String>();
+        let original = format!("int old = 0;\n// 😀draft\n{tail}");
+        let formatted = format!("int formatted = 0;\n// 😀note\n{tail}");
+        let (_fixture, workspace, visual) = open_fixture(&mut app, None, |root| {
+            fs::write(root.join("format-mode"), "static")?;
+            fs::write(root.join("main.cpp"), &original)?;
+            Ok(())
+        })?;
+        pump(visual, "formatter session", |visual| {
+            visual.update(|_, cx| {
+                workspace
+                    .read(cx)
+                    .active_file()
+                    .and_then(|file| file.language_server.as_ref())
+                    .is_some_and(|server| server.document.action_capabilities().list)
+            })
+        })?;
+        let selection = |text: &str| {
+            let start = text.find("unchanged 80").unwrap();
+            start..start + "unchanged".len()
+        };
+        let editor = visual.update(|window, cx| {
+            let editor = workspace.read(cx).active_file().unwrap().editor.clone();
+            editor.update(cx, |editor, cx| {
+                editor.focus(window, cx);
+                editor.set_selected_range_with_direction(selection(&original), true, cx);
+                let top = editor.line_height().unwrap() * 65.;
+                editor.set_scroll_offset(point(px(0.), -top), cx);
+            });
+            editor
+        });
+        let observe = |visual: &mut VisualTestContext, text: &str| {
+            visual.update(|window, cx| {
+                window.draw(cx).clear(cx);
+                let editor = editor.read(cx);
+                let range = selection(text);
+                assert_eq!(editor.text(), text);
+                assert_eq!(editor.selected_range(), range);
+                assert!(editor.is_selection_reversed());
+                assert!(editor.focus_handle(cx).is_focused(window));
+                let bounds = editor
+                    .range_to_bounds(&range)
+                    .expect("selection was laid out");
+                let viewport = editor.input_bounds();
+                assert!(bounds.top() >= viewport.top() && bounds.bottom() <= viewport.bottom());
+                editor.projected_top_line()
+            })
+        };
+        let top = observe(visual, &original);
+        assert!(top > 50);
+        visual.update(|window, cx| {
+            workspace.update(cx, |workspace, cx| {
+                workspace.format_document(&FormatDocument, window, cx);
+            });
+        });
+        wait_for_formatting(visual, &workspace)?;
+        assert_eq!(observe(visual, &formatted), top);
+        visual.update(|window, cx| window.dispatch_action(Box::new(Undo), cx));
+        assert_eq!(observe(visual, &original), top);
+        visual.update(|window, cx| window.dispatch_action(Box::new(Redo), cx));
+        assert_eq!(observe(visual, &formatted), top);
+        Ok(())
     }
 
     #[::core::prelude::v1::test]

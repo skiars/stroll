@@ -108,6 +108,7 @@ impl Render for PaneDrag {
 const FILE_TOOLBAR_HEIGHT: Pixels = px(36.);
 const PANE_RESIZE_GUTTER: Pixels = px(5.);
 const RECENT_REPOSITORY_LIMIT: usize = 3;
+const EDITOR_JUMP_CONTEXT_LINES: usize = 5;
 
 pub(crate) fn panel_resize(id: &'static str, edge: HandleEdge, top: Pixels) -> impl IntoElement {
     div()
@@ -406,6 +407,23 @@ enum FileOpen {
 enum SourcePosition {
     Lsp(lsp_types::Position),
     MarkdownFragment(String),
+}
+
+fn reveal_editor_range(
+    editor: &mut EditorState,
+    range: std::ops::Range<usize>,
+    leading_block: Option<usize>,
+    window: &mut Window,
+    cx: &mut Context<EditorState>,
+) {
+    use gpui_component::input::RopeExt as _;
+    editor.unfold_at(editor.text().offset_to_position(range.start), cx);
+    if !range.is_empty() {
+        editor.unfold_at(editor.text().offset_to_position(range.end), cx);
+    }
+    editor.set_selected_range(range, cx);
+    editor.focus(window, cx);
+    editor.scroll_to_caret_with_context(EDITOR_JUMP_CONTEXT_LINES, leading_block, cx);
 }
 
 struct DocumentOpen {
@@ -1913,44 +1931,39 @@ impl Workspace {
             FileOpen::Startup | FileOpen::Restore => (true, None, None),
         };
         self.select_file_tab(&path, preview, window, cx);
-        if position.is_some() || location.is_some() {
-            self.files.get_mut(&path).unwrap().restore_position = None;
-        }
         if let Some(position) = position {
             use gpui_component::input::RopeExt as _;
-            let found = self.files[&path].editor.update(cx, |editor, cx| {
-                let position = match &position {
-                    SourcePosition::Lsp(position) => lsp::editor_position(editor.text(), *position),
-                    SourcePosition::MarkdownFragment(fragment) => {
-                        docs::heading_source_offset(&editor.text().to_string(), fragment)
-                            .map(|offset| editor.text().offset_to_position(offset))
+            let text = self.files[&path].editor.read(cx).text();
+            let offset = match position {
+                SourcePosition::Lsp(position) => lsp::editor_position(text, position)
+                    .map(|position| text.position_to_offset(&position)),
+                SourcePosition::MarkdownFragment(fragment) => {
+                    let offset = docs::heading_source_offset(&text.to_string(), &fragment);
+                    if offset.is_none() {
+                        toast::info(window, cx, t!("docs.fragment_missing", fragment = fragment));
                     }
-                };
-                if let Some(position) = position {
-                    editor.unfold_at(position, cx);
-                    editor.set_cursor_position(position, window, cx);
+                    offset
                 }
-                position.is_some()
-            });
-            if !found && let SourcePosition::MarkdownFragment(fragment) = position {
-                toast::info(window, cx, t!("docs.fragment_missing", fragment = fragment));
+            };
+            if let Some(offset) = offset {
+                let file = self.files.get_mut(&path).unwrap();
+                file.restore_position = None;
+                file.editor.update(cx, |editor, cx| {
+                    reveal_editor_range(editor, offset..offset, None, window, cx);
+                });
             }
         }
         if let Some((range, fingerprint)) = location {
-            use gpui_component::input::RopeExt as _;
-            let applied = self.files[&path].editor.update(cx, |editor, cx| {
+            let file = self.files.get_mut(&path).unwrap();
+            file.restore_position = None;
+            let applied = file.editor.update(cx, |editor, cx| {
                 let text = editor.text();
                 if crate::locator::fingerprint(&text.to_string()) != fingerprint
                     || range.end > text.len()
                 {
                     return false;
                 }
-                let start = text.offset_to_position(range.start);
-                let end = text.offset_to_position(range.end);
-                editor.unfold_at(start, cx);
-                editor.unfold_at(end, cx);
-                editor.set_cursor_position(start, window, cx);
-                editor.set_selected_range(range, cx);
+                reveal_editor_range(editor, range, None, window, cx);
                 true
             });
             if !applied {
@@ -4394,6 +4407,119 @@ mod layout_tests {
     use gpui::{TestAppContext, TestDispatcher, VisualTestContext, px, size};
     use gpui_component::Root;
     use std::process::Command;
+
+    #[::core::prelude::v1::test]
+    fn definition_jump_reveals_wrapped_caret_on_open_and_at_eof() -> Result<()> {
+        use gpui_component::input::RopeExt as _;
+        use lsp_types::{Position, Range, ShowDocumentParams};
+
+        let fixture = tempfile::tempdir()?;
+        let root = fixture.path().canonicalize()?.join("repo");
+        assert!(
+            Command::new("git")
+                .args(["init", "-q"])
+                .arg(&root)
+                .status()?
+                .success()
+        );
+        let source = PathBuf::from("source.txt");
+        let target = PathBuf::from("target.txt");
+        let prefix = "data ".repeat(240) + "😀 ";
+        let text = format!(
+            "{}{prefix}definition\n{}last",
+            "before\n".repeat(32),
+            "after\n".repeat(48)
+        );
+        fs::write(root.join(&source), "definition\n")?;
+        fs::write(root.join(&target), text)?;
+        let uri: lsp_types::Uri = url::Url::from_file_path(root.join(&target))
+            .unwrap()
+            .as_str()
+            .parse()?;
+        let store = Arc::new(Store::new(fixture.path().join("state"))?);
+        let config = ConfigFile::load(Some(fixture.path().join("config.toml")));
+        let mut app = TestAppContext::build_with_text_system(
+            TestDispatcher::new(0),
+            None,
+            gpui_platform::current_platform(true).text_system(),
+        );
+        app.update(gpui_component::init);
+        let mut workspace = None;
+        let (_, visual) = app.add_window_view(|window, cx| {
+            let view = cx
+                .new(|cx| Workspace::with_config(store, config, WorkspaceView::Editor, window, cx));
+            workspace = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        let workspace = workspace.unwrap();
+        visual.simulate_resize(size(px(920.), px(510.)));
+        visual.update(|window, cx| {
+            workspace.update(cx, |this, cx| {
+                this.open_repository(
+                    Location {
+                        root,
+                        file: Some(source.clone()),
+                    },
+                    window,
+                    cx,
+                );
+            });
+        });
+        visual.run_until_parked();
+        visual.update(|window, cx| {
+            window.draw(cx).clear(cx);
+            let workspace = workspace.read(cx);
+            assert_eq!(workspace.tabs.active(), Some(source.as_path()));
+            assert!(!workspace.files.contains_key(&target));
+        });
+
+        let jump = |visual: &mut VisualTestContext, line, character| {
+            visual.update(|window, cx| {
+                workspace.update(cx, |this, cx| {
+                    let start = Position::new(line, character);
+                    this.open_definition(
+                        ShowDocumentParams {
+                            uri: uri.clone(),
+                            external: None,
+                            take_focus: Some(true),
+                            selection: Some(Range::new(start, start)),
+                        },
+                        window,
+                        cx,
+                    );
+                });
+            });
+            visual.run_until_parked();
+            visual.update(|window, cx| {
+                window.draw(cx).clear(cx);
+                let workspace = workspace.read(cx);
+                assert_eq!(workspace.tabs.active(), Some(target.as_path()));
+                let editor = workspace.files[&target].editor.read(cx);
+                assert!(editor.focus_handle(cx).is_focused(window));
+                let offset = editor.cursor();
+                let caret = editor.range_to_bounds(&(offset..offset)).unwrap();
+                let viewport = editor.input_bounds();
+                assert!(caret.top() >= viewport.top() && caret.bottom() <= viewport.bottom());
+                (
+                    editor.text().offset_to_position(offset),
+                    caret.top() - viewport.top(),
+                    editor.line_height().unwrap(),
+                    editor.projected_wrap_rows(line as usize),
+                )
+            })
+        };
+        let (position, inset, line_height, wrapped) =
+            jump(visual, 32, prefix.encode_utf16().count() as u32);
+        assert_eq!(position, Position::new(32, prefix.chars().count() as u32));
+        assert!(wrapped > EDITOR_JUMP_CONTEXT_LINES);
+        let expected = EDITOR_JUMP_CONTEXT_LINES * line_height;
+        assert!(
+            (inset - expected).abs() < px(1.),
+            "Wrapped caret at {inset:?}, expected {expected:?}"
+        );
+        assert_eq!(jump(visual, 81, 4).0, Position::new(81, 4));
+        Ok(())
+    }
 
     /// Saving reports itself without moving the buffer.
     ///

@@ -12,7 +12,7 @@ mod tree;
 
 use std::{
     borrow::Cow,
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{BTreeSet, HashMap, HashSet, VecDeque},
     path::PathBuf,
     rc::Rc,
     sync::Arc,
@@ -184,7 +184,7 @@ struct Review {
     live: HashMap<usize, review::LivePatch>,
     by_path: Rc<HashMap<String, usize>>,
     collapsed: HashSet<String>,
-    directories: HashSet<String>,
+    directories: Arc<BTreeSet<String>>,
     tree_rows: std::cell::RefCell<Option<tree::TreeRows>>,
     tree_motion: std::cell::RefCell<super::tree_motion::TreeMotion<tree::Row>>,
     summary_layout: Option<(review::CommitSummaryLayout, Pixels)>,
@@ -276,6 +276,7 @@ pub(super) struct GitPanel {
     tree_pane: Entity<GitPane>,
     tree_scroll: UniformListScrollHandle,
     tree_followed_file: Option<String>,
+    worktree_directories: Arc<BTreeSet<String>>,
     query: String,
     filter: String,
     only_matching: bool,
@@ -533,6 +534,11 @@ impl GitPanel {
             tree_pane,
             tree_scroll: UniformListScrollHandle::new(),
             tree_followed_file: None,
+            worktree_directories: session
+                .git
+                .as_ref()
+                .map(|git| git.worktree_directories.clone())
+                .unwrap_or_default(),
             query,
             filter: String::new(),
             only_matching: false,
@@ -1117,6 +1123,7 @@ impl GitPanel {
             selection: self.selection.clone(),
             history,
             diff,
+            worktree_directories: self.worktree_directories.clone(),
         })
     }
 

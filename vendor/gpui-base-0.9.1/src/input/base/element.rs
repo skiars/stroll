@@ -37,6 +37,7 @@ use super::{
     cursor::CursorSelection,
     layout::{LastLayout, WhitespaceIndicators},
     mode::LayoutMode,
+    state::ProjectedScroll,
     tab_stops::{expand_tabs, expanded_width, tab_stop_width},
 };
 
@@ -1151,6 +1152,33 @@ impl<M: InputModeKind> TextElement<M> {
         }
     }
 
+    fn resolve_projected_scroll(
+        state: &mut InputBaseState<M>,
+        request: ProjectedScroll,
+        line_height: Pixels,
+        viewport_height: Pixels,
+    ) {
+        let map = &state.display_map;
+        let (row, inset) = match request {
+            ProjectedScroll::Line { line, inset } => (map.buffer_line_to_display_row(line), inset),
+            ProjectedScroll::Caret {
+                context_lines,
+                leading_block,
+            } => {
+                let row = leading_block
+                    .and_then(|line| map.block_start(line))
+                    .unwrap_or_else(|| {
+                        map.offset_to_display_row(state.cursor(), state.cursor_line_end_affinity)
+                    });
+                let inset =
+                    (context_lines * line_height).min((viewport_height - line_height).max(px(0.)));
+                (row, inset)
+            }
+        };
+        let y = inset - map.display_row_top(row, line_height);
+        state.deferred_scroll_offset = Some(point(state.scroll_handle.offset().x, y));
+    }
+
     fn active_caret_selection(state: &InputBaseState<M>) -> CursorSelection {
         let mut selection = *state.active_selection();
         if let Some(marked) = state.ime_marked_range {
@@ -1177,6 +1205,10 @@ impl<M: InputModeKind> TextElement<M> {
 
         let active_selection = Self::active_caret_selection(state);
         let edited = state.pending_edit_reveal;
+        let jump = matches!(
+            state.pending_projected_scroll,
+            Some(ProjectedScroll::Caret { .. })
+        );
         let mut scroll_offset = state.scroll_handle.offset();
         let mut current_row = None;
         let mut resize_reveal_owned = false;
@@ -1286,10 +1318,10 @@ impl<M: InputModeKind> TextElement<M> {
                 current_row = Some(cursor_row);
 
                 let auto_scrolling = state.auto_scroll.is_active();
-                if (selection_changed || reveal_on_resize || edited) && !is_selected_all {
+                if (selection_changed || reveal_on_resize || edited || jump) && !is_selected_all {
                     // Resize-follow owns only vertical visibility. An unshaped
                     // target has no reliable x; retain the existing x offset.
-                    if selection_changed || edited {
+                    if selection_changed || edited || jump {
                         // Right-aligned carets are clamped instead of scrolling.
                         let safety_margin = match last_layout.text_align {
                             TextAlign::Left if !edited => RIGHT_MARGIN,
@@ -1361,7 +1393,11 @@ impl<M: InputModeKind> TextElement<M> {
         }
 
         if let Some(deferred_scroll_offset) = state.deferred_scroll_offset {
-            scroll_offset = deferred_scroll_offset;
+            if jump {
+                scroll_offset.y = deferred_scroll_offset.y;
+            } else {
+                scroll_offset = deferred_scroll_offset;
+            }
         }
         scroll_offset.x = clamp_horizontal_scroll_offset(
             scroll_offset.x,
@@ -4125,12 +4161,17 @@ impl<M: InputModeKind> Element for TextElement<M> {
                 }
             });
         }
-        if let Some((line, inset)) = self.state.read(cx).pending_projected_scroll {
-            self.state.update(cx, |state, _| {
-                let map = &state.display_map;
-                let y =
-                    inset - map.display_row_top(map.buffer_line_to_display_row(line), line_height);
-                state.deferred_scroll_offset = Some(point(state.scroll_handle.offset().x, y));
+        let projected_scroll = self.state.read(cx).pending_projected_scroll;
+        if let Some(request) = projected_scroll {
+            self.state.update(cx, |state, cx| {
+                if matches!(request, ProjectedScroll::Caret { .. })
+                    && state.display_map.wrap_pending()
+                {
+                    let caret = state.text.offset_to_point(state.cursor()).row;
+                    state.display_map.prepare_wrap_rows(caret..caret + 1, cx);
+                    Self::update_block_projection(state, &hunk_rows, line_height);
+                }
+                Self::resolve_projected_scroll(state, request, line_height, bounds.size.height);
             });
         }
         if self.state.read(cx).display_map.wrap_pending() && line_height > px(0.) {
@@ -4161,6 +4202,9 @@ impl<M: InputModeKind> Element for TextElement<M> {
                     Self::update_block_projection(state, &hunk_rows, line_height);
                     true
                 });
+                if let Some(request @ ProjectedScroll::Caret { .. }) = projected_scroll {
+                    Self::resolve_projected_scroll(state, request, line_height, bounds.size.height);
+                }
                 if let Some((job, batch)) = state.display_map.wrap_batch(cx) {
                     let hunk_rows = hunk_rows.clone();
                     let hunk_render = state.extras.gutter_hunk().map(|hunk| hunk.render.clone());

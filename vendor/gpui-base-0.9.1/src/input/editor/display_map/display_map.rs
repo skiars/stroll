@@ -515,6 +515,15 @@ impl DisplayMap {
         self.fold_map.wrap_row_to_display_row(wrap_row)
     }
 
+    /// The first virtual display row at this buffer-line boundary.
+    pub(crate) fn block_start(&self, line: usize) -> Option<usize> {
+        let boundary = self.block_boundary(line)?;
+        let inserted = boundary
+            .checked_sub(1)
+            .map_or(0, |row| self.block_rows_through(row));
+        Some(boundary + inserted)
+    }
+
     /// Move through editable rows, skipping virtual blocks.
     pub(crate) fn move_wrap_row(&self, wrap_row: usize, delta: isize) -> usize {
         let row = self.fold_map.nearest_visible_display_row(wrap_row);
