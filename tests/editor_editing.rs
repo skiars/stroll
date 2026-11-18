@@ -88,7 +88,7 @@ fn select(
 }
 
 #[test]
-fn edits_keep_diagnostics_on_untouched_lines_until_the_next_reply() {
+fn edits_keep_diagnostics_on_untouched_ranges_until_the_next_reply() {
     let source = "edit me\n😀 error\n";
     with_editor(source, true, false, false, |visual, editor| {
         visual.update(|_, cx| {
@@ -106,7 +106,7 @@ fn edits_keep_diagnostics_on_untouched_lines_until_the_next_reply() {
                 }
             });
         });
-        select(visual, editor, 4..4);
+        select(visual, editor, 2..2);
         visual.simulate_input("\n");
         draw(visual);
         visual.update(|_, cx| {

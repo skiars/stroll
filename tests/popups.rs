@@ -678,6 +678,86 @@ fn resize_handle_cancels_pending_and_active_drags_when_the_left_button_is_up(
 }
 
 #[gpui::test]
+fn open_diagnostic_updates_in_place_after_an_edit(cx: &mut gpui::TestAppContext) {
+    use gpui::{AppContext as _, Context, Entity, Render, Styled as _, Window};
+    use gpui_component::{
+        Root,
+        input::{Editor, EditorState},
+    };
+
+    use lsp_types::{Diagnostic, Position, Range};
+
+    let diagnostic = |row, message: &str| {
+        Diagnostic::new_simple(
+            Range::new(Position::new(row, 0), Position::new(row, 5)),
+            message.into(),
+        )
+    };
+    struct Probe(Entity<EditorState>);
+    impl Render for Probe {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl gpui::IntoElement {
+            Editor::new(&self.0).size_full()
+        }
+    }
+
+    cx.update(gpui_component::init);
+    let mut editor = None;
+    let (_, cx) = cx.add_window_view(|window, cx| {
+        let state = cx.new(|cx| {
+            let mut state = EditorState::new(window, cx).default_value("error; ok\nother\n");
+            let set = state.diagnostics_mut().unwrap();
+            set.push(diagnostic(0, "Previous error"));
+            set.push(diagnostic(1, "Other error"));
+            state
+        });
+        editor = Some(state.clone());
+        let probe = cx.new(|_| Probe(state));
+        Root::new(probe, window, cx)
+    });
+    let editor = editor.unwrap();
+    let pointer = cx.update(|window, cx| {
+        editor.update(cx, |editor, cx| {
+            editor.focus(window, cx);
+            editor.set_selected_range(9..9, cx);
+        });
+        window.draw(cx).clear(cx);
+        editor.read(cx).range_to_bounds(&(0..5)).unwrap().center()
+    });
+    cx.simulate_mouse_move(pointer, None, Default::default());
+
+    let visible_message = |cx: &mut gpui::VisualTestContext| {
+        cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+            editor
+                .read(cx)
+                .diagnostic_popover()
+                .map(|entry| entry.message.clone())
+        })
+    };
+    assert_eq!(visible_message(cx).as_deref(), Some("Previous error"));
+    cx.simulate_input(" ");
+    assert_eq!(visible_message(cx).as_deref(), Some("Previous error"));
+    cx.update(|_, cx| {
+        editor.update(cx, |editor, cx| {
+            let text = editor.text().clone();
+            let set = editor.diagnostics_mut().unwrap();
+            assert_eq!(set.iter().nth(1).unwrap().range, 11..16);
+            set.reset(&text);
+            set.push(diagnostic(0, "Current error"));
+            cx.notify();
+        });
+    });
+    assert_eq!(visible_message(cx).as_deref(), Some("Current error"));
+    cx.update(|_, cx| {
+        editor.update(cx, |editor, cx| {
+            editor.diagnostics_mut().unwrap().clear();
+            cx.notify();
+        });
+    });
+    assert_eq!(visible_message(cx), None);
+}
+
+#[gpui::test]
 fn editor_hover_waits_for_pointer_motion_after_scrolling(cx: &mut gpui::TestAppContext) {
     use std::rc::Rc;
 

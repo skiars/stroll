@@ -4,7 +4,11 @@ use instant::Duration;
 use ropey::Rope;
 use std::{collections::BTreeMap, ops::Range, rc::Rc, sync::Arc};
 
-use crate::input::{DiagnosticSeverity, EditorMode, HoverPopoverState, InputBaseState, RopeExt};
+use crate::input::{
+    DiagnosticEntry, DiagnosticSeverity, EditorMode, HoverPopoverState, InputBaseState, RopeExt,
+};
+
+use super::super::diagnostics::retained_range;
 
 /// Additional documentation resolved after the original hover is visible.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -66,18 +70,7 @@ impl InputBaseState<EditorMode> {
         )
     }
 
-    /// Handle hover trigger LSP request.
-    pub(super) fn handle_hover_popover(
-        &mut self,
-        offset: usize,
-        position: Point<Pixels>,
-        window: &mut Window,
-        cx: &mut Context<InputBaseState<EditorMode>>,
-    ) {
-        if self.selecting {
-            return;
-        }
-
+    fn hover_diagnostics_at(&self, offset: usize) -> Vec<&DiagnosticEntry> {
         let mut diagnostics = self
             .diagnostics()
             .into_iter()
@@ -92,6 +85,22 @@ impl InputBaseState<EditorMode> {
             };
             (severity, entry.range.len())
         });
+        diagnostics
+    }
+
+    /// Handle hover trigger LSP request.
+    pub(super) fn handle_hover_popover(
+        &mut self,
+        offset: usize,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<InputBaseState<EditorMode>>,
+    ) {
+        if self.selecting {
+            return;
+        }
+
+        let diagnostics = self.hover_diagnostics_at(offset);
 
         if self.extras.hover_popover.as_ref().is_some_and(|popover| {
             popover.pointer.is_none()
@@ -254,6 +263,40 @@ impl InputBaseState<EditorMode> {
         }
     }
 
+    pub(in crate::input) fn adjust_language_hover_for_edit(
+        &mut self,
+        edited: &Range<usize>,
+        inserted_len: usize,
+    ) {
+        self.extras.lsp._hover_task = Task::ready(Ok(()));
+        self.extras.hover_definition.clear();
+        let Some(popover) = self.extras.hover_popover.as_mut() else {
+            return;
+        };
+        // Only keep an open diagnostic attached to surviving text. A pending
+        // documentation request belongs to the previous document revision.
+        let remap = |range: &Range<usize>| retained_range(range, edited, inserted_len);
+        let (Some(symbol_range), Some(target_range)) =
+            (remap(&popover.symbol_range), remap(&popover.target_range))
+        else {
+            self.extras.hover_popover = None;
+            return;
+        };
+        if popover.pointer.is_none() || popover.diagnostics.is_empty() {
+            self.extras.hover_popover = None;
+            return;
+        }
+        popover.symbol_range = symbol_range;
+        popover.target_range = target_range;
+        popover.documentation_target = popover.documentation_target.as_ref().and_then(remap);
+        if popover.documentation_target.is_none() {
+            popover.hover = None;
+            popover.documentation = None;
+        } else if popover.hover.is_none() {
+            popover.documentation_target = None;
+        }
+    }
+
     pub(crate) fn validate_language_hover(&mut self, clip: Bounds<Pixels>, cx: &mut Context<Self>) {
         let Some(popover) = self.extras.hover_popover.as_ref() else {
             return;
@@ -261,19 +304,35 @@ impl InputBaseState<EditorMode> {
         let Some(pointer) = popover.pointer else {
             return;
         };
-        let valid = self.input_bounds.contains(&pointer)
-            && clip.contains(&pointer)
-            && self.text_offset_at_point(pointer).is_some_and(|offset| {
-                if popover.documentation_target.is_some() {
-                    popover.documentation_target == self.documentation_target_at(offset)
+        let offset = (self.input_bounds.contains(&pointer) && clip.contains(&pointer))
+            .then(|| self.text_offset_at_point(pointer))
+            .flatten()
+            .filter(|&offset| {
+                if let Some(target) = &popover.documentation_target {
+                    self.documentation_target_at(offset).as_ref() == Some(target)
                 } else {
                     popover.target_range.contains(&offset) || popover.target_range.start == offset
                 }
-            })
-            && self.range_to_bounds(&popover.symbol_range).is_some();
-        if !valid {
+            });
+        let Some(offset) = offset.filter(|_| self.range_to_bounds(&popover.symbol_range).is_some())
+        else {
+            self.clear_language_hover(cx);
+            return;
+        };
+        if !popover.visible() {
+            return;
+        }
+        let diagnostics = self.hover_diagnostics_at(offset);
+        if diagnostics.iter().copied().eq(popover.diagnostics.iter()) {
+            return;
+        }
+        let diagnostics: Rc<[_]> = diagnostics.into_iter().cloned().collect();
+        let popover = self.extras.hover_popover.as_mut().unwrap();
+        popover.diagnostics = diagnostics;
+        if !popover.visible() && popover.documentation_target.is_none() {
             self.clear_language_hover(cx);
         }
+        cx.notify();
     }
 
     pub fn clear_hover_state(&mut self, cx: &mut Context<Self>) {

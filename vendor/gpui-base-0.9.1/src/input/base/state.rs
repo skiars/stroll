@@ -58,7 +58,10 @@ pub(crate) enum ScrollPadding {
 
 #[derive(Clone, Copy)]
 pub(super) enum ProjectedScroll {
-    Line { line: usize, inset: Pixels },
+    Line {
+        line: usize,
+        inset: Pixels,
+    },
     Caret {
         context_lines: usize,
         leading_block: Option<usize>,
@@ -5061,8 +5064,7 @@ impl<M: InputModeKind> InputBaseState<M> {
         )
         .then_some(EditIntent::Atomic));
         let selection_before = *self.active_selection();
-        let original_selections: Vec<CursorSelection> =
-            self.selections.iter().copied().collect();
+        let original_selections: Vec<CursorSelection> = self.selections.iter().copied().collect();
         let line_edit_source =
             matches!(selection_after_edit, EditSelection::WholeLines).then(|| self.text.clone());
         // Snapshot the cursors before applying, so undo can restore them. A
@@ -5590,7 +5592,11 @@ impl<M: InputModeKind> EntityInputHandler for InputBaseState<M> {
             );
         }
         if let Some(diagnostics) = self.mode.diagnostics_mut() {
-            diagnostics.reset(&self.text)
+            if mask_changed {
+                diagnostics.reset(&self.text);
+            } else {
+                diagnostics.adjust_for_edit(&self.text, &range, new_text.len());
+            }
         }
         // Adjust folds before updating wrap map: remove overlapping folds and shift others
         self.display_map
@@ -5742,7 +5748,7 @@ impl<M: InputModeKind> EntityInputHandler for InputBaseState<M> {
         }
         M::adjust_annotations(self, &range, new_text.len());
         if let Some(diagnostics) = self.mode.diagnostics_mut() {
-            diagnostics.reset(&self.text)
+            diagnostics.adjust_for_edit(&self.text, &range, new_text.len());
         }
         // Adjust folds before updating wrap map: remove overlapping folds and shift others
         self.display_map

@@ -28,6 +28,7 @@ pub(super) struct CaretHints {
     decorations: RangeDecorationCollection,
     snapshot: Option<Snapshot>,
     highlights: Task<()>,
+    highlighted_word: Option<String>,
     signature_request: Task<()>,
     signature: Option<SignatureHelp>,
     signature_active: bool,
@@ -39,6 +40,7 @@ impl CaretHints {
             decorations: editor.create_range_decorations_collection(Vec::new(), cx),
             snapshot: None,
             highlights: Task::ready(()),
+            highlighted_word: None,
             signature_request: Task::ready(()),
             signature: None,
             signature_active: false,
@@ -48,8 +50,14 @@ impl CaretHints {
     pub(super) fn clear(&mut self, cx: &mut App) {
         self.snapshot = None;
         self.highlights = Task::ready(());
+        self.highlighted_word = None;
         self.decorations.clear(cx);
         self.dismiss_signature();
+    }
+
+    #[cfg(test)]
+    pub(super) fn highlight_ranges(&self, cx: &App) -> Vec<Range<usize>> {
+        self.decorations.get_ranges(cx)
     }
 
     fn dismiss_signature(&mut self) {
@@ -205,9 +213,18 @@ impl Workspace {
         let path = file.path.clone();
         if moved {
             hints.highlights = Task::ready(());
-            hints.decorations.clear(cx);
-            let at_word = snapshot.caret < text.len() && text.word_range(snapshot.caret).is_some();
-            if at_word {
+            let target = text.word_range(snapshot.caret);
+            let retain = target.as_ref().is_some_and(|target| {
+                hints.highlighted_word.as_deref().is_some_and(|word| {
+                    text.slice(target.clone()) == word
+                        && hints.decorations.get_ranges(cx).contains(target)
+                })
+            });
+            if !retain {
+                hints.decorations.clear(cx);
+                hints.highlighted_word = None;
+            }
+            if let Some(target) = target {
                 let expected = snapshot.clone();
                 let text = text.clone();
                 let document = document.clone();
@@ -227,6 +244,7 @@ impl Workspace {
                         else {
                             return;
                         };
+                        let decorations = file.caret_hints.decorations.clone();
                         let foreground = cx.theme().foreground;
                         let highlights = highlights
                             .into_iter()
@@ -250,7 +268,12 @@ impl Workspace {
                                 })
                             })
                             .collect();
-                        file.caret_hints.decorations.clone().set(highlights, cx);
+                        this.files
+                            .get_mut(&path)
+                            .unwrap()
+                            .caret_hints
+                            .highlighted_word = Some(text.slice(target).to_string());
+                        decorations.set(highlights, cx);
                     });
                 });
             }

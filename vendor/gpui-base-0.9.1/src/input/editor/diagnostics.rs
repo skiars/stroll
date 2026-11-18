@@ -123,6 +123,24 @@ pub struct DiagnosticEntry {
     pub diagnostic: Diagnostic,
 }
 
+// An annotation remains valid while its underlying text is unchanged.
+pub(super) fn retained_range(
+    range: &Range<usize>,
+    edited: &Range<usize>,
+    inserted_len: usize,
+) -> Option<Range<usize>> {
+    if range.end <= edited.start && range.start < edited.start {
+        return Some(range.clone());
+    }
+    if range.start >= edited.end {
+        let delta = inserted_len as isize - edited.len() as isize;
+        return Some(
+            range.start.saturating_add_signed(delta)..range.end.saturating_add_signed(delta),
+        );
+    }
+    None
+}
+
 impl Deref for DiagnosticEntry {
     type Target = Diagnostic;
 
@@ -198,23 +216,15 @@ impl DiagnosticSet {
             return;
         }
 
-        let first_row = self.text.offset_to_point(edited.start).row;
-        let last_row = self.text.offset_to_point(edited.end).row;
-        let first_byte = self.text.line_start_offset(first_row);
-        let next_line = self.text.line_start_offset(last_row + 1);
-        let delta = inserted_len as isize - edited.len() as isize;
         let retained = self.diagnostics.iter().filter_map(|entry| {
-            if entry.range.start < first_byte && entry.range.end <= first_byte {
+            let range = retained_range(&entry.range, edited, inserted_len)?;
+            if entry.range.end <= edited.start && entry.range.start < edited.start {
                 return Some(entry.clone());
             }
-            if last_row + 1 >= self.text.lines_len() || entry.range.start < next_line {
-                return None;
-            }
             let mut entry = entry.clone();
-            entry.range.start = entry.range.start.saturating_add_signed(delta);
-            entry.range.end = entry.range.end.saturating_add_signed(delta);
-            entry.diagnostic.range = text.offset_to_position(entry.range.start)
-                ..text.offset_to_position(entry.range.end);
+            entry.diagnostic.range =
+                text.offset_to_position(range.start)..text.offset_to_position(range.end);
+            entry.range = range;
             Some(entry)
         });
         self.diagnostics = SumTree::from_iter(retained, &());

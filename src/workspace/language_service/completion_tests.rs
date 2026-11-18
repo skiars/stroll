@@ -480,6 +480,228 @@ fn workspace_completion_with_clangd() -> Result<()> {
 }
 
 #[test]
+#[ignore = "requires clangd on PATH"]
+fn local_cpp_diagnostics_and_highlights_stay_visible_during_edits() -> Result<()> {
+    let fixture = tempfile::tempdir()?;
+    let root = fixture.path().canonicalize()?;
+    let source = concat!(
+        "int broken = unknown;\n",
+        "int malformed = ;\n",
+        "int apple = 1;\n",
+        "int pear = 2;\n",
+        "int run() { return apple + apple + pear + pear; }\n",
+    );
+    let local_file = root.join("standalone.cpp");
+    fs::write(&local_file, source)?;
+    let configuration = "[lsp.clangd]\ncommand = 'clangd'\n";
+
+    with_workspace_editor(
+        &root,
+        "repository.cpp",
+        configuration,
+        "int repository_value;\n",
+        0,
+        |visual, workspace, _| {
+            let position = visual.debug_bounds("file-drop-content").unwrap().center();
+            visual.simulate_event(gpui::FileDropEvent::Entered {
+                position,
+                paths: gpui::ExternalPaths([local_file.clone()].into_iter().collect()),
+            });
+            visual.simulate_event(gpui::FileDropEvent::Submit { position });
+            exercise_local_cpp(visual, workspace, &local_file, source)
+        },
+    )?;
+
+    let store = Arc::new(Store::new(root.join("standalone-state"))?);
+    let config = ConfigFile::load(Some(root.join("config.toml")));
+    let mut app = TestAppContext::build_with_text_system(
+        TestDispatcher::new(0),
+        None,
+        gpui_platform::current_platform(true).text_system(),
+    );
+    app.update(gpui_component::init);
+    app.update(|cx| Workspace::open_standalone(store, config, local_file.clone(), None, cx))?;
+    let handle = app.windows()[0];
+    let mut visual = VisualTestContext::from_window(handle, &app);
+    visual.simulate_resize(size(px(940.), px(580.)));
+    let workspace = app.update_window(handle, |root, _, cx| {
+        root.downcast::<Root>()
+            .unwrap()
+            .read(cx)
+            .view()
+            .clone()
+            .downcast::<Workspace>()
+            .unwrap()
+    })?;
+    visual.update(|_, cx| assert!(workspace.read(cx).repository.is_none()));
+    exercise_local_cpp(&mut visual, &workspace, &local_file, source)
+}
+
+fn exercise_local_cpp(
+    visual: &mut VisualTestContext,
+    workspace: &Entity<Workspace>,
+    path: &Path,
+    source: &str,
+) -> Result<()> {
+    let initial_diagnostics = wait(visual, "diagnostics for the local C++ file", |visual| {
+        visual.update(|_, cx| {
+            workspace.read(cx).active_file().is_some_and(|file| {
+                file.path == path
+                    && file.server_project.as_ref().is_some_and(|project| {
+                        !project.key.is_remote()
+                            && project.key.project_path() == path.parent().unwrap()
+                    })
+                    && file.editor.read(cx).diagnostics().is_some_and(|set| {
+                        set.iter().any(|entry| entry.message.contains("unknown"))
+                            && set.iter().any(|entry| {
+                                entry
+                                    .message
+                                    .to_ascii_lowercase()
+                                    .contains("expected expression")
+                            })
+                    })
+            })
+        })
+    });
+    if initial_diagnostics.is_err() {
+        visual.update(|_, cx| {
+            let state = workspace.read(cx);
+            let active = state.active_file();
+            eprintln!(
+                "Expected {path:?}, active file: {:?}",
+                active.map(|file| &file.path)
+            );
+            if let Some(file) = active {
+                eprintln!("Has a language server: {}", file.language_server.is_some());
+                eprintln!(
+                    "Actual diagnostics: {:?}",
+                    file.editor
+                        .read(cx)
+                        .diagnostics()
+                        .into_iter()
+                        .flat_map(|set| set.iter())
+                        .map(|entry| entry.message.as_str())
+                        .collect::<Vec<_>>()
+                );
+            }
+        });
+        initial_diagnostics?;
+    }
+    let apple = source.find("return apple").unwrap() + "return ".len();
+    let editor = visual.update(|window, cx| {
+        let file = workspace.read(cx).active_file().unwrap();
+        let editor = file.editor.clone();
+        editor.update(cx, |editor, cx| {
+            editor.focus(window, cx);
+            editor.set_selected_range(apple..apple, cx);
+        });
+        editor
+    });
+    let highlights = |visual: &mut VisualTestContext, word: &str| {
+        visual.update(|_, cx| {
+            let file = workspace.read(cx).active_file().unwrap();
+            let ranges = file.caret_hints.highlight_ranges(cx);
+            ranges.len() == 3
+                && ranges
+                    .into_iter()
+                    .all(|range| editor.read(cx).text().slice(range) == word)
+        })
+    };
+    wait(visual, "three apple highlights", |visual| {
+        highlights(visual, "apple")
+    })?;
+    let pointer = visual.update(|_, cx| {
+        let start = source.find("unknown").unwrap();
+        editor
+            .read(cx)
+            .range_to_bounds(&(start..start + "unknown".len()))
+            .unwrap()
+            .center()
+    });
+    visual.simulate_mouse_move(pointer, None, Default::default());
+    let has_error_popup = |visual: &mut VisualTestContext| {
+        visual.update(|_, cx| {
+            editor.read(cx).hover_popover().is_some_and(|popover| {
+                popover
+                    .diagnostics
+                    .iter()
+                    .any(|entry| entry.message.contains("unknown"))
+            })
+        })
+    };
+    wait(visual, "open diagnostic popup", has_error_popup)?;
+    for _ in 0..6 {
+        visual.simulate_input(" ");
+        for _ in 0..3 {
+            frame(visual);
+            assert!(
+                has_error_popup(visual)
+                    && visual.debug_bounds("diagnostic-quick-fix-button").is_some(),
+                "the diagnostic popup disappeared during input"
+            );
+            assert!(
+                highlights(visual, "apple"),
+                "the symbol decorations disappeared during input at {:?}",
+                visual.update(|_, cx| {
+                    let file = workspace.read(cx).active_file().unwrap();
+                    (
+                        editor.read(cx).cursor(),
+                        file.caret_hints.highlight_ranges(cx),
+                    )
+                })
+            );
+            visual.update(|_, cx| {
+                assert!(editor.read(cx).diagnostics().unwrap().len() >= 2);
+            });
+        }
+    }
+
+    visual.update(|window, cx| {
+        editor.update(cx, |editor, cx| {
+            let unknown = source.find("unknown").unwrap();
+            let semicolon = source.find("= ;").unwrap() + 2;
+            editor.edit_ranges(
+                &[
+                    (unknown..unknown + "unknown".len(), "0".into()),
+                    (semicolon..semicolon, "0".into()),
+                ],
+                window,
+                cx,
+            );
+        });
+    });
+    wait(visual, "clangd clears the repaired errors", |visual| {
+        visual.update(|_, cx| editor.read(cx).diagnostics().unwrap().is_empty())
+    })?;
+    assert!(!has_error_popup(visual));
+
+    visual.update(|_, cx| {
+        editor.update(cx, |editor, cx| {
+            let caret = editor.text().to_string().rfind("pear").unwrap() + 1;
+            editor.set_selected_range(caret..caret, cx);
+        });
+    });
+    frame(visual);
+    assert!(
+        !highlights(visual, "apple"),
+        "the previous symbol retained its highlights"
+    );
+    wait(visual, "three pear highlights", |visual| {
+        highlights(visual, "pear")
+    })?;
+
+    visual.dispatch_action(crate::workspace::FindReferences);
+    frame(visual);
+    assert!(visual.update(|_, cx| workspace.read(cx).locator.open));
+    wait(visual, "jump from a local C++ reference", |visual| {
+        if visual.update(|_, cx| workspace.read(cx).locator.open) {
+            visual.simulate_keystrokes("enter");
+        }
+        visual.update(|_, cx| !workspace.read(cx).locator.open)
+    })
+}
+
+#[test]
 fn workspace_caret_hints_use_the_latest_symbol_and_signature() -> Result<()> {
     let fixture = tempfile::tempdir()?;
     let script = fixture.path().join("server.py");

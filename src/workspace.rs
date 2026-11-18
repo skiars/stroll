@@ -2639,7 +2639,6 @@ impl Workspace {
             return;
         }
         file.git.clear_hunk(&editor, cx);
-        editor.update(cx, |editor, cx| editor.clear_hover_state(cx));
         file.revision += 1;
         file.pending_draft = true;
         let changed_local_doc = path.is_absolute()

@@ -55,8 +55,7 @@ impl InputModeKind for EditorMode {
         range: &std::ops::Range<usize>,
         new_len: usize,
     ) {
-        state.extras.hover_popover = None;
-        state.extras.lsp._hover_task = gpui::Task::ready(Ok(()));
+        state.adjust_language_hover_for_edit(range, new_len);
         state
             .extras
             .lsp
