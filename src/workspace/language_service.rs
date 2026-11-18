@@ -48,6 +48,7 @@ impl Workspace {
 pub(super) struct ServerKey {
     server: ServiceServer,
     root: PathBuf,
+    remote: bool,
 }
 
 #[derive(Clone, PartialEq, Eq, Hash)]
@@ -57,6 +58,10 @@ enum ServiceServer {
 }
 
 impl ServerKey {
+    pub(super) fn is_remote(&self) -> bool {
+        self.remote
+    }
+
     pub(super) fn project_path(&self) -> &Path {
         &self.root
     }
@@ -79,8 +84,21 @@ impl ServerProject {
 
     pub(super) fn for_file(repo: &crate::repository::Repository, path: &Path) -> Option<Self> {
         if path.is_absolute() {
-            return None;
+            return Self::for_local_file(path);
         }
+        Self::resolve(Some(repo), &repo.root, path)
+    }
+
+    pub(super) fn for_local_file(path: &Path) -> Option<Self> {
+        Self::resolve(None, path.parent()?, path)
+    }
+
+    fn resolve(
+        repo: Option<&crate::repository::Repository>,
+        root: &Path,
+        path: &Path,
+    ) -> Option<Self> {
+        let ssh = repo.and_then(|repo| repo.ssh.as_ref());
         match crate::language::external::load() {
             Ok(entries) => {
                 let mut selected = None;
@@ -92,7 +110,7 @@ impl ServerProject {
                     }
                 }
                 if let Some((language_id, server, _)) = selected {
-                    let root = match &repo.ssh {
+                    let root = match ssh {
                         Some(ssh) => {
                             let version = crate::remote::EXTERNAL_LSP_VERSION;
                             if ssh.call::<u32>(crate::remote::Request::Hello(version)).ok()
@@ -106,12 +124,13 @@ impl ServerProject {
                             ))
                             .ok()?
                         }
-                        None => server.project_root(&repo.root, path),
+                        None => server.project_root(root, path),
                     };
                     return Some(Self {
                         key: ServerKey {
                             server: ServiceServer::External(server.into()),
                             root,
+                            remote: ssh.is_some(),
                         },
                         language_id,
                     });
@@ -123,15 +142,16 @@ impl ServerProject {
         Some(Self {
             key: ServerKey {
                 server: ServiceServer::Builtin(server),
-                root: match &repo.ssh {
+                root: match ssh {
                     Some(ssh) => ssh
                         .call(crate::remote::Request::LspRoot(
                             server,
                             crate::remote::RepoPath::from_local(path).ok()?,
                         ))
                         .ok()?,
-                    None => server.project_root(&repo.root, path),
+                    None => server.project_root(root, path),
                 },
+                remote: ssh.is_some(),
             },
             language_id: language_id.into(),
         })
@@ -188,10 +208,16 @@ impl Workspace {
             return;
         }
         let start = (|| {
-            if let Some(repo) = &self.repository
-                && let Some(ssh) = &repo.ssh
-            {
+            if key.remote {
                 use crate::remote::LspTarget;
+                let repo = self
+                    .repository
+                    .as_ref()
+                    .expect("remote language service has a repository");
+                let ssh = repo
+                    .ssh
+                    .as_ref()
+                    .expect("remote language service has an SSH connection");
                 let repository = crate::remote::SshTarget::parse(&repo.root)?.unwrap().path;
                 let (target, options) = match &key.server {
                     ServiceServer::Builtin(server) => (
@@ -302,7 +328,6 @@ impl Workspace {
     pub(super) fn connect_file_to_language_service(&mut self, path: &Path, cx: &mut Context<Self>) {
         let file = &self.files[path];
         let connection = file.server_project.as_ref().and_then(|project| {
-            let repo = self.repository.as_ref()?;
             let Some(LanguageService::Session { client, .. }) =
                 self.language_servers.get(&project.key)
             else {
@@ -311,7 +336,8 @@ impl Workspace {
             if !matches!(client.state(), SessionState::Starting | SessionState::Ready) {
                 return None;
             }
-            if repo.ssh.is_some() {
+            if project.key.remote {
+                let repo = self.repository.as_ref()?;
                 let target = crate::remote::SshTarget::parse(&repo.root).ok()??;
                 let relative = crate::remote::RepoPath::from_local(path).ok()?;
                 let absolute = format!("{}/{}", target.path.to_str()?, relative.as_str());
@@ -325,9 +351,14 @@ impl Workspace {
                     )
                     .ok()
             } else {
+                let absolute = if path.is_absolute() {
+                    path.to_owned()
+                } else {
+                    self.repository.as_ref()?.root.join(path)
+                };
                 client
                     .open_document(
-                        &repo.root.join(path),
+                        &absolute,
                         &project.language_id,
                         file.committed.clone(),
                         file.saved.clone(),
@@ -345,9 +376,12 @@ impl Workspace {
             CompletionActivation::Code
         };
         let (server, refresh) = connection
-            .zip(self.repository.as_ref())
-            .map(|((document, refresh), repo)| {
-                let context = (self.ai.clone(), repo.clone(), path.to_owned());
+            .map(|(document, refresh)| {
+                let context = self
+                    .repository
+                    .as_ref()
+                    .filter(|_| !path.is_absolute())
+                    .map(|repo| (self.ai.clone(), repo.clone(), path.to_owned()));
                 (
                     EditorLsp::new(document, language, completion_activation, context),
                     refresh,
@@ -679,7 +713,11 @@ impl Workspace {
                     .child(t!("common.language_server")),
             )
             .when_some(project, |panel, project| {
-                let ssh = self.repository.as_ref().and_then(|repo| repo.ssh.as_ref());
+                let ssh = self
+                    .repository
+                    .as_ref()
+                    .filter(|_| project.key.remote)
+                    .and_then(|repo| repo.ssh.as_ref());
                 let program = match &project.key.server {
                     ServiceServer::Builtin(server) if ssh.is_some() => server.name().to_owned(),
                     ServiceServer::Builtin(server) => {

@@ -1177,8 +1177,13 @@ impl Workspace {
                         cx.notify();
                     }
                     if let Some(error) = error {
-                        this.language_servers.clear();
-                        let paths = this.files.keys().cloned().collect::<Vec<_>>();
+                        this.language_servers.retain(|key, _| !key.is_remote());
+                        let paths = this
+                            .files
+                            .keys()
+                            .filter(|path| !path.is_absolute())
+                            .cloned()
+                            .collect::<Vec<_>>();
                         for path in paths {
                             this.connect_file_to_language_service(&path, cx);
                         }
@@ -1221,7 +1226,7 @@ impl Workspace {
         self.git_edit.clear();
         self.git_history.busy = false;
         self.git_watch = Task::ready(());
-        self.language_servers.clear();
+        self.language_servers.retain(|key, _| !key.is_remote());
         self.rebuild_tree();
         self.watch_connection(window, cx);
         self.load_docs_tree(window, cx);
@@ -2071,7 +2076,8 @@ impl Workspace {
             let path = path.clone();
             let store = self.store.clone();
             cx.background_spawn(async move {
-                Ok((FileBuffer::new(Document::open_local(&path, &store)?), None))
+                let buffer = FileBuffer::new(Document::open_local(&path, &store)?);
+                Ok((buffer, ServerProject::for_local_file(&path)))
             })
         } else {
             return;
@@ -2517,6 +2523,22 @@ impl Workspace {
         }
     }
 
+    fn language_source_path(
+        repo: Option<&Repository>,
+        uri: &str,
+        local_source: bool,
+    ) -> Option<PathBuf> {
+        if !local_source {
+            return repo?.source_path(uri);
+        }
+        let path = url::Url::parse(uri).ok()?.to_file_path().ok()?;
+        if let Some(repo) = repo {
+            repo.local_file_key(&path).ok()
+        } else {
+            crate::repository::canonical_local_file(&path).ok()
+        }
+    }
+
     fn open_definition(
         &mut self,
         params: lsp_types::ShowDocumentParams,
@@ -2543,23 +2565,20 @@ impl Workspace {
                     .ok()
             })
             .filter(|fragment| !fragment.is_empty());
-        let path = if let Some(repo) = &self.repository {
-            repo.source_path(uri)
-        } else if self.standalone.is_some() {
-            url::Url::parse(uri)
-                .ok()
-                .and_then(|uri| uri.to_file_path().ok())
-        } else {
-            None
-        };
+        let local_source = self.view == WorkspaceView::Editor
+            && self
+                .active_file()
+                .is_some_and(|file| file.path.is_absolute());
+        let path = Self::language_source_path(self.repository.as_deref(), uri, local_source);
         let Some(path) = path else {
             toast::info(window, cx, t!("workspace.external_definition"));
             return;
         };
-        if self
-            .standalone
-            .as_ref()
-            .is_some_and(|current| current != &path)
+        if markdown_source
+            && self
+                .standalone
+                .as_ref()
+                .is_some_and(|current| current != &path)
         {
             self.open_local_window(path, fragment.map(|value| value.into_owned()), window, cx);
             return;
@@ -3935,11 +3954,7 @@ impl Workspace {
         let locked =
             file.document.conflict || file.document.mixed_newlines || self.git_edit.contains(path);
         let status_size = 11.;
-        let progress = if self.standalone.is_none() {
-            self.language_service_progress(file, status_size, colors, cx)
-        } else {
-            None
-        };
+        let progress = self.language_service_progress(file, status_size, colors, cx);
         // Every text/button in this row goes through `baseline_aligned`,
         // so new status content with a different size still shares the
         // row's baseline without forcing one font size everywhere.
@@ -4028,17 +4043,20 @@ impl Workspace {
                                 )
                                 .flex_shrink_0(),
                             )
-                            .when(self.standalone.is_none(), |bar| {
-                                bar.child(
-                                    baseline_aligned(
-                                        cx,
-                                        status_size,
-                                        status_size,
-                                        self.language_service_status(file, colors, cx),
+                            .when(
+                                self.standalone.is_none() || file.server_project.is_some(),
+                                |bar| {
+                                    bar.child(
+                                        baseline_aligned(
+                                            cx,
+                                            status_size,
+                                            status_size,
+                                            self.language_service_status(file, colors, cx),
+                                        )
+                                        .flex_shrink_0(),
                                     )
-                                    .flex_shrink_0(),
-                                )
-                            }),
+                                },
+                            ),
                     ),
             )
     }

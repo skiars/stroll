@@ -94,7 +94,7 @@ impl TargetEditor {
 }
 
 struct EditPlan {
-    repo: Arc<Repository>,
+    repo: Option<Arc<Repository>>,
     started: Option<SystemTime>,
     targets: BTreeMap<PathBuf, TargetEdit>,
 }
@@ -288,22 +288,8 @@ impl LanguageActions {
                     "This action requires a server command"
                 );
                 let edit = item.edit.context("This action has no text changes")?;
-                let edits = single_file_edits(edit, &source, &editor, &snapshot)?;
                 let repo = cx.update(|_, cx| source.repo(&editor, cx))??;
-                Rc::new(EditPlan {
-                    repo,
-                    started: None,
-                    targets: BTreeMap::from([(
-                        source.path.clone(),
-                        TargetEdit {
-                            original: editor.text.clone(),
-                            edits,
-                            editor: Some(editor.clone()),
-                            version: None,
-                            buffer: None,
-                        },
-                    )]),
-                })
+                Rc::new(source.single_file_plan(edit, &editor, &snapshot, repo)?)
             };
             if let Err(error) = plan.check_disk(cx).await {
                 cache.borrow_mut().preview = None;
@@ -432,11 +418,39 @@ impl ActionSource {
         self.current(workspace, editor, cx) && (capabilities.list || capabilities.rename)
     }
 
-    fn repo(&self, editor: &TargetEditor, cx: &App) -> Result<Arc<Repository>> {
+    fn repo(&self, editor: &TargetEditor, cx: &App) -> Result<Option<Arc<Repository>>> {
         self.workspace.read_with(cx, |workspace, cx| {
             ensure!(self.active(workspace, editor, cx), actions::stale());
-            workspace.repository.clone().ok_or_else(actions::stale)
+            Ok(if self.path.is_absolute() {
+                None
+            } else {
+                Some(workspace.repository.clone().ok_or_else(actions::stale)?)
+            })
         })?
+    }
+
+    fn single_file_plan(
+        &self,
+        edit: WorkspaceEdit,
+        editor: &TargetEditor,
+        snapshot: &ActionSnapshot,
+        repo: Option<Arc<Repository>>,
+    ) -> Result<EditPlan> {
+        let edits = single_file_edits(edit, self, editor, snapshot)?;
+        Ok(EditPlan {
+            repo,
+            started: None,
+            targets: BTreeMap::from([(
+                self.path.clone(),
+                TargetEdit {
+                    original: editor.text.clone(),
+                    edits,
+                    editor: Some(editor.clone()),
+                    version: None,
+                    buffer: None,
+                },
+            )]),
+        })
     }
 
     async fn rename_plan(
@@ -447,8 +461,15 @@ impl ActionSource {
         version: Option<i32>,
         cx: &mut AsyncWindowContext,
     ) -> Result<EditPlan> {
-        let (repo, store, open_at_request) = cx.update(|_, cx| {
-            let repo = self.repo(source_editor, cx)?;
+        let repo = cx.update(|_, cx| self.repo(source_editor, cx))??;
+        let Some(repo) = repo else {
+            let (edit, snapshot) = self
+                .document
+                .rename(source_editor.text.clone(), position, name, version)
+                .await?;
+            return self.single_file_plan(edit, source_editor, &snapshot, None);
+        };
+        let (store, open_at_request) = cx.update(|_, cx| {
             self.workspace
                 .read_with(cx, |workspace, cx| {
                     let opened = workspace
@@ -462,7 +483,7 @@ impl ActionSource {
                             (path.clone(), (editor, file.document.draft_baseline()))
                         })
                         .collect::<BTreeMap<_, _>>();
-                    (repo, workspace.store.clone(), opened)
+                    (workspace.store.clone(), opened)
                 })
                 .map_err(anyhow::Error::from)
         })??;
@@ -577,7 +598,7 @@ impl ActionSource {
                 }
                 ensure!(!output.is_empty(), "This action has no text changes");
                 Ok(EditPlan {
-                    repo,
+                    repo: Some(repo),
                     started: Some(started),
                     targets: output,
                 })
@@ -601,10 +622,15 @@ impl ActionSource {
     ) -> Result<()> {
         ensure!(
             self.active(workspace, source, cx)
-                && workspace
-                    .repository
+                && plan
+                    .repo
                     .as_ref()
-                    .is_some_and(|repo| Arc::ptr_eq(repo, &plan.repo)),
+                    .map_or(self.path.is_absolute(), |expected| {
+                        workspace
+                            .repository
+                            .as_ref()
+                            .is_some_and(|repo| Arc::ptr_eq(repo, expected))
+                    }),
             actions::stale()
         );
         for (path, target) in &plan.targets {
@@ -654,7 +680,7 @@ fn target_version(repo: &Repository, path: &Path, before: SystemTime) -> Result<
 
 impl EditPlan {
     async fn check_disk(&self, cx: &mut AsyncWindowContext) -> Result<()> {
-        let Some(started) = self.started else {
+        let Some((started, repo)) = self.started.zip(self.repo.clone()) else {
             return Ok(());
         };
         let targets = self
@@ -662,7 +688,6 @@ impl EditPlan {
             .iter()
             .map(|(path, target)| (path.clone(), target.version.clone()))
             .collect::<Vec<_>>();
-        let repo = self.repo.clone();
         cx.background_executor()
             .spawn(async move {
                 for (path, version) in targets {
@@ -821,8 +846,7 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         let Some(file) = self.active_file().filter(|file| {
-            self.repository.is_some()
-                && self.can_format_file(file, cx)
+            self.can_format_file(file, cx)
                 && file.editor.read(cx).focus_handle(cx).is_focused(window)
                 && !self.locator.open
                 && !window.has_active_dialog(cx)

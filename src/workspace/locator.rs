@@ -378,14 +378,19 @@ impl Workspace {
     }
 
     fn locator_session(&self) -> &Session {
-        &self.locator.sessions[self.repository.as_ref().unwrap().storage_key()]
+        let key = self
+            .repository
+            .as_ref()
+            .map_or(&[][..], |repo| repo.storage_key());
+        &self.locator.sessions[key]
     }
 
     fn locator_session_mut(&mut self) -> &mut Session {
-        self.locator
-            .sessions
-            .get_mut(self.repository.as_ref().unwrap().storage_key())
-            .unwrap()
+        let key = self
+            .repository
+            .as_ref()
+            .map_or(&[][..], |repo| repo.storage_key());
+        self.locator.sessions.get_mut(key).unwrap()
     }
 
     fn locator_tab(&self) -> &Tab {
@@ -432,10 +437,8 @@ impl Workspace {
     }
 
     fn show_locator(&mut self, mode: Mode, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        let Some(repo) = &self.repository else {
-            return false;
-        };
-        if self.locator.open
+        if (self.repository.is_none() && mode != Mode::References)
+            || self.locator.open
             || self.repository_overlay_open()
             || self.confirming_close
             || window.has_active_dialog(cx)
@@ -448,7 +451,11 @@ impl Workspace {
         }
         self.locator
             .sessions
-            .entry(repo.storage_key().to_vec())
+            .entry(
+                self.repository
+                    .as_ref()
+                    .map_or_else(Vec::new, |repo| repo.storage_key().to_vec()),
+            )
             .or_default();
         if self.locator.motion.is_some() || mode == Mode::References {
             self.locator_set_items(Vec::new());
@@ -612,7 +619,7 @@ impl Workspace {
             self.notify_locator(cx);
             return;
         }
-        let repo = self.repository.as_ref().unwrap().clone();
+        let repo = self.repository.clone();
         let references = self.locator.references.clone().map(|search| {
             let targets = self.reference_targets(cx);
             (search, targets)
@@ -650,58 +657,73 @@ impl Workspace {
                         .document
                         .references(search.text, search.offset, search.include_declaration)
                         .await?;
-                    Ok(reference_entries(&repo, locations, targets))
+                    let local_source = source.as_ref().is_some_and(|path| path.is_absolute());
+                    Ok(reference_entries(
+                        repo.as_deref(),
+                        local_source,
+                        locations,
+                        targets,
+                    ))
                 }
                 .await
-            } else if mode == Mode::Files {
-                async {
-                    let paths = match paths {
-                        Some((_, paths)) => paths,
-                        None => {
-                            let paths = Arc::new(
-                                cx.background_spawn(async move { locator::listed_paths(&repo) })
+            } else if let Some(repo) = repo {
+                if mode == Mode::Files {
+                    async {
+                        let paths = match paths {
+                            Some((_, paths)) => paths,
+                            None => {
+                                let paths = Arc::new(
+                                    cx.background_spawn(
+                                        async move { locator::listed_paths(&repo) },
+                                    )
                                     .await?,
-                            );
-                            fresh_paths = Some((std::time::Instant::now(), paths.clone()));
-                            paths
-                        }
-                    };
+                                );
+                                fresh_paths = Some((std::time::Instant::now(), paths.clone()));
+                                paths
+                            }
+                        };
+                        cx.background_spawn(async move {
+                            locator::search_files(&paths, &query.query, &query.scope, &recent)
+                                .map(|result| map_results(result, Entry::file))
+                        })
+                        .await
+                    }
+                    .await
+                } else if mode == Mode::Text {
                     cx.background_spawn(async move {
-                        locator::search_files(&paths, &query.query, &query.scope, &recent)
-                            .map(|result| map_results(result, Entry::file))
+                        let hits = if let Some(ssh) = &repo.ssh {
+                            anyhow::ensure!(ssh.supports_locator(), t!("locator.upgrade_helper"));
+                            ssh.call(Request::Locator(query))?
+                        } else {
+                            locator::search_text(&repo, &query, || {
+                                cancelled.load(Ordering::Relaxed)
+                            })?
+                        };
+                        Ok(map_results(hits, |hit| {
+                            let mut entry = Entry::file(hit.path.clone());
+                            entry.hit = Some(Arc::new(hit));
+                            entry
+                        }))
                     })
                     .await
+                } else {
+                    async {
+                        let source =
+                            source.ok_or_else(|| anyhow::anyhow!(t!("locator.needs_file")))?;
+                        let (document, text) =
+                            lsp.ok_or_else(|| anyhow::anyhow!(t!("locator.unavailable")))?;
+                        let value = document
+                            .locator_symbols(
+                                text,
+                                (mode == Mode::WorkspaceSymbols).then(|| query.query.clone()),
+                            )
+                            .await?;
+                        symbols(&repo, source, mode, &query.query, value)
+                    }
+                    .await
                 }
-                .await
-            } else if mode == Mode::Text {
-                cx.background_spawn(async move {
-                    let hits = if let Some(ssh) = &repo.ssh {
-                        anyhow::ensure!(ssh.supports_locator(), t!("locator.upgrade_helper"));
-                        ssh.call(Request::Locator(query))?
-                    } else {
-                        locator::search_text(&repo, &query, || cancelled.load(Ordering::Relaxed))?
-                    };
-                    Ok(map_results(hits, |hit| {
-                        let mut entry = Entry::file(hit.path.clone());
-                        entry.hit = Some(Arc::new(hit));
-                        entry
-                    }))
-                })
-                .await
             } else {
-                async {
-                    let source = source.ok_or_else(|| anyhow::anyhow!(t!("locator.needs_file")))?;
-                    let (document, text) =
-                        lsp.ok_or_else(|| anyhow::anyhow!(t!("locator.unavailable")))?;
-                    let value = document
-                        .locator_symbols(
-                            text,
-                            (mode == Mode::WorkspaceSymbols).then(|| query.query.clone()),
-                        )
-                        .await?;
-                    symbols(&repo, source, mode, &query.query, value)
-                }
-                .await
+                Err(anyhow::anyhow!(t!("locator.unavailable")))
             };
             _ = this.update_in(cx, |this, window, cx| {
                 let result = if mode == Mode::References && !this.reference_source_is_current(cx) {
@@ -778,7 +800,7 @@ impl Workspace {
         Ok(self
             .files
             .values()
-            .filter(|file| !file.path.is_absolute())
+            .filter(|file| !file.path.is_absolute() || source.is_absolute())
             .map(|file| {
                 let document = file.language_server.as_ref().filter(|_| {
                     file.server_project
@@ -857,7 +879,7 @@ impl Workspace {
         if self.locator.busy {
             return;
         }
-        let repo = self.repository.as_ref().unwrap().clone();
+        let repo = self.repository.clone();
         let store = self.store.clone();
         let live_text = |workspace: &Workspace, path: &Path, cx: &App| {
             workspace
@@ -889,7 +911,8 @@ impl Workspace {
                     let location: SymbolLocation =
                         serde_json::from_value(value["location"].clone())?;
                     let path = repo
-                        .source_path(location.uri.as_str())
+                        .as_ref()
+                        .and_then(|repo| repo.source_path(location.uri.as_str()))
                         .ok_or_else(|| anyhow::anyhow!(t!("workspace.external_definition")))?;
                     live = this
                         .update_in(cx, |this, _, cx| live_text(this, &path, cx))
@@ -906,7 +929,11 @@ impl Workspace {
                     let (text, draft, saved) = match live {
                         Some((text, draft)) => (text, draft, None),
                         None => {
-                            let document = Document::open(&repo, &entry.path, &store)?;
+                            let document = if let Some(repo) = &repo {
+                                Document::open(repo, &entry.path, &store)?
+                            } else {
+                                Document::open_local(&entry.path, &store)?
+                            };
                             let saved = (document.restored && entry.reference.is_some())
                                 .then(|| Rope::from(document.saved_text.as_str()));
                             (Rope::from(document.text.as_str()), document.restored, saved)
@@ -1110,7 +1137,8 @@ fn map_results<A, B>(result: Results<A>, map: impl FnMut(A) -> B) -> Results<B> 
 }
 
 fn reference_entries(
-    repo: &Repository,
+    repo: Option<&Repository>,
+    local_source: bool,
     locations: Vec<SymbolLocation>,
     targets: HashMap<PathBuf, Rope>,
 ) -> Results<Entry> {
@@ -1118,7 +1146,8 @@ fn reference_entries(
     let mut skipped = 0;
     let mut items = Vec::new();
     for location in locations {
-        let Some(path) = repo.source_path(location.uri.as_str()) else {
+        let Some(path) = Workspace::language_source_path(repo, location.uri.as_str(), local_source)
+        else {
             skipped += 1;
             continue;
         };

@@ -137,7 +137,7 @@ pub(crate) struct EditorLsp {
     pub fallback: LocalSymbols,
     pub(super) completion: super::completion::CompletionCache,
     pub(super) completion_activation: super::CompletionActivation,
-    hover_context: (Service, Arc<Repository>, PathBuf),
+    hover_context: Option<(Service, Arc<Repository>, PathBuf)>,
 }
 
 impl EditorLsp {
@@ -145,7 +145,7 @@ impl EditorLsp {
         document: Document,
         language: &'static str,
         completion_activation: super::CompletionActivation,
-        hover_context: (Service, Arc<Repository>, PathBuf),
+        hover_context: Option<(Service, Arc<Repository>, PathBuf)>,
     ) -> Rc<Self> {
         Rc::new(Self {
             document: Arc::new(document),
@@ -214,7 +214,10 @@ fn editor_inlay_hint(text: &Rope, hint: lsp_types::InlayHint) -> Option<InlayHin
 
 impl HoverProvider for EditorLsp {
     fn code_languages(&self) -> Option<gpui_component::text::CodeLanguages> {
-        self.hover_context.1.language_resources().code_languages()
+        self.hover_context.as_ref().map_or_else(
+            || crate::language_resources::LanguageResources::installed().code_languages(),
+            |(_, repo, _)| repo.language_resources().code_languages(),
+        )
     }
 
     fn hover(
@@ -266,7 +269,9 @@ impl HoverProvider for EditorLsp {
         _: &mut Window,
         cx: &mut App,
     ) -> Task<Option<HoverDocumentation>> {
-        let (ai, repo, path) = &self.hover_context;
+        let Some((ai, repo, path)) = &self.hover_context else {
+            return Task::ready(None);
+        };
         let Some(request) = ai.snapshot(true) else {
             return Task::ready(None);
         };

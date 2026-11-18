@@ -116,7 +116,10 @@ impl Workspace {
                                             Document::open(repo, &path, &store)?,
                                             ServerProject::for_file(repo, &path),
                                         ),
-                                        None => (Document::open_local(&path, &store)?, None),
+                                        None => (
+                                            Document::open_local(&path, &store)?,
+                                            ServerProject::for_local_file(&path),
+                                        ),
                                     };
                                     Some((FileBuffer::new(document), project))
                                 };
