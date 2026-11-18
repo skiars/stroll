@@ -183,11 +183,11 @@ impl Blame {
             Line::Unsaved => (t!("git.blame_unsaved").into(), None),
             Line::Committed(line) => match self.cache.get(&line) {
                 Some(Some(line)) => (
-                    format!(
-                        "{} · {} · {}",
-                        line.author,
-                        relative_date(line.timestamp),
-                        line.subject
+                    t!(
+                        "git.blame_summary",
+                        author = line.author,
+                        date = relative_date(line.timestamp),
+                        subject = line.subject
                     )
                     .into(),
                     Some(line.clone()),
@@ -414,6 +414,7 @@ pub(in crate::workspace) fn hint(
     let commit = (shown.resolved == version)
         .then(|| shown.commit.clone())
         .flatten();
+    let show_icon = shown.commit.is_some();
     let label = shown.label.clone();
     let editor = file.editor.clone();
     let id = SharedString::from(format!(
@@ -428,16 +429,19 @@ pub(in crate::workspace) fn hint(
                     let editor = editor.read(cx);
                     let viewport = editor.input_bounds();
                     let (bounds, baseline) = editor.cursor_line_end_geometry()?;
-                    let gap = px(16.);
+                    let gap = px(32.);
+                    let size = font_size * 0.93;
+                    let icon_width = if show_icon { size + px(6.) } else { px(0.) };
                     let width = bounds.size.width - gap - px(24.);
                     if width < px(100.) {
                         return None;
                     }
-                    let size = font_size * 0.93;
+                    let text_width = width - icon_width;
+                    let color = colors.muted.opacity(0.78);
                     let run = [TextRun {
                         len: label.len(),
                         font: gpui::font(font),
-                        color: colors.muted.opacity(0.78),
+                        color,
                         background_color: None,
                         underline: None,
                         strikethrough: None,
@@ -467,23 +471,33 @@ pub(in crate::workspace) fn hint(
                         baseline
                     };
                     let line = text_system.shape_line(label.clone(), size, &run, None);
-                    let line = if line.width() <= width {
+                    let line = if line.width() <= text_width {
                         line
                     } else {
                         let (text, runs) = cx
                             .text_system()
                             .line_wrapper(run[0].font.clone(), size)
-                            .truncate_line(label, width, "…", &run, TruncateFrom::End);
+                            .truncate_line(label, text_width, "…", &run, TruncateFrom::End);
                         text_system.shape_line(text, size, &runs, None)
                     };
                     let offset =
                         (bounds.size.height - line.ascent - line.descent) / 2. + line.ascent;
-                    let mut element = div()
+                    let line_width = line.width().min(text_width);
+                    let mut element = h_flex()
                         .id(id)
-                        .w(line.width().min(width))
+                        .w(icon_width + line_width)
                         .h(bounds.size.height)
                         .cursor_text()
                         .debug_selector(|| "editor-blame".into())
+                        .when(show_icon, |hint| {
+                            hint.child(
+                                h_flex()
+                                    .w(icon_width)
+                                    .flex_shrink_0()
+                                    .debug_selector(|| "editor-blame-icon".into())
+                                    .child(icon(IconName::GitBranch, color, size.into())),
+                            )
+                        })
                         .child(
                             canvas(
                                 |_, _, _| (),
@@ -501,7 +515,8 @@ pub(in crate::workspace) fn hint(
                                     );
                                 },
                             )
-                            .size_full(),
+                            .w(line_width)
+                            .h_full(),
                         )
                         .when_some(commit, |label, commit| {
                             label.managed_interactive_tooltip(move |bounds, _, cx| {
@@ -562,10 +577,9 @@ impl Render for CommitCard {
                 let zone = line.timezone.parse::<i32>().ok().and_then(|zone| {
                     chrono::FixedOffset::east_opt((zone / 100 * 60 + zone % 100) * 60)
                 });
-                zone.map_or_else(
-                    || date.to_rfc3339(),
-                    |zone| date.with_timezone(&zone).to_rfc3339(),
-                )
+                zone.map_or_else(|| date.fixed_offset(), |zone| date.with_timezone(&zone))
+                    .format("%Y-%m-%d %H:%M:%S %:z")
+                    .to_string()
             })
             .unwrap_or_default();
         let card = v_flex()
@@ -645,11 +659,18 @@ fn relative_date(timestamp: i64) -> String {
         .unwrap_or_default()
         .as_secs() as i64;
     let minutes = elapsed.saturating_sub(timestamp).max(0) / 60;
+    let days = minutes / 1440;
     match minutes {
         0 => t!("git.blame_now"),
         1..60 => t!("git.blame_minutes", count = minutes),
         60..1440 => t!("git.blame_hours", count = minutes / 60),
-        _ => t!("git.blame_days", count = minutes / 1440),
+        _ => match days {
+            1..30 => t!("git.blame_days", count = days),
+            30..60 => t!("git.blame_month"),
+            60..365 => t!("git.blame_months", count = (days / 30).min(11)),
+            365..730 => t!("git.blame_year"),
+            _ => t!("git.blame_years", count = days / 365),
+        },
     }
     .into_owned()
 }
@@ -709,7 +730,7 @@ mod tests {
             .collect::<String>();
         fs::write(root.join(&path), &source).unwrap();
         run_git(&["add", "source.txt"]);
-        run_git(&["commit", "-qm", "Add source lines"]);
+        run_git(&["commit", "--date=5 years ago", "-qm", "Add source lines"]);
         let oid = run_git(&["rev-parse", "HEAD"]).trim().to_owned();
 
         let store = Arc::new(Store::new(fixture.path().join("state")).unwrap());
@@ -753,6 +774,29 @@ mod tests {
         let first = visual
             .debug_bounds("editor-blame")
             .expect("current line blame is visible");
+        let branch = visual
+            .debug_bounds("editor-blame-icon")
+            .expect("committed blame shows the branch icon");
+        assert_eq!(branch.left(), first.left());
+        visual.update(|_, cx| {
+            let summary = &workspace.read(cx).files[&path]
+                .git
+                .blame
+                .shown
+                .as_ref()
+                .unwrap()
+                .label;
+            assert_eq!(
+                summary.as_str(),
+                t!(
+                    "git.blame_summary",
+                    author = "History Author",
+                    date = t!("git.blame_years", count = 5),
+                    subject = "Add source lines"
+                )
+                .as_ref()
+            );
+        });
         let at = first.center();
         visual.simulate_mouse_move(at, None, Modifiers::default());
         visual.executor().advance_clock(Duration::from_millis(400));
@@ -860,6 +904,7 @@ mod tests {
             );
         });
         assert!(visual.debug_bounds("editor-blame").is_some());
+        assert!(visual.debug_bounds("editor-blame-icon").is_none());
 
         let baseline_offset = |line, visual: &mut VisualTestContext| {
             visual.update(|window, cx| {
@@ -893,7 +938,7 @@ mod tests {
                 .expect("blame is visible on the first frame after scrolling");
             let (space, baseline) =
                 visual.update(|_, cx| editor.read(cx).cursor_line_end_geometry().unwrap());
-            assert!((hint.left() - space.left() - px(16.)).abs() <= px(0.5));
+            assert!((hint.left() - space.left() - px(32.)).abs() <= px(0.5));
             assert!((hint.top() - space.top()).abs() <= px(0.5));
             let painted = PAINTED_BASELINE.get().expect("hint painted in this frame");
             assert!((painted - baseline).abs() < px(0.05));
