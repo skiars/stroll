@@ -320,6 +320,7 @@ type SharedDocumentUpdates = Arc<Mutex<DocumentUpdates>>;
 
 #[derive(Default)]
 struct DocumentUpdates {
+    pending_changes: usize,
     diagnostics: Option<(Rope, Vec<Diagnostic>)>,
     semantic_refresh: bool,
     inlay_refresh: bool,
@@ -340,19 +341,35 @@ impl Drop for Document {
 
 impl Document {
     pub(crate) fn take_updates(&self, text: &Rope) -> (bool, bool, Option<Vec<Diagnostic>>) {
-        let updates = std::mem::take(&mut *self.updates.lock().unwrap());
-        let diagnostics = updates
-            .diagnostics
-            .and_then(|(snapshot, diagnostics)| (&snapshot == text).then_some(diagnostics));
-        (updates.semantic_refresh, updates.inlay_refresh, diagnostics)
+        let mut updates = self.updates.lock().unwrap();
+        // An edit can return to the same bytes before the worker has processed
+        // both versions. Wait for queued changes before comparing snapshots.
+        let diagnostics = if updates.pending_changes == 0 {
+            updates
+                .diagnostics
+                .take()
+                .and_then(|(snapshot, diagnostics)| (&snapshot == text).then_some(diagnostics))
+        } else {
+            None
+        };
+        (
+            std::mem::take(&mut updates.semantic_refresh),
+            std::mem::take(&mut updates.inlay_refresh),
+            diagnostics,
+        )
     }
 
     pub(crate) fn changed(&self, text: Rope) {
-        _ = self
+        let mut updates = self.updates.lock().unwrap();
+        if self
             .client
             .0
             .events
-            .send(Event::Change(self.key.clone(), text));
+            .send(Event::Change(self.key.clone(), text))
+            .is_ok()
+        {
+            updates.pending_changes += 1;
+        }
     }
 
     pub fn saved(&self, text: Rope) {
@@ -878,6 +895,17 @@ impl Session {
             }
             Event::Change(document, text) => {
                 self.sync(&document, text)?;
+                if let Some(open) = self
+                    .documents
+                    .get(&document.uri)
+                    .filter(|open| open.id == document.id)
+                {
+                    let mut updates = open.updates.lock().unwrap();
+                    updates.pending_changes -= 1;
+                    if updates.pending_changes == 0 && updates.diagnostics.is_some() {
+                        _ = open.refresh.try_send(());
+                    }
+                }
             }
             Event::Save(document, text) => {
                 if self.sync(&document, text.clone())? {

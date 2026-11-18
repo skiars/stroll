@@ -8,7 +8,7 @@ use crate::input::{
     DiagnosticEntry, DiagnosticSeverity, EditorMode, HoverPopoverState, InputBaseState, RopeExt,
 };
 
-use super::super::diagnostics::retained_range;
+use super::super::diagnostics::adjust_diagnostic_range;
 
 /// Additional documentation resolved after the original hover is visible.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -88,6 +88,24 @@ impl InputBaseState<EditorMode> {
         diagnostics
     }
 
+    fn diagnostic_hover_symbol(
+        &self,
+        target: &Range<usize>,
+        offset: usize,
+        word: Range<usize>,
+    ) -> Range<usize> {
+        // A multiline diagnostic can begin or end outside the viewport.
+        // Anchor to the word when the full range cannot fit on the pointer row.
+        if self.range_to_bounds(target).is_some_and(|bounds| {
+            self.range_to_bounds(&(offset..offset))
+                .is_some_and(|caret| bounds.size.height == caret.size.height)
+        }) {
+            target.clone()
+        } else {
+            word
+        }
+    }
+
     /// Handle hover trigger LSP request.
     pub(super) fn handle_hover_popover(
         &mut self,
@@ -127,16 +145,10 @@ impl InputBaseState<EditorMode> {
         let target_range = diagnostics
             .first()
             .map_or_else(|| word.clone(), |entry| entry.range.clone());
-        // A multi-line diagnostic can begin or end outside the viewport.
-        // Anchor to the hovered word if the full range cannot fit on this row.
-        let symbol_range = if diagnostics.is_empty()
-            || self.range_to_bounds(&target_range).is_some_and(|bounds| {
-                self.range_to_bounds(&(offset..offset))
-                    .is_some_and(|caret| bounds.size.height == caret.size.height)
-            }) {
-            target_range.clone()
-        } else {
+        let symbol_range = if diagnostics.is_empty() {
             word
+        } else {
+            self.diagnostic_hover_symbol(&target_range, offset, word)
         };
         if let Some(popover) = self.extras.hover_popover.as_ref()
             && popover.documentation_target == documentation_target
@@ -273,12 +285,10 @@ impl InputBaseState<EditorMode> {
         let Some(popover) = self.extras.hover_popover.as_mut() else {
             return;
         };
-        // Only keep an open diagnostic attached to surviving text. A pending
-        // documentation request belongs to the previous document revision.
-        let remap = |range: &Range<usize>| retained_range(range, edited, inserted_len);
-        let (Some(symbol_range), Some(target_range)) =
-            (remap(&popover.symbol_range), remap(&popover.target_range))
-        else {
+        // Documentation belongs to an unchanged symbol. Diagnostic ranges can
+        // survive partial edits and are refreshed against the laid-out text.
+        let remap = |range: &Range<usize>| adjust_diagnostic_range(range, edited, inserted_len);
+        let Some(target_range) = remap(&popover.target_range) else {
             self.extras.hover_popover = None;
             return;
         };
@@ -286,14 +296,16 @@ impl InputBaseState<EditorMode> {
             self.extras.hover_popover = None;
             return;
         }
-        popover.symbol_range = symbol_range;
+        popover.symbol_range = remap(&popover.symbol_range).unwrap_or_else(|| target_range.clone());
         popover.target_range = target_range;
-        popover.documentation_target = popover.documentation_target.as_ref().and_then(remap);
+        popover.documentation_target = popover.documentation_target.as_ref().and_then(|range| {
+            (popover.hover.is_some() && (range.end <= edited.start || range.start >= edited.end))
+                .then(|| remap(range))
+                .flatten()
+        });
         if popover.documentation_target.is_none() {
             popover.hover = None;
             popover.documentation = None;
-        } else if popover.hover.is_none() {
-            popover.documentation_target = None;
         }
     }
 
@@ -306,29 +318,57 @@ impl InputBaseState<EditorMode> {
         };
         let offset = (self.input_bounds.contains(&pointer) && clip.contains(&pointer))
             .then(|| self.text_offset_at_point(pointer))
-            .flatten()
-            .filter(|&offset| {
-                if let Some(target) = &popover.documentation_target {
-                    self.documentation_target_at(offset).as_ref() == Some(target)
-                } else {
-                    popover.target_range.contains(&offset) || popover.target_range.start == offset
-                }
-            });
+            .flatten();
         let Some(offset) = offset.filter(|_| self.range_to_bounds(&popover.symbol_range).is_some())
         else {
             self.clear_language_hover(cx);
             return;
         };
+        let same_documentation_target = popover
+            .documentation_target
+            .as_ref()
+            .is_some_and(|target| self.documentation_target_at(offset).as_ref() == Some(target));
+        let same_diagnostic_target = !popover.diagnostics.is_empty()
+            && (popover.target_range.contains(&offset) || popover.target_range.start == offset);
+        if !same_documentation_target && !same_diagnostic_target {
+            self.clear_language_hover(cx);
+            return;
+        }
         if !popover.visible() {
             return;
         }
         let diagnostics = self.hover_diagnostics_at(offset);
-        if diagnostics.iter().copied().eq(popover.diagnostics.iter()) {
+        let diagnostics_changed = !diagnostics.iter().copied().eq(popover.diagnostics.iter());
+        if !diagnostics_changed
+            && (same_documentation_target || popover.documentation_target.is_none())
+        {
             return;
         }
-        let diagnostics: Rc<[_]> = diagnostics.into_iter().cloned().collect();
+        let target = diagnostics.first().map(|diagnostic| {
+            let target = diagnostic.range.clone();
+            let word = self.text.word_range(offset).unwrap_or(offset..offset);
+            let symbol = self.diagnostic_hover_symbol(&target, offset, word);
+            (target, symbol)
+        });
+        let diagnostics = diagnostics_changed.then(|| diagnostics.into_iter().cloned().collect());
         let popover = self.extras.hover_popover.as_mut().unwrap();
-        popover.diagnostics = diagnostics;
+        if let Some(diagnostics) = diagnostics {
+            popover.diagnostics = diagnostics;
+        }
+        if let Some((target, symbol)) = target {
+            popover.target_range = target;
+            popover.symbol_range = symbol;
+        } else if same_documentation_target
+            && let Some(target) = popover.documentation_target.clone()
+        {
+            popover.target_range = target.clone();
+            popover.symbol_range = target;
+        }
+        if !same_documentation_target {
+            popover.documentation_target = None;
+            popover.hover = None;
+            popover.documentation = None;
+        }
         if !popover.visible() && popover.documentation_target.is_none() {
             self.clear_language_hover(cx);
         }

@@ -1,15 +1,15 @@
-use std::{ops::Range, sync::Arc, time::Duration};
+use std::{collections::HashSet, ops::Range, sync::Arc, time::Duration};
 
 use gpui::*;
 use gpui_component::{
     ActiveTheme as _, ThemeStyled as _,
     input::{
         CaretAnchoredPopup, EditorState, RangeDecoration, RangeDecorationCollection,
-        RangeDecorationStyle, RopeExt as _,
+        RangeDecorationStyle, Rope, RopeExt as _,
     },
 };
 use lsp_types::{
-    DocumentHighlightKind, ParameterLabel, SignatureHelp, SignatureHelpContext,
+    DocumentHighlight, DocumentHighlightKind, ParameterLabel, SignatureHelp, SignatureHelpContext,
     SignatureHelpTriggerKind,
 };
 
@@ -25,7 +25,7 @@ struct Snapshot {
 }
 
 pub(super) struct CaretHints {
-    decorations: RangeDecorationCollection,
+    decorations: [RangeDecorationCollection; 2],
     snapshot: Option<Snapshot>,
     highlights: Task<()>,
     highlighted_word: Option<String>,
@@ -37,7 +37,9 @@ pub(super) struct CaretHints {
 impl CaretHints {
     pub(super) fn new(editor: &mut EditorState, cx: &mut Context<EditorState>) -> Self {
         Self {
-            decorations: editor.create_range_decorations_collection(Vec::new(), cx),
+            decorations: std::array::from_fn(|_| {
+                editor.create_range_decorations_collection(Vec::new(), cx)
+            }),
             snapshot: None,
             highlights: Task::ready(()),
             highlighted_word: None,
@@ -50,14 +52,60 @@ impl CaretHints {
     pub(super) fn clear(&mut self, cx: &mut App) {
         self.snapshot = None;
         self.highlights = Task::ready(());
-        self.highlighted_word = None;
-        self.decorations.clear(cx);
+        self.clear_highlights(cx);
         self.dismiss_signature();
     }
 
-    #[cfg(test)]
+    fn clear_highlights(&mut self, cx: &mut App) {
+        self.highlighted_word = None;
+        for collection in &self.decorations {
+            collection.clear(cx);
+        }
+    }
+
     pub(super) fn highlight_ranges(&self, cx: &App) -> Vec<Range<usize>> {
-        self.decorations.get_ranges(cx)
+        self.decorations
+            .iter()
+            .flat_map(|collection| collection.get_ranges(cx))
+            .collect()
+    }
+
+    fn retain_unchanged_highlights(&self, text: &Rope, cx: &mut App) {
+        let Some(word) = &self.highlighted_word else {
+            return;
+        };
+        for (kind, collection) in self.decorations.iter().enumerate() {
+            let ranges = collection.get_ranges(cx);
+            let unchanged = |range: &Range<usize>| {
+                text.slice(range.clone()) == word.as_str()
+                    && text.word_range(range.start).as_ref() == Some(range)
+            };
+            if !ranges.iter().all(unchanged) {
+                let foreground = cx.theme().foreground;
+                collection.set(
+                    ranges
+                        .into_iter()
+                        .filter(unchanged)
+                        .map(|range| symbol_decoration(range, kind, foreground))
+                        .collect(),
+                    cx,
+                );
+            }
+        }
+    }
+
+    fn show_highlights(&mut self, word: Option<String>, highlights: SymbolRanges, cx: &mut App) {
+        self.highlighted_word = word.filter(|_| !highlights.iter().all(Vec::is_empty));
+        let foreground = cx.theme().foreground;
+        for (kind, (collection, ranges)) in self.decorations.iter().zip(highlights).enumerate() {
+            collection.set(
+                ranges
+                    .into_iter()
+                    .map(|range| symbol_decoration(range, kind, foreground))
+                    .collect(),
+                cx,
+            );
+        }
     }
 
     fn dismiss_signature(&mut self) {
@@ -211,69 +259,65 @@ impl Workspace {
         }
         let text = state.text().clone();
         let path = file.path.clone();
+        let typed = previous.is_some_and(|previous| previous.revision != snapshot.revision);
         if moved {
             hints.highlights = Task::ready(());
-            let target = text.word_range(snapshot.caret);
-            let retain = target.as_ref().is_some_and(|target| {
+            let target = symbol_target(&text, snapshot.caret);
+            if typed {
+                hints.retain_unchanged_highlights(&text, cx);
+            } else if !target.as_ref().is_some_and(|(range, _)| {
                 hints.highlighted_word.as_deref().is_some_and(|word| {
-                    text.slice(target.clone()) == word
-                        && hints.decorations.get_ranges(cx).contains(target)
+                    text.slice(range.clone()) == word && hints.highlight_ranges(cx).contains(range)
                 })
-            });
-            if !retain {
-                hints.decorations.clear(cx);
-                hints.highlighted_word = None;
+            }) {
+                hints.clear_highlights(cx);
             }
-            if let Some(target) = target {
+            let displayed = hints.highlight_ranges(cx);
+            if target.is_some() || !displayed.is_empty() {
                 let expected = snapshot.clone();
                 let text = text.clone();
                 let document = document.clone();
                 let path = path.clone();
                 let editor = editor.downgrade();
+                let retained_word = hints.highlighted_word.clone();
                 hints.highlights = cx.spawn_in(window, async move |workspace, cx| {
-                    cx.background_executor()
-                        .timer(Duration::from_millis(120))
-                        .await;
-                    let request = document.document_highlights(text.clone(), expected.caret);
-                    let Ok(highlights) = request.await else {
+                    let timer = cx.background_executor();
+                    timer.timer(Duration::from_millis(120)).await;
+                    // Give a result that would remove visible ranges a second
+                    // chance after 270 ms of quiet. A newer target cancels both.
+                    let settle = timer.timer(Duration::from_millis(150));
+                    let word = target
+                        .as_ref()
+                        .map(|(range, _)| text.slice(range.clone()).to_string());
+                    let Ok(mut highlights) =
+                        request_symbol_ranges(&document, &text, target.as_ref()).await
+                    else {
                         return;
                     };
-                    _ = workspace.update_in(cx, |this, window, cx| {
-                        let Some(file) = this
-                            .current_caret_file(&path, &editor, &expected, &document, window, cx)
+                    let removes_highlights = || {
+                        let ranges: HashSet<_> = highlights.iter().flatten().collect();
+                        displayed.iter().any(|range| !ranges.contains(range))
+                    };
+                    if !displayed.is_empty() && (word != retained_word || removes_highlights()) {
+                        settle.await;
+                        let Ok(confirmed) =
+                            request_symbol_ranges(&document, &text, target.as_ref()).await
                         else {
                             return;
                         };
-                        let decorations = file.caret_hints.decorations.clone();
-                        let foreground = cx.theme().foreground;
-                        let highlights = highlights
-                            .into_iter()
-                            .filter_map(|highlight| {
-                                let start = byte_offset(&text, highlight.range.start)?;
-                                let end = byte_offset(&text, highlight.range.end)?;
-                                (start < end).then(|| {
-                                    let write =
-                                        highlight.kind == Some(DocumentHighlightKind::WRITE);
-                                    RangeDecoration::new(start..end)
-                                        .with_style(if write {
-                                            RangeDecorationStyle::Frame
-                                        } else {
-                                            RangeDecorationStyle::Fill
-                                        })
-                                        .with_color(foreground.opacity(if write {
-                                            0.42
-                                        } else {
-                                            0.14
-                                        }))
-                                })
-                            })
-                            .collect();
-                        this.files
-                            .get_mut(&path)
-                            .unwrap()
-                            .caret_hints
-                            .highlighted_word = Some(text.slice(target).to_string());
-                        decorations.set(highlights, cx);
+                        highlights = confirmed;
+                    }
+                    _ = workspace.update_in(cx, |this, window, cx| {
+                        if this
+                            .current_caret_file(&path, &editor, &expected, &document, window, cx)
+                            .is_some()
+                        {
+                            this.files
+                                .get_mut(&path)
+                                .unwrap()
+                                .caret_hints
+                                .show_highlights(word, highlights, cx);
+                        }
                     });
                 });
             }
@@ -282,7 +326,6 @@ impl Workspace {
         let Some(options) = document.signature_options() else {
             return;
         };
-        let typed = previous.is_some_and(|previous| previous.revision != snapshot.revision);
         let preceding = typed
             .then(|| text.chars_at(snapshot.caret).reversed().next())
             .flatten();
@@ -369,6 +412,63 @@ impl Workspace {
             && !state.is_composing())
         .then_some(file)
     }
+}
+
+type SymbolRanges = [Vec<Range<usize>>; 2];
+
+fn symbol_target(text: &Rope, caret: usize) -> Option<(Range<usize>, usize)> {
+    let previous_character = || {
+        text.chars_at(caret)
+            .reversed()
+            .next()
+            .map(|ch| caret - ch.len_utf8())
+    };
+    let range = text.word_range(caret).or_else(|| {
+        (caret == text.len())
+            .then(|| previous_character().and_then(|offset| text.word_range(offset)))
+            .flatten()
+            .filter(|range| range.end == caret)
+    })?;
+    // Some servers return no highlights for the boundary immediately after a word.
+    let position = if caret == range.end {
+        previous_character()?
+    } else {
+        caret
+    };
+    Some((range, position))
+}
+
+async fn request_symbol_ranges(
+    document: &Document,
+    text: &Rope,
+    target: Option<&(Range<usize>, usize)>,
+) -> anyhow::Result<SymbolRanges> {
+    let mut ranges = SymbolRanges::default();
+    if let Some((_, position)) = target {
+        let highlights = document
+            .document_highlights(text.clone(), *position)
+            .await?;
+        for DocumentHighlight { range, kind } in highlights {
+            if let (Some(start), Some(end)) =
+                (byte_offset(text, range.start), byte_offset(text, range.end))
+                && start < end
+            {
+                ranges[usize::from(kind == Some(DocumentHighlightKind::WRITE))].push(start..end);
+            }
+        }
+    }
+    Ok(ranges)
+}
+
+fn symbol_decoration(range: Range<usize>, kind: usize, foreground: Hsla) -> RangeDecoration {
+    let (style, opacity) = if kind == 1 {
+        (RangeDecorationStyle::Frame, 0.42)
+    } else {
+        (RangeDecorationStyle::Fill, 0.14)
+    };
+    RangeDecoration::new(range)
+        .with_style(style)
+        .with_color(foreground.opacity(opacity))
 }
 
 fn signature_label(help: &SignatureHelp) -> Option<(SharedString, Option<Range<usize>>)> {

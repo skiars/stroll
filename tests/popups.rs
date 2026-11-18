@@ -687,9 +687,9 @@ fn open_diagnostic_updates_in_place_after_an_edit(cx: &mut gpui::TestAppContext)
 
     use lsp_types::{Diagnostic, Position, Range};
 
-    let diagnostic = |row, message: &str| {
+    let diagnostic = |row, end, message: &str| {
         Diagnostic::new_simple(
-            Range::new(Position::new(row, 0), Position::new(row, 5)),
+            Range::new(Position::new(row, 0), Position::new(row, end)),
             message.into(),
         )
     };
@@ -706,8 +706,8 @@ fn open_diagnostic_updates_in_place_after_an_edit(cx: &mut gpui::TestAppContext)
         let state = cx.new(|cx| {
             let mut state = EditorState::new(window, cx).default_value("error; ok\nother\n");
             let set = state.diagnostics_mut().unwrap();
-            set.push(diagnostic(0, "Previous error"));
-            set.push(diagnostic(1, "Other error"));
+            set.push(diagnostic(0, 5, "Previous error"));
+            set.push(diagnostic(1, 5, "Other error"));
             state
         });
         editor = Some(state.clone());
@@ -737,13 +737,19 @@ fn open_diagnostic_updates_in_place_after_an_edit(cx: &mut gpui::TestAppContext)
     assert_eq!(visible_message(cx).as_deref(), Some("Previous error"));
     cx.simulate_input(" ");
     assert_eq!(visible_message(cx).as_deref(), Some("Previous error"));
+    cx.update(|window, cx| {
+        editor.update(cx, |editor, cx| {
+            editor.edit_ranges(&[(4..5, String::new())], window, cx);
+        });
+    });
+    assert_eq!(visible_message(cx).as_deref(), Some("Previous error"));
     cx.update(|_, cx| {
         editor.update(cx, |editor, cx| {
             let text = editor.text().clone();
             let set = editor.diagnostics_mut().unwrap();
-            assert_eq!(set.iter().nth(1).unwrap().range, 11..16);
+            assert_eq!(set.iter().nth(1).unwrap().range, 10..15);
             set.reset(&text);
-            set.push(diagnostic(0, "Current error"));
+            set.push(diagnostic(0, 4, "Current error"));
             cx.notify();
         });
     });

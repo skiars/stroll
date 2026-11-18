@@ -208,13 +208,17 @@ dialogs in a Wayland window after changes to paint order or focus handling.
   Inlay hints use the light weight of the current editor font. The light and
   dark editor theme captures include a rendered hint.
 
-- Interactive edits retain diagnostics on surviving text and remap their ranges.
-  The open diagnostic hover validates its pointer against the laid-out text
-  and reads the current diagnostic set in place. The editor editing and popup
-  integration tests cover line insertion, undo, and replacement of an open
-  diagnostic. With clangd installed, run
+- Interactive edits remap surviving diagnostics using the editor's tracked range
+  logic, including partial deletions. An open diagnostic hover follows its
+  remapped target and reconciles the current diagnostic set after layout. Run
+  `cargo test --release --locked --test editor_editing edits_track_surviving_diagnostics_until_the_next_reply`
+  and `cargo test --release --locked --test popups open_diagnostic_updates_in_place_after_an_edit`
+  to verify range and popup updates. The workspace
+  `editor_annotations_handle_delayed_out_of_order_and_empty_results` test controls
+  LSP replies. With clangd installed, run
   `cargo test --release --locked --lib local_cpp_diagnostics_and_highlights_stay_visible_during_edits -- --ignored`
-  to exercise the complete refresh in both workspace and standalone windows.
+  for frame checks during timed backspace and restore sequences in workspace and
+  standalone windows.
 
 - The shared caret-anchored popup can prefer the space above the caret. The
   workspace uses this placement for LSP signature help and hides the hint while

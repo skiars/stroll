@@ -2630,6 +2630,9 @@ impl Workspace {
             return;
         }
         file.committed = text.clone();
+        if let Some(server) = &file.language_server {
+            server.document.changed(file.committed.clone());
+        }
         if self.standalone.is_some() {
             file.dirty = file.committed != file.saved;
             file.revision += 1;

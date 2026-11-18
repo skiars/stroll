@@ -88,7 +88,7 @@ fn select(
 }
 
 #[test]
-fn edits_keep_diagnostics_on_untouched_ranges_until_the_next_reply() {
+fn edits_track_surviving_diagnostics_until_the_next_reply() {
     let source = "edit me\n😀 error\n";
     with_editor(source, true, false, false, |visual, editor| {
         visual.update(|_, cx| {
@@ -112,25 +112,35 @@ fn edits_keep_diagnostics_on_untouched_ranges_until_the_next_reply() {
         visual.update(|_, cx| {
             let state = editor.read(cx);
             let diagnostics = state.diagnostics().unwrap();
-            assert_eq!(diagnostics.len(), 1);
-            let entry = diagnostics.iter().next().unwrap();
-            assert_eq!(entry.message.as_str(), "untouched");
+            assert_eq!(diagnostics.len(), 2);
+            let mut entries = diagnostics.iter();
+            let edited = entries.next().unwrap();
+            assert_eq!(edited.message.as_str(), "edited");
+            assert_eq!(state.text().slice(edited.range.clone()), "ed\nit");
+            let untouched = entries.next().unwrap();
+            assert_eq!(untouched.message.as_str(), "untouched");
             assert_eq!(
-                entry.diagnostic.range,
+                untouched.diagnostic.range,
                 Position::new(2, 2)..Position::new(2, 7)
             );
-            assert_eq!(state.text().slice(entry.range.clone()).to_string(), "error");
+            assert_eq!(state.text().slice(untouched.range.clone()), "error");
         });
         visual.update(|window, cx| {
             editor.update(cx, |state, cx| state.replay_text_history(true, window, cx));
         });
-        visual.update(|_, cx| {
-            let state = editor.read(cx);
-            let entry = state.diagnostics().unwrap().iter().next().unwrap();
-            assert_eq!(
-                entry.diagnostic.range,
-                Position::new(1, 2)..Position::new(1, 7)
-            );
+        visual.update(|window, cx| {
+            editor.update(cx, |state, cx| {
+                let diagnostics = state.diagnostics().unwrap();
+                let untouched = diagnostics.iter().nth(1).unwrap();
+                assert_eq!(
+                    untouched.diagnostic.range,
+                    Position::new(1, 2)..Position::new(1, 7)
+                );
+                state.edit_ranges(&[(0..4, "new".into())], window, cx);
+                let mut remaining = state.diagnostics().unwrap().iter();
+                assert_eq!(remaining.next().unwrap().message.as_str(), "untouched");
+                assert!(remaining.next().is_none());
+            });
         });
     });
 }

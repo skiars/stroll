@@ -6,6 +6,8 @@ use sum_tree::SumTree;
 
 use crate::input::{Position, RopeExt as _};
 
+use super::decorations::adjust_range_for_edit;
+
 pub type DiagnosticRelatedInformation = lsp_types::DiagnosticRelatedInformation;
 pub(super) type CodeDescription = lsp_types::CodeDescription;
 pub type RelatedInformation = lsp_types::DiagnosticRelatedInformation;
@@ -123,22 +125,26 @@ pub struct DiagnosticEntry {
     pub diagnostic: Diagnostic,
 }
 
-// An annotation remains valid while its underlying text is unchanged.
-pub(super) fn retained_range(
+// Keep a diagnostic attached to surviving text while the server analyzes the edit.
+pub(super) fn adjust_diagnostic_range(
     range: &Range<usize>,
     edited: &Range<usize>,
     inserted_len: usize,
 ) -> Option<Range<usize>> {
-    if range.end <= edited.start && range.start < edited.start {
-        return Some(range.clone());
+    if range.is_empty() {
+        let point = range.start;
+        if point < edited.start {
+            return Some(range.clone());
+        }
+        return (point >= edited.end).then(|| {
+            let offset = point - edited.len() + inserted_len;
+            offset..offset
+        });
     }
-    if range.start >= edited.end {
-        let delta = inserted_len as isize - edited.len() as isize;
-        return Some(
-            range.start.saturating_add_signed(delta)..range.end.saturating_add_signed(delta),
-        );
+    if edited.start <= range.start && range.end <= edited.end {
+        return None;
     }
-    None
+    Some(adjust_range_for_edit(range, edited, inserted_len))
 }
 
 impl Deref for DiagnosticEntry {
@@ -217,7 +223,7 @@ impl DiagnosticSet {
         }
 
         let retained = self.diagnostics.iter().filter_map(|entry| {
-            let range = retained_range(&entry.range, edited, inserted_len)?;
+            let range = adjust_diagnostic_range(&entry.range, edited, inserted_len)?;
             if entry.range.end <= edited.start && entry.range.start < edited.start {
                 return Some(entry.clone());
             }

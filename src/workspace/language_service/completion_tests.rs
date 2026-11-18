@@ -480,6 +480,244 @@ fn workspace_completion_with_clangd() -> Result<()> {
 }
 
 #[test]
+fn editor_annotations_handle_delayed_out_of_order_and_empty_results() -> Result<()> {
+    use serde_json::{Value, json};
+
+    let fixture = tempfile::tempdir()?;
+    let root = fixture.path();
+    let script = root.join("server.py");
+    fs::write(
+        &script,
+        include_str!("../../../tests/fixtures/lsp_annotation_updates.py"),
+    )?;
+    let source = "int broken = unknown;\nint apple = apple;\nint pear = pear;\n";
+    let error_start = source.find("unknown").unwrap();
+    let configuration = format!(
+        "[lsp.clangd]\ncommand = 'python3 -u {}'\n",
+        script.display()
+    );
+    let mut response_number = 0;
+    let mut send = |message: Value| -> Result<_> {
+        response_number += 1;
+        let dest = root.join(format!("reply-{response_number:02}.json"));
+        let staging = dest.with_extension("tmp");
+        fs::write(&staging, serde_json::to_vec(&message)?)?;
+        fs::rename(staging, &dest)?;
+        Ok(dest)
+    };
+    with_workspace_editor(
+        root,
+        "main.cpp",
+        &configuration,
+        source,
+        source.find("apple").unwrap() + 1,
+        |visual, workspace, editor| {
+            let receive = |visual: &mut VisualTestContext,
+                           name: &str,
+                           check: &dyn Fn(&mut VisualTestContext)|
+             -> Result<Value> {
+                let incoming = root.join(format!("{name}.json"));
+                wait(visual, name, |visual| {
+                    check(visual);
+                    incoming.exists()
+                })?;
+                Ok(serde_json::from_slice(&fs::read(incoming)?)?)
+            };
+            let open = receive(visual, "open-1", &|_| {})?;
+            let uri = &open["params"]["textDocument"]["uri"];
+            let publish = |version: &Value, message: Option<(&str, usize)>| {
+                let diagnostics = message
+                    .map(|(message, end)| {
+                        json!({
+                            "range": {
+                                "start": {"line": 0, "character": error_start},
+                                "end": {"line": 0, "character": end},
+                            },
+                            "severity": 1,
+                            "message": message,
+                        })
+                    })
+                    .into_iter()
+                    .collect::<Vec<_>>();
+                json!({
+                    "method": "textDocument/publishDiagnostics",
+                    "params": {"uri": uri, "version": version, "diagnostics": diagnostics},
+                })
+            };
+            let highlight = |request: &Value, word: &str| {
+                let (line, text) = source
+                    .lines()
+                    .enumerate()
+                    .find(|(_, line)| line.contains(word))
+                    .unwrap();
+                assert_eq!(request["params"]["position"]["line"], line);
+                let result = text
+                    .match_indices(word)
+                    .map(|(start, _)| {
+                        json!({
+                            "range": {
+                                "start": {"line": line, "character": start},
+                                "end": {"line": line, "character": start + word.len()},
+                            }
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                json!({"id": request["id"], "result": result})
+            };
+            let shown_word = |visual: &mut VisualTestContext, word: &str| {
+                visual.update(|_, cx| {
+                    let file = workspace.read(cx).active_file().unwrap();
+                    let ranges = file.caret_hints.highlight_ranges(cx);
+                    ranges.len() == 2
+                        && ranges
+                            .into_iter()
+                            .all(|range| editor.read(cx).text().slice(range) == word)
+                })
+            };
+            let shown_diagnostic = |visual: &mut VisualTestContext, message: &str| {
+                visual.update(|window, cx| {
+                    let editor = editor.read(cx);
+                    editor
+                        .diagnostic_popover()
+                        .is_some_and(|entry| entry.message == message)
+                        && editor
+                            .diagnostics()
+                            .unwrap()
+                            .iter()
+                            .any(|entry| entry.message == message)
+                        && !window.painted_underlines().is_empty()
+                }) && visual.debug_bounds("diagnostic-quick-fix-button").is_some()
+            };
+            let edit_before_caret = |visual: &mut VisualTestContext,
+                                     range: std::ops::Range<usize>,
+                                     replacement: &str| {
+                visual.update(|window, cx| {
+                    editor.update(cx, |editor, cx| {
+                        let caret = editor.cursor() - range.len() + replacement.len();
+                        editor.edit_ranges(&[(range, replacement.into())], window, cx);
+                        editor.set_selected_range(caret..caret, cx);
+                    });
+                });
+            };
+
+            send(publish(
+                &open["params"]["textDocument"]["version"],
+                Some(("initial", error_start + 7)),
+            ))?;
+            let apple = receive(visual, "highlight-1", &|_| {})?;
+            send(highlight(&apple, "apple"))?;
+            wait(
+                visual,
+                "initial diagnostic and apple highlights",
+                |visual| {
+                    shown_word(visual, "apple")
+                        && visual.update(|_, cx| !editor.read(cx).diagnostics().unwrap().is_empty())
+                },
+            )?;
+            let pointer = visual.update(|_, cx| {
+                editor
+                    .read(cx)
+                    .range_to_bounds(&(error_start..error_start + 7))
+                    .unwrap()
+                    .center()
+            });
+            visual.simulate_mouse_move(pointer, None, Default::default());
+            wait(visual, "initial diagnostic popup", |visual| {
+                shown_diagnostic(visual, "initial")
+            })?;
+
+            let apple_and_initial = |visual: &mut VisualTestContext| {
+                assert!(shown_word(visual, "apple"));
+                assert!(shown_diagnostic(visual, "initial"));
+            };
+            edit_before_caret(visual, error_start + 6..error_start + 7, "");
+            let change = receive(visual, "change-1", &apple_and_initial)?;
+            let older = &change["params"]["textDocument"]["version"];
+            let first = receive(visual, "highlight-2", &apple_and_initial)?;
+            send(json!({"id": first["id"], "result": null}))?;
+            let confirmation = receive(visual, "highlight-3", &apple_and_initial)?;
+            send(highlight(&confirmation, "apple"))?;
+            for _ in 0..4 {
+                frame(visual);
+                apple_and_initial(visual);
+            }
+
+            edit_before_caret(visual, error_start + 6..error_start + 6, "n");
+            let change = receive(visual, "change-2", &apple_and_initial)?;
+            let latest = &change["params"]["textDocument"]["version"];
+            let late = receive(visual, "highlight-4", &apple_and_initial)?;
+            send(publish(latest, Some(("current", error_start + 7))))?;
+            wait(visual, "updated diagnostic in the same popup", |visual| {
+                assert!(shown_word(visual, "apple"));
+                assert!(shown_diagnostic(visual, "initial") || shown_diagnostic(visual, "current"));
+                shown_diagnostic(visual, "current")
+            })?;
+
+            visual.update(|_, cx| {
+                editor.update(cx, |editor, cx| {
+                    let caret = source.find("pear").unwrap() + 1;
+                    editor.set_selected_range(caret..caret, cx);
+                });
+            });
+            let assert_no_highlights = |visual: &mut VisualTestContext| {
+                visual.update(|_, cx| {
+                    let file = workspace.read(cx).active_file().unwrap();
+                    assert!(file.caret_hints.highlight_ranges(cx).is_empty());
+                });
+            };
+            frame(visual);
+            assert_no_highlights(visual);
+            let pear = receive(visual, "highlight-5", &|visual| {
+                assert_no_highlights(visual);
+                assert!(shown_diagnostic(visual, "current"));
+            })?;
+            send(highlight(&pear, "pear"))?;
+            wait(visual, "latest symbol", |visual| shown_word(visual, "pear"))?;
+            send(highlight(&late, "apple"))?;
+            let stale = send(publish(older, None))?;
+            let pear_and_current = |visual: &mut VisualTestContext| {
+                assert!(shown_word(visual, "pear"));
+                assert!(shown_diagnostic(visual, "current"));
+            };
+            wait(
+                visual,
+                "older responses sent after the latest results",
+                |visual| {
+                    pear_and_current(visual);
+                    !stale.exists()
+                },
+            )?;
+            for _ in 0..4 {
+                frame(visual);
+                pear_and_current(visual);
+            }
+
+            edit_before_caret(visual, error_start..error_start + 1, "");
+            let change = receive(visual, "change-3", &pear_and_current)?;
+            let empty = receive(visual, "highlight-6", &pear_and_current)?;
+            send(json!({"id": empty["id"], "result": []}))?;
+            let confirmation = receive(visual, "highlight-7", &pear_and_current)?;
+            send(json!({"id": confirmation["id"], "result": null}))?;
+            send(publish(&change["params"]["textDocument"]["version"], None))?;
+            wait(
+                visual,
+                "confirmed empty results clear the decorations and popup",
+                |visual| {
+                    visual.update(|_, cx| {
+                        let file = workspace.read(cx).active_file().unwrap();
+                        let editor = editor.read(cx);
+                        file.caret_hints.highlight_ranges(cx).is_empty()
+                            && editor.diagnostics().unwrap().is_empty()
+                            && editor.diagnostic_popover().is_none()
+                    })
+                },
+            )?;
+            Ok(())
+        },
+    )
+}
+
+#[test]
 #[ignore = "requires clangd on PATH"]
 fn local_cpp_diagnostics_and_highlights_stay_visible_during_edits() -> Result<()> {
     let fixture = tempfile::tempdir()?;
@@ -587,13 +825,11 @@ fn exercise_local_cpp(
         });
         initial_diagnostics?;
     }
-    let apple = source.find("return apple").unwrap() + "return ".len();
     let editor = visual.update(|window, cx| {
         let file = workspace.read(cx).active_file().unwrap();
         let editor = file.editor.clone();
         editor.update(cx, |editor, cx| {
             editor.focus(window, cx);
-            editor.set_selected_range(apple..apple, cx);
         });
         editor
     });
@@ -607,88 +843,160 @@ fn exercise_local_cpp(
                     .all(|range| editor.read(cx).text().slice(range) == word)
         })
     };
-    wait(visual, "three apple highlights", |visual| {
-        highlights(visual, "apple")
-    })?;
+    let error_offset = source.find("unknown").unwrap();
+    let operator = source.find("apple + apple").unwrap() + "apple ".len();
+    let apple_caret = operator + "+ a".len();
+    let pear_caret = source.rfind("pear").unwrap() + 1;
     let pointer = visual.update(|_, cx| {
-        let start = source.find("unknown").unwrap();
         editor
             .read(cx)
-            .range_to_bounds(&(start..start + "unknown".len()))
+            .range_to_bounds(&(error_offset..error_offset + "unknown".len()))
             .unwrap()
             .center()
     });
-    visual.simulate_mouse_move(pointer, None, Default::default());
     let has_error_popup = |visual: &mut VisualTestContext| {
         visual.update(|_, cx| {
-            editor.read(cx).hover_popover().is_some_and(|popover| {
-                popover
-                    .diagnostics
-                    .iter()
-                    .any(|entry| entry.message.contains("unknown"))
-            })
-        })
+            let editor = editor.read(cx);
+            let is_unresolved = |entry: &gpui_component::highlighter::DiagnosticEntry| {
+                editor
+                    .text()
+                    .slice(entry.range.clone())
+                    .to_string()
+                    .starts_with("unknow")
+                    && entry.message.contains("undeclared identifier")
+            };
+            editor
+                .diagnostic_popover()
+                .as_deref()
+                .is_some_and(is_unresolved)
+                && editor.diagnostics().unwrap().iter().any(is_unresolved)
+        }) && visual.debug_bounds("diagnostic-quick-fix-button").is_some()
     };
-    wait(visual, "open diagnostic popup", has_error_popup)?;
-    for _ in 0..6 {
-        visual.simulate_input(" ");
+    let select = |visual: &mut VisualTestContext, caret| {
+        visual.update(|_, cx| {
+            editor.update(cx, |editor, cx| editor.set_selected_range(caret..caret, cx));
+        });
+    };
+    let edit_with_caret = |visual: &mut VisualTestContext,
+                           range: std::ops::Range<usize>,
+                           replacement: &str,
+                           caret: usize| {
+        visual.update(|window, cx| {
+            editor.update(cx, |editor, cx| {
+                editor.edit_ranges(&[(range, replacement.into())], window, cx);
+                editor.set_selected_range(caret..caret, cx);
+            });
+        });
+    };
+
+    for interval in [30, 70, 130, 220].map(Duration::from_millis) {
+        if interval != Duration::from_millis(30) {
+            let len = visual.update(|_, cx| editor.read(cx).text().len());
+            edit_with_caret(visual, 0..len, source, error_offset + "unknown".len());
+            wait(
+                visual,
+                "restored diagnostics before a new input cadence",
+                |visual| visual.update(|_, cx| editor.read(cx).diagnostics().unwrap().len() >= 2),
+            )?;
+        }
+        select(visual, error_offset + "unknown".len());
+        // Move away first so the same pointer position can open the next round's popup.
+        visual.simulate_mouse_move(gpui::point(px(2.), px(2.)), None, Default::default());
+        visual.simulate_mouse_move(pointer, None, Default::default());
+        wait(
+            visual,
+            "open unresolved-identifier diagnostic popup",
+            has_error_popup,
+        )?;
+
         for _ in 0..3 {
-            frame(visual);
-            assert!(
-                has_error_popup(visual)
-                    && visual.debug_bounds("diagnostic-quick-fix-button").is_some(),
-                "the diagnostic popup disappeared during input"
-            );
-            assert!(
-                highlights(visual, "apple"),
-                "the symbol decorations disappeared during input at {:?}",
-                visual.update(|_, cx| {
-                    let file = workspace.read(cx).active_file().unwrap();
-                    (
-                        editor.read(cx).cursor(),
-                        file.caret_hints.highlight_ranges(cx),
-                    )
-                })
-            );
+            visual.simulate_keystrokes("backspace");
             visual.update(|_, cx| {
-                assert!(editor.read(cx).diagnostics().unwrap().len() >= 2);
+                assert_eq!(
+                    editor.read(cx).text().slice(error_offset..error_offset + 7),
+                    "unknow;"
+                );
+            });
+            draw_through_interval(visual, interval, |visual| {
+                assert!(
+                    has_error_popup(visual),
+                    "diagnostic or popup blinked at {interval:?} after Backspace"
+                );
+            });
+            visual.simulate_input("n");
+            visual.update(|_, cx| assert_eq!(editor.read(cx).text().to_string(), source));
+            draw_through_interval(visual, interval, |visual| {
+                assert!(
+                    has_error_popup(visual),
+                    "diagnostic or popup blinked at {interval:?} after restore"
+                );
             });
         }
+        select(visual, apple_caret);
+        wait(
+            visual,
+            "three apple highlights before operator edits",
+            |visual| highlights(visual, "apple"),
+        )?;
+        for _ in 0..3 {
+            edit_with_caret(visual, operator..operator + 1, "", apple_caret - 1);
+            draw_through_interval(visual, interval, |visual| {
+                assert!(
+                    highlights(visual, "apple"),
+                    "apple highlights blinked at {interval:?} after deleting +"
+                );
+                assert!(
+                    has_error_popup(visual),
+                    "the unrelated popup blinked at {interval:?}"
+                );
+            });
+            edit_with_caret(visual, operator..operator, "+", apple_caret);
+            draw_through_interval(visual, interval, |visual| {
+                assert!(
+                    highlights(visual, "apple"),
+                    "apple highlights blinked at {interval:?} after restoring +"
+                );
+                assert!(
+                    has_error_popup(visual),
+                    "the unrelated popup blinked at {interval:?}"
+                );
+            });
+        }
+
+        let repaired_caret = apple_caret - "unknown".len() + 2;
+        visual.update(|window, cx| {
+            editor.update(cx, |editor, cx| {
+                let semicolon = source.find("= ;").unwrap() + 2;
+                editor.edit_ranges(
+                    &[
+                        (error_offset..error_offset + "unknown".len(), "0".into()),
+                        (semicolon..semicolon, "0".into()),
+                    ],
+                    window,
+                    cx,
+                );
+                editor.set_selected_range(repaired_caret..repaired_caret, cx);
+            });
+        });
+        wait(visual, "clangd clears the repaired errors", |visual| {
+            visual.update(|_, cx| editor.read(cx).diagnostics().unwrap().is_empty())
+        })?;
+        assert!(!has_error_popup(visual));
+
+        select(visual, pear_caret - "unknown".len() + 2);
+        frame(visual);
+        assert!(
+            !highlights(visual, "apple"),
+            "old highlights remained after moving to pear"
+        );
+        wait(visual, "three pear highlights", |visual| {
+            highlights(visual, "pear")
+        })?;
+        draw_through_interval(visual, interval, |visual| {
+            assert!(highlights(visual, "pear") && !has_error_popup(visual));
+        });
+        eprintln!("Validated {interval:?} in {path:?}");
     }
-
-    visual.update(|window, cx| {
-        editor.update(cx, |editor, cx| {
-            let unknown = source.find("unknown").unwrap();
-            let semicolon = source.find("= ;").unwrap() + 2;
-            editor.edit_ranges(
-                &[
-                    (unknown..unknown + "unknown".len(), "0".into()),
-                    (semicolon..semicolon, "0".into()),
-                ],
-                window,
-                cx,
-            );
-        });
-    });
-    wait(visual, "clangd clears the repaired errors", |visual| {
-        visual.update(|_, cx| editor.read(cx).diagnostics().unwrap().is_empty())
-    })?;
-    assert!(!has_error_popup(visual));
-
-    visual.update(|_, cx| {
-        editor.update(cx, |editor, cx| {
-            let caret = editor.text().to_string().rfind("pear").unwrap() + 1;
-            editor.set_selected_range(caret..caret, cx);
-        });
-    });
-    frame(visual);
-    assert!(
-        !highlights(visual, "apple"),
-        "the previous symbol retained its highlights"
-    );
-    wait(visual, "three pear highlights", |visual| {
-        highlights(visual, "pear")
-    })?;
 
     visual.dispatch_action(crate::workspace::FindReferences);
     frame(visual);
@@ -699,6 +1007,30 @@ fn exercise_local_cpp(
         }
         visual.update(|_, cx| !workspace.read(cx).locator.open)
     })
+}
+
+fn draw_through_interval(
+    visual: &mut VisualTestContext,
+    interval: Duration,
+    mut check: impl FnMut(&mut VisualTestContext),
+) {
+    let start = Instant::now();
+    let mut elapsed = Duration::ZERO;
+    loop {
+        visual.run_until_parked();
+        visual.update(|window, cx| {
+            window.simulate_next_frame(cx);
+            window.draw(cx).clear(cx);
+        });
+        check(visual);
+        if elapsed == interval {
+            break;
+        }
+        let next = (elapsed + Duration::from_millis(10)).min(interval);
+        std::thread::sleep((start + next).saturating_duration_since(Instant::now()));
+        visual.executor().advance_clock(next - elapsed);
+        elapsed = next;
+    }
 }
 
 #[test]
