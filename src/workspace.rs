@@ -4035,6 +4035,10 @@ impl Workspace {
         let locked =
             file.document.conflict || file.document.mixed_newlines || self.git_edit.contains(path);
         let status_size = 11.;
+        let language = self
+            .source_resources(path)
+            .display_name_for_path(path)
+            .unwrap_or_else(|| language_for(path).into());
         let progress = self.language_service_progress(file, status_size, colors, cx);
         // Every text/button in this row goes through `baseline_aligned`,
         // so new status content with a different size still shares the
@@ -4071,7 +4075,7 @@ impl Workspace {
                     .flex_shrink_0()
                     .gap_3()
                     .child(
-                        baseline_aligned(cx, status_size, status_size, language_for(path))
+                        baseline_aligned(cx, status_size, status_size, language)
                             .debug_selector(|| "status-file-language".into()),
                     )
                     .child(

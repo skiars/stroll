@@ -313,8 +313,24 @@ impl LanguageResources {
         Some(language)
     }
 
+    fn matched_grammar(&self, path: &Path) -> Option<(&Language, &SharedString)> {
+        let language = self.match_path(path)?;
+        Some((language, self.names.get(&language.id)?))
+    }
+
     pub(crate) fn for_path(&self, path: &Path) -> Option<SharedString> {
-        self.names.get(&self.match_path(path)?.id).cloned()
+        self.matched_grammar(path).map(|(_, name)| name.clone())
+    }
+
+    pub(crate) fn display_name_for_path(&self, path: &Path) -> Option<SharedString> {
+        let (language, _) = self.matched_grammar(path)?;
+        let display_name = language
+            .aliases
+            .iter()
+            .map(|alias| alias.trim())
+            .find(|alias| !alias.is_empty())
+            .unwrap_or(&language.id);
+        Some(display_name.to_owned().into())
     }
 
     pub(crate) fn is_source_file(&self, path: &Path) -> bool {
@@ -628,7 +644,7 @@ mod tests {
     fn textmate_source_files_use_the_same_language_match_as_highlighting() -> Result<()> {
         let mut resources = LanguageResources::default();
         resources.languages = serde_json::from_value(json!([
-            {"id": "code", "extensions": [".example"]},
+            {"id": "code", "extensions": [".example"], "aliases": ["Example", "example"]},
             {"id": "prose", "filenames": ["README.example"]},
             {"id": "unregistered", "extensions": [".incomplete.example"]}
         ]))?;
@@ -647,12 +663,28 @@ mod tests {
         resources.register_textmate(textmate);
 
         assert!(resources.is_source_file(Path::new("sample.example")));
+        assert_eq!(
+            resources
+                .display_name_for_path(Path::new("sample.example"))
+                .as_deref(),
+            Some("Example")
+        );
         assert!(!resources.is_source_file(Path::new("sample.txt")));
+        assert!(
+            resources
+                .display_name_for_path(Path::new("sample.txt"))
+                .is_none()
+        );
         let prose = Path::new("README.example");
         assert!(resources.for_path(prose).is_some());
+        assert_eq!(
+            resources.display_name_for_path(prose).as_deref(),
+            Some("prose")
+        );
         assert!(!resources.is_source_file(prose));
         let unregistered = Path::new("sample.incomplete.example");
         assert!(resources.for_path(unregistered).is_none());
+        assert!(resources.display_name_for_path(unregistered).is_none());
         assert!(!resources.is_source_file(unregistered));
         Ok(())
     }
