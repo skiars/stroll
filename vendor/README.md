@@ -71,6 +71,9 @@ dialogs in a Wayland window after changes to paint order or focus handling.
 - Caret-anchored editor popups use intrinsic layout so short signatures size to
   their content and viewport caps apply to long signatures. The workspace
   signature-help and popup integration tests verify the rendered bounds.
+- Source editor Up and Down reach the document edges when no visual row remains
+  in that direction. The editor editing integration tests verify the boundary
+  behavior and column preservation when moving between rows.
 - Source editors opt into deleting, duplicating, moving and commenting logical lines.
   Commands merge overlapping or adjacent line selections and use a single undo transaction.
   The language provider supplies built-in comment markers. Language extensions can supply

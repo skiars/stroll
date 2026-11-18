@@ -169,10 +169,8 @@ impl<M: InputModeKind> InputBaseState<M> {
         }
     }
 
-    /// Extend to the document edge when there is no further visual row. Plain
-    /// movement retains its column there, but selection must still reach the
-    /// remaining text on the first or last row.
-    pub(super) fn vertical_selection_target(
+    /// Reach the document edge when there is no further visual row.
+    pub(super) fn vertical_target_or_document_edge(
         &self,
         offset: usize,
         column_anchor: Option<(Pixels, usize)>,
@@ -276,7 +274,11 @@ impl<M: InputModeKind> InputBaseState<M> {
                 };
                 let anchor =
                     anchor.or_else(|| s.preferred_column_for_with_affinity(effective, affinity));
-                let (offset, affinity) = s.vertical_target(effective, anchor, affinity, move_lines);
+                let (offset, affinity) = if collapse && s.is_code_editor() {
+                    s.vertical_target_or_document_edge(effective, anchor, affinity, move_lines)
+                } else {
+                    s.vertical_target(effective, anchor, affinity, move_lines)
+                };
                 (offset, anchor, affinity)
             },
             Some(direction),

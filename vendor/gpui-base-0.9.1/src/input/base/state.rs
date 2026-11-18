@@ -1890,7 +1890,7 @@ impl<M: InputModeKind> InputBaseState<M> {
         }
         self.select_all_cursors_to_with_affinity(
             |s, sel| {
-                s.vertical_selection_target(
+                s.vertical_target_or_document_edge(
                     sel.cursor_offset(),
                     sel.column_anchor,
                     s.line_end_affinity_for(sel),
@@ -1908,7 +1908,7 @@ impl<M: InputModeKind> InputBaseState<M> {
         }
         self.select_all_cursors_to_with_affinity(
             |s, sel| {
-                s.vertical_selection_target(
+                s.vertical_target_or_document_edge(
                     sel.cursor_offset(),
                     sel.column_anchor,
                     s.line_end_affinity_for(sel),

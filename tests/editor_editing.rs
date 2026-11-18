@@ -88,6 +88,28 @@ fn select(
 }
 
 #[test]
+fn vertical_arrows_reach_the_document_edges() {
+    let source = "source row\nsource row";
+    let last_row = source.find('\n').unwrap() + 1;
+    with_editor(source, false, false, false, |visual, editor| {
+        select(visual, editor, 3..3);
+        visual.simulate_keystrokes("down");
+        assert_eq!(visual.update(|_, cx| editor.read(cx).cursor()), 14);
+        visual.simulate_keystrokes("down");
+        assert_eq!(
+            visual.update(|_, cx| editor.read(cx).cursor()),
+            source.len()
+        );
+
+        select(visual, editor, last_row + 3..last_row + 3);
+        visual.simulate_keystrokes("up");
+        assert_eq!(visual.update(|_, cx| editor.read(cx).cursor()), 3);
+        visual.simulate_keystrokes("up");
+        assert_eq!(visual.update(|_, cx| editor.read(cx).cursor()), 0);
+    });
+}
+
+#[test]
 fn edits_track_surviving_diagnostics_until_the_next_reply() {
     let source = "edit me\n😀 error\n";
     with_editor(source, true, false, false, |visual, editor| {
