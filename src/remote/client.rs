@@ -74,6 +74,8 @@ struct Connection {
     batch: AtomicBool,
     #[cfg(feature = "desktop")]
     revision_comparison: std::sync::OnceLock<bool>,
+    #[cfg(feature = "desktop")]
+    worktree_lsp: std::sync::OnceLock<bool>,
     repository_events: crate::git::watch::RepoEvents,
     #[cfg(feature = "desktop")]
     repository_watch: AtomicBool,
@@ -236,6 +238,14 @@ impl SshSession {
         self.0.lsp_edits.load(Ordering::Relaxed)
     }
 
+    #[cfg(feature = "desktop")]
+    pub(crate) fn supports_worktree_lsp(&self) -> bool {
+        *self.0.worktree_lsp.get_or_init(|| {
+            let version = super::WORKTREE_LSP_VERSION;
+            self.call::<u32>(Request::Hello(version)).ok() == Some(version)
+        })
+    }
+
     pub fn failure(&self) -> Option<String> {
         self.0.failure.lock().unwrap().clone()
     }
@@ -350,6 +360,8 @@ impl Connection {
             batch: AtomicBool::new(false),
             #[cfg(feature = "desktop")]
             revision_comparison: Default::default(),
+            #[cfg(feature = "desktop")]
+            worktree_lsp: Default::default(),
             repository_events: Default::default(),
             #[cfg(feature = "desktop")]
             repository_watch: AtomicBool::new(false),

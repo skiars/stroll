@@ -120,12 +120,15 @@ impl Client {
     }
 
     pub(crate) fn start_with_uri(
-        command: Command,
-        cwd: Option<PathBuf>,
+        command: impl FnOnce() -> Result<Command> + Send + 'static,
         uri: String,
         options: ServerOptions,
     ) -> Result<Self> {
-        Self::start_session(move || Ok(command), cwd, uri, options)
+        Self::start_session(command, None, uri, options)
+    }
+
+    pub(crate) fn stopped(&self) -> async_channel::Receiver<()> {
+        self.0.stopped.clone()
     }
 
     fn start_session(
@@ -164,6 +167,9 @@ impl Client {
                 let mut program = "startup".to_owned();
                 let result = (|| {
                     let mut command = command()?;
+                    if *state.lock().unwrap() == SessionState::Stopping {
+                        return Ok(());
+                    }
                     program = command.get_program().to_string_lossy().into_owned();
                     let wire = Transport::start(
                         &mut command,

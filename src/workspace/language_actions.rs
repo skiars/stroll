@@ -557,8 +557,7 @@ impl ActionSource {
                         (editor.text.clone(), Some(editor.clone()), None)
                     } else {
                         ensure!(!document.restored && snapshot.is_none(), actions::stale());
-                        let buffer = FileBuffer::new(document);
-                        let project = ServerProject::for_file(&repo, path);
+                        let (buffer, project) = FileBuffer::new(document).with_project(&repo, path);
                         (buffer.text.clone(), None, Some((buffer, project)))
                     };
                     let edits = if disk_has_bom {

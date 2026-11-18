@@ -6,19 +6,19 @@ use std::{
 };
 
 use anyhow::{Context as _, Result, ensure};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ExternalLsp {
     pub id: String,
     pub languages: BTreeMap<String, String>,
     #[serde(default)]
-    root_markers: Vec<String>,
+    pub(super) root_markers: Vec<String>,
     pub server: ExternalCommand,
     #[serde(default)]
-    disabled: bool,
+    pub(super) disabled: bool,
 }
 
 impl Hash for ExternalLsp {
@@ -27,12 +27,12 @@ impl Hash for ExternalLsp {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ExternalCommand {
     pub command: String,
     #[serde(default)]
-    args: Vec<String>,
+    pub(super) args: Vec<String>,
     #[serde(default)]
     pub env: BTreeMap<String, String>,
     #[serde(default)]
@@ -83,7 +83,7 @@ pub(crate) fn load() -> Result<Vec<ExternalLsp>> {
 }
 
 impl ExternalLsp {
-    fn validate(&self) -> Result<()> {
+    pub(super) fn validate(&self) -> Result<()> {
         ensure!(!self.id.trim().is_empty(), "Expected a language server ID");
         ensure!(
             self.server
@@ -108,17 +108,7 @@ impl ExternalLsp {
                     || executable.file_name() == Some(executable.as_os_str())),
             "Expected an executable name or absolute path"
         );
-        ensure!(
-            self.root_markers.iter().all(|marker| {
-                let path = Path::new(marker);
-                !marker.is_empty()
-                    && path
-                        .components()
-                        .all(|part| matches!(part, Component::Normal(_)))
-            }),
-            "Root markers must be relative paths"
-        );
-        Ok(())
+        validate_root_markers(&self.root_markers)
     }
 
     #[cfg(feature = "desktop")]
@@ -132,38 +122,7 @@ impl ExternalLsp {
     }
 
     pub(crate) fn project_root(&self, root: &Path, file: &Path) -> PathBuf {
-        let paths: Vec<_> = self
-            .root_markers
-            .iter()
-            .map(|marker| {
-                let glob = if marker.contains('*') && !marker.contains(['/', '\\']) {
-                    globset::Glob::new(marker)
-                        .ok()
-                        .map(|glob| glob.compile_matcher())
-                } else {
-                    None
-                };
-                (marker, glob)
-            })
-            .collect();
-        let full = root.join(file);
-        full.ancestors()
-            .skip(1)
-            .take_while(|dir| *dir != root)
-            .find(|dir| {
-                paths.iter().any(|(marker, glob)| {
-                    dir.join(marker).exists()
-                        || glob.as_ref().is_some_and(|glob| {
-                            std::fs::read_dir(dir).is_ok_and(|entries| {
-                                entries
-                                    .flatten()
-                                    .any(|entry| glob.is_match(entry.file_name()))
-                            })
-                        })
-                })
-            })
-            .unwrap_or(root)
-            .to_owned()
+        project_root(root, file, &self.root_markers)
     }
 
     pub(crate) fn command(&self) -> Command {
@@ -171,6 +130,54 @@ impl ExternalLsp {
         command.args(&self.server.args).envs(&self.server.env);
         command
     }
+}
+
+pub(super) fn validate_root_markers(markers: &[String]) -> Result<()> {
+    ensure!(
+        markers.iter().all(|marker| {
+            let path = Path::new(marker);
+            !marker.is_empty()
+                && path
+                    .components()
+                    .all(|part| matches!(part, Component::Normal(_)))
+        }),
+        "Root markers must be relative paths"
+    );
+    Ok(())
+}
+
+pub(super) fn project_root(root: &Path, file: &Path, markers: &[String]) -> PathBuf {
+    let paths: Vec<_> = markers
+        .iter()
+        .map(|marker| {
+            let glob = if marker.contains('*') && !marker.contains(['/', '\\']) {
+                globset::Glob::new(marker)
+                    .ok()
+                    .map(|glob| glob.compile_matcher())
+            } else {
+                None
+            };
+            (marker, glob)
+        })
+        .collect();
+    let full = root.join(file);
+    full.ancestors()
+        .skip(1)
+        .take_while(|dir| *dir != root)
+        .find(|dir| {
+            paths.iter().any(|(marker, glob)| {
+                dir.join(marker).exists()
+                    || glob.as_ref().is_some_and(|glob| {
+                        std::fs::read_dir(dir).is_ok_and(|entries| {
+                            entries
+                                .flatten()
+                                .any(|entry| glob.is_match(entry.file_name()))
+                        })
+                    })
+            })
+        })
+        .unwrap_or(root)
+        .to_owned()
 }
 
 #[cfg(all(test, feature = "desktop"))]

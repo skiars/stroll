@@ -1,7 +1,15 @@
+mod worktree_config;
+pub(super) use worktree_config::{WorktreeLanguageState, read_config as read_worktree_lsp};
+
 use rust_i18n::t;
 
-use std::path::{Path, PathBuf};
-use std::rc::Rc;
+use std::{
+    collections::HashSet,
+    hash::{Hash, Hasher},
+    path::{Path, PathBuf},
+    rc::Rc,
+    sync::Arc,
+};
 
 use gpui::{prelude::FluentBuilder as _, *};
 use gpui_component::{
@@ -17,7 +25,10 @@ use gpui_component::{
 use gpui_kit_assets::IconName;
 
 use crate::{
-    language::CommandSource,
+    language::{
+        CommandSource,
+        worktree::{WorktreeLsp, WorktreeServer},
+    },
     lsp::{Client, CompletionActivation, EditorLsp, LanguageServer, NewlineServer, SessionState},
     paths,
     symbols::LocalSymbols,
@@ -54,7 +65,26 @@ pub(super) struct ServerKey {
 #[derive(Clone, PartialEq, Eq, Hash)]
 enum ServiceServer {
     Builtin(LanguageServer),
-    External(std::sync::Arc<crate::language::external::ExternalLsp>),
+    External(Arc<crate::language::external::ExternalLsp>),
+    Worktree(WorktreeTarget),
+}
+
+#[derive(Clone)]
+struct WorktreeTarget(Arc<WorktreeServer>);
+
+impl PartialEq for WorktreeTarget {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.entry.id == other.0.entry.id && self.0.fingerprint == other.0.fingerprint
+    }
+}
+
+impl Eq for WorktreeTarget {}
+
+impl Hash for WorktreeTarget {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.0.entry.id.hash(state);
+        self.0.fingerprint.hash(state);
+    }
 }
 
 impl ServerKey {
@@ -65,9 +95,17 @@ impl ServerKey {
     pub(super) fn project_path(&self) -> &Path {
         &self.root
     }
+
+    fn server_id(&self) -> &str {
+        match &self.server {
+            ServiceServer::Builtin(server) => server.name(),
+            ServiceServer::External(server) => &server.id,
+            ServiceServer::Worktree(server) => &server.0.entry.id,
+        }
+    }
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub(super) struct ServerProject {
     pub(super) key: ServerKey,
     language_id: SharedString,
@@ -83,27 +121,56 @@ impl ServerProject {
     }
 
     pub(super) fn for_file(repo: &crate::repository::Repository, path: &Path) -> Option<Self> {
+        let config = repo.worktree_lsp.read().unwrap().clone();
+        Self::with_config(repo, path, &config)
+    }
+
+    pub(super) fn with_config(
+        repo: &crate::repository::Repository,
+        path: &Path,
+        config: &WorktreeLsp,
+    ) -> Option<Self> {
         if path.is_absolute() {
             return Self::for_local_file(path);
         }
-        Self::resolve(Some(repo), &repo.root, path)
+        if let Some((server, language_id)) = config.select(path) {
+            let root = if let Some(ssh) = &repo.ssh {
+                ssh.call(crate::remote::Request::WorktreeLspRoot(
+                    server.roots.clone(),
+                    crate::remote::RepoPath::from_local(path).ok()?,
+                ))
+                .ok()?
+            } else {
+                server.roots.resolve(&repo.root, path)
+            };
+            return Some(Self {
+                key: ServerKey {
+                    server: ServiceServer::Worktree(WorktreeTarget(Arc::new(server.clone()))),
+                    root,
+                    remote: repo.ssh.is_some(),
+                },
+                language_id: language_id.into(),
+            });
+        }
+        Self::resolve(repo.ssh.as_ref(), &repo.root, path, Some(config))
     }
 
     pub(super) fn for_local_file(path: &Path) -> Option<Self> {
-        Self::resolve(None, path.parent()?, path)
+        Self::resolve(None, path.parent()?, path, None)
     }
 
     fn resolve(
-        repo: Option<&crate::repository::Repository>,
+        ssh: Option<&crate::remote::SshSession>,
         root: &Path,
         path: &Path,
+        config: Option<&WorktreeLsp>,
     ) -> Option<Self> {
-        let ssh = repo.and_then(|repo| repo.ssh.as_ref());
         match crate::language::external::load() {
             Ok(entries) => {
                 let mut selected = None;
                 for entry in entries {
-                    if let Some((id, length)) = entry.language_id(path)
+                    if config.is_none_or(|config| config.entry(&entry.id).is_none())
+                        && let Some((id, length)) = entry.language_id(path)
                         && selected.as_ref().is_none_or(|(_, _, best)| length > *best)
                     {
                         selected = Some((SharedString::from(id.to_owned()), entry, length));
@@ -139,6 +206,9 @@ impl ServerProject {
             Err(error) => eprintln!("Could not load external language servers: {error:#}"),
         }
         let (server, language_id) = LanguageServer::for_path(path)?;
+        if config.is_some_and(|config| config.entry(server.name()).is_some()) {
+            return None;
+        }
         Some(Self {
             key: ServerKey {
                 server: ServiceServer::Builtin(server),
@@ -204,9 +274,25 @@ impl ServiceStatus {
 
 impl Workspace {
     pub(super) fn start_language_service(&mut self, key: &ServerKey, cx: &mut Context<Self>) {
-        if !self.startup_lsp.enabled {
+        if !self.startup_lsp.enabled
+            || (matches!(key.server, ServiceServer::Worktree(_))
+                && !self.session.worktree_lsp_trusted)
+        {
             return;
         }
+        let barriers = &mut self.worktree_language.retiring;
+        barriers.retain(|(_, _, stopped)| !stopped.is_closed());
+        let wait: Vec<_> = barriers
+            .iter()
+            .filter_map(|(id, remote, stopped)| {
+                (id == key.server_id() && *remote == key.remote).then(|| stopped.clone())
+            })
+            .collect();
+        let wait_for_exit = move || {
+            for stopped in wait {
+                _ = stopped.recv_blocking();
+            }
+        };
         let start = (|| {
             if key.remote {
                 use crate::remote::LspTarget;
@@ -230,6 +316,18 @@ impl Workspace {
                         },
                         server.server.lsp_options(),
                     ),
+                    ServiceServer::Worktree(server) => (
+                        LspTarget::Worktree {
+                            id: server.0.entry.id.clone(),
+                            fingerprint: server.0.fingerprint.clone(),
+                            snapshot: server
+                                .0
+                                .remote_snapshot
+                                .clone()
+                                .expect("remote worktree LSP snapshot"),
+                        },
+                        server.0.entry.server.lsp_options(),
+                    ),
                 };
                 let command = ssh.language_command(repository, key.root.clone(), target)?;
                 let uri = crate::remote::file_uri(
@@ -237,7 +335,14 @@ impl Workspace {
                         .to_str()
                         .ok_or_else(|| anyhow::anyhow!("The remote path is not UTF-8"))?,
                 )?;
-                Client::start_with_uri(command, None, uri, options)
+                Client::start_with_uri(
+                    move || {
+                        wait_for_exit();
+                        Ok(command)
+                    },
+                    uri,
+                    options,
+                )
             } else {
                 let project = key.root.clone();
                 match &key.server {
@@ -247,11 +352,14 @@ impl Workspace {
                             .local_command(&self.startup_lsp.server(server).command)
                             .expect("startup LSP configuration was validated");
                         Client::start_with_command(
-                            move || match source {
-                                CommandSource::Path => {
-                                    server.resolve_default_command(&project, None)
+                            move || {
+                                wait_for_exit();
+                                match source {
+                                    CommandSource::Path => {
+                                        server.resolve_default_command(&project, None)
+                                    }
+                                    _ => Ok(command),
                                 }
-                                _ => Ok(command),
                             },
                             key.root.clone(),
                             server.initialization_options().into(),
@@ -260,9 +368,25 @@ impl Workspace {
                     ServiceServer::External(server) => {
                         let command = server.command();
                         Client::start_with_command(
-                            move || Ok(command),
+                            move || {
+                                wait_for_exit();
+                                Ok(command)
+                            },
                             project,
                             server.server.lsp_options(),
+                        )
+                    }
+                    ServiceServer::Worktree(server) => {
+                        let server = server.0.clone();
+                        let options = server.entry.server.lsp_options();
+                        let directory = project.clone();
+                        Client::start_with_command(
+                            move || {
+                                wait_for_exit();
+                                server.command(&directory, None)
+                            },
+                            project,
+                            options,
                         )
                     }
                 }
@@ -407,6 +531,7 @@ impl Workspace {
                         match project.key.server {
                             ServiceServer::Builtin(server) => Some(server),
                             ServiceServer::External(_) => None,
+                            ServiceServer::Worktree(ref server) => server.0.builtin,
                         },
                     )
                 });
@@ -727,6 +852,7 @@ impl Workspace {
                         command.get_program().to_string_lossy().into_owned()
                     }
                     ServiceServer::External(server) => server.server.command.clone(),
+                    ServiceServer::Worktree(server) => server.0.entry.server.command.clone(),
                 };
                 panel
                     .child(service_detail(t!("lsp.server"), program, colors))
@@ -745,6 +871,7 @@ impl Workspace {
             })
             .child(service_detail(t!("lsp.status"), status.label(), colors));
 
+        let worktree_workspace = workspace.clone();
         if status.controls() {
             let stop_workspace = workspace.clone();
             panel = panel
@@ -790,7 +917,7 @@ impl Workspace {
                         ),
                 );
         }
-        panel
+        panel.children(self.worktree_language_controls(worktree_workspace, colors))
     }
 }
 
@@ -1053,3 +1180,6 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod worktree_tests;

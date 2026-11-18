@@ -50,6 +50,9 @@ pub struct Repository {
     #[cfg(feature = "desktop")]
     language_resources:
         std::sync::Arc<std::sync::OnceLock<crate::language_resources::LanguageResources>>,
+    #[cfg(feature = "desktop")]
+    pub(crate) worktree_lsp:
+        std::sync::Arc<std::sync::RwLock<std::sync::Arc<crate::language::worktree::WorktreeLsp>>>,
     pub root: PathBuf,
     pub name: String,
     pub branch: String,
@@ -104,6 +107,8 @@ impl Repository {
             remote_identity,
             #[cfg(feature = "desktop")]
             language_resources: Default::default(),
+            #[cfg(feature = "desktop")]
+            worktree_lsp: Default::default(),
             root,
             common_dir,
             name: info.name,
@@ -125,6 +130,8 @@ impl Repository {
             remote_identity: None,
             #[cfg(feature = "desktop")]
             language_resources: Default::default(),
+            #[cfg(feature = "desktop")]
+            worktree_lsp: Default::default(),
             root,
             name,
             branch,

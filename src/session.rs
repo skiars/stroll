@@ -34,6 +34,8 @@ pub(crate) struct WorktreeSession {
     pub panels: PanelPreferences,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub commit_draft: Option<String>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub worktree_lsp_trusted: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]

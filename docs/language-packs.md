@@ -72,6 +72,57 @@ For SSH, install the updated remote helper and register the same server ID
 in the helper user's `lsp.json` with the command for that host. The client
 routes by ID and the helper resolves the executable from its own configuration.
 
+### Worktree LSP configuration
+
+Add an `lsp` array to the root `.stroll.json`. Entries use the same fields
+as `lsp.json`, and this file accepts comments and trailing commas.
+
+```jsonc
+{
+  "lsp": [
+    {
+      "id": "clangd",
+      "rootMarkers": [],
+      "server": {
+        "args": ["--compile-commands-dir=cmake-build-debug", "--background-index"]
+      }
+    },
+    {
+      "id": "my-lang",
+      "languages": { ".my-lang": "my-lang" },
+      "server": { "command": "my-lang-lsp" }
+    }
+  ]
+}
+```
+
+An entry overrides the user or built-in server with the same ID. Omitted
+fields are inherited. Supplied fields replace the previous value, including
+arrays, maps, and LSP option objects. An empty `rootMarkers` array sets the
+project root to the worktree. An entry with a new ID specifies its language
+suffix map and program. Use `disabled: true` to hide an inherited server.
+
+Worktree entries take priority over matching user and built-in entries.
+Use an optional `paths` array of worktree-relative globs such as
+`["examples/zephyr-app/**"]` to select a separate server ID for a subtree.
+Among matching worktree entries, path-scoped entries take priority, followed
+by the longest suffix and then declaration order. Root markers select the
+project root after the server is chosen. The program runs in that directory
+with each `args` element passed as one argument.
+
+Stroll asks once per worktree for permission to apply repository-controlled
+launch settings, including future changes. Use the language server status
+panel to revoke permission. Saving the file restarts only sessions whose
+effective launch or initialization settings changed and rebinds documents
+whose routing changed. Invalid edits keep the previous active configuration.
+Removing the file restores the user and built-in defaults.
+
+On SSH, upgrade `stroll-remote` and edit the remote worktree's file. The
+helper resolves inherited launch settings, programs, project roots, and
+relative arguments on the remote machine. Worktree entries with a complete
+launch configuration only need to be defined in that file. Use a compilation
+database generated for the filesystem and toolchain where clangd runs.
+
 ### Python with pylsp
 
 Stroll uses `pylsp` for `.py` and `.pyi` files in a repository. Install

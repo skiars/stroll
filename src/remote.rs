@@ -46,6 +46,7 @@ pub(crate) const DOCUMENT_PATHS_VERSION: u32 = 17;
 pub(crate) const DOCUMENT_BATCH_VERSION: u32 = 18;
 pub(crate) const REVISION_COMPARISON_VERSION: u32 = 19;
 pub(crate) const WORKSPACE_TRANSFER_VERSION: u32 = 20;
+pub(crate) const WORKTREE_LSP_VERSION: u32 = 21;
 const MAX_FRAME: usize = 40 * 1024 * 1024;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -270,6 +271,8 @@ pub(crate) enum Request {
     TerminalClose(u64),
     LspRoot(crate::language::LanguageServer, RepoPath),
     ExternalLspRoot(String, RepoPath),
+    WorktreeLspConfig,
+    WorktreeLspRoot(crate::language::worktree::ProjectRoots, RepoPath),
     LspEditTime,
     LspEditTarget(RepoPath, std::time::SystemTime),
 }
@@ -316,10 +319,17 @@ fn write_frame(output: &mut impl Write, frame: &impl Serialize) -> Result<()> {
 }
 
 #[derive(Serialize, Deserialize)]
-#[serde(untagged)]
+#[serde(untagged, deny_unknown_fields)]
 pub(crate) enum LspTarget {
     Builtin(crate::language::LanguageServer),
-    External { id: String },
+    Worktree {
+        id: String,
+        fingerprint: String,
+        snapshot: PathBuf,
+    },
+    External {
+        id: String,
+    },
 }
 
 #[derive(Serialize, Deserialize)]

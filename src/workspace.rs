@@ -39,7 +39,7 @@ pub use window_bounds::{repository_window_bounds, standalone_window_bounds};
 
 use file_icons::file_type_icon;
 use git_panel::GitPanel;
-use language_service::{LanguageService, ServerKey, ServerProject};
+use language_service::{LanguageService, ServerKey, ServerProject, WorktreeLanguageState};
 use repository_ui::RepositoryUi;
 use settings::SettingsWindow;
 
@@ -582,6 +582,7 @@ struct FileBuffer {
     document: Document,
     text: Rope,
     saved: Rope,
+    lsp_config: Option<Arc<crate::language::worktree::WorktreeLsp>>,
 }
 
 impl FileBuffer {
@@ -596,7 +597,15 @@ impl FileBuffer {
             document,
             text,
             saved,
+            lsp_config: None,
         }
+    }
+
+    fn with_project(mut self, repo: &Repository, path: &Path) -> (Self, Option<ServerProject>) {
+        let config = repo.worktree_lsp.read().unwrap().clone();
+        let project = ServerProject::with_config(repo, path, &config);
+        self.lsp_config = Some(config);
+        (self, project)
     }
 }
 
@@ -734,6 +743,7 @@ pub struct Workspace {
     pub(crate) outline_width: Pixels,
     pub(crate) outline_visibility: Option<bool>,
     language_servers: HashMap<ServerKey, LanguageService>,
+    worktree_language: WorktreeLanguageState,
     lsp_panel_open: bool,
     language_action_groups: BTreeMap<u64, Vec<PathBuf>>,
     language_rename: Task<()>,
@@ -919,6 +929,7 @@ impl Workspace {
             outline_width: px(195.),
             outline_visibility: None,
             language_servers: HashMap::new(),
+            worktree_language: WorktreeLanguageState::default(),
             lsp_panel_open: false,
             language_action_groups: BTreeMap::new(),
             language_rename: Task::ready(()),
@@ -1042,7 +1053,16 @@ impl Workspace {
             .collect();
         let startup_view = self.startup_view;
         let view = self.view;
+        let lsp = self.startup_lsp.clone();
         let task = cx.background_spawn(async move {
+            let prepare_lsp = |repo: &Repository, session: &WorktreeSession| {
+                if lsp.enabled
+                    && session.worktree_lsp_trusted
+                    && let Ok(config) = language_service::read_worktree_lsp(repo, &lsp)
+                {
+                    *repo.worktree_lsp.write().unwrap() = Arc::new(config);
+                }
+            };
             let prepare_docs =
                 |repo: &Repository, session: &WorktreeSession, file: Option<&Path>| {
                     let target_view = startup_view.unwrap_or_else(|| {
@@ -1073,6 +1093,7 @@ impl Workspace {
                 let session = store.session(&repo)?;
                 if repo.ssh.as_ref().is_some_and(|ssh| ssh.failure().is_none()) {
                     let docs = prepare_docs(&repo, &session, location.file.as_deref());
+                    prepare_lsp(&repo, &session);
                     return Ok(Some(((*repo).clone(), session, location.file, docs, true)));
                 }
             }
@@ -1100,6 +1121,7 @@ impl Workspace {
             repo.language_resources();
             let session = store.session(&repo)?;
             let docs = prepare_docs(&repo, &session, location.file.as_deref());
+            prepare_lsp(&repo, &session);
             Ok(Some((repo, session, location.file, docs, false)))
         });
         self.repository_ui.open_task = cx.spawn_in(window, async move |this, cx| {
@@ -1164,6 +1186,8 @@ impl Workspace {
     }
 
     fn watch_connection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.worktree_language = WorktreeLanguageState::default();
+        self.refresh_worktree_language(window, cx);
         self.connection_watch = Task::ready(());
         if self.view == WorkspaceView::Docs {
             self.repository_watch = Task::ready(());
@@ -1240,6 +1264,9 @@ impl Workspace {
         self.doc_error = None;
         self.open_documents_list = false;
         self.reset_workspace_tree();
+        if !self.session.worktree_lsp_trusted {
+            *repo.worktree_lsp.write().unwrap() = Arc::default();
+        }
         self.repository = Some(Arc::new(repo));
         self.git = None;
         self.git_edit.clear();
@@ -1267,12 +1294,14 @@ impl Workspace {
             self.load_image_tab(path, window, cx);
         }
         let check_repo = repo.clone();
+        let lsp_config = repo.worktree_lsp.read().unwrap().clone();
+        let check_config = lsp_config.clone();
         let check = cx.background_spawn(async move {
             paths
                 .into_iter()
                 .map(|path| {
                     let disk = Document::read(&check_repo, &path);
-                    let project = ServerProject::for_file(&check_repo, &path);
+                    let project = ServerProject::with_config(&check_repo, &path, &check_config);
                     (path, disk, project)
                 })
                 .collect::<Vec<_>>()
@@ -1288,6 +1317,8 @@ impl Workspace {
                     return;
                 }
                 let mut keys = std::collections::HashSet::new();
+                let stale_lsp = !Arc::ptr_eq(&lsp_config, &repo.worktree_lsp.read().unwrap());
+                let mut resolve = Vec::new();
                 for (path, disk, project) in updates {
                     let Some(file) = this.files.get_mut(&path) else {
                         continue;
@@ -1330,13 +1361,22 @@ impl Workspace {
                             }
                         }
                     }
-                    if let Some(project) = &project {
-                        keys.insert(project.key.clone());
+                    if stale_lsp {
+                        resolve.push(path);
+                    } else {
+                        if let Some(project) = &project {
+                            keys.insert(project.key.clone());
+                        }
+                        file.server_project = project;
                     }
-                    file.server_project = project;
                 }
                 for key in keys {
-                    this.start_language_service(&key, cx);
+                    if !this.language_servers.contains_key(&key) {
+                        this.start_language_service(&key, cx);
+                    }
+                }
+                for path in resolve {
+                    this.resolve_worktree_language_file(&path, cx);
                 }
                 cx.notify();
             });
@@ -1417,6 +1457,7 @@ impl Workspace {
             // The target session was read before flushing the current UI state.
             session.commit_draft = self.session.commit_draft.take();
             session.panels = self.session.panels;
+            session.worktree_lsp_trusted = self.session.worktree_lsp_trusted;
             session.source_history = std::mem::take(&mut self.session.source_history);
         }
         session.source_history.normalize();
@@ -1489,6 +1530,9 @@ impl Workspace {
         } else if let Some(tree) = prepared_docs {
             self.docs_tree = Rc::new(tree);
             self.docs_tree_seeded = true;
+        }
+        if !self.session.worktree_lsp_trusted {
+            *repo.worktree_lsp.write().unwrap() = Arc::default();
         }
         self.repository = Some(Arc::new(repo));
         self.watch_connection(window, cx);
@@ -2335,8 +2379,7 @@ impl Workspace {
         let store = self.store.clone();
         cx.background_spawn(async move {
             let buffer = FileBuffer::new(Document::open(&repo, &path, &store)?);
-            let project = ServerProject::for_file(&repo, &path);
-            Ok((buffer, project))
+            Ok(buffer.with_project(&repo, &path))
         })
     }
 
@@ -2423,11 +2466,23 @@ impl Workspace {
         self.source_resources(path).configure_editor(path, cx);
         let wrap = self.wrap;
         let line_numbers = self.config.current().editor.line_numbers;
+        let stale_project = self.repository.as_ref().is_some_and(|repo| {
+            if path.is_absolute() {
+                return false;
+            }
+            let current = repo.worktree_lsp.read().unwrap();
+            buffer
+                .lsp_config
+                .as_ref()
+                .map_or(!current.is_empty(), |loaded| !Arc::ptr_eq(loaded, &current))
+        });
+        let project = if stale_project { None } else { project };
         let key = project.as_ref().map(|project| project.key.clone());
         let FileBuffer {
             document,
             text,
             saved,
+            ..
         } = buffer;
         let editor = cx.new(|cx| {
             EditorState::new(window, cx)
@@ -2530,6 +2585,9 @@ impl Workspace {
             self.start_language_service(&key, cx);
         } else {
             self.connect_file_to_language_service(path, cx);
+        }
+        if stale_project {
+            self.resolve_worktree_language_file(path, cx);
         }
     }
 

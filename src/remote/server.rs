@@ -1,7 +1,7 @@
 use std::{
     collections::HashMap,
     io::{self, BufReader, BufWriter},
-    path::Component,
+    path::{Component, Path, PathBuf},
     sync::{
         Arc, Mutex, RwLock,
         atomic::{AtomicU64, Ordering},
@@ -11,12 +11,14 @@ use std::{
 };
 
 use anyhow::{Context, Result, ensure};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, to_value};
 
 use super::{Bytes, Call, Reply, Request, TerminalEvent, VERSION, read_frame, write_frame};
 use crate::{
-    git, pty,
+    git,
+    language::worktree::WorktreeLsp,
+    pty,
     repository::{Repository, RepositoryInfo, write_checked},
 };
 
@@ -32,6 +34,94 @@ struct Server {
     review_commit: Mutex<Option<Arc<git::Changes>>>,
     terminals: Mutex<HashMap<u64, Terminal>>,
     next_terminal: AtomicU64,
+    lsp_snapshot: Mutex<Option<LspSnapshot>>,
+}
+
+#[derive(Deserialize, Serialize)]
+struct LspSnapshotFile {
+    root: PathBuf,
+    config: WorktreeLsp,
+}
+
+struct LspSnapshot {
+    path: tempfile::TempPath,
+    config: WorktreeLsp,
+}
+
+impl LspSnapshot {
+    fn publish(
+        current: &mut Option<Self>,
+        root: &Path,
+        config: WorktreeLsp,
+    ) -> Result<WorktreeLsp> {
+        if current
+            .as_ref()
+            .is_none_or(|snapshot| snapshot.config != config)
+        {
+            let bytes = serde_json::to_vec(&LspSnapshotFile {
+                root: root.to_owned(),
+                config: config.clone(),
+            })?;
+            // Reuse the same private pathname across saves. A launch can only
+            // use a configuration the bound helper has already validated.
+            if let Some(snapshot) = current.as_mut() {
+                crate::repository::atomic_write(&snapshot.path, &bytes)?;
+                snapshot.config = config;
+            } else {
+                use std::io::Write as _;
+                let directory = std::env::temp_dir().canonicalize()?;
+                let mut file = tempfile::Builder::new()
+                    .prefix("stroll-lsp-")
+                    .tempfile_in(directory)?;
+                file.write_all(&bytes)?;
+                *current = Some(Self {
+                    path: file.into_temp_path(),
+                    config,
+                });
+            }
+        }
+        let snapshot = current
+            .as_ref()
+            .expect("published language server configuration");
+        Ok(snapshot.config.clone().for_remote(&snapshot.path))
+    }
+
+    fn read(path: &Path) -> Result<LspSnapshotFile> {
+        ensure!(
+            path.parent() == Some(std::env::temp_dir().canonicalize()?.as_path())
+                && path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("stroll-lsp-")),
+            "Invalid worktree language server snapshot"
+        );
+        let mut options = std::fs::File::options();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        }
+        let file = options
+            .open(path)
+            .context("Could not open the worktree language server snapshot")?;
+        let metadata = file.metadata()?;
+        ensure!(
+            metadata.is_file() && metadata.len() <= 2 * 1024 * 1024,
+            "Invalid worktree language server snapshot"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+            // SAFETY: geteuid reads the current process identity and takes no arguments.
+            let uid = unsafe { libc::geteuid() };
+            ensure!(
+                metadata.uid() == uid && metadata.mode() & 0o077 == 0,
+                "Invalid worktree language server snapshot permissions"
+            );
+        }
+        Ok(serde_json::from_reader(file)?)
+    }
 }
 
 struct Terminal {
@@ -67,6 +157,7 @@ impl Server {
                             | super::DOCUMENT_BATCH_VERSION
                             | super::REVISION_COMPARISON_VERSION
                             | super::WORKSPACE_TRANSFER_VERSION
+                            | super::WORKTREE_LSP_VERSION
                     ),
                     "SSH workspace protocol version mismatch. Update the remote helper."
                 );
@@ -435,6 +526,16 @@ impl Server {
                 }
                 value(events)
             }
+            Request::WorktreeLspConfig => {
+                let mut snapshot = self.lsp_snapshot.lock().unwrap();
+                let config = worktree_lsp(root)?;
+                value(LspSnapshot::publish(&mut snapshot, root, config)?)
+            }
+            Request::WorktreeLspRoot(roots, file) => {
+                roots.validate()?;
+                crate::repository::resolve_file(root, file.as_path())?;
+                value(roots.resolve(root, file.as_path()))
+            }
             Request::ExternalLspRoot(id, file) => {
                 crate::repository::resolve_file(root, file.as_path())?;
                 value(external_server(&id)?.project_root(root, file.as_path()))
@@ -584,6 +685,29 @@ fn external_server(id: &str) -> Result<crate::language::external::ExternalLsp> {
         .with_context(|| format!("Unknown external language server {id:?}"))
 }
 
+fn worktree_lsp(root: &std::path::Path) -> Result<crate::language::worktree::WorktreeLsp> {
+    let environment = std::cell::OnceCell::new();
+    crate::language::worktree::WorktreeLsp::load(root, |server| {
+        #[cfg(unix)]
+        let variables = environment
+            .get_or_init(|| login_environment(root).ok())
+            .as_ref();
+        #[cfg(not(unix))]
+        let variables = environment
+            .get_or_init(|| None::<HashMap<std::ffi::OsString, std::ffi::OsString>>)
+            .as_ref();
+        let variable = std::ffi::OsStr::new(server.executable_variable());
+        let executable = match variables {
+            Some(variables) => variables.get(variable).cloned(),
+            None => std::env::var_os(variable),
+        };
+        match executable {
+            Some(executable) => (server.command_for(executable), false),
+            None => (server.default_command(), true),
+        }
+    })
+}
+
 pub fn serve_lsp(options: &str) -> Result<()> {
     use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
     let options: super::LspLaunch = serde_json::from_slice(&URL_SAFE_NO_PAD.decode(options)?)?;
@@ -604,6 +728,27 @@ pub fn serve_lsp(options: &str) -> Result<()> {
     #[cfg(not(unix))]
     let environment: Option<HashMap<std::ffi::OsString, std::ffi::OsString>> = None;
     let mut command = match options.server {
+        super::LspTarget::Worktree {
+            id,
+            fingerprint,
+            snapshot,
+        } => {
+            let snapshot = LspSnapshot::read(&snapshot)?;
+            ensure!(
+                snapshot.root == root,
+                "The language server snapshot is for another worktree"
+            );
+            let server = snapshot
+                .config
+                .entry(&id)
+                .filter(|server| server.enabled())
+                .with_context(|| format!("Unknown worktree language server {id:?}"))?;
+            ensure!(
+                server.fingerprint == fingerprint,
+                "The worktree language server configuration changed before launch"
+            );
+            server.command(&options.project, environment.as_ref())?
+        }
         super::LspTarget::External { id } => {
             let server = external_server(&id)?;
             let mut command = server.command();

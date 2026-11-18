@@ -111,17 +111,16 @@ impl Workspace {
                                 let buffer = if loaded.contains(&path) {
                                     None
                                 } else {
-                                    let (document, project) = match &repo {
-                                        Some(repo) => (
-                                            Document::open(repo, &path, &store)?,
-                                            ServerProject::for_file(repo, &path),
-                                        ),
+                                    Some(match &repo {
+                                        Some(repo) => {
+                                            FileBuffer::new(Document::open(repo, &path, &store)?)
+                                                .with_project(repo, &path)
+                                        }
                                         None => (
-                                            Document::open_local(&path, &store)?,
+                                            FileBuffer::new(Document::open_local(&path, &store)?),
                                             ServerProject::for_local_file(&path),
                                         ),
-                                    };
-                                    Some((FileBuffer::new(document), project))
+                                    })
                                 };
                                 DroppedFile::Editor(buffer)
                             };

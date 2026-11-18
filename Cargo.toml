@@ -7,7 +7,7 @@ default-run = "stroll"
 
 [features]
 default = ["desktop"]
-desktop = ["dep:glob", "dep:alacritty_terminal", "dep:gpui", "dep:gpui_platform", "dep:gpui-base", "dep:gpui-component", "dep:gpui-kit-assets", "dep:toml_edit", "dep:markdown", "dep:merman", "dep:ratex-layout", "dep:ratex-parser", "dep:ratex-svg", "dep:percent-encoding", "dep:ratex-types", "dep:roxmltree", "dep:sys-locale", "dep:blocking", "dep:image", "dep:ureq", "dep:shlex", "dep:similar", "dep:chrono", "dep:keyring", "dep:giallo", "dep:jsonc-parser", "dep:tree-sitter", "dep:objc2", "dep:objc2-app-kit", "dep:objc2-foundation"]
+desktop = ["dep:glob", "dep:alacritty_terminal", "dep:gpui", "dep:gpui_platform", "dep:gpui-base", "dep:gpui-component", "dep:gpui-kit-assets", "dep:toml_edit", "dep:markdown", "dep:merman", "dep:ratex-layout", "dep:ratex-parser", "dep:ratex-svg", "dep:percent-encoding", "dep:ratex-types", "dep:roxmltree", "dep:sys-locale", "dep:blocking", "dep:image", "dep:ureq", "dep:shlex", "dep:similar", "dep:chrono", "dep:keyring", "dep:giallo", "dep:tree-sitter", "dep:objc2", "dep:objc2-app-kit", "dep:objc2-foundation"]
 
 [[bin]]
 name = "stroll"
@@ -77,7 +77,7 @@ chrono = { version = "0.4", default-features = false, optional = true }
 rusqlite = { version = "0.43.0", features = ["bundled"] }
 keyring = { version = "=3.6.3", default-features = false, features = ["apple-native", "windows-native", "sync-secret-service", "crypto-rust", "vendored"], optional = true }
 giallo = { version = "0.6.0", default-features = false, optional = true }
-jsonc-parser = { version = "0.32", features = ["serde"], optional = true }
+jsonc-parser = { version = "0.32", features = ["serde"] }
 tree-sitter = { version = "0.26.13", optional = true }
 
 [dev-dependencies]

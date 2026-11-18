@@ -1,6 +1,6 @@
 pub(crate) mod external;
+pub(crate) mod worktree;
 
-#[cfg(feature = "desktop")]
 use serde_json::{Value, json};
 use std::{
     collections::HashMap,
@@ -45,20 +45,45 @@ impl LanguageServer {
         }
     }
 
+    pub(crate) const ALL: [Self; 4] = [Self::Rust, Self::Clangd, Self::TypeScript, Self::Python];
+
+    pub(crate) fn languages(self) -> &'static [(&'static str, &'static str)] {
+        match self {
+            Self::Rust => &[(".rs", "rust")],
+            Self::Clangd => &[
+                (".c", "c"),
+                (".C", "cpp"),
+                (".cc", "cpp"),
+                (".cpp", "cpp"),
+                (".cxx", "cpp"),
+                (".h", "cpp"),
+                (".hh", "cpp"),
+                (".hpp", "cpp"),
+                (".hxx", "cpp"),
+                (".m", "objective-c"),
+                (".mm", "objective-cpp"),
+            ],
+            Self::TypeScript => &[
+                (".ts", "typescript"),
+                (".mts", "typescript"),
+                (".cts", "typescript"),
+                (".tsx", "typescriptreact"),
+                (".js", "javascript"),
+                (".mjs", "javascript"),
+                (".cjs", "javascript"),
+                (".jsx", "javascriptreact"),
+            ],
+            Self::Python => &[(".py", "python"), (".pyi", "python")],
+        }
+    }
+
     #[cfg(feature = "desktop")]
     pub fn for_path(path: &Path) -> Option<(Self, &'static str)> {
-        Some(match path.extension()?.to_str()? {
-            "rs" => (Self::Rust, "rust"),
-            "c" => (Self::Clangd, "c"),
-            "C" | "cc" | "cpp" | "cxx" | "h" | "hh" | "hpp" | "hxx" => (Self::Clangd, "cpp"),
-            "m" => (Self::Clangd, "objective-c"),
-            "mm" => (Self::Clangd, "objective-cpp"),
-            "ts" | "mts" | "cts" => (Self::TypeScript, "typescript"),
-            "tsx" => (Self::TypeScript, "typescriptreact"),
-            "js" | "mjs" | "cjs" => (Self::TypeScript, "javascript"),
-            "jsx" => (Self::TypeScript, "javascriptreact"),
-            "py" | "pyi" => (Self::Python, "python"),
-            _ => return None,
+        let extension = path.extension()?.to_str()?;
+        Self::ALL.into_iter().find_map(|server| {
+            server.languages().iter().find_map(|(suffix, id)| {
+                (suffix.strip_prefix('.') == Some(extension)).then_some((server, *id))
+            })
         })
     }
 
@@ -103,7 +128,7 @@ impl LanguageServer {
         command
     }
 
-    fn default_command(self) -> Command {
+    pub(crate) fn default_command(self) -> Command {
         match self {
             Self::TypeScript => typescript_command(if cfg!(windows) { "tsc.cmd" } else { "tsc" }),
             _ => crate::process::background(self.name()),
@@ -160,7 +185,6 @@ impl LanguageServer {
         repository.to_owned()
     }
 
-    #[cfg(feature = "desktop")]
     pub fn initialization_options(self) -> Value {
         match self {
             Self::Rust => json!({

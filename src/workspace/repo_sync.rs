@@ -690,6 +690,13 @@ impl Workspace {
         {
             return;
         }
+        if changes.rescan
+            || changes
+                .paths
+                .contains(crate::language::worktree::CONFIG_PATH)
+        {
+            self.refresh_worktree_language(window, cx);
+        }
         let git_rescan = changes.rescan;
         changes.rescan |= changes.ignored_paths.iter().any(|path| {
             Path::new(path)
