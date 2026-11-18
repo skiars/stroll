@@ -67,6 +67,7 @@ pub(crate) fn valid_message(message: &str) -> bool {
     !message.trim().is_empty() && !message.contains('\0')
 }
 
+#[derive(Clone)]
 pub(crate) enum HistoryEdit {
     Rebase(HistoryPlan),
     Amend(HistoryTip, super::CommitState, String),
@@ -76,6 +77,17 @@ pub(crate) enum HistoryEdit {
     Revert(HistoryTip, String),
     Resume(HistoryProgress, HistoryResolution),
 }
+
+#[derive(Debug)]
+pub(crate) struct PublishedHistory;
+
+impl std::fmt::Display for PublishedHistory {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&t!("git.history_edit_published"))
+    }
+}
+
+impl std::error::Error for PublishedHistory {}
 
 impl HistoryEdit {
     fn recording_tip(&self) -> Option<&HistoryTip> {
@@ -142,6 +154,7 @@ pub(crate) struct SavedChanges {
     pub can_restore: bool,
 }
 
+#[derive(Clone)]
 pub(crate) enum HistoryResolution {
     Continue,
     Abort,
@@ -211,9 +224,17 @@ impl Backend {
         &self,
         edit: HistoryEdit,
     ) -> Result<(Option<String>, Option<RewriteRecord>)> {
+        self.edit_history_with_confirmation(edit, false)
+    }
+
+    pub(crate) fn edit_history_with_confirmation(
+        &self,
+        edit: HistoryEdit,
+        confirmed: bool,
+    ) -> Result<(Option<String>, Option<RewriteRecord>)> {
         ensure!(self.supports_history_edit(), t!("git.history_edit_local"));
         let recording = edit.recording_tip().cloned();
-        let result = edit_history(&self.root, edit);
+        let result = execute_history_edit(&self.root, edit, confirmed);
         self.invalidate();
         result?;
         let head = head(&self.root)?;
@@ -262,21 +283,7 @@ fn prepare_reset(root: &Path, tip: HistoryTip, target: &str) -> Result<ResetPlan
             .any(|oid| oid == target.as_bytes()),
         t!("git.reset_ancestor")
     );
-    let excluded = format!("^{target}");
-    let count = |only_private: bool| -> Result<usize> {
-        let args = ["rev-list", "--count", &tip.oid, &excluded];
-        let remote = only_private
-            .then_some(["--not", "--remotes"])
-            .into_iter()
-            .flatten();
-        Ok(
-            text(&read(root, args.into_iter().chain(remote).chain(["--"]))?)
-                .trim()
-                .parse()?,
-        )
-    };
-    let removed = count(false)?;
-    ensure!(removed == count(true)?, t!("git.history_edit_published"));
+    let removed = range_count(root, &tip.oid, Some(target), false)?;
     Ok(ResetPlan {
         tip,
         target: target.to_owned(),
@@ -284,8 +291,45 @@ fn prepare_reset(root: &Path, tip: HistoryTip, target: &str) -> Result<ResetPlan
     })
 }
 
-fn reset(root: &Path, plan: ResetPlan, mode: ResetMode) -> Result<()> {
+fn range_count(root: &Path, tip: &str, base: Option<&str>, private_only: bool) -> Result<usize> {
+    let excluded = base.map(|oid| format!("^{oid}"));
+    let remotes = private_only
+        .then_some(["--not", "--remotes"])
+        .into_iter()
+        .flatten();
+    let count = read(
+        root,
+        ["rev-list", "--count", tip]
+            .into_iter()
+            .chain(excluded.as_deref())
+            .chain(remotes)
+            .chain(["--"]),
+    )?;
+    Ok(std::str::from_utf8(&count)?.trim().parse()?)
+}
+
+fn check_published_range(
+    root: &Path,
+    tip: &str,
+    base: Option<&str>,
+    count: usize,
+    confirmed: bool,
+) -> Result<()> {
+    if !confirmed && range_count(root, tip, base, true)? != count {
+        return Err(PublishedHistory.into());
+    }
+    Ok(())
+}
+
+fn reset(root: &Path, plan: ResetPlan, mode: ResetMode, confirmed: bool) -> Result<()> {
     let current = prepare_reset(root, plan.tip, &plan.target)?;
+    check_published_range(
+        root,
+        &current.tip.oid,
+        Some(&current.target),
+        current.removed,
+        confirmed,
+    )?;
     apply_reset(root, &current.tip, &current.target, mode)
 }
 
@@ -359,17 +403,6 @@ fn take_entry(root: &Path, tip: &HistoryTip, oldest: &str) -> Result<HistoryPlan
             .is_some_and(|row| row[0] == oldest.oid.as_bytes())
             && parent == Some(tip.oid.as_str()),
         t!("git.history_edit_linear")
-    );
-    let private_count = read(
-        root,
-        ["rev-list", "--count"]
-            .into_iter()
-            .chain(range())
-            .chain(["--not", "--remotes", "--"]),
-    )?;
-    ensure!(
-        text(&private_count).trim().parse::<usize>()? == rows.len(),
-        t!("git.history_edit_published")
     );
     let entries = rows
         .iter()
@@ -641,7 +674,7 @@ fn write_todo(directory: &Path, entries: &[HistoryEntry]) -> Result<()> {
     Ok(())
 }
 
-fn rebase(root: &Path, plan: HistoryPlan) -> Result<()> {
+fn rebase(root: &Path, plan: HistoryPlan, confirmed: bool) -> Result<()> {
     ready(root, &plan.tip)?;
     ensure!(plan.valid(), t!("git.history_edit_plan_invalid"));
     ensure!(
@@ -668,6 +701,13 @@ fn rebase(root: &Path, plan: HistoryPlan) -> Result<()> {
             }),
         t!("git.history_edit_stale")
     );
+    check_published_range(
+        root,
+        &plan.tip.oid,
+        plan.base.as_deref(),
+        actual.entries.len(),
+        confirmed,
+    )?;
     let owner = Owner {
         tip: plan.tip.clone(),
         operation: Operation::Rebase,
@@ -707,42 +747,58 @@ fn check_amend(root: &Path, tip: &HistoryTip, expected: &super::CommitState) -> 
     ready(root, tip)?;
     let current = commit_state(root)?;
     ensure!(&current == expected, t!("git.worktree_changed"));
-    ensure!(
-        read(
-            root,
-            ["for-each-ref", "--contains", &tip.oid, "refs/remotes"]
-        )?
-        .is_empty(),
-        t!("git.history_edit_published")
-    );
+
     Ok(())
 }
 
-fn amend(root: &Path, tip: HistoryTip, expected: super::CommitState, message: &str) -> Result<()> {
+fn amend(
+    root: &Path,
+    tip: HistoryTip,
+    expected: super::CommitState,
+    message: &str,
+    confirmed: bool,
+) -> Result<()> {
     use std::io::{Seek as _, Write as _};
     ensure!(valid_message(message), t!("git.commit_message_required"));
     let mut input = tempfile::tempfile()?;
     input.write_all(message.as_bytes())?;
     input.rewind()?;
     check_amend(root, &tip, &expected)?;
+    if !confirmed
+        && !read(
+            root,
+            ["for-each-ref", "--contains", &tip.oid, "refs/remotes"],
+        )?
+        .is_empty()
+    {
+        return Err(PublishedHistory.into());
+    }
     let mut git = command(root, ["commit", "--amend", "--file=-"]);
     git.stdin(input);
     capture_repository(git)?;
     rewrite::record_success(root, &tip, RewriteKind::Amend)
 }
 
+#[cfg(test)]
 fn edit_history(root: &Path, edit: HistoryEdit) -> Result<()> {
+    execute_history_edit(root, edit, false)
+}
+
+fn execute_history_edit(root: &Path, edit: HistoryEdit, confirmed: bool) -> Result<()> {
     let _lock = OperationLock::acquire(root)?;
     match edit {
-        HistoryEdit::Rebase(plan) => rebase(root, plan),
-        HistoryEdit::Amend(tip, expected, message) => amend(root, tip, expected, &message),
-        HistoryEdit::UndoRewrite(record) => rewrite::undo(root, record),
+        HistoryEdit::Rebase(plan) => rebase(root, plan, confirmed),
+        HistoryEdit::Amend(tip, expected, message) => {
+            amend(root, tip, expected, &message, confirmed)
+        }
+        HistoryEdit::UndoRewrite(record) => rewrite::undo(root, record, confirmed),
         HistoryEdit::Undo(tip) => {
             let plan = prepare(root, tip.clone(), std::slice::from_ref(&tip.oid))?;
             let parent = plan.base.context(t!("git.history_edit_no_parent"))?;
+            check_published_range(root, &tip.oid, Some(&parent), 1, confirmed)?;
             apply_reset(root, &tip, &parent, ResetMode::Soft)
         }
-        HistoryEdit::Reset(plan, mode) => reset(root, plan, mode),
+        HistoryEdit::Reset(plan, mode) => reset(root, plan, mode, confirmed),
         HistoryEdit::Revert(tip, oid) => {
             ready(root, &tip)?;
             let entry = super::commit(root, &oid)?;
@@ -907,8 +963,13 @@ mod tests {
         repo.git(["update-ref", "refs/remotes/origin/feature", &published])?;
         let private = repo.change("two", "two\n", "Private")?;
         let tip = repo.tip()?;
-        assert!(repo.plan(&base).is_err());
-        assert!(repo.plan(&published).is_err());
+        assert!(repo.plan(&base).is_ok());
+        let published_plan = repo.plan(&published)?;
+        assert!(
+            edit_history(&repo.root, HistoryEdit::Rebase(published_plan))
+                .unwrap_err()
+                .is::<PublishedHistory>()
+        );
         let plan = repo.plan(&private)?;
         edit_history(&repo.root, HistoryEdit::Undo(tip))?;
         assert_eq!(repo.tip()?.oid, published);
@@ -1188,8 +1249,8 @@ mod tests {
             repo.git(["update-ref", "refs/remotes/origin/main", &tip])?;
             assert!(edit_history(&repo.root, HistoryEdit::Reset(plan.clone(), mode)).is_err());
             assert_eq!(repo.tip()?.oid, tip);
-            repo.git(["update-ref", "-d", "refs/remotes/origin/main"])?;
-            edit_history(&repo.root, HistoryEdit::Reset(plan.clone(), mode))?;
+            execute_history_edit(&repo.root, HistoryEdit::Reset(plan.clone(), mode), true)?;
+            assert_eq!(repo.git(["rev-parse", "origin/main"])?, tip);
             assert_eq!(repo.tip()?.oid, base);
             assert_eq!(repo.git(["rev-parse", "ORIG_HEAD"])?, tip);
             assert!(edit_history(&repo.root, HistoryEdit::Reset(plan, mode)).is_err());
@@ -1326,8 +1387,8 @@ mod tests {
                     .is_err()
             );
             assert_eq!(repo.tip()?.oid, after);
-            repo.git(["update-ref", "-d", "refs/remotes/origin/main"])?;
-            backend.edit_history(HistoryEdit::UndoRewrite(record))?;
+            backend.edit_history_with_confirmation(HistoryEdit::UndoRewrite(record), true)?;
+            assert_eq!(repo.git(["rev-parse", "origin/main"])?, after);
             assert_eq!(repo.tip()?.oid, original);
             assert!(repo.root.join("first").exists());
             assert_eq!(repo.git(["show", ":tracked"])?, "staged");

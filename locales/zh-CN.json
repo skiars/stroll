@@ -172,6 +172,8 @@
   "git.history_edit_blocked": "请先完成当前 Git 操作，再编辑提交历史。",
   "git.history_edit_linear": "请选择当前检出分支上的线性提交范围，范围内不能有合并提交。",
   "git.history_edit_published": "此范围内的提交已被远端跟踪分支包含。",
+  "git.history_edit_published_title": "编辑已推送的历史？",
+  "git.history_edit_published_detail": "此次操作涉及已被远端跟踪分支包含的提交。继续会改写本地历史，之后更新远端时可能需要强制推送。",
   "git.history_edit_no_parent": "分支上的第一个提交没有可退回的父提交。",
   "git.history_edit_plan_invalid": "从根提交开始时至少保留一个提交。Squash 和 Fixup 前面必须有可合并的提交。",
   "git.history_edit_resolve_first": "请解决并暂存所有冲突文件后再继续。",

@@ -2219,6 +2219,8 @@ fn commit_list_squashes_rewords_and_resets_with_local_changes() -> Result<()> {
     );
     assert!(visual.update(|_, cx| panel.read(cx).history_rewrite.is_none()));
     let before_amend = commit.oid;
+    let remote = "refs/remotes/origin/main";
+    git(&root, &["update-ref", remote, &before_amend]);
     let worktree = row(visual, 0);
     visual.simulate_click(worktree, Modifiers::default());
     draw(visual);
@@ -2281,8 +2283,40 @@ fn commit_list_squashes_rewords_and_resets_with_local_changes() -> Result<()> {
     let button = visual.debug_bounds("git-create-commit").unwrap().center();
     visual.simulate_click(button, Modifiers::default());
     draw(visual);
+    assert!(
+        visual
+            .debug_bounds("git-history-published-confirmation")
+            .is_some()
+    );
+    assert_eq!(git::head(&root)?.as_deref(), Some(before_amend.as_str()));
+    visual.simulate_keystrokes("escape");
+    draw(visual);
+    assert!(
+        visual
+            .debug_bounds("git-history-published-confirmation")
+            .is_none()
+    );
+    assert_eq!(message(visual), (true, "Amended from the worktree".into()));
+    assert_eq!(git::head(&root)?.as_deref(), Some(before_amend.as_str()));
+    visual.simulate_click(button, Modifiers::default());
+    draw(visual);
+    let confirm = visual
+        .debug_bounds("git-history-edit-apply")
+        .unwrap()
+        .center();
+    visual.simulate_click(confirm, Modifiers::default());
+    draw(visual);
     let amended = git::commit(&root, &git::head(&root)?.unwrap())?;
     assert_ne!(amended.oid, before_amend);
+    assert_eq!(
+        git::history(&root)?
+            .branches
+            .iter()
+            .find(|branch| branch.reference == remote)
+            .unwrap()
+            .oid,
+        before_amend
+    );
     assert_eq!(amended.subject, "Amended from the worktree");
     assert_eq!(message(visual), (false, "Ordinary commit draft".into()));
     assert!(

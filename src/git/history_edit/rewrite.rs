@@ -5,8 +5,8 @@ use rust_i18n::t;
 use serde::{Deserialize, Serialize};
 
 use super::{
-    HistoryTip, Operation, Owner, ResetMode, apply_reset, check_tip, head, object_id, read, ready,
-    with_saved_changes,
+    HistoryTip, Operation, Owner, ResetMode, apply_reset, check_published_range, check_tip, head,
+    object_id, range_count, read, ready, with_saved_changes,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -98,19 +98,22 @@ pub(super) fn record_for(root: &Path, branch: &str, after: &str) -> Option<Rewri
     })
 }
 
-pub(super) fn undo(root: &Path, record: RewriteRecord) -> Result<()> {
+pub(super) fn undo(root: &Path, record: RewriteRecord, confirmed: bool) -> Result<()> {
     ready(root, &record.after)?;
     ensure!(
         record_for(root, &record.after.branch, &record.after.oid).as_ref() == Some(&record),
         t!("git.history_edit_stale")
     );
-    let excluded = format!("^{}", record.before);
-    let range = ["rev-list", "--count", &record.after.oid, &excluded];
-    ensure!(
-        read(root, range.into_iter().chain(["--"]))?
-            == read(root, range.into_iter().chain(["--not", "--remotes", "--"]))?,
-        t!("git.history_edit_published")
-    );
+    if !confirmed {
+        let removed = range_count(root, &record.after.oid, Some(&record.before), false)?;
+        check_published_range(
+            root,
+            &record.after.oid,
+            Some(&record.before),
+            removed,
+            false,
+        )?;
+    }
     let touched = read(
         root,
         [

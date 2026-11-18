@@ -7,7 +7,7 @@ use gpui_component::{
 use super::*;
 use crate::git::{
     HistoryAction, HistoryEdit, HistoryPlan, HistoryProgress, HistoryResolution, HistoryTip,
-    ResetMode, ResetPlan, RewriteKind, RewriteRecord, SavedChanges,
+    PublishedHistory, ResetMode, ResetPlan, RewriteKind, RewriteRecord, SavedChanges,
 };
 
 #[derive(Default)]
@@ -404,6 +404,16 @@ impl GitPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.run_history_edit(edit, false, window, cx);
+    }
+
+    fn run_history_edit(
+        &mut self,
+        edit: HistoryEdit,
+        confirmed: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.writes_busy(cx) {
             self.report_operation_error(anyhow::anyhow!(t!("git.git_busy")), window, cx);
             return;
@@ -460,14 +470,33 @@ impl GitPanel {
         self.stage_error = None;
         self.commit_state_task = Task::ready(());
         let task = cx.background_spawn(async move {
-            let result = backend.edit_history(edit);
+            let result = if confirmed {
+                backend.edit_history_with_confirmation(edit.clone(), true)
+            } else {
+                backend.edit_history(edit.clone())
+            };
             let progress = backend.history_progress();
-            (result, progress)
+            (result, progress, edit)
         });
         self.stage_task = cx.spawn_in(window, async move |this, cx| {
-            let (result, progress) = task.await;
+            let (result, progress, edit) = task.await;
             _ = this.update_in(cx, |panel, window, cx| {
                 panel.staging = false;
+                if result
+                    .as_ref()
+                    .is_err_and(|error| error.is::<PublishedHistory>())
+                {
+                    HistoryDialog::open(
+                        t!("git.history_edit_published_title"),
+                        DialogBody::ConfirmPublished(edit),
+                        cx.weak_entity(),
+                        window,
+                        cx,
+                    );
+                    panel.refresh_commit_state(window, cx);
+                    cx.notify();
+                    return;
+                }
                 let completed = result.is_ok();
                 if amend && completed {
                     panel.clear_commit_amend(window, cx);
@@ -805,13 +834,14 @@ fn prepare_dialog(
 
 enum DialogBody {
     Confirm(SharedString, HistoryEdit),
+    ConfirmPublished(HistoryEdit),
     Message(HistoryPlan, String),
     Plan(HistoryPlan, Vec<String>),
     Reset(ResetPlan, SharedString),
 }
 
 enum DialogContent {
-    Confirm(SharedString, Option<HistoryEdit>),
+    Confirm(SharedString, Option<HistoryEdit>, bool),
     Reset(ResetPlan, SharedString, ResetMode),
     Message(HistoryPlan, Entity<TextareaState>, String),
     Plan {
@@ -842,7 +872,14 @@ impl HistoryDialog {
         let state = cx.new(|cx| {
             let order_focus = cx.focus_handle();
             let content = match body {
-                DialogBody::Confirm(label, edit) => DialogContent::Confirm(label, Some(edit)),
+                DialogBody::Confirm(label, edit) => {
+                    DialogContent::Confirm(label, Some(edit), false)
+                }
+                DialogBody::ConfirmPublished(edit) => DialogContent::Confirm(
+                    t!("git.history_edit_published_detail").into(),
+                    Some(edit),
+                    true,
+                ),
                 DialogBody::Reset(plan, subject) => {
                     DialogContent::Reset(plan, subject, ResetMode::default())
                 }
@@ -904,7 +941,7 @@ impl HistoryDialog {
 
     fn valid(&self, cx: &App) -> bool {
         match &self.content {
-            DialogContent::Confirm(_, edit) => edit.is_some(),
+            DialogContent::Confirm(_, edit, _) => edit.is_some(),
             DialogContent::Reset(..) => true,
             DialogContent::Message(plan, input, original) => {
                 let value = input.read(cx).value();
@@ -939,8 +976,9 @@ impl HistoryDialog {
         if !self.valid(cx) {
             return;
         }
+        let confirmed = matches!(self.content, DialogContent::Confirm(_, _, true));
         let edit = match &mut self.content {
-            DialogContent::Confirm(_, edit) => edit.take().unwrap(),
+            DialogContent::Confirm(_, edit, _) => edit.take().unwrap(),
             DialogContent::Reset(plan, _, mode) => HistoryEdit::Reset(plan.clone(), *mode),
 
             DialogContent::Message(plan, input, _) => {
@@ -959,9 +997,9 @@ impl HistoryDialog {
             }
         };
         window.close_dialog(cx);
-        _ = self
-            .owner
-            .update(cx, |panel, cx| panel.start_history_edit(edit, window, cx));
+        _ = self.owner.update(cx, |panel, cx| {
+            panel.run_history_edit(edit, confirmed, window, cx)
+        });
     }
 
     fn set_action(
@@ -1151,9 +1189,17 @@ impl Render for HistoryDialog {
         let colors = Palette::for_mode(cx.theme().mode);
         let valid = self.valid(cx);
         let reset = matches!(self.content, DialogContent::Reset(..));
-        let hard = matches!(self.content, DialogContent::Reset(_, _, ResetMode::Hard));
+        let danger = matches!(
+            self.content,
+            DialogContent::Reset(_, _, ResetMode::Hard) | DialogContent::Confirm(_, _, true)
+        );
         let body = match &self.content {
-            DialogContent::Confirm(label, _) => div().child(label.clone()).into_any_element(),
+            DialogContent::Confirm(label, _, published) => div()
+                .when(*published, |body| {
+                    body.debug_selector(|| "git-history-published-confirmation".into())
+                })
+                .child(label.clone())
+                .into_any_element(),
             DialogContent::Reset(plan, subject, mode) => {
                 Self::reset_controls(plan, subject, *mode, colors, cx).into_any_element()
             }
@@ -1354,7 +1400,7 @@ impl Render for HistoryDialog {
                             } else {
                                 t!("git.history_edit_apply")
                             })
-                            .when(hard, |button| button.danger())
+                            .when(danger, |button| button.danger())
                             .disabled(!valid)
                             .on_click(cx.listener(|this, _, window, cx| this.submit(window, cx))),
                     ),

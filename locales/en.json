@@ -172,6 +172,8 @@
   "git.history_edit_blocked": "Finish the current Git operation before editing commit history.",
   "git.history_edit_linear": "Select a linear range on the checked-out branch. The range must exclude merge commits.",
   "git.history_edit_published": "A remote-tracking branch already contains commits in this range.",
+  "git.history_edit_published_title": "Edit published history?",
+  "git.history_edit_published_detail": "A remote-tracking branch already contains commits affected by this edit. Continuing rewrites local history. Updating the remote afterward may require a force push.",
   "git.history_edit_no_parent": "The first commit on the branch has no parent to return to.",
   "git.history_edit_plan_invalid": "Keep at least one commit when starting at the root. Squash and Fixup need a preceding commit to join.",
   "git.history_edit_resolve_first": "Resolve and stage all conflicted files before continuing.",
