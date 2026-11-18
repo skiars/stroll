@@ -798,6 +798,14 @@ pub(crate) struct RawPatch {
     pub(super) count_lines: bool,
 }
 
+#[cfg(feature = "desktop")]
+impl RawPatch {
+    pub(crate) fn content_fingerprint(&self) -> [u8; 32] {
+        use sha2::{Digest, Sha256};
+        Sha256::digest(self.text.as_bytes()).into()
+    }
+}
+
 pub(crate) fn raw_patch(
     state: &RepoState,
     detail: &Changes,

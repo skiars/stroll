@@ -674,6 +674,7 @@ fn diff_file_and_row_menus_reveal_worktree_lines() {
             let ix = review.by_path[guide];
             review.patches[ix] = PatchState::Pending;
             review.documents[ix] = git::placeholder(&review.detail.files[ix], "").unwrap();
+            review.patch_display[ix].content = None;
             panel.patch_loading[1] = true;
             ix
         })
@@ -698,8 +699,7 @@ fn diff_file_and_row_menus_reveal_worktree_lines() {
         });
     });
     settle(visual);
-    // The staged hunk is displayed first even though the unstaged hunk is near line five.
-    assert_editor(visual, guide, 29);
+    assert_editor(visual, guide, 2);
 
     show_diff(visual, false, false);
     let tree_guide = visual.debug_bounds("git-tree-row:file:z-guide.md").unwrap();
@@ -1118,7 +1118,11 @@ fn check_file_tree_navigation(split: bool) {
             assert!(matches!(review.patches[ix], PatchState::Ready), "{path}");
             assert!(review.documents[ix].hunk_locations().next().is_some());
             if path == "last.txt" {
-                assert!(review.secondary.contains_key(&ix));
+                let lines = review.documents[ix]
+                    .patch_source_lines()
+                    .map(|(_, _, text)| text)
+                    .collect::<Vec<_>>();
+                assert_eq!(lines, ["before", "working copy"]);
             }
         });
     }

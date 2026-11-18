@@ -20,14 +20,6 @@ pub(crate) enum Layer {
 }
 
 impl Layer {
-    #[cfg(feature = "desktop")]
-    pub fn label(self) -> std::borrow::Cow<'static, str> {
-        match self {
-            Self::Staged => t!("git.staged"),
-            Self::Unstaged => t!("git.unstaged"),
-        }
-    }
-
     pub fn mode(self) -> Mode {
         match self {
             Self::Staged => Mode::Staged,

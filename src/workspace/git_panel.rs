@@ -167,6 +167,7 @@ enum PatchState {
 struct PatchDisplay {
     // Keep the published result while a replacement patch is being read.
     truncated: Option<bool>,
+    content: Option<[u8; 32]>,
     error: Option<String>,
 }
 
@@ -175,7 +176,6 @@ struct Review {
     patches: Vec<PatchState>,
     patch_display: Vec<PatchDisplay>,
     documents: Vec<DiffFile>,
-    secondary: HashMap<usize, DiffFile>,
     operations: HashMap<usize, review::FileOperations>,
     pending_assets: HashMap<usize, review::PatchAssets>,
     versions: HashMap<usize, git::FileVersion>,
@@ -471,17 +471,7 @@ impl GitPanel {
                     if expanded {
                         review.collapsed.remove(&primary);
                     } else {
-                        review.collapsed.insert(primary.clone());
-                    }
-                    let other = if path.as_str() == primary {
-                        review.secondary.get(&ix).map(|doc| doc.path().to_string())
-                    } else {
-                        Some(primary)
-                    };
-                    if let Some(other) = other {
-                        this.diff.update(cx, |diff, cx| {
-                            diff.set_file_collapsed(&other, !expanded, cx);
-                        });
+                        review.collapsed.insert(primary);
                     }
                     if expanded {
                         this.request_patch(ix, window, cx);
@@ -3438,6 +3428,7 @@ mod tests {
                 review.patches[ix] = PatchState::Failed;
                 review.patch_display[ix] = PatchDisplay {
                     truncated: None,
+                    content: None,
                     error: Some("Unable to read the requested revision. ".repeat(14)),
                 };
                 panel.editor.invalidate();

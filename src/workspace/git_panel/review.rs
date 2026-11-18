@@ -42,42 +42,67 @@ fn translated_placeholder(file: &git::ChangedFile) -> Result<DiffFile> {
 
 pub(super) struct FileOperations {
     version: git::FileVersion,
-    primary: Option<HunkActions>,
-    secondary: Option<HunkActions>,
+    staged: Option<HunkActions>,
+    unstaged: Option<HunkActions>,
+    staged_worktree: Vec<std::ops::Range<usize>>,
 }
 
 struct HunkActions {
-    layer: git::Layer,
     whole_file: bool,
     blocks: Vec<git::Block>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) struct ActionBlocks {
+    pub(super) staged: Option<usize>,
+    pub(super) unstaged: Option<usize>,
+}
+
+impl FileOperations {
+    fn patch(&self, layer: git::Layer) -> Option<&HunkActions> {
+        match layer {
+            git::Layer::Staged => self.staged.as_ref(),
+            git::Layer::Unstaged => self.unstaged.as_ref(),
+        }
+    }
+}
+
+fn block_at(blocks: &[git::Block], line: usize, original: bool) -> Option<usize> {
+    let range = |block: &git::Block| {
+        if original {
+            block.old_start..block.old_start + block.old_count
+        } else {
+            block.new_start..block.new_start + block.new_count
+        }
+    };
+    let index = blocks.partition_point(|block| range(block).end <= line);
+    range(blocks.get(index)?).contains(&line).then_some(index)
+}
+
+/// Project a HEAD line that survived staging into index coordinates.
+fn index_line(staged: &[git::Block], line: usize) -> Option<usize> {
+    let old_end = |block: &git::Block| block.old_start + block.old_count.saturating_sub(1);
+    let previous = staged.partition_point(|block| old_end(block) < line);
+    if staged
+        .get(previous)
+        .is_some_and(|block| block.old_count > 0 && block.old_start <= line)
+    {
+        return None;
+    }
+    let Some(block) = previous.checked_sub(1).and_then(|ix| staged.get(ix)) else {
+        return Some(line);
+    };
+    let new_end = block.new_start + block.new_count.saturating_sub(1);
+    Some(new_end + (line - old_end(block)))
 }
 
 impl From<git::LayerPatch> for HunkActions {
     fn from(patch: git::LayerPatch) -> Self {
         Self {
-            layer: patch.layer,
             whole_file: patch.whole_file(),
             blocks: patch.blocks,
         }
     }
-}
-
-fn layered(file: &git::ChangedFile, detail: &Changes) -> bool {
-    matches!(
-        detail.comparison,
-        Comparison::Worktree {
-            mode: Mode::All,
-            base: None
-        }
-    ) && file
-        .worktree
-        .as_ref()
-        .is_some_and(|state| !state.conflict && state.staged && (state.unstaged || state.untracked))
-        && !file.submodule()
-}
-
-fn secondary_path(path: &str) -> String {
-    format!("\0{path}")
 }
 
 pub(super) fn change_stat(stats: &git::ChangeStats, file: &git::ChangedFile) -> git::ChangeStat {
@@ -154,13 +179,6 @@ impl Review {
             // Keep the last displayed content while a changed file's replacement loads.
             if self.patch_display[ix].truncated.is_some() {
                 self.documents[ix] = previous.documents[old].clone();
-                let secondary = secondary_path(&file.path);
-                if let Some(document) = previous.secondary.get(&old) {
-                    self.secondary.insert(ix, document.clone());
-                    Rc::make_mut(&mut self.by_path).insert(secondary, ix);
-                } else if self.secondary.remove(&ix).is_some() {
-                    Rc::make_mut(&mut self.by_path).remove(&secondary);
-                }
                 // These actions refer to the patch still on screen. Git verifies its version.
                 if let Some(version) = previous.versions.remove(&old) {
                     self.versions.insert(ix, version);
@@ -226,7 +244,7 @@ fn prefetch(
                 detail.files[ix].path.clone(),
                 git::FileDiffOptions {
                     mode,
-                    context,
+                    context: if mode == Mode::All { 0 } else { context },
                     whitespace,
                 },
             ));
@@ -292,7 +310,8 @@ fn snapshot_worktree_path(
 pub(super) struct PatchAssets {
     version: Option<git::FileVersion>,
     operations: Option<git::FileDiffOptions>,
-    layers: Vec<(SharedString, Option<git::Layer>)>,
+    source: Option<(SharedString, Option<git::Layer>)>,
+    content: Option<[u8; 32]>,
 }
 
 impl PatchAssets {
@@ -306,12 +325,37 @@ impl PatchAssets {
         if &actions.version != version {
             return None;
         }
-        let mut layers = actions.layers.into_iter();
-        Some(FileOperations {
+        let mut operations = FileOperations {
             version: actions.version,
-            primary: layers.next().map(Into::into),
-            secondary: layers.next().map(Into::into),
-        })
+            staged: None,
+            unstaged: None,
+            staged_worktree: Vec::new(),
+        };
+        for patch in actions.layers {
+            let destination = match patch.layer {
+                git::Layer::Staged => &mut operations.staged,
+                git::Layer::Unstaged => &mut operations.unstaged,
+            };
+            *destination = Some(patch.into());
+        }
+        if let Some(staged) = operations.patch(git::Layer::Staged) {
+            let unstaged = operations
+                .patch(git::Layer::Unstaged)
+                .map_or(&[][..], |patch| patch.blocks.as_slice());
+            let project = super::super::editor_git::worktree_line;
+            operations.staged_worktree = staged
+                .blocks
+                .iter()
+                .map(|block| {
+                    let start = block
+                        .new_start
+                        .saturating_sub(usize::from(block.new_count > 0));
+                    let end = start + block.new_count;
+                    project(start, unstaged, true)..project(end, unstaged, block.new_count == 0)
+                })
+                .collect();
+        }
+        Some(operations)
     }
 
     fn sources(
@@ -324,7 +368,7 @@ impl PatchAssets {
         if file.submodule() || file.conflict() || file.binary {
             return sources;
         }
-        for (path, layer) in &self.layers {
+        if let Some((path, layer)) = &self.source {
             for (side, diff_side, source_path) in [
                 (
                     Side::Old,
@@ -361,6 +405,16 @@ impl PatchAssets {
     }
 }
 
+pub(super) fn is_all_worktree_changes(comparison: &Comparison) -> bool {
+    matches!(
+        comparison,
+        Comparison::Worktree {
+            mode: Mode::All,
+            base: None
+        }
+    )
+}
+
 fn review_patch(
     backend: &git::Backend,
     detail: &Changes,
@@ -368,8 +422,9 @@ fn review_patch(
     context: usize,
     whitespace: bool,
     prefetched: Option<git::FileChanges>,
-) -> Result<(git::Patch, Option<git::Patch>, PatchAssets)> {
+) -> Result<(git::Patch, PatchAssets)> {
     let mode = batchable(backend, detail, file);
+    let mixed = is_all_worktree_changes(&detail.comparison);
     let verified = mode.and_then(|mode| {
         prefetched
             .or_else(|| {
@@ -378,7 +433,7 @@ fn review_patch(
                         &file.path,
                         git::FileDiffOptions {
                             mode,
-                            context,
+                            context: if mixed { 0 } else { context },
                             whitespace,
                         },
                     )
@@ -386,126 +441,46 @@ fn review_patch(
             })
             .filter(|changes| changes.version.status.as_ref() == file.worktree.as_ref())
     });
-    if let (Some(mode), Some(changes)) = (mode, verified) {
-        let mut layers = changes.layers.into_iter();
-        let primary = layers.next();
-        let secondary = layers.next();
-        let use_layer = |layer: &git::LayerPatch| git::render_patch(file, layer.patch.clone());
-        let mut primary_patch = match &primary {
-            Some(layer) => use_layer(layer)?,
-            _ => backend.patch(detail, file, context, whitespace)?,
-        };
-        let secondary_patch = if layered(file, detail) {
-            Some(match &secondary {
-                Some(layer) => {
-                    let mut patch = use_layer(layer)?;
-                    patch.document = patch.document.with_view_path(secondary_path(&file.path));
-                    patch
-                }
-                None => git::Patch {
-                    document: translated_placeholder(file)?
-                        .with_view_path(secondary_path(&file.path)),
-                    truncated: false,
-                    counts: None,
-                },
-            })
-        } else {
-            None
-        };
-        if secondary_patch.is_some() && !file.binary {
-            primary_patch.counts = Some(
-                std::iter::once(&primary_patch)
-                    .chain(secondary_patch.as_ref())
-                    .fold((0, 0), |(add, del), patch| {
-                        (
-                            add + patch.document.additions(),
-                            del + patch.document.deletions(),
-                        )
-                    }),
-            );
-        }
-        let mut sources = vec![(
-            primary_patch.document.path().clone(),
-            primary.as_ref().map(|p| p.layer),
-        )];
-        if let Some(patch) = &secondary_patch {
-            sources.push((patch.document.path().clone(), Some(git::Layer::Unstaged)));
-        }
-        return Ok((
-            primary_patch,
-            secondary_patch,
-            PatchAssets {
-                version: Some(changes.version),
-                operations: Some(git::FileDiffOptions {
-                    mode,
-                    context: 0,
-                    whitespace,
-                }),
-                layers: sources,
-            },
-        ));
-    }
-    // A changing worktree can invalidate edit coordinates while Git is reading.
-    // The read-only patch can still update the display without offering those edits.
-    if mode.is_some() && layered(file, detail) {
-        let read_layer = |mode| {
-            backend.patch(
-                &Changes {
-                    comparison: Comparison::Worktree { mode, base: None },
-                    base: detail.base.clone(),
-                    files: Vec::new(),
-                    status: None,
-                },
-                file,
-                context,
-                whitespace,
-            )
-        };
-        let mut primary = read_layer(Mode::Staged)?;
-        let mut secondary = read_layer(Mode::Unstaged)?;
-        secondary.document = secondary
-            .document
-            .with_view_path(secondary_path(&file.path));
-        if !file.binary && !primary.truncated && !secondary.truncated {
-            primary.counts = Some((
-                primary.document.additions() + secondary.document.additions(),
-                primary.document.deletions() + secondary.document.deletions(),
-            ));
-        }
-        return Ok((
-            primary,
-            Some(secondary),
-            PatchAssets {
-                version: None,
-                operations: None,
-                layers: Vec::new(),
-            },
-        ));
-    }
-    // Custom workspace comparisons have no layer operations, but the displayed
-    // patch still needs to identify the exact working file it was read from.
-    let version = (is_custom_worktree(&detail.comparison) && !file.binary)
+    // A draft can only use the baseline from the same source version as the displayed patch.
+    let custom_version = (is_custom_worktree(&detail.comparison) && !file.binary)
         .then(|| backend.file_version(&file.path).ok())
         .flatten()
         .filter(|version| version.status.as_ref() == file.worktree.as_ref());
-    let patch = backend.patch(detail, file, context, whitespace)?;
-    let version = version.filter(|version| {
-        !patch.truncated
-            && !patch.document.is_binary()
-            && backend.file_version(&file.path).ok().as_ref() == Some(version)
-    });
-    let layers = if mode.is_some() {
-        Vec::new()
+    let layer = (!mixed)
+        .then(|| verified.as_ref()?.layers.first())
+        .flatten();
+    let (patch, content) = if let Some(layer) = layer {
+        (git::render_patch(file, layer.patch.clone())?, None)
+    } else if mixed {
+        let raw = backend.review_patch_text(detail, file, context, whitespace)?;
+        let content = raw.content_fingerprint();
+        (git::render_patch(file, raw)?, Some(content))
     } else {
-        vec![(patch.document.path().clone(), None)]
+        (backend.patch(detail, file, context, whitespace)?, None)
     };
+    let source = (verified.is_some() || mixed || mode.is_none())
+        .then(|| (patch.document.path().clone(), layer.map(|p| p.layer)));
+    let operations = mode
+        .filter(|_| verified.is_some())
+        .map(|mode| git::FileDiffOptions {
+            mode,
+            context: 0,
+            whitespace,
+        });
+    let version = verified.map(|changes| changes.version).or_else(|| {
+        custom_version.filter(|version| {
+            !patch.truncated
+                && !patch.document.is_binary()
+                && backend.file_version(&file.path).ok().as_ref() == Some(version)
+        })
+    });
     Ok((
         patch,
-        None,
         PatchAssets {
             version,
-            operations: None,
-            layers,
+            operations,
+            source,
+            content,
         },
     ))
 }
@@ -565,6 +540,7 @@ impl GitPanel {
                     && let Ok(document) = translated_placeholder(file)
                 {
                     review.documents[ix] = document.clone();
+                    review.patch_display[ix].content = None;
                     Some(document)
                 } else {
                     None
@@ -590,11 +566,23 @@ impl GitPanel {
         &mut self,
         selection: Selection,
         preserve: bool,
-        position: Option<crate::session::DiffPosition>,
+        mut position: Option<DiffPosition>,
         restoring: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if restoring
+            && selection == Selection::Worktree(Mode::All)
+            && let Some(position) = &mut position
+            && let Some(path) = position.path.strip_prefix('\0')
+        {
+            // Old sessions stored the unstaged section under a synthetic path.
+            position.path = path.to_owned();
+            if position.line.is_some_and(|(original, _)| original) {
+                position.line = None;
+                position.inset = 0.;
+            }
+        }
         self.load_review_with_changes(
             selection, preserve, position, restoring, None, false, window, cx,
         );
@@ -704,7 +692,6 @@ impl GitPanel {
         }
         let restoring_commit = restoring && matches!(selection, Selection::Commit(..));
         let backend = self.backend.clone();
-        let supports_git_edit = backend.supports_git_edit();
         let foreign = self
             .foreign_branch()
             .then(|| self.branch_oid())
@@ -762,27 +749,11 @@ impl GitPanel {
                             let active = review.active?;
                             Some(review.detail.files[active].path.as_str())
                         });
-                        let secondary = detail
-                            .files
-                            .iter()
-                            .enumerate()
-                            .filter(|(_, file)| supports_git_edit && layered(file, &detail))
-                            .filter_map(|(ix, file)| {
-                                translated_placeholder(file)
-                                    .ok()
-                                    .map(|doc| (ix, doc.with_view_path(secondary_path(&file.path))))
-                            })
-                            .collect::<HashMap<_, _>>();
                         let by_path = detail
                             .files
                             .iter()
                             .enumerate()
                             .map(|(ix, file)| (file.path.clone(), ix))
-                            .chain(
-                                secondary
-                                    .iter()
-                                    .map(|(&ix, doc)| (doc.path().to_string(), ix)),
-                            )
                             .collect::<HashMap<_, _>>();
                         let active = active_path
                             .and_then(|path| by_path.get(path).copied())
@@ -814,7 +785,6 @@ impl GitPanel {
                             detail: Arc::new(detail),
                             patches,
                             documents,
-                            secondary,
                             operations: HashMap::new(),
                             pending_assets: HashMap::new(),
                             versions: HashMap::new(),
@@ -901,39 +871,33 @@ impl GitPanel {
                         if locale != *rust_i18n::locale() {
                             this.refresh_placeholders(cx);
                         }
+                        let revision = this.diff.read(cx).editor_row_revision();
                         this.sync_review_documents(keep, cx);
+                        let projection_changed =
+                            this.diff.read(cx).editor_row_revision() != revision;
                         if !keep {
                             this.editor.restore_viewport();
                         }
-                        if let Some(mut anchor) = viewport {
+                        if let Some(anchor) = viewport {
                             let path = anchor.path();
                             let ix = this.review.as_ref().and_then(|review| {
-                                review
-                                    .by_path
-                                    .get(path)
-                                    .or_else(|| {
-                                        path.strip_prefix('\0')
-                                            .and_then(|path| review.by_path.get(path))
-                                    })
-                                    .copied()
-                                    .filter(|&ix| {
-                                        !this.only_matching
-                                            || super::tree::matches(
-                                                &review.detail.files[ix],
-                                                &this.filter,
-                                            )
-                                    })
+                                review.by_path.get(path).copied().filter(|&ix| {
+                                    !this.only_matching
+                                        || super::tree::matches(
+                                            &review.detail.files[ix],
+                                            &this.filter,
+                                        )
+                                })
                             });
                             if let Some(ix) = ix {
                                 let review = this.review.as_ref().unwrap();
-                                if !review.by_path.contains_key(anchor.path()) {
-                                    anchor.retarget(
-                                        review.detail.files[ix].path.clone().into(),
-                                        gpui_component::diff::DiffSide::Modified,
-                                    );
+                                if changed.is_none()
+                                    || projection_changed
+                                    || !is_all_worktree_changes(&review.detail.comparison)
+                                {
+                                    this.diff.read(cx).restore_viewport_anchor(&anchor);
+                                    this.editor.restore_viewport();
                                 }
-                                this.diff.read(cx).restore_viewport_anchor(&anchor);
-                                this.editor.restore_viewport();
                                 if this.snapshot.is_none()
                                     && matches!(review.patches[ix], PatchState::Pending)
                                     && !review.collapsed.contains(&review.detail.files[ix].path)
@@ -1071,19 +1035,10 @@ impl GitPanel {
             .filter(|(ix, _)| {
                 !self.only_matching || super::tree::matches(&review.detail.files[*ix], &self.filter)
             })
-            .flat_map(|(ix, document)| {
-                std::iter::once(document.clone()).chain(review.secondary.get(&ix).cloned())
-            })
+            .map(|(_, document)| document.clone())
             .map(|document| scope_diff_document(document, repo.as_deref()))
             .collect::<Vec<_>>();
-        let mut collapsed = review.collapsed.clone();
-        collapsed.extend(
-            review
-                .secondary
-                .iter()
-                .filter(|(ix, _)| review.collapsed.contains(&review.detail.files[**ix].path))
-                .map(|(_, document)| document.path().to_string()),
-        );
+        let collapsed = review.collapsed.clone();
         self.diff.update(cx, |diff, cx| {
             if keep {
                 diff.reconcile_files(visible, cx);
@@ -1152,7 +1107,6 @@ impl GitPanel {
             self.sync_documents(cx);
         }
         let review = self.review.as_mut().unwrap();
-        let secondary = review.secondary.get(&ix).map(|doc| doc.path().clone());
         review.active = Some(ix);
         if expand {
             self.pending_editor_open = None;
@@ -1166,9 +1120,6 @@ impl GitPanel {
         self.diff.update(cx, |diff, cx| {
             if expand {
                 diff.set_file_collapsed(&path, false, cx);
-                if let Some(secondary) = secondary {
-                    diff.set_file_collapsed(&secondary, false, cx);
-                }
             }
             diff.scroll_to_file(&path, cx);
         });
@@ -1233,10 +1184,10 @@ impl GitPanel {
             return;
         }
         let source = if matches!(review.patches[ix], PatchState::Ready) {
-            std::iter::once(&review.documents[ix])
-                .chain(review.secondary.get(&ix))
-                .filter(|doc| doc.hunk_locations().next().is_some())
-                .find_map(|doc| {
+            let doc = &review.documents[ix];
+            doc.hunk_locations()
+                .next()
+                .and_then(|_| {
                     let (side, line, _) = doc.patch_source_lines().next()?;
                     let position = DiffLinePosition::new(doc.path().clone(), side, line);
                     self.diff_source(&position, cx)
@@ -1474,7 +1425,7 @@ impl GitPanel {
     fn publish_patch(
         &mut self,
         ix: usize,
-        result: Result<(git::Patch, Option<git::Patch>, PatchAssets)>,
+        result: Result<(git::Patch, PatchAssets)>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -1485,20 +1436,17 @@ impl GitPanel {
         let Some(review) = &mut self.review else {
             return;
         };
-        let mut documents = Vec::new();
+        let mut document = None;
         let mut position = None;
-        let mut membership_changed = false;
         let anchor = self
             .pending_review_anchor
             .take_if(|anchor| review.by_path.get(anchor.path()) == Some(&ix))
             .or_else(|| self.diff.read(cx).viewport_anchor());
         match result {
-            Ok((mut patch, mut secondary, assets)) => {
-                patch.document = scope_diff_document(patch.document, repo.as_deref());
-                if let Some(secondary) = &mut secondary {
-                    secondary.document =
-                        scope_diff_document(secondary.document.clone(), repo.as_deref());
-                }
+            Ok((patch, assets)) => {
+                let same_content = assets.content.is_some()
+                    && assets.content == review.patch_display[ix].content
+                    && review.patch_display[ix].truncated == Some(patch.truncated);
                 let file = &review.detail.files[ix];
                 let counts = |review: &Review| {
                     review
@@ -1518,17 +1466,24 @@ impl GitPanel {
                 let after = counts(review);
                 review.totals.0 = review.totals.0 - before.0 + after.0;
                 review.totals.1 = review.totals.1 - before.1 + after.1;
-                review.documents[ix] = patch.document.clone();
+                // Index-only changes keep the rendered projection, including expanded context.
+                if !same_content {
+                    let patch = scope_diff_document(patch.document, repo.as_deref());
+                    review.documents[ix] = patch.clone();
+                    document = Some(patch);
+                    review.sources.remove(&ix);
+                    review.live.remove(&ix);
+                }
                 review.patches[ix] = PatchState::Ready;
                 review.patch_display[ix] = PatchDisplay {
-                    truncated: Some(
-                        patch.truncated || secondary.as_ref().is_some_and(|p| p.truncated),
-                    ),
+                    truncated: Some(patch.truncated),
+                    content: assets.content,
                     error: None,
                 };
-                review.operations.remove(&ix);
-                review.sources.remove(&ix);
-                review.live.remove(&ix);
+                if !same_content || assets.operations.is_none() {
+                    review.operations.remove(&ix);
+                    self.editor.invalidate_actions();
+                }
                 review.versions.remove(&ix);
                 if self
                     .confirm_restore
@@ -1536,19 +1491,6 @@ impl GitPanel {
                     .is_some_and(|(path, _)| review.by_path.get(path) == Some(&ix))
                 {
                     self.confirm_restore = None;
-                }
-                documents.push(patch.document);
-                membership_changed = review.secondary.contains_key(&ix) != secondary.is_some();
-                if let Some(secondary) = secondary {
-                    review.secondary.insert(ix, secondary.document.clone());
-                    if membership_changed {
-                        Rc::make_mut(&mut review.by_path)
-                            .insert(secondary.document.path().to_string(), ix);
-                    }
-                    documents.push(secondary.document);
-                } else if membership_changed {
-                    review.secondary.remove(&ix);
-                    Rc::make_mut(&mut review.by_path).remove(&secondary_path(&file.path));
                 }
                 if let Some(version) = assets.version.clone() {
                     review.versions.insert(ix, version);
@@ -1567,23 +1509,15 @@ impl GitPanel {
                 }
             }
         }
-        if membership_changed {
-            self.sync_review_documents(true, cx);
-        }
-        let restore = position.is_none() && anchor.is_some() && !documents.is_empty();
+        let restore = position.is_none() && document.is_some() && anchor.is_some();
         self.diff.update(cx, |diff, cx| {
-            if !membership_changed {
-                diff.replace_files(documents, cx);
+            if let Some(document) = document {
+                diff.replace_file(document, cx);
             }
             if let Some(position) = position {
                 diff.scroll_to_line(position, cx);
             } else if restore && let Some(mut anchor) = anchor {
-                let path = anchor.path().to_owned();
-                let sibling = path
-                    .strip_prefix('\0')
-                    .map(str::to_owned)
-                    .unwrap_or_else(|| secondary_path(&path));
-                diff.reconcile_viewport_anchor(&mut anchor, &sibling);
+                diff.reconcile_viewport_anchor(&mut anchor, "");
                 diff.restore_viewport_anchor(&anchor);
             }
         });
@@ -1664,10 +1598,14 @@ impl GitPanel {
                         .get(&ix)
                         .is_some_and(|assets| assets.version == pending_version)
             };
-            if let Ok(Some(operations)) = receive.recv().await {
+            if let Ok(operations) = receive.recv().await {
                 _ = this.update_in(cx, |this, _, cx| {
                     if let Some(review) = this.review.as_mut().filter(|review| current(review)) {
-                        review.operations.insert(ix, operations);
+                        if let Some(operations) = operations {
+                            review.operations.insert(ix, operations);
+                        } else {
+                            review.operations.remove(&ix);
+                        }
                         this.editor.invalidate_actions();
                         App::notify(cx, this.review_pane.entity_id());
                     }
@@ -1689,17 +1627,8 @@ impl GitPanel {
                             let file = &review.detail.files[ix];
                             let worktree_path =
                                 snapshot_worktree_path(&review.detail.comparison, file, key.1);
-                            let document = if review.documents[ix].path() == &key.0 {
-                                Some(&mut review.documents[ix])
-                            } else {
-                                review
-                                    .secondary
-                                    .get_mut(&ix)
-                                    .filter(|document| document.path() == &key.0)
-                            };
-                            if let Some(document) = document
-                                && language == "bash"
-                            {
+                            let document = &mut review.documents[ix];
+                            if language == "bash" && !editors.contains_key(&key) {
                                 *document = scope_diff_document(
                                     document.clone().with_side_language(key.1, language.into()),
                                     repo.as_deref(),
@@ -1890,87 +1819,115 @@ impl GitPanel {
         cx.notify();
     }
 
-    pub(super) fn document_layer(&self, ix: usize, view_path: &str) -> Option<git::Layer> {
+    pub(super) fn document_layer(&self) -> Option<git::Layer> {
         let review = self.review.as_ref()?;
-        if view_path.starts_with('\0') && review.secondary.contains_key(&ix) {
-            return Some(git::Layer::Unstaged);
+        if !self.backend.supports_git_edit() {
+            return None;
         }
-        if let Some(operations) = review.operations.get(&ix) {
-            if view_path.starts_with('\0') {
-                operations.secondary.as_ref().map(|patch| patch.layer)
-            } else {
-                operations.primary.as_ref().map(|patch| patch.layer)
-            }
-        } else if let Some(assets) = review.pending_assets.get(&ix) {
-            assets
-                .layers
-                .iter()
-                .find_map(|(path, layer)| (path.as_str() == view_path).then_some(*layer))
-                .flatten()
-        } else if review.secondary.contains_key(&ix) {
-            Some(if view_path.starts_with('\0') {
-                git::Layer::Unstaged
-            } else {
-                git::Layer::Staged
-            })
-        } else {
-            None
+        match review.detail.comparison {
+            Comparison::Worktree {
+                mode: Mode::Staged,
+                base: None,
+            } => Some(git::Layer::Staged),
+            Comparison::Worktree {
+                mode: Mode::Unstaged,
+                base: None,
+            } => Some(git::Layer::Unstaged),
+            _ => None,
         }
     }
 
-    pub(super) fn action_block(
+    pub(super) fn action_blocks(
         &self,
         path: &str,
         original: Option<usize>,
         modified: Option<usize>,
-    ) -> Option<usize> {
-        let patch = self.action_patch(path)?;
-        let (line, original) = modified
-            .map(|line| (line, false))
-            .or_else(|| original.map(|line| (line, true)))?;
-        let range = |block: &git::Block| {
-            if original {
-                (block.old_start, block.old_count)
-            } else {
-                (block.new_start, block.new_count)
+    ) -> Option<ActionBlocks> {
+        let review = self.review.as_ref()?;
+        let &ix = review.by_path.get(path)?;
+        if review.live.contains_key(&ix) {
+            return None;
+        }
+        let operations = review.operations.get(&ix)?;
+        let staged = operations.patch(git::Layer::Staged);
+        let unstaged = operations.patch(git::Layer::Unstaged);
+        let direct = |patch: &HunkActions, original: Option<usize>| {
+            modified
+                .and_then(|line| block_at(&patch.blocks, line, false))
+                .or_else(|| original.and_then(|line| block_at(&patch.blocks, line, true)))
+        };
+        let actions = if is_all_worktree_changes(&review.detail.comparison) {
+            let staged_blocks = staged.map_or(&[][..], |patch| patch.blocks.as_slice());
+            ActionBlocks {
+                staged: original
+                    .and_then(|line| block_at(staged_blocks, line, true))
+                    .or_else(|| {
+                        let line = modified?.checked_sub(1)?;
+                        let ranges = &operations.staged_worktree;
+                        let ix = ranges.partition_point(|range| range.end <= line);
+                        ranges.get(ix)?.contains(&line).then_some(ix)
+                    }),
+                unstaged: unstaged.and_then(|patch| {
+                    direct(
+                        patch,
+                        original.and_then(|line| index_line(staged_blocks, line)),
+                    )
+                }),
+            }
+        } else {
+            ActionBlocks {
+                staged: staged.and_then(|patch| direct(patch, original)),
+                unstaged: unstaged.and_then(|patch| direct(patch, original)),
             }
         };
-        let index = patch.blocks.partition_point(|block| {
-            let (start, count) = range(block);
-            start.saturating_add(count) <= line
-        });
-        let block = patch.blocks.get(index)?;
-        let (start, count) = range(block);
-        (start <= line && count != 0).then_some(index)
-    }
-
-    fn action_patch(&self, path: &str) -> Option<&HunkActions> {
-        let review = self.review.as_ref()?;
-        let operations = review.operations.get(review.by_path.get(path)?)?;
-        if path.starts_with('\0') {
-            operations.secondary.as_ref()
-        } else {
-            operations.primary.as_ref()
-        }
+        (actions.staged.is_some() || actions.unstaged.is_some()).then_some(actions)
     }
 
     pub(super) fn hunk_actions(
         &self,
         path: &str,
-        index: usize,
+        blocks: ActionBlocks,
         cx: &Context<Self>,
     ) -> Option<AnyElement> {
         let review = self.review.as_ref()?;
         let &ix = review.by_path.get(path)?;
         let operations = review.operations.get(&ix)?;
-        if review.live.contains_key(&ix)
-            && self.document_layer(ix, path) != Some(git::Layer::Staged)
-        {
-            return None;
+        let status = operations.version.status.as_ref()?;
+        let stale = !matches!(review.patches[ix], PatchState::Ready)
+            || review.versions.get(&ix) != Some(&operations.version);
+        let mut targets = Vec::new();
+        let mut whole_file = false;
+        for (layer, index) in [
+            (git::Layer::Staged, blocks.staged),
+            (git::Layer::Unstaged, blocks.unstaged),
+        ] {
+            let Some((patch, index)) = operations.patch(layer).zip(index) else {
+                continue;
+            };
+            let block = patch.blocks.get(index)?;
+            if !patch.whole_file && block.target.is_none() {
+                continue;
+            }
+            whole_file |= layer == git::Layer::Unstaged && patch.whole_file;
+            let target = if patch.whole_file {
+                None
+            } else {
+                block.target.clone()
+            };
+            targets.extend(
+                layer
+                    .actions()
+                    .iter()
+                    .copied()
+                    .filter(|action| {
+                        action.available(status)
+                            && (*action != git::FileAction::Restore
+                                || self.backend.supports_git_operations())
+                    })
+                    .map(|action| (action, target.clone())),
+            );
         }
-        let patch = self.action_patch(path)?;
-        let block = patch.blocks.get(index)?;
-        if !patch.whole_file && block.target.is_none() {
+        if targets.is_empty() {
             return self.whitespace.then(|| {
                 div()
                     .text_size(GIT_TEXT_SIZE)
@@ -1978,26 +1935,12 @@ impl GitPanel {
                     .into_any_element()
             });
         }
-        let status = operations.version.status.as_ref()?;
-        let actions = patch
-            .layer
-            .actions()
+        let actions = targets
             .iter()
-            .copied()
-            .filter(|action| {
-                action.available(status)
-                    && (*action != git::FileAction::Restore
-                        || self.backend.supports_git_operations())
-            })
+            .map(|(action, _)| *action)
             .collect::<Vec<_>>();
-        let target = if patch.whole_file {
-            None
-        } else {
-            block.target.clone()
-        };
+        let key = (path.to_owned(), blocks.unstaged.or(blocks.staged).unwrap());
         let file_path = review.detail.files[ix].path.clone();
-        let key = (path.to_owned(), index);
-        let whole_file = patch.whole_file;
         let confirm = whole_file && self.confirm_restore.as_ref() == Some(&key);
         let version = operations.version.clone();
         let owner = cx.weak_entity();
@@ -2012,7 +1955,7 @@ impl GitPanel {
                                 action,
                             )
                             .is_ok(),
-                        self.staging || !workspace.git_edit.is_empty(),
+                        stale || self.staging || !workspace.git_edit.is_empty(),
                     )
                 })
                 .unwrap_or((false, false))
@@ -2040,7 +1983,10 @@ impl GitPanel {
                                 path: file_path.clone(),
                                 version: version.clone(),
                                 action,
-                                block: target.clone(),
+                                block: targets
+                                    .iter()
+                                    .find(|(candidate, _)| *candidate == action)
+                                    .and_then(|(_, target)| target.clone()),
                             },
                             window,
                             cx,
@@ -2700,9 +2646,6 @@ impl GitPanel {
                 };
                 let baseline = match (mode, base) {
                     (_, Some(base)) => t!("git.to_worktree", base = git::short(base)).into_owned(),
-                    (Mode::All, None) if self.backend.supports_git_edit() => {
-                        t!("git.through_index", base = head).into_owned()
-                    }
                     (Mode::All, None) => t!("git.to_worktree", base = head).into_owned(),
                     (Mode::Staged, None) => t!("git.to_index", base = head).into_owned(),
                     (Mode::Unstaged, None) => t!("git.index_to_worktree").into(),
@@ -2959,12 +2902,6 @@ impl GitPanel {
         let edit_path = path.clone();
         let name = name.to_owned();
         let context = review.contexts.get(&ix).copied().unwrap_or(3);
-        let split_layers = self.document_layer(ix, &name) == Some(git::Layer::Staged);
-        let view_path = if split_layers {
-            secondary_path(&name)
-        } else {
-            name.clone()
-        };
         let task = cx.spawn_in(window, async move |this, cx| {
             let executor = cx.background_executor().clone();
             executor.timer(Duration::from_millis(90)).await;
@@ -2972,7 +2909,9 @@ impl GitPanel {
                 .spawn(async move {
                     let base = match base {
                         Some(base) => base,
-                        None if is_custom_worktree(&patch_detail.comparison) => {
+                        None if is_all_worktree_changes(&patch_detail.comparison)
+                            || is_custom_worktree(&patch_detail.comparison) =>
+                        {
                             let file = &patch_detail.files[ix];
                             let base = match backend.snapshot(&patch_detail, file, Side::Old)? {
                                 git::Snapshot::Text {
@@ -2992,15 +2931,12 @@ impl GitPanel {
                         }
                         None => backend.index_text(&name, &version)?.map(Arc::<str>::from),
                     };
-                    let mut doc = git::worktree_buffer_diff(
+                    let doc = git::worktree_buffer_diff(
                         &name,
                         base.as_deref(),
                         &text.to_string(),
                         context,
                     )?;
-                    if split_layers {
-                        doc = doc.with_view_path(view_path);
-                    }
                     Ok::<_, anyhow::Error>((doc, LivePatch { base, version }))
                 })
                 .await;
@@ -3050,32 +2986,10 @@ impl GitPanel {
                     }
                 }
                 review.live.insert(ix, live);
-                let added_layer = split_layers && !review.secondary.contains_key(&ix);
-                if split_layers {
-                    Rc::make_mut(&mut review.by_path).insert(doc.path().to_string(), ix);
-                    review.secondary.insert(ix, doc.clone());
-                } else {
-                    review.documents[ix] = doc.clone();
-                }
-                if added_layer {
-                    let anchor = this.diff.read(cx).viewport_anchor();
-                    this.sync_documents(cx);
-                    if let Some(anchor) = anchor {
-                        this.diff
-                            .update(cx, |diff, _| diff.restore_viewport_anchor(&anchor));
-                    }
-                    if let Some((position, column)) = this.editor.position_for_path(&edit_path, cx)
-                    {
-                        let position = DiffLinePosition::new(
-                            doc.path().clone(),
-                            DiffSide::Modified,
-                            position.line(),
-                        );
-                        this.editor.restore_caret(position, column);
-                    }
-                } else {
-                    this.diff.update(cx, |diff, cx| diff.replace_file(doc, cx));
-                }
+                this.editor.invalidate_actions();
+                review.documents[ix] = doc.clone();
+                review.patch_display[ix].content = None;
+                this.diff.update(cx, |diff, cx| diff.replace_file(doc, cx));
                 App::notify(cx, this.review_pane.entity_id());
                 cx.notify();
             });
@@ -3087,11 +3001,7 @@ impl GitPanel {
         let review = self.review.as_ref()?;
         let &ix = review.by_path.get(path)?;
         let file = &review.detail.files[ix];
-        let document = if path.starts_with('\0') {
-            review.secondary.get(&ix)?
-        } else {
-            &review.documents[ix]
-        };
+        let document = &review.documents[ix];
         let display = &review.patch_display[ix];
         let label = if file.conflict() {
             t!("git.file_conflict")
@@ -3102,7 +3012,7 @@ impl GitPanel {
         } else {
             match display.truncated {
                 None if display.error.is_some() => return display.error.clone().map(Into::into),
-                None if !path.starts_with('\0') && self.active_file(cx) == Some(ix) => {
+                None if self.active_file(cx) == Some(ix) => {
                     t!("git.loading_changes")
                 }
                 None => return None,
@@ -3156,7 +3066,7 @@ impl GitPanel {
                 return div().into_any_element();
             };
             let file = &detail.files[ix];
-            let Some((display, counts, can_open, layer, layered)) = view
+            let Some((display, counts, can_open)) = view
                 .read_with(cx, |this, _| {
                     let review = this.review.as_ref()?;
                     if !Arc::ptr_eq(&review.detail, &detail) {
@@ -3170,8 +3080,6 @@ impl GitPanel {
                             .copied()
                             .or(change_stat(&review.stats, file).counts),
                         review.openable[ix],
-                        this.document_layer(ix, path),
-                        review.secondary.contains_key(&ix),
                     ))
                 })
                 .ok()
@@ -3179,15 +3087,6 @@ impl GitPanel {
             else {
                 return div().into_any_element();
             };
-            if path.starts_with('\0') {
-                return h_flex()
-                    .w_full()
-                    .min_w_0()
-                    .text_size(GIT_TEXT_SIZE)
-                    .text_color(colors.muted)
-                    .child(layer.unwrap_or(git::Layer::Unstaged).label())
-                    .into_any_element();
-            }
             let view_for_menu = view.clone();
             let failed = display.error.is_some();
             let path = file.path.clone();
@@ -3232,14 +3131,6 @@ impl GitPanel {
                         })
                         .child(title),
                 )
-                .when_some(layer.filter(|_| layered), |row, layer| {
-                    row.child(
-                        div()
-                            .flex_shrink_0()
-                            .text_color(colors.muted)
-                            .child(layer.label()),
-                    )
-                })
                 .when_some(notice, |row, label| {
                     row.child(div().text_color(colors.warning).child(label))
                 })
@@ -3298,7 +3189,14 @@ impl GitPanel {
                             menu = menu.item(PopupMenuItem::new(label).on_click(
                                 move |_, window, cx| {
                                     _ = view.update(cx, |this, cx| {
-                                        this.open_layer_snapshot(ix, layer, side, line, window, cx)
+                                        this.open_layer_snapshot(
+                                            ix,
+                                            this.document_layer(),
+                                            side,
+                                            line,
+                                            window,
+                                            cx,
+                                        )
                                     });
                                 },
                             ));

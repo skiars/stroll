@@ -179,7 +179,6 @@
   "git.restore_file_question": "还原此文件？",
   "git.return_to_comparison": "返回原比较",
   "git.search_versions": "搜索提交 ID、分支、标签或提交说明",
-  "git.through_index": "%{base} → 暂存区 → 工作区",
   "git.invalid_branch_base": "无效的分支比较基准",
   "git.invalid_changes": "无法解析 Git 改动记录",
   "git.invalid_commit_base": "无效的提交比较基准",

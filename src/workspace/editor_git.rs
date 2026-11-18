@@ -180,7 +180,11 @@ fn line_offsets(text: &str) -> Vec<usize> {
 }
 
 /// Project an index line through the unstaged hunks to a working-tree boundary.
-fn worktree_line(line: usize, unstaged: &[git::Block], include_insertions: bool) -> usize {
+pub(super) fn worktree_line(
+    line: usize,
+    unstaged: &[git::Block],
+    include_insertions: bool,
+) -> usize {
     let mut delta = 0;
     for block in unstaged {
         let old_start = block

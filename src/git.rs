@@ -426,7 +426,20 @@ impl Backend {
         context: usize,
         whitespace: bool,
     ) -> Result<Patch> {
-        let raw = self.call(
+        render_patch(
+            file,
+            self.review_patch_text(detail, file, context, whitespace)?,
+        )
+    }
+
+    pub(crate) fn review_patch_text(
+        &self,
+        detail: &Changes,
+        file: &ChangedFile,
+        context: usize,
+        whitespace: bool,
+    ) -> Result<RawPatch> {
+        self.call(
             crate::remote::Request::Patch(
                 detail.comparison.clone(),
                 file.path.clone(),
@@ -434,8 +447,7 @@ impl Backend {
                 whitespace,
             ),
             |state| raw_patch(state, detail, file, context, whitespace),
-        )?;
-        render_patch(file, raw)
+        )
     }
 
     pub fn snapshot(&self, detail: &Changes, file: &ChangedFile, side: Side) -> Result<Snapshot> {

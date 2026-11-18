@@ -297,20 +297,8 @@ impl GitPanel {
         let detail = review.detail.clone();
         let counts = review.counts.clone();
         let stats = review.stats.clone();
-        let documents = &review.documents;
         let hunks = active
-            .map(|ix| {
-                documents[ix]
-                    .hunk_locations()
-                    .chain(
-                        review
-                            .secondary
-                            .get(&ix)
-                            .into_iter()
-                            .flat_map(|doc| doc.hunk_locations()),
-                    )
-                    .collect::<Vec<_>>()
-            })
+            .map(|ix| review.documents[ix].hunk_locations().collect::<Vec<_>>())
             .unwrap_or_default();
         let stage_allowed = detail.status.is_some() && self.current_worktree();
         let stage_busy = self.writes_busy(cx);

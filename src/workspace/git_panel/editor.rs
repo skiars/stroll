@@ -1,4 +1,4 @@
-use super::*;
+use super::{review::ActionBlocks, *};
 use crate::workspace::{
     DiffSource, OpenFile, WorkspaceView, code_theme::HunkPalette, editor_git::hunk_toolbar_row,
     inlay_hints::InlayHints, line_alignment::LineAlignment,
@@ -701,7 +701,7 @@ pub(super) struct ReviewEditor {
     row_revision: Option<usize>,
     headers: Rc<Vec<usize>>,
     hunk_neighbors: Rc<HashMap<usize, [Option<usize>; 2]>>,
-    blocks: Rc<Vec<Option<(SharedString, usize, usize)>>>,
+    blocks: Rc<Vec<Option<(SharedString, ActionBlocks, usize)>>>,
     actions_valid: bool,
     dirty_sources: HashSet<PathBuf>,
     split: bool,
@@ -718,7 +718,6 @@ pub(super) struct ReviewEditor {
     notices: Rc<HashMap<usize, SharedString>>,
     highlight_revision: usize,
     theme: Option<gpui_component::ThemeMode>,
-    pending_caret: Option<(DiffLinePosition, usize)>,
     context_click: Rc<RefCell<Option<DiffLinePosition>>>,
     alignment_task: Option<Task<()>>,
 }
@@ -749,7 +748,6 @@ impl ReviewEditor {
             notices: Rc::default(),
             highlight_revision: 0,
             theme: None,
-            pending_caret: None,
             context_click: Rc::default(),
             alignment_task: None,
         }
@@ -878,24 +876,6 @@ impl ReviewEditor {
                 App::notify(cx, panel.review_pane.entity_id());
             },
         )
-    }
-
-    pub(super) fn position_for_path(
-        &self,
-        path: &std::path::Path,
-        cx: &App,
-    ) -> Option<(DiffLinePosition, usize)> {
-        let projection = self.modified.projection.borrow();
-        let offset = self.modified.editor.read(cx).cursor();
-        let (source, _) = projection.source_range(&(offset..offset))?;
-        if source != path {
-            return None;
-        }
-        projection.position(offset)
-    }
-
-    pub(super) fn restore_caret(&mut self, position: DiffLinePosition, column: usize) {
-        self.pending_caret = Some((position, column));
     }
 
     pub(super) fn clear_hover(&self, cx: &mut App) {
@@ -1289,7 +1269,7 @@ impl ReviewEditor {
                         let number = |line: &(DiffLinePosition, SharedString)| line.0.line();
                         Some((
                             position.path(),
-                            panel.action_block(
+                            panel.action_blocks(
                                 position.path(),
                                 original.as_ref().map(number),
                                 modified.as_ref().map(number),
@@ -1411,19 +1391,7 @@ impl ReviewEditor {
                 matches!(&panel.editor.rows[row], DiffEditorRow::File(header) if header.as_str() == path)
             })
         });
-        if let Some((position, column)) = panel.editor.pending_caret.take()
-            && file_row.is_none()
-            && let Some(offset) = panel
-                .editor
-                .modified
-                .projection
-                .borrow()
-                .offset(&position, column)
-        {
-            panel.editor.modified.editor.update(cx, |editor, cx| {
-                editor.set_selected_range(offset..offset, cx)
-            });
-        } else if file_row.is_some()
+        if file_row.is_some()
             || panel.editor.restore_viewport
             || panel.editor.navigation_row != target
         {
@@ -1495,6 +1463,9 @@ impl ReviewEditor {
         let pending_file = panel.pending_file_reveal.clone();
         let headers = self.headers.clone();
         let blocks = self.blocks.clone();
+        let mixed = panel.review.as_ref().is_some_and(|review| {
+            super::review::is_all_worktree_changes(&review.detail.comparison)
+        });
         let split = self.split;
         let last_scroll = self.last_scroll.clone();
         let scroll_from_left = self.scroll_from_left.clone();
@@ -1709,12 +1680,30 @@ impl ReviewEditor {
                     if !bounds.intersects(&line) {
                         continue;
                     }
-                    if let Some((path, hunk, origin)) = &blocks[row]
-                        && bounds.contains(&mouse)
-                        && line.top() <= mouse.y
-                        && mouse.y < line.bottom()
-                    {
-                        active_hunk = Some((path, *hunk, *origin, line.bottom()));
+                    if let Some((path, hunk, origin)) = &blocks[row] {
+                        if bounds.contains(&mouse)
+                            && line.top() <= mouse.y
+                            && mouse.y < line.bottom()
+                        {
+                            active_hunk = Some((path, *hunk, *origin, line.bottom()));
+                        }
+                        if mixed {
+                            let marker = div()
+                                .w(px(4.))
+                                .h_full()
+                                .when(hunk.staged.is_some(), |marker| {
+                                    marker.border_1().border_color(colors.accent)
+                                })
+                                .when(hunk.unstaged.is_some(), |marker| {
+                                    marker.bg(if hunk.staged.is_some() {
+                                        colors.accent.opacity(0.35)
+                                    } else {
+                                        colors.accent
+                                    })
+                                })
+                                .into_any_element();
+                            elements.push((marker, line.top(), line.size.height));
+                        }
                     }
                     let chrome = match entry {
                         DiffEditorRow::Preamble => hover
@@ -1962,7 +1951,7 @@ fn hunk_neighbors(rows: &[DiffEditorRow]) -> HashMap<usize, [Option<usize>; 2]> 
         let DiffEditorRow::Hunk(path, _, _) = entry else {
             continue;
         };
-        let path = path.trim_start_matches('\0');
+        let path = path.as_str();
         if let Some((previous_row, previous_path)) = previous
             && previous_path == path
         {
@@ -2283,11 +2272,7 @@ impl GitPanel {
     pub(super) fn diff_source(&self, position: &DiffLinePosition, cx: &App) -> Option<DiffSource> {
         let review = self.review.as_ref()?;
         let ix = *review.by_path.get(position.path().as_str())?;
-        let document = if position.path().starts_with('\0') {
-            review.secondary.get(&ix)?
-        } else {
-            &review.documents[ix]
-        };
+        let document = &review.documents[ix];
         let deletion = (position.side() == DiffSide::Original
             && document.modified_path().is_some())
         .then(|| deletion_target(document, position.line()))
@@ -2308,7 +2293,7 @@ impl GitPanel {
             // The tree can request navigation before the review has loaded its language assets.
             let backend = self.backend.clone();
             let detail = review.detail.clone();
-            let layer = self.document_layer(ix, target.path());
+            let layer = self.document_layer();
             let side = if target.side() == DiffSide::Modified {
                 Side::New
             } else {
@@ -2345,36 +2330,20 @@ impl GitPanel {
         (super::review::has_live_target(&review.detail.comparison)
             && (!super::review::is_custom_worktree(&review.detail.comparison)
                 || review.versions.contains_key(&ix))
-            && (self.document_layer(ix, position.path()) != Some(git::Layer::Staged)
+            && (self.document_layer() != Some(git::Layer::Staged)
                 || file
                     .worktree
                     .as_ref()
-                    .is_some_and(|status| !status.unstaged && !status.untracked)
-                    && !review.secondary.contains_key(&ix)))
+                    .is_some_and(|status| !status.unstaged && !status.untracked)))
         .then(|| PathBuf::from(&file.path))
     }
 
     fn worktree_hint_path(&self, position: &DiffLinePosition) -> Option<&str> {
-        let (review, ix, file) = self.worktree_source_file(position)?;
+        let (review, _, file) = self.worktree_source_file(position)?;
         if !super::review::has_live_target(&review.detail.comparison) {
             return None;
         }
-        let layer = self.document_layer(ix, position.path());
-        let staged = layer == Some(git::Layer::Staged)
-            || (layer.is_none()
-                && self.backend.supports_git_edit()
-                && matches!(
-                    review.detail.comparison,
-                    Comparison::Worktree {
-                        mode: Mode::All,
-                        base: None
-                    }
-                )
-                && file
-                    .worktree
-                    .as_ref()
-                    .is_some_and(|status| status.staged && !status.unstaged && !status.untracked));
-        (!staged).then_some(&file.path)
+        (self.document_layer() != Some(git::Layer::Staged)).then_some(&file.path)
     }
 
     fn worktree_source_file(

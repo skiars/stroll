@@ -1892,7 +1892,8 @@ fn partial_stage_keeps_surviving_line_in_place_offscreen() -> Result<()> {
             panel.review_source_bounds(position, cx).unwrap().top()
         })
     };
-    let before = y(&mut cx, &anchor);
+    let operated = DiffLinePosition::new(path, DiffSide::Modified, 58);
+    let before = (y(&mut cx, &anchor), y(&mut cx, &operated));
     let output = std::env::var_os("STROLL_GIT_SCREENSHOTS").map(PathBuf::from);
     if let Some(output) = &output {
         fs::create_dir_all(output)?;
@@ -1928,8 +1929,7 @@ fn partial_stage_keeps_surviving_line_in_place_offscreen() -> Result<()> {
     for _ in 0..5 {
         draw(&mut cx)?;
     }
-    let migrated = DiffLinePosition::new(format!("\0{path}"), DiffSide::Modified, 34);
-    assert!((y(&mut cx, &migrated) - before).abs() <= px(1.));
+    assert_eq!((y(&mut cx, &anchor), y(&mut cx, &operated)), before);
     if let Some(output) = output {
         cx.capture_screenshot(window)?
             .save(output.join("partial-stage-after.png"))?;

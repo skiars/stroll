@@ -179,7 +179,6 @@
   "git.restore_file_question": "Restore this file?",
   "git.return_to_comparison": "Return to previous comparison",
   "git.search_versions": "Search by commit ID, branch, tag, or message",
-  "git.through_index": "%{base} → Index → Worktree",
   "git.invalid_branch_base": "Invalid branch comparison base",
   "git.invalid_changes": "Could not parse Git changes",
   "git.invalid_commit_base": "Invalid commit comparison base",

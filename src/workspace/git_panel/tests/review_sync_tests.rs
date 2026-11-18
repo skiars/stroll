@@ -107,167 +107,124 @@ fn report(
 }
 
 #[::core::prelude::v1::test]
-fn partial_stage_and_refocus_keep_reading_position() {
+fn hunk_toolbar_keeps_mixed_diff_in_place_across_repeated_toggles() {
     for split in [false, true] {
-        check_partial_stage_and_refocus(split);
+        check_hunk_toggles(split);
     }
 }
 
-fn check_partial_stage_and_refocus(split: bool) {
-    let tmp = tempfile::tempdir().unwrap();
-    let root = tmp.path().join("repo");
+fn check_hunk_toggles(split: bool) {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("repo");
     fs::create_dir(&root).unwrap();
     setup(&root);
-    for path in ["a.txt", "b.txt", "c.txt"] {
-        let body = (1..=320)
-            .map(|line| format!("original line {line}\n"))
-            .collect::<String>();
-        fs::write(root.join(path), body).unwrap();
+    let path = "b.txt";
+    let original = (1..=130)
+        .map(|line| format!("original line {line}\n"))
+        .collect::<Vec<_>>();
+    for file in ["a.txt", path, "c.txt"] {
+        fs::write(root.join(file), original.concat()).unwrap();
     }
     command(&root, &["add", "."]);
     command(&root, &["commit", "-qm", "Initial"]);
-    for path in ["a.txt", "b.txt", "c.txt"] {
-        let body = (1..=320)
-            .map(|line| {
-                if (32..36).contains(&line) || (58..63).contains(&line) || (98..104).contains(&line)
-                {
-                    format!("modified line {line}\n")
-                } else {
-                    format!("original line {line}\n")
-                }
-            })
-            .collect::<String>();
-        fs::write(root.join(path), body).unwrap();
+
+    let mut disk = original.clone();
+    disk.remove(99);
+    disk[57] = "modified middle line\n".into();
+    disk.insert(11, "additional early line\n".into());
+    let disk = disk.concat();
+    fs::write(root.join(path), &disk).unwrap();
+    for file in ["a.txt", "c.txt"] {
+        fs::write(root.join(file), format!("changed\n{}", original.concat())).unwrap();
     }
+
     let mut cx = test_context();
-    let (panel, visual) = open(&mut cx, tmp.path(), &root);
-    visual.update(|_, cx| {
-        panel.update(cx, |panel, cx| {
-            panel.split = split;
-            cx.notify();
-        })
-    });
-    settle(visual);
-    let source = DiffLinePosition::new("b.txt", DiffSide::Modified, 34);
+    let (panel, visual) = open(&mut cx, temp.path(), &root);
     visual.update(|window, cx| {
         panel.update(cx, |panel, cx| {
-            let ix = panel.review.as_ref().unwrap().by_path["b.txt"];
+            panel.split = split;
+            let ix = panel.review.as_ref().unwrap().by_path[path];
             panel.reveal_file(ix, true, window, cx);
         })
     });
     settle(visual);
-    visual.update(|_, cx| {
-        panel
-            .read(cx)
-            .diff
-            .clone()
-            .update(cx, |diff, cx| diff.scroll_to_line(source.clone(), cx))
-    });
-    settle(visual);
-    let source_y = |position: &DiffLinePosition, visual: &mut VisualTestContext| {
+    let source_bounds = |visual: &mut VisualTestContext, position: &DiffLinePosition| {
+        visual.update(|_, cx| panel.read(cx).review_source_bounds(position, cx).unwrap())
+    };
+
+    for (side, line) in [(DiffSide::Modified, 59), (DiffSide::Original, 100)] {
+        let position = DiffLinePosition::new(path, side, line);
         visual.update(|_, cx| {
             panel
                 .read(cx)
-                .review_source_bounds(position, cx)
-                .unwrap()
-                .top()
-        })
-    };
-    let before = source_y(&source, visual);
-    let middle = DiffLinePosition::new("b.txt", DiffSide::Modified, 58);
-    visual.update(|window, cx| {
-        let panel = panel.read(cx);
-        let editor = panel.editor.focused_column(window, cx).read(cx);
-        assert!(
-            editor
-                .input_bounds()
-                .intersects(&panel.review_source_bounds(&middle, cx).unwrap())
-        );
-    });
-    visual.update(|window, cx| {
-        panel.update(cx, |panel, cx| {
-            let review = panel.review.as_ref().unwrap();
-            assert_eq!(review.active, review.by_path.get("b.txt").copied());
-            let operations = &review.operations[&review.by_path["b.txt"]];
-            let blocks = &operations.primary.as_ref().unwrap().blocks;
-            assert_eq!(blocks.len(), 3, "{blocks:?}");
-            let edit = git::FileEdit {
-                path: "b.txt".into(),
-                version: operations.version.clone(),
-                action: git::FileAction::Stage,
-                block: blocks[1].target.clone(),
+                .diff
+                .clone()
+                .update(cx, |diff, cx| diff.scroll_to_line(position.clone(), cx));
+        });
+        settle(visual);
+        let bounds = source_bounds(visual, &position);
+        let revision = visual.update(|_, cx| panel.read(cx).diff.read(cx).editor_row_revision());
+        let hover = point(bounds.left() + px(56.), bounds.center().y);
+        for staged in [true, false, true, false] {
+            let selector = if staged {
+                "git-hunk-action:0"
+            } else {
+                "git-hunk-action:1"
             };
-            assert!(edit.block.is_some());
-            panel.edit_worktree_file(edit, window, cx);
-        })
-    });
-    settle(visual);
-    let migrated = DiffLinePosition::new(secondary_path("b.txt"), DiffSide::Modified, 34);
-    let stage_delta = (source_y(&migrated, visual) - before).abs();
-    assert!(
-        stage_delta <= px(1.),
-        "stage, split={split}: {stage_delta:?}"
-    );
-    visual.update(|_, cx| {
-        let panel = panel.read(cx);
-        let review = panel.review.as_ref().unwrap();
-        assert!(panel.stage_error.is_none(), "{:?}", panel.stage_error);
-        assert!(review.secondary.contains_key(&review.by_path["b.txt"]));
-    });
-    let source = DiffLinePosition::new(secondary_path("b.txt"), DiffSide::Modified, 100);
-    visual.update(|_, cx| {
-        panel
-            .read(cx)
-            .diff
-            .clone()
-            .update(cx, |diff, cx| diff.scroll_to_line(source.clone(), cx))
-    });
-    settle(visual);
-    let before = source_y(&source, visual);
-    let revision = visual.update(|_, cx| panel.read(cx).diff.read(cx).editor_row_revision());
+            visual.simulate_mouse_move(hover, None, Modifiers::default());
+            visual.update(|window, cx| window.draw(cx).clear(cx));
+            let button = visual.debug_bounds(selector).unwrap_or_else(|| {
+                panic!("missing {selector}, split={split}, {side:?} line {line}")
+            });
+            visual.simulate_mouse_move(button.center(), None, Modifiers::default());
+            visual.simulate_click(button.center(), Modifiers::default());
+            visual.update(|window, cx| window.draw(cx).clear(cx));
+            assert_eq!(source_bounds(visual, &position), bounds);
+            settle(visual);
+            assert_eq!(
+                source_bounds(visual, &position),
+                bounds,
+                "split={split}, {side:?} {line}, stage={staged}"
+            );
+            visual.update(|_, cx| {
+                let panel = panel.read(cx);
+                assert!(panel.stage_error.is_none(), "{:?}", panel.stage_error);
+                assert_eq!(panel.diff.read(cx).editor_row_revision(), revision);
+                let review = panel.review.as_ref().unwrap();
+                let status = &review.detail.status.as_ref().unwrap()[path];
+                assert_eq!(status.staged, staged);
+                assert!(status.unstaged);
+            });
+            let mut indexed = original.clone();
+            if staged {
+                if side == DiffSide::Modified {
+                    indexed[57] = "modified middle line\n".into();
+                } else {
+                    indexed.remove(99);
+                }
+            }
+            let output = Command::new("git")
+                .arg("-C")
+                .arg(&root)
+                .args(["show", ":b.txt"])
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+            assert_eq!(output.stdout, indexed.concat().as_bytes());
+            assert_eq!(fs::read_to_string(root.join(path)).unwrap(), disk);
+        }
+    }
+
     visual.update(|_, cx| {
         let workspace = panel.read(cx).workspace.upgrade().unwrap();
         workspace.update(cx, |workspace, _| workspace.repository_watch_active = false);
     });
+    let position = DiffLinePosition::new(path, DiffSide::Original, 100);
+    let before = source_bounds(visual, &position);
     visual.deactivate_window();
     visual.update(|window, _| window.activate_window());
     settle(visual);
-    let focus_delta = (source_y(&source, visual) - before).abs();
-    assert!(
-        focus_delta <= px(1.),
-        "focus, split={split}: {focus_delta:?}"
-    );
-    visual.update(|_, cx| assert_eq!(panel.read(cx).diff.read(cx).editor_row_revision(), revision));
-
-    visual.update(|window, cx| {
-        panel.update(cx, |panel, cx| {
-            let review = panel.review.as_ref().unwrap();
-            let operations = &review.operations[&review.by_path["b.txt"]];
-            let block = operations.primary.as_ref().unwrap().blocks[0]
-                .target
-                .clone();
-            panel.edit_worktree_file(
-                git::FileEdit {
-                    path: "b.txt".into(),
-                    action: git::FileAction::Unstage,
-                    version: operations.version.clone(),
-                    block,
-                },
-                window,
-                cx,
-            );
-        })
-    });
-    settle(visual);
-    let merged = DiffLinePosition::new("b.txt", DiffSide::Modified, 100);
-    let unstage_delta = (source_y(&merged, visual) - before).abs();
-    assert!(
-        unstage_delta <= px(1.),
-        "unstage, split={split}: {unstage_delta:?}"
-    );
-    eprintln!(
-        "split={split}: stage={stage_delta:?}, refocus={focus_delta:?}, unstage={unstage_delta:?}"
-    );
+    assert_eq!(source_bounds(visual, &position), before);
 }
 
 #[::core::prelude::v1::test]
@@ -433,7 +390,7 @@ fn slow_worktree_reads_publish_during_continuous_writes_and_keep_open_snapshots(
     });
     let mut stale_file = detail.files[0].clone();
     stale_file.worktree = None;
-    let (patch, _, assets) = review_patch(&backend, &detail, &stale_file, 3, false, None).unwrap();
+    let (patch, assets) = review_patch(&backend, &detail, &stale_file, 3, false, None).unwrap();
     assert_eq!(patch.document.additions(), 1);
     assert!(assets.version.is_none() && assets.operations.is_none());
     visual.update(|window, cx| {
@@ -563,7 +520,7 @@ fn slow_worktree_reads_publish_during_continuous_writes_and_keep_open_snapshots(
 }
 
 #[::core::prelude::v1::test]
-fn changed_worktree_status_keeps_both_diff_layers_readable_without_edit_targets() {
+fn changed_worktree_status_keeps_net_diff_readable_without_edit_targets() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path();
     setup(root);
@@ -585,21 +542,13 @@ fn changed_worktree_status_keeps_both_diff_layers_readable_without_edit_targets(
         .unwrap();
     let mut file = detail.files[0].clone();
     file.worktree.as_mut().unwrap().code = '?';
-    let (primary, secondary, assets) =
-        review_patch(&backend, &detail, &file, 3, false, None).unwrap();
-    let secondary = secondary.unwrap();
-    assert!(
-        primary
-            .document
-            .patch_source_lines()
-            .any(|(_, _, text)| text == "staged change")
-    );
-    assert!(
-        secondary
-            .document
-            .patch_source_lines()
-            .any(|(_, _, text)| text == "worktree change")
-    );
+    let (patch, assets) = review_patch(&backend, &detail, &file, 3, false, None).unwrap();
+    let lines = patch
+        .document
+        .patch_source_lines()
+        .map(|(_, _, text)| text)
+        .collect::<Vec<_>>();
+    assert_eq!(lines, ["original", "worktree change"]);
     assert!(assets.version.is_none() && assets.operations.is_none());
 }
 
