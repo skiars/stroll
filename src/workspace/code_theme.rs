@@ -1398,6 +1398,7 @@ fn cpp_highlights_survive_delayed_semantic_responses() -> anyhow::Result<()> {
         "    GX_NODISCARD bool isEmpty() const;\n",
         "    GX_NODISCARD constexpr const Vertex &operator[](unsigned i) const;\n",
         "    bool operator==(const VectorPath &other) const;\n",
+        "    bool bits[2] = {true, false};\n",
         "};\n",
     );
     type Reply = oneshot::Sender<SemanticTokens>;
@@ -1574,6 +1575,8 @@ fn cpp_highlights_survive_delayed_semantic_responses() -> anyhow::Result<()> {
 
     frame(&mut cx)?;
     assert_color(&mut cx, "bool", "type")?;
+    assert_color(&mut cx, "true", "boolean")?;
+    assert_color(&mut cx, "false", "boolean")?;
     assert_color(&mut cx, "operator[]", "function")?;
     assert_color(&mut cx, "operator==", "function")?;
     let provider = Rc::new(Tokens::default());
@@ -1615,6 +1618,8 @@ fn cpp_highlights_survive_delayed_semantic_responses() -> anyhow::Result<()> {
     current.send(response(1, 2)).unwrap();
     cx.run_until_parked();
     assert_color(&mut cx, "isEmpty", "constant.lsp.0")?;
+    assert_color(&mut cx, "true", "boolean")?;
+    assert_color(&mut cx, "false", "boolean")?;
     Ok(())
 }
 

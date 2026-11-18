@@ -8,3 +8,8 @@
 (operator_name) @function
 (operator_name _ @function)
 (operator_cast "operator" @keyword)
+
+[
+  (true)
+  (false)
+] @boolean
