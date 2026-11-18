@@ -2567,6 +2567,8 @@ mod tests {
         let changed = format!("{}\n", "long added line ".repeat(150));
         fs::write(root.join(path), &changed).unwrap();
         let store = Arc::new(Store::new(fixture.path().join("state")).unwrap());
+        let config_path = fixture.path().join("config.toml");
+        fs::write(&config_path, "[editor]\nfont_size = 20\n").unwrap();
         let platform = gpui_platform::current_platform(true);
         let mut cx = TestAppContext::build_with_text_system(
             TestDispatcher::new(0),
@@ -2577,7 +2579,7 @@ mod tests {
         let (workspace, visual) = cx.add_window_view(|window, cx| {
             Workspace::with_config(
                 store,
-                crate::config::ConfigFile::load(None),
+                crate::config::ConfigFile::load(Some(config_path)),
                 WorkspaceView::Git,
                 window,
                 cx,
@@ -2617,6 +2619,17 @@ mod tests {
             visual.run_until_parked();
             visual.update(|window, cx| window.draw(cx).clear(cx));
         }
+        visual.update(|window, cx| {
+            let editor = panel.read(cx).editor.focused_column(window, cx).clone();
+            assert_eq!(editor.read(cx).line_height(), Some(px(30.)));
+            workspace.update(cx, |workspace, cx| {
+                let mut config = workspace.config.current().clone();
+                config.editor.line_height = 2.2;
+                workspace.commit_settings(config, window, cx).unwrap();
+            });
+            window.draw(cx).clear(cx);
+            assert_eq!(editor.read(cx).line_height(), Some(px(44.)));
+        });
         let line = DiffLinePosition::new(path, gpui_component::diff::DiffSide::Modified, 1);
         let edit_point = visual.update(|_, cx| {
             let row = panel.read(cx).review_source_bounds(&line, cx).unwrap();
@@ -2676,6 +2689,8 @@ mod tests {
         visual.run_until_parked();
         visual.update(|window, cx| {
             window.draw(cx).clear(cx);
+            let file = &workspace.read(cx).files[&source];
+            assert_eq!(file.editor.read(cx).line_height(), Some(px(44.)));
             for _ in 0..2 {
                 window.dispatch_action(Box::new(gpui_component::input::Undo), cx);
             }
@@ -2724,6 +2739,17 @@ mod tests {
             visual.update(|window, cx| window.draw(cx).clear(cx));
             assert!(visual.debug_bounds(selector).is_none());
             if mode == DiffMode::Split {
+                visual.update(|window, cx| {
+                    let editor = &panel.read(cx).editor;
+                    assert_eq!(
+                        editor.focused_column(window, cx).read(cx).line_height(),
+                        Some(px(44.))
+                    );
+                    assert_eq!(
+                        editor.original_state().read(cx).line_height(),
+                        Some(px(44.))
+                    );
+                });
                 let old_position =
                     DiffLinePosition::new(path, gpui_component::diff::DiffSide::Original, 1);
                 let old = visual.update(|_, cx| {

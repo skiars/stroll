@@ -1463,6 +1463,7 @@ impl ReviewEditor {
         &self,
         panel: &GitPanel,
         font_size: Pixels,
+        line_height: f32,
         font: Option<SharedString>,
         colors: Palette,
         hunk_actions: bool,
@@ -1515,6 +1516,7 @@ impl ReviewEditor {
                 .external_search_panel()
                 .with_size(gpui_component::Size::XSmall)
                 .text_size(font_size)
+                .line_height(relative(line_height))
                 .when_some(font.clone(), |editor, font| editor.font_family(font))
                 .appearance(false)
                 .bordered(false)

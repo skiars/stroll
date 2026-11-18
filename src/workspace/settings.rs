@@ -23,8 +23,8 @@ use gpui_component::{
 use super::{CloseSettings, ToggleSettings, Workspace, action_button, apply_theme_with_fonts};
 use crate::{
     config::{
-        CodeContrast, CodeTheme, Config, DiffLayout, FONT_SIZE_MAX, FONT_SIZE_MIN, Theme,
-        UI_FONT_SIZE_MAX, UI_FONT_SIZE_MIN,
+        CodeContrast, CodeTheme, Config, DiffLayout, EDITOR_LINE_HEIGHT_RANGE, FONT_SIZE_MAX,
+        FONT_SIZE_MIN, Theme, UI_FONT_SIZE_MAX, UI_FONT_SIZE_MIN,
     },
     language::CommandSource,
     locale::Language,
@@ -496,6 +496,11 @@ impl Workspace {
             // same setting, so the theme has to be re-applied with it.
             self.apply_appearance(window, cx);
         }
+        if previous.editor.line_height != config.editor.line_height
+            && let Some(panel) = &self.git
+        {
+            panel.update(cx, |_, cx| cx.notify());
+        }
         if previous.editor.soft_wrap != config.editor.soft_wrap {
             self.wrap = config.editor.soft_wrap;
             for file in self.files.values_mut() {
@@ -780,9 +785,10 @@ impl SettingsPage {
             .description(t!("settings.ui_font_family_description").into_owned()),
             setting_item(
                 t!("settings.ui_font_size"),
-                self.size_in(
+                self.number_in(
                     default.appearance.ui_font_size,
                     UI_FONT_SIZE_MIN..=UI_FONT_SIZE_MAX,
+                    0.5,
                     |c| &mut c.appearance.ui_font_size,
                 ),
             )
@@ -868,6 +874,16 @@ impl SettingsPage {
                 t!("settings.code_font_size"),
                 self.size(default.editor.font_size, |c| &mut c.editor.font_size),
             ),
+            setting_item(
+                t!("settings.editor_line_height"),
+                self.number_in(
+                    default.editor.line_height,
+                    EDITOR_LINE_HEIGHT_RANGE,
+                    0.1,
+                    |c| &mut c.editor.line_height,
+                ),
+            )
+            .description(t!("settings.editor_line_height_description").into_owned()),
             setting_item(
                 t!("settings.line_numbers"),
                 self.switch(default.editor.line_numbers, |c| &mut c.editor.line_numbers),
@@ -1309,13 +1325,14 @@ impl SettingsPage {
     }
 
     fn size(&self, default: f64, field: fn(&mut Config) -> &mut f64) -> SettingField<f64> {
-        self.size_in(default, FONT_SIZE_MIN..=FONT_SIZE_MAX, field)
+        self.number_in(default, FONT_SIZE_MIN..=FONT_SIZE_MAX, 0.5, field)
     }
 
-    fn size_in(
+    fn number_in(
         &self,
         default: f64,
         range: std::ops::RangeInclusive<f64>,
+        step: f64,
         field: fn(&mut Config) -> &mut f64,
     ) -> SettingField<f64> {
         let (read, write) = self.field(field);
@@ -1323,7 +1340,7 @@ impl SettingsPage {
             NumberFieldOptions {
                 min: *range.start(),
                 max: *range.end(),
-                step: 0.5,
+                step,
             },
             read,
             write,

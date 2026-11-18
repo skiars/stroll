@@ -21,6 +21,7 @@ pub(crate) const FONT_SIZE_MIN: f64 = 10.;
 pub(crate) const FONT_SIZE_MAX: f64 = 32.;
 pub(crate) const UI_FONT_SIZE_MIN: f64 = 12.;
 pub(crate) const UI_FONT_SIZE_MAX: f64 = 14.;
+pub(crate) const EDITOR_LINE_HEIGHT_RANGE: std::ops::RangeInclusive<f64> = 1.0..=3.0;
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
 #[serde(default)]
@@ -172,6 +173,7 @@ impl Default for Docs {
 pub(crate) struct Editor {
     pub font_family: String,
     pub font_size: f64,
+    pub line_height: f64,
     pub line_numbers: bool,
     pub soft_wrap: bool,
     pub inlay_hints: bool,
@@ -182,6 +184,7 @@ impl Default for Editor {
         Self {
             font_family: String::new(),
             font_size: 13.5,
+            line_height: 1.5,
             line_numbers: true,
             soft_wrap: true,
             inlay_hints: false,
@@ -302,6 +305,14 @@ impl Config {
                 t!("config.font_range", key = key, min = min, max = max)
             );
         }
+        ensure!(
+            EDITOR_LINE_HEIGHT_RANGE.contains(&self.editor.line_height),
+            t!(
+                "config.line_height_range",
+                min = EDITOR_LINE_HEIGHT_RANGE.start(),
+                max = EDITOR_LINE_HEIGHT_RANGE.end()
+            )
+        );
         for (key, family) in [
             ("appearance.ui_font_family", &self.appearance.ui_font_family),
             (
@@ -648,6 +659,7 @@ mod tests {
         assert_eq!(config.docs.body_font_size, 15.5);
         assert_eq!(config.docs.code_block_font_size, 12.);
         assert_eq!(config.editor.font_size, 15.);
+        assert_eq!(config.editor.line_height, 1.5);
         assert_eq!(config.appearance.language, Language::System);
         assert!(config.appearance.ui_font_family.is_empty());
         assert_eq!(config.appearance.ui_font_size, 13.);
@@ -667,6 +679,7 @@ mod tests {
         config.docs.body_font_size = 17.;
         config.docs.code_block_font_size = 14.;
         config.editor.font_size = 18.;
+        config.editor.line_height = 2.2;
         assert!(!config.editor.inlay_hints);
         config.editor.inlay_hints = true;
         config.git.diff_layout = DiffLayout::Split;
@@ -694,6 +707,7 @@ mod tests {
             "body_font_size = 17.0 # prose",
             "code_block_font_size = 14.0 # code blocks",
             "18.0 # pixels",
+            "line_height = 2.2",
             "inlay_hints = true",
             "extra = true",
             "tsc --lsp --stdio",
@@ -723,6 +737,22 @@ mod tests {
             ("nan", false),
         ] {
             let config = format!("[appearance]\nui_font_size = {value}\n");
+            assert_eq!(decode(config.as_bytes()).is_ok(), valid, "{value}");
+        }
+    }
+
+    #[test]
+    fn editor_line_height_accepts_only_ratios_in_range() {
+        for (value, valid) in [
+            ("1.0", true),
+            ("3.0", true),
+            ("0.9", false),
+            ("3.1", false),
+            ("nan", false),
+            ("inf", false),
+            ("'20px'", false),
+        ] {
+            let config = format!("[editor]\nline_height = {value}\n");
             assert_eq!(decode(config.as_bytes()).is_ok(), valid, "{value}");
         }
     }

@@ -3843,6 +3843,9 @@ impl Workspace {
                         .child(
                             Editor::new(&file.editor)
                                 .text_size(px(self.config.current().editor.font_size as f32))
+                                .line_height(relative(
+                                    self.config.current().editor.line_height as f32,
+                                ))
                                 .font_family(self.editor_font_family(cx))
                                 .appearance(false)
                                 .bordered(false)

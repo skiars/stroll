@@ -3134,17 +3134,23 @@ impl GitPanel {
         let stage_busy = self.writes_busy(cx);
         let by_path = review.by_path.clone();
         let selected = self.diff.read(cx).selected_lines();
-        let font_size = self
+        let (font_size, line_height, editor_font) = self
             .workspace
             .read_with(cx, |workspace, _| {
-                px(workspace.config.current().editor.font_size as f32)
+                let editor = &workspace.config.current().editor;
+                (
+                    px(editor.font_size as f32),
+                    editor.line_height as f32,
+                    workspace.editor_font.clone(),
+                )
             })
-            .unwrap_or(cx.theme().mono_font_size);
-        let editor_font = self
-            .workspace
-            .read_with(cx, |workspace, _| workspace.editor_font.clone())
-            .ok()
-            .flatten();
+            .unwrap_or_else(|_| {
+                (
+                    cx.theme().mono_font_size,
+                    crate::config::Editor::default().line_height as f32,
+                    None,
+                )
+            });
         let header = move |path: &str, cx: &mut App| {
             let Some(&ix) = by_path.get(path) else {
                 return div().into_any_element();
@@ -3365,6 +3371,7 @@ impl GitPanel {
         self.editor.render(
             self,
             font_size,
+            line_height,
             editor_font,
             colors,
             stage_allowed && self.backend.supports_git_edit(),
