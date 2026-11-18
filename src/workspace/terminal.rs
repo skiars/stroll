@@ -564,6 +564,7 @@ impl Workspace {
                         t!("terminal.maximize")
                     },
                 )
+                .debug_selector(|| "terminal-maximize".into())
                 .size(px(22.))
                 .selected(panel.maximized)
                 .toggled(panel.maximized)

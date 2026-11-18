@@ -7,7 +7,7 @@ use alacritty_terminal::{
     index::{Column, Line, Point, Side},
     selection::{Selection, SelectionType},
     term::{Config, Osc52, TermMode, cell::Flags, color::Colors},
-    vte::ansi::{Color, CursorShape, CursorStyle, NamedColor, Processor, Rgb as VtRgb},
+    vte::ansi::{Color, CursorShape, CursorStyle, Handler, NamedColor, Processor, Rgb as VtRgb},
 };
 
 use crate::pty::{Command, PtySize};
@@ -176,7 +176,25 @@ impl Emulator {
         }
     }
 
-    pub(crate) fn resize(&mut self, size: PtySize) {
+    pub(crate) fn resize(&mut self, size: PtySize, conpty: bool) {
+        if conpty && size.rows > self.size.rows {
+            let grid = self.term.grid();
+            let pulled = usize::from(size.rows - self.size.rows).min(grid.history_size());
+            if pulled > 0 {
+                let offset = grid.display_offset();
+                // ConPTY repaints from the top of the viewport. Keep rows that
+                // Alacritty would pull into that viewport in scrollback instead.
+                self.term.resize(GridSize(PtySize {
+                    cols: self.size.cols,
+                    ..size
+                }));
+                self.term.scroll_up(pulled);
+                let grid = self.term.grid_mut();
+                grid.cursor.point.line -= pulled;
+                grid.saved_cursor.point.line -= pulled;
+                grid.scroll_display(Scroll::Delta(offset as i32 - grid.display_offset() as i32));
+            }
+        }
         self.term.resize(GridSize(size));
         self.size = size;
         self.reply();
@@ -510,6 +528,47 @@ mod tests {
         terminal.finish_sync();
         terminal.frame(&mut frame);
         assert_eq!(frame.rows[0][2].1, "C");
+    }
+
+    #[test]
+    fn conpty_resize_preserves_history_across_viewport_repaints() {
+        let (mut terminal, _) = terminal(80, 8);
+        for number in 1..=80 {
+            terminal.write(format!("rr-mark-{number:03}\r\n").as_bytes());
+        }
+        terminal.scroll(-6);
+        let offset = terminal.term.grid().display_offset();
+
+        for (cols, rows) in [(80, 38), (80, 8), (100, 38), (80, 8)] {
+            terminal.resize(
+                PtySize {
+                    cols,
+                    rows,
+                    ..terminal.size
+                },
+                true,
+            );
+            assert_eq!(terminal.term.grid().display_offset(), offset);
+
+            // ConPTY redraws the old viewport at the top and clears the new rows.
+            terminal.write(b"\x1b[H");
+            for number in 74..=80 {
+                terminal.write(format!("rr-mark-{number:03}\x1b[K\r\n").as_bytes());
+            }
+            for _ in 8..rows {
+                terminal.write(b"\x1b[K\r\n");
+            }
+            terminal.write(b"\x1b[K\x1b[8;1H");
+
+            let grid = terminal.term.grid();
+            let markers: Vec<_> = (grid.topmost_line().0..=grid.bottommost_line().0)
+                .filter_map(|line| {
+                    let text: String = (0..11).map(|col| grid[Line(line)][Column(col)].c).collect();
+                    text.strip_prefix("rr-mark-")?.parse::<u32>().ok()
+                })
+                .collect();
+            assert_eq!(markers, (1..=80).collect::<Vec<_>>());
+        }
     }
 
     #[test]

@@ -3849,14 +3849,16 @@ impl Workspace {
                                 }),
                         )
                         .children(file.caret_hints.popup(&file.editor, window, cx))
-                        .children(editor_git::blame::hint(
-                            file,
-                            cx.weak_entity(),
-                            px(self.config.current().editor.font_size as f32),
-                            self.editor_font_family(cx),
-                            colors,
-                            cx,
-                        ))
+                        .when(!maximized, |pane| {
+                            pane.children(editor_git::blame::hint(
+                                file,
+                                cx.weak_entity(),
+                                px(self.config.current().editor.font_size as f32),
+                                self.editor_font_family(cx),
+                                colors,
+                                cx,
+                            ))
+                        })
                         .when(file.missing, |pane| {
                             pane.child(
                                 div()

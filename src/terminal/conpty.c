@@ -38,25 +38,36 @@ DWORD reader_conpty_open(ReaderConPty *pty, HANDLE *input, HANDLE *output, wchar
                                  &limits, sizeof(limits))) goto fail;
 
     SIZE_T size = 0;
-    InitializeProcThreadAttributeList(NULL, 2, 0, &size);
+    InitializeProcThreadAttributeList(NULL, 1, 0, &size);
     attributes = HeapAlloc(GetProcessHeap(), 0, size);
     if (!attributes) {
         error = ERROR_OUTOFMEMORY;
         goto cleanup;
     }
-    if (!InitializeProcThreadAttributeList(attributes, 2, 0, &size)) goto fail;
+    if (!InitializeProcThreadAttributeList(attributes, 1, 0, &size)) goto fail;
     initialized = TRUE;
     if (!UpdateProcThreadAttribute(attributes, 0, PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE,
-                                   pty->console, sizeof(pty->console), NULL, NULL) ||
-        !UpdateProcThreadAttribute(attributes, 0, PROC_THREAD_ATTRIBUTE_JOB_LIST,
-                                   &pty->job, sizeof(pty->job), NULL, NULL)) goto fail;
+                                   pty->console, sizeof(pty->console), NULL, NULL)) goto fail;
 
     STARTUPINFOEXW startup = {0};
     startup.StartupInfo.cb = sizeof(startup);
+    // Use ConPTY's console streams even if Stroll's output is redirected.
+    startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
     startup.lpAttributeList = attributes;
     PROCESS_INFORMATION child = {0};
-    if (!CreateProcessW(NULL, command, NULL, NULL, FALSE, EXTENDED_STARTUPINFO_PRESENT,
+    // App execution aliases can reject a job list during process creation.
+    // Assign the suspended child before it can start any descendants.
+    if (!CreateProcessW(NULL, command, NULL, NULL, FALSE,
+                        EXTENDED_STARTUPINFO_PRESENT | CREATE_SUSPENDED,
                         NULL, directory, &startup.StartupInfo, &child)) goto fail;
+    if (!AssignProcessToJobObject(pty->job, child.hProcess) ||
+        ResumeThread(child.hThread) == (DWORD)-1) {
+        error = GetLastError();
+        TerminateProcess(child.hProcess, error);
+        CloseHandle(child.hThread);
+        CloseHandle(child.hProcess);
+        goto cleanup;
+    }
     pty->process = child.hProcess;
     CloseHandle(child.hThread);
     *input = input_write;

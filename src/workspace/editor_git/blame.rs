@@ -797,6 +797,29 @@ mod tests {
                 .as_ref()
             );
         });
+        visual.update(|window, cx| {
+            workspace.update(cx, |workspace, cx| {
+                workspace.toggle_terminal_menu(window, cx)
+            })
+        });
+        draw(visual);
+        let maximize = visual.debug_bounds("terminal-maximize").unwrap().center();
+        visual.simulate_click(maximize, Modifiers::default());
+        draw(visual);
+        visual.update(|_, cx| assert!(workspace.read(cx).terminal_maximized()));
+        assert!(visual.debug_bounds("editor-blame").is_none());
+
+        let restore = visual.debug_bounds("terminal-maximize").unwrap().center();
+        visual.simulate_click(restore, Modifiers::default());
+        draw(visual);
+        visual.update(|_, cx| assert!(!workspace.read(cx).terminal_maximized()));
+        assert!(visual.debug_bounds("editor-blame").is_some());
+        visual.update(|window, cx| {
+            workspace.update(cx, |workspace, cx| {
+                workspace.toggle_terminal_menu(window, cx)
+            })
+        });
+        draw(visual);
         let at = first.center();
         visual.simulate_mouse_move(at, None, Modifiers::default());
         visual.executor().advance_clock(Duration::from_millis(400));

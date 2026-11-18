@@ -384,7 +384,7 @@ impl Session {
         } else if self.geometry.size() != size
             && let Some(emulator) = &mut self.emulator
         {
-            emulator.resize(size);
+            emulator.resize(size, cfg!(windows) && self.ssh.is_none());
             _ = self.commands.send(Command::Resize(size));
             self.dirty = true;
         }
