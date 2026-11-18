@@ -112,7 +112,10 @@ where
         let state_on_close = menu_state.downgrade();
         let on_open_change = self.on_open_change;
 
+        let priority =
+            crate::root::WindowState::anchored_popup_priority(window, cx, &trigger_focus);
         Popover::new(SharedString::from(format!("popover:{}", self.id)))
+            .popup_priority(priority)
             .appearance(false)
             .dropdown_motion()
             .overlay_closable(false)

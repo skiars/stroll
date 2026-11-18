@@ -1937,3 +1937,364 @@ fn partial_stage_keeps_surviving_line_in_place_offscreen() -> Result<()> {
     assert_eq!(fs::read_to_string(root.join(path))?, text(true));
     Ok(())
 }
+
+#[::core::prelude::v1::test]
+fn commit_list_squashes_rewords_and_resets_with_local_changes() -> Result<()> {
+    let fixture = tempfile::tempdir()?;
+    let root = fixture.path().join("repo");
+    fs::create_dir(&root)?;
+    git(&root, &["init", "-q", "-b", "main"]);
+    git(&root, &["config", "user.name", "Reviewer"]);
+    git(&root, &["config", "user.email", "reviewer@example.invalid"]);
+    git(&root, &["config", "commit.gpgsign", "false"]);
+    let mut commits = Vec::new();
+    for (file, title) in [
+        ("base", "Base"),
+        ("one", "First"),
+        ("two", "Second"),
+        ("three", "Third"),
+    ] {
+        fs::write(root.join(file), title)?;
+        git(&root, &["add", "--", file]);
+        git(&root, &["commit", "-qm", title]);
+        commits.push(git::head(&root)?.unwrap());
+    }
+    let store = Arc::new(Store::new(fixture.path().join("state"))?);
+    let config = crate::config::ConfigFile::load(Some(fixture.path().join("config.toml")));
+    let platform = gpui_platform::current_platform(true);
+    let mut cx = TestAppContext::build_with_text_system(
+        TestDispatcher::new(0),
+        None,
+        platform.text_system(),
+    );
+    cx.update(gpui_component::init);
+    let mut workspace = None;
+    let (_, visual) = cx.add_window_view(|window, cx| {
+        let view =
+            cx.new(|cx| Workspace::with_config(store, config, WorkspaceView::Git, window, cx));
+        workspace = Some(view.clone());
+        Root::new(view, window, cx)
+    });
+    let workspace = workspace.unwrap();
+    visual.simulate_resize(size(px(1280.), px(760.)));
+    visual.update(|window, cx| {
+        cx.set_reduce_motion(true);
+        workspace.update(cx, |workspace, cx| {
+            workspace.open_repository(
+                Location {
+                    root: root.clone(),
+                    file: None,
+                },
+                window,
+                cx,
+            );
+        });
+    });
+    let draw = |visual: &mut VisualTestContext| {
+        for _ in 0..4 {
+            visual.run_until_parked();
+            visual.update(|window, cx| {
+                window.draw(cx).clear(cx);
+                window.simulate_next_frame(cx);
+            });
+        }
+    };
+    draw(visual);
+    let panel = visual.update(|_, cx| workspace.read(cx).git.clone().unwrap());
+    let row = |visual: &mut VisualTestContext, index| {
+        visual.update(|_, cx| {
+            panel
+                .read(cx)
+                .history_scroll
+                .bounds_for_item(index)
+                .unwrap()
+                .center()
+        })
+    };
+    let newest = row(visual, 1);
+    visual.simulate_click(newest, Modifiers::default());
+    draw(visual);
+    visual.simulate_keystrokes("shift-down");
+    draw(visual);
+    assert!(visual.debug_bounds("git-history-selected-count").is_some());
+    visual.update(|_, cx| {
+        let panel = panel.read(cx);
+        let selection = panel.history_pick.rows.as_ref().unwrap();
+        assert_eq!(selection.len(), 2);
+        assert!(selection.contains(&SharedString::from(commits[3].clone())));
+        assert!(selection.contains(&SharedString::from(commits[2].clone())));
+        assert_eq!(
+            panel.selection.as_ref().and_then(Selection::target_commit),
+            Some(commits[2].as_str())
+        );
+    });
+    let second = row(visual, 2);
+    visual.simulate_click(
+        second,
+        Modifiers {
+            control: !cfg!(target_os = "macos"),
+            platform: cfg!(target_os = "macos"),
+            ..Default::default()
+        },
+    );
+    draw(visual);
+    assert!(visual.debug_bounds("git-history-selected-count").is_none());
+    visual.simulate_click(
+        second,
+        Modifiers {
+            control: !cfg!(target_os = "macos"),
+            platform: cfg!(target_os = "macos"),
+            ..Default::default()
+        },
+    );
+    draw(visual);
+    visual.simulate_mouse_down(newest, MouseButton::Right, Modifiers::default());
+    visual.simulate_mouse_up(newest, MouseButton::Right, Modifiers::default());
+    draw(visual);
+    visual.simulate_keystrokes("down down enter");
+    draw(visual);
+    assert!(visual.debug_bounds("git-history-message").is_some());
+    visual.simulate_keystrokes("ctrl-enter");
+    draw(visual);
+    assert!(
+        visual.debug_bounds("git-history-message").is_none(),
+        "Ctrl+Enter should close the message editor"
+    );
+    visual.update(|_, cx| {
+        let panel = panel.read(cx);
+        assert!(!panel.staging);
+        assert!(panel.stage_error.is_none(), "{:?}", panel.stage_error);
+    });
+    let squashed = git::head(&root)?.unwrap();
+    let commit = git::commit(&root, &squashed)?;
+    assert_eq!(commit.parents, [commits[1].clone()]);
+    assert_eq!(commit.subject, "Second");
+    assert_eq!(commit.body, "Third");
+
+    let renamed = {
+        let newest = row(visual, 1);
+        visual.simulate_click(newest, Modifiers::default());
+        draw(visual);
+        visual.simulate_keystrokes("f2");
+        draw(visual);
+        assert!(visual.debug_bounds("git-history-message").is_some());
+        visual.simulate_keystrokes("ctrl-a");
+        visual.simulate_input("Squashed changes");
+        visual.simulate_keystrokes("ctrl-enter");
+        draw(visual);
+        let renamed = git::head(&root)?.unwrap();
+        assert_ne!(renamed, squashed);
+        assert_eq!(git::commit(&root, &renamed)?.subject, "Squashed changes");
+        renamed
+    };
+
+    let newest = row(visual, 1);
+    let oldest = row(visual, 3);
+    visual.simulate_mouse_down(oldest, MouseButton::Right, Modifiers::default());
+    visual.simulate_mouse_up(oldest, MouseButton::Right, Modifiers::default());
+    draw(visual);
+    visual.simulate_keystrokes("down down down enter");
+    draw(visual);
+    let selector = |oid: &str| -> &'static str {
+        Box::leak(format!("git-history-plan-row:{oid}").into_boxed_str())
+    };
+    let base_row = selector(&commits[0]);
+    let first_row = selector(&commits[1]);
+    let renamed_row = selector(&renamed);
+    let y = |visual: &mut VisualTestContext, selector| visual.debug_bounds(selector).unwrap().top();
+    assert!(y(visual, base_row) < y(visual, first_row));
+    assert!(y(visual, first_row) < y(visual, renamed_row));
+    visual.simulate_keystrokes("alt-down");
+    draw(visual);
+    assert!(y(visual, first_row) < y(visual, base_row));
+    let trigger = visual.debug_bounds("git-history-plan-action:0").unwrap();
+    visual.simulate_click(trigger.center(), Modifiers::default());
+    draw(visual);
+    let surface = visual.debug_bounds("popup-menu-surface").unwrap();
+    let dialog = visual.debug_bounds("dialog-0").unwrap();
+    let left = surface.left().max(dialog.left());
+    let right = surface.right().min(dialog.right());
+    let reword = point(
+        (left + right) / 2.,
+        surface.top() + surface.size.height * 0.3,
+    );
+    assert!(
+        right > left && dialog.contains(&reword),
+        "Reword must overlap the dialog surface: menu {surface:?}, dialog {dialog:?}"
+    );
+    visual.simulate_click(reword, Modifiers::default());
+    draw(visual);
+    assert!(visual.debug_bounds("git-history-plan-message").is_some());
+    visual.simulate_keystrokes("escape");
+    draw(visual);
+
+    // Noncontiguous squash uses the same prefilled message editor as adjacent squash.
+    visual.simulate_click(newest, Modifiers::default());
+    visual.simulate_click(
+        oldest,
+        Modifiers {
+            control: true,
+            ..Default::default()
+        },
+    );
+    draw(visual);
+    visual.simulate_mouse_down(newest, MouseButton::Right, Modifiers::default());
+    visual.simulate_mouse_up(newest, MouseButton::Right, Modifiers::default());
+    draw(visual);
+    visual.simulate_keystrokes("down down enter");
+    draw(visual);
+    assert!(visual.debug_bounds("git-history-message").is_some());
+    assert!(visual.debug_bounds(base_row).is_none());
+    visual.simulate_keystrokes("ctrl-end enter enter");
+    visual.simulate_input("Reviewed");
+    visual.simulate_keystrokes("ctrl-enter");
+    draw(visual);
+    let final_tip = git::commit(&root, &git::head(&root)?.unwrap())?;
+    assert_eq!(final_tip.subject, "First");
+    let root_commit = git::commit(&root, &final_tip.parents[0])?;
+    assert_eq!(root_commit.subject, "Base");
+    assert_eq!(root_commit.body, "Squashed changes\n\nReviewed");
+    assert!(root_commit.parents.is_empty());
+
+    // Reset is a single-selection action. Inspect Hard, then apply the default Soft mode.
+    let open_reset = |visual: &mut VisualTestContext| {
+        let oldest = row(visual, 2);
+        visual.simulate_mouse_down(oldest, MouseButton::Right, Modifiers::default());
+        visual.simulate_mouse_up(oldest, MouseButton::Right, Modifiers::default());
+        draw(visual);
+        visual.simulate_keystrokes("down down down down down down enter");
+        draw(visual);
+        assert!(visual.debug_bounds("git-reset-dialog").is_some());
+    };
+    let apply = |visual: &mut VisualTestContext| {
+        let button = visual
+            .debug_bounds("git-history-edit-apply")
+            .unwrap()
+            .center();
+        visual.simulate_click(button, Modifiers::default());
+        draw(visual);
+    };
+    open_reset(visual);
+    let hard = visual.debug_bounds("git-reset-hard").unwrap().center();
+    visual.simulate_click(hard, Modifiers::default());
+    draw(visual);
+    assert!(visual.debug_bounds("git-reset-hard-warning").is_some());
+    visual.simulate_keystrokes("escape");
+    draw(visual);
+    assert!(visual.debug_bounds("git-reset-dialog").is_none());
+
+    fs::write(root.join("two"), "staged before reset")?;
+    git(&root, &["add", "two"]);
+    fs::write(root.join("two"), "unstaged before reset")?;
+    fs::write(root.join("untracked"), "untracked before reset")?;
+    open_reset(visual);
+    assert!(visual.debug_bounds("git-reset-hard-warning").is_none());
+    apply(visual);
+    assert_eq!(git::head(&root)?.as_deref(), Some(root_commit.oid.as_str()));
+    let status = git::history(&root)?.changes;
+    assert!(status["two"].staged && status["two"].unstaged);
+    assert!(status["one"].staged);
+    assert!(status["untracked"].untracked);
+
+    let head = row(visual, 1);
+    visual.simulate_click(head, Modifiers::default());
+    draw(visual);
+    visual.simulate_keystrokes("f2");
+    draw(visual);
+    assert!(visual.debug_bounds("git-history-message").is_some());
+    visual.simulate_keystrokes("ctrl-a");
+    visual.simulate_input("Root message with a dirty worktree");
+    visual.simulate_keystrokes("ctrl-enter");
+    draw(visual);
+    let commit = git::commit(&root, &git::head(&root)?.unwrap())?;
+    assert_eq!(commit.subject, "Root message with a dirty worktree");
+    assert_eq!(git::history(&root)?.changes, status);
+    assert_eq!(
+        fs::read_to_string(root.join("two"))?,
+        "unstaged before reset"
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("untracked"))?,
+        "untracked before reset"
+    );
+    assert!(visual.update(|_, cx| panel.read(cx).history_rewrite.is_none()));
+    let before_amend = commit.oid;
+    let worktree = row(visual, 0);
+    visual.simulate_click(worktree, Modifiers::default());
+    draw(visual);
+    visual.update(|window, cx| {
+        panel.update(cx, |panel, cx| {
+            panel.commit_message.update(cx, |input, cx| {
+                input.set_value("Ordinary commit draft", window, cx);
+            });
+        });
+    });
+    draw(visual);
+    let toggle_amend = |visual: &mut VisualTestContext| {
+        let split = visual.debug_bounds("git-commit-split").unwrap();
+        let button = visual.debug_bounds("git-create-commit").unwrap();
+        let dropdown = visual.debug_bounds("dropdown-button-trigger").unwrap();
+        let small_button_height = visual.update(|window, _| rems(1.5).to_pixels(window.rem_size()));
+        assert!((button.size.height - small_button_height).abs() < px(1.));
+        assert_eq!(button.size.height, split.size.height);
+        assert_eq!(dropdown.top(), button.top());
+        assert_eq!(dropdown.bottom(), button.bottom());
+        assert_eq!(dropdown.left(), button.right());
+        visual.simulate_click(dropdown.center(), Modifiers::default());
+        draw(visual);
+        visual.simulate_keystrokes("down enter");
+        draw(visual);
+    };
+    let message = |visual: &mut VisualTestContext| {
+        visual.update(|_, cx| {
+            let panel = panel.read(cx);
+            (
+                panel.commit_amend.is_some(),
+                panel.commit_message.read(cx).value(),
+            )
+        })
+    };
+    toggle_amend(visual);
+    assert_eq!(
+        message(visual),
+        (true, "Root message with a dirty worktree".into())
+    );
+    visual.update(|_, cx| {
+        assert_eq!(
+            panel.read(cx).commit_draft(cx).as_str(),
+            "Ordinary commit draft"
+        );
+    });
+    assert!(visual.debug_bounds("git-amend-message").is_none());
+    assert_eq!(git::head(&root)?.as_deref(), Some(before_amend.as_str()));
+    toggle_amend(visual);
+    assert_eq!(message(visual), (false, "Ordinary commit draft".into()));
+    toggle_amend(visual);
+    visual.update(|window, cx| {
+        panel.update(cx, |panel, cx| {
+            panel.commit_message.update(cx, |input, cx| {
+                input.set_value("Amended from the worktree", window, cx);
+            });
+        });
+    });
+    draw(visual);
+    let button = visual.debug_bounds("git-create-commit").unwrap().center();
+    visual.simulate_click(button, Modifiers::default());
+    draw(visual);
+    let amended = git::commit(&root, &git::head(&root)?.unwrap())?;
+    assert_ne!(amended.oid, before_amend);
+    assert_eq!(amended.subject, "Amended from the worktree");
+    assert_eq!(message(visual), (false, "Ordinary commit draft".into()));
+    assert!(
+        git::history(&root)?
+            .changes
+            .values()
+            .all(|file| !file.staged)
+    );
+    let undo = visual.debug_bounds("git-history-rewrite-undo").unwrap();
+    visual.simulate_click(undo.center(), Modifiers::default());
+    draw(visual);
+    assert_eq!(git::head(&root)?.as_deref(), Some(before_amend.as_str()));
+    assert_eq!(git::history(&root)?.changes, status);
+    Ok(())
+}

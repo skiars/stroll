@@ -34,6 +34,7 @@ pub struct Popup {
     anchor: Anchor,
     offset: Pixels,
     travel: Pixels,
+    priority: usize,
     occlude: bool,
     on_position: Option<Box<dyn Fn(ResolvedPosition, Bounds<Pixels>)>>,
     trigger: AnyElement,
@@ -50,6 +51,7 @@ impl Popup {
             anchor: Anchor::TopLeft,
             offset: px(0.),
             travel: px(0.),
+            priority: POPUP_PRIORITY,
             occlude: true,
             on_position: None,
             trigger: trigger.into_any_element(),
@@ -65,6 +67,11 @@ impl Popup {
     /// Gap from the trigger along the anchor's outward direction, zero by default.
     pub fn offset(mut self, offset: Pixels) -> Self {
         self.offset = offset;
+        self
+    }
+
+    pub(crate) fn priority(mut self, priority: usize) -> Self {
+        self.priority = priority;
         self
     }
 
@@ -214,7 +221,7 @@ impl RenderOnce for Popup {
                     .travel(self.travel)
                     .child(content),
             )
-            .with_priority(POPUP_PRIORITY),
+            .with_priority(self.priority),
         )
     }
 }

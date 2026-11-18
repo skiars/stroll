@@ -2419,6 +2419,9 @@ impl GitPanel {
             .min_h_0()
             .overflow_hidden()
             .child(self.review_toolbar(layout, cx, colors))
+            .when_some(self.history_progress.as_ref(), |panel, progress| {
+                panel.child(self.history_progress_banner(progress, colors, cx))
+            })
             .when_some(self.detail_error.clone(), |panel, error| {
                 panel.child(
                     h_flex()

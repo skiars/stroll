@@ -167,6 +167,8 @@ impl RenderOnce for DropdownButton {
 
         let variant = self.effective_variant();
         let size = self.effective_size();
+        let rounding = self.button.as_ref().map(Button::button_rounding);
+        let joined = self.button.is_some() && self.menu.is_some();
         let selected = self.selected || self.button.as_ref().is_some_and(Selectable::is_selected);
         // Only a ghost split has no surface at rest, so only it needs hovering
         // one half to reveal the other, and the action half to stay revealed
@@ -205,7 +207,9 @@ impl RenderOnce for DropdownButton {
             .when_some(self.menu, |this, menu| {
                 this.child(
                     Button::new("popup")
+                        .debug_selector(|| "dropdown-button-trigger".into())
                         .dropdown_caret(true)
+                        .when_some(rounding, |this, rounding| this.rounded(rounding))
                         .accessibility_label(
                             self.menu_accessibility_label
                                 .unwrap_or_else(|| t!("DropdownButton.more_options").into()),
@@ -227,6 +231,7 @@ impl RenderOnce for DropdownButton {
                         .when(self.outline, |this| this.outline())
                         .with_size(size)
                         .with_variant(variant)
+                        .when(joined, |this| this.h(Button::standard_height(size)))
                         .when(is_ghost, |this| this.hover_group(HALVES_GROUP))
                         .dropdown_menu_with_anchor(self.anchor, menu)
                         .on_open_change(move |open, _, cx| {

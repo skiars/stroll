@@ -465,7 +465,7 @@ where
     fn set_open(&mut self, open: bool, window: &Window, cx: &mut Context<Self>) {
         if open && !self.state.open {
             self.popup_row_height = None;
-            self.popup_priority = crate::root::WindowState::select_popup_priority(
+            self.popup_priority = crate::root::WindowState::anchored_popup_priority(
                 window,
                 cx,
                 &self.state.focus_handle,

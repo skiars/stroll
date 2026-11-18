@@ -10,10 +10,10 @@ use crate::{
     tooltip::{ManagedTooltipExt as _, Tooltip},
 };
 use gpui::{
-    AnyElement, App, Background, ClickEvent, Corners, Edges, ElementId, FocusHandle, Hsla,
-    InteractiveElement, Interactivity, IntoElement, MouseButton, ParentElement, Pixels, RenderOnce,
-    Role, SharedString, StatefulInteractiveElement as _, StyleRefinement, Styled, Window, div,
-    prelude::FluentBuilder as _, relative, transparent_white,
+    AbsoluteLength, AnyElement, App, Background, ClickEvent, Corners, Edges, ElementId,
+    FocusHandle, Hsla, InteractiveElement, Interactivity, IntoElement, MouseButton, ParentElement,
+    Pixels, RenderOnce, Role, SharedString, StatefulInteractiveElement as _, StyleRefinement,
+    Styled, Window, div, prelude::FluentBuilder as _, relative, rems, transparent_white,
 };
 
 /// Ink of the focus line a filled button draws inside its fill: its own
@@ -322,6 +322,19 @@ impl Button {
     pub fn label_size(mut self, size: Pixels) -> Self {
         self.content_style = self.content_style.text_size(size);
         self
+    }
+
+    pub(super) fn button_rounding(&self) -> ButtonRounded {
+        self.rounded
+    }
+
+    pub(super) fn standard_height(size: Size) -> AbsoluteLength {
+        match size {
+            Size::XSmall => rems(1.25).into(),
+            Size::Small => rems(1.5).into(),
+            Size::Medium | Size::Large => rems(2.).into(),
+            Size::Size(height) => height.into(),
+        }
     }
 
     pub(super) fn button_size(&self) -> Size {
@@ -714,29 +727,22 @@ impl RenderOnce for Button {
             .when(!style.no_padding(), |this| {
                 if self.label.is_none() && children.is_empty() {
                     // Icon Button
-                    match self.size {
-                        Size::Size(px) => this.size(px),
-                        Size::XSmall => this.size_5(),
-                        Size::Small => this.size_6(),
-                        Size::Large | Size::Medium => this.size_8(),
-                    }
+                    this.size(Self::standard_height(self.size))
                 } else {
                     // Normal Button
+                    let this = this.when(!matches!(self.size, Size::Size(_)), |this| {
+                        this.h(Self::standard_height(self.size))
+                    });
                     match self.size {
                         Size::Size(size) => this.px(size * 0.2),
-                        Size::XSmall => this.h_5().px_1().when(self.compact, |this| this.min_w_5()),
+                        Size::XSmall => this.px_1().when(self.compact, |this| this.min_w_5()),
                         Size::Small => this
-                            .h_6()
                             .px_2()
                             .when(self.compact, |this| this.min_w_6().px_1p5()),
                         Size::Medium => this
-                            .h_8()
                             .px_2p5()
                             .when(self.compact, |this| this.min_w_8().px_2()),
-                        Size::Large => this
-                            .h_8()
-                            .px_3()
-                            .when(self.compact, |this| this.min_w_8().px_2()),
+                        Size::Large => this.px_3().when(self.compact, |this| this.min_w_8().px_2()),
                     }
                 }
             })
@@ -814,7 +820,9 @@ impl RenderOnce for Button {
             .items_center()
             .justify_center()
             .button_text_size(self.size)
-            .when(self.dropdown_caret, |this| this.text_size(cx.theme().control_font_size))
+            .when(self.dropdown_caret, |this| {
+                this.text_size(cx.theme().control_font_size)
+            })
             .map(|this| match self.size {
                 Size::XSmall => this.gap_1(),
                 Size::Small => this.gap_1(),

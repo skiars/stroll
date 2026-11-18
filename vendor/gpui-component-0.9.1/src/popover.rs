@@ -102,6 +102,7 @@ pub struct Popover {
     arrow: bool,
     default_open: bool,
     motion_kind: gpui_base::PopupMotionKind,
+    popup_priority: Option<usize>,
     open: Option<bool>,
     tracked_focus_handle: Option<FocusHandle>,
     trigger: Option<Box<dyn FnOnce(bool, &Window, &App) -> AnyElement + 'static>>,
@@ -142,6 +143,7 @@ impl Popover {
             overlay_closable: true,
             default_open: false,
             motion_kind: gpui_base::PopupMotionKind::Popover,
+            popup_priority: None,
             open: None,
             on_open_change: None,
         }
@@ -224,6 +226,11 @@ impl Popover {
     /// This names the popover's own anchor, not a corner of the trigger.
     /// `TopLeft` opens below the trigger, left-aligned; `BottomRight` opens
     /// above it, right-aligned. Legacy anchoring clamps without flipping.
+    pub(crate) fn popup_priority(mut self, priority: usize) -> Self {
+        self.popup_priority = Some(priority);
+        self
+    }
+
     pub fn anchor(mut self, anchor: impl Into<Anchor>) -> Self {
         self.anchor = anchor.into();
         self
@@ -406,6 +413,7 @@ impl RenderOnce for Popover {
 
         BasePopover::new(self.id)
             .motion_kind(self.motion_kind)
+            .when_some(self.popup_priority, BasePopover::popup_priority)
             .anchor(self.anchor)
             .offset(offset)
             .on_position(move |position, trigger| resolved.set(Some((position, trigger))))

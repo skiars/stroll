@@ -140,12 +140,18 @@ impl WindowState {
             .unwrap_or_default()
     }
 
-    pub(crate) fn select_popup_priority(window: &Window, cx: &App, trigger: &FocusHandle) -> usize {
+    pub(crate) fn anchored_popup_priority(
+        window: &Window,
+        cx: &App,
+        trigger: &FocusHandle,
+    ) -> usize {
         Self::try_read(window, cx)
             .and_then(|state| {
-                state.active_dialogs.iter().rev().find(|dialog| {
-                    !dialog.closing && dialog.focus_handle.contains(trigger, window)
-                })
+                state
+                    .active_dialogs
+                    .iter()
+                    .rev()
+                    .find(|dialog| !dialog.closing && dialog.focus_handle.contains(trigger, window))
             })
             // The dropdown is enqueued after its dialog, so it paints above that
             // dialog at the same priority and below any newer dialog.

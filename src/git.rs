@@ -3,6 +3,8 @@ use rust_i18n::t;
 mod blame;
 mod changes;
 mod history;
+#[cfg(feature = "desktop")]
+mod history_edit;
 mod operations;
 mod repo;
 pub(crate) mod watch;
@@ -11,6 +13,8 @@ mod worktree_edit;
 pub(crate) use blame::*;
 pub(crate) use changes::*;
 pub(crate) use history::*;
+#[cfg(feature = "desktop")]
+pub(crate) use history_edit::*;
 pub(crate) use operations::*;
 #[cfg(feature = "desktop")]
 pub(crate) use repo::GitSession;

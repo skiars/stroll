@@ -3,6 +3,7 @@ use rust_i18n::t;
 
 mod editor;
 mod graph;
+mod history_edit;
 mod history_preview;
 mod history_rows;
 mod operations;
@@ -263,6 +264,7 @@ pub(super) struct GitPanel {
     branches: Entity<SelectState<Branches>>,
     commit_input: Entity<InputState>,
     commit_message: Entity<TextareaState>,
+    commit_amend: Option<operations::CommitAmend>,
     commit_state: Option<Result<git::CommitState, String>>,
     commit_state_task: Task<()>,
     ai_commit_pending: bool,
@@ -277,6 +279,11 @@ pub(super) struct GitPanel {
     graph_layout: graph::Graph,
     history_scroll: ListState,
     history_geometry: Option<(Pixels, Font, Pixels)>,
+    history_focus: FocusHandle,
+    history_pick: history_edit::HistoryPick,
+    history_preparing: bool,
+    history_progress: Option<git::HistoryProgress>,
+    history_rewrite: Option<git::RewriteRecord>,
     startup_session: Option<GitSession>,
     restore_history: Option<HistoryPosition>,
     restore_pages: usize,
@@ -515,6 +522,7 @@ impl GitPanel {
             branches,
             commit_input,
             commit_message,
+            commit_amend: None,
             ai_commit_pending: false,
             ai_commit_task: Task::ready(()),
             commit_state: None,
@@ -529,6 +537,11 @@ impl GitPanel {
             graph_layout: graph::Graph::default(),
             history_scroll,
             history_geometry: None,
+            history_focus: cx.focus_handle(),
+            history_pick: history_edit::HistoryPick::default(),
+            history_preparing: false,
+            history_progress: None,
+            history_rewrite: None,
             startup_session: session.git.clone(),
             restore_history: None,
             restore_pages: 0,
@@ -715,29 +728,69 @@ impl GitPanel {
                     .map(|(&ix, version)| (review.detail.files[ix].path.clone(), version.clone()))
             })
             .collect::<Vec<_>>();
-        let task = cx.background_spawn(async move {
-            let history = backend.history()?;
-            if !versions.is_empty() {
-                let files = versions
-                    .iter()
-                    .map(|(path, _)| path.clone())
-                    .collect::<Vec<_>>();
-                let current = backend.file_versions(&files);
-                for ((path, previous), version) in versions.into_iter().zip(current) {
-                    if version.as_ref() != Some(&previous) {
-                        paths.insert(path);
+        let previous_tip = self
+            .history
+            .as_ref()
+            .map(|history| (history.checkout.clone(), history.head.clone()));
+        let previous_rewrite = self.history_rewrite.clone();
+        self.history_task = cx.spawn_in(window, async move |this, cx| {
+            let recover = this
+                .read_with(cx, |this, cx| {
+                    !this.writes_busy(cx)
+                        && this
+                            .workspace
+                            .read_with(cx, |workspace, _| {
+                                workspace
+                                    .files
+                                    .values()
+                                    .all(|file| !file.is_dirty() && file.unconfirmed_save.is_none())
+                            })
+                            .unwrap_or(false)
+                })
+                .unwrap_or(false);
+            let task = cx.background_spawn(async move {
+                let recovery = recover.then(|| backend.recover_history_backup());
+                let check_commit = recovery.is_some_and(|result| !matches!(result, Ok(false)));
+                let history = backend.history()?;
+                if !versions.is_empty() {
+                    let files = versions
+                        .iter()
+                        .map(|(path, _)| path.clone())
+                        .collect::<Vec<_>>();
+                    let current = backend.file_versions(&files);
+                    for ((path, previous), version) in versions.into_iter().zip(current) {
+                        if version.as_ref() != Some(&previous) {
+                            paths.insert(path);
+                        }
                     }
                 }
-            }
-            let counts = worktree_counts(&history.changes);
-            Ok::<_, anyhow::Error>((history, counts, paths))
-        });
-        self.history_task = cx.spawn_in(window, async move |this, cx| {
+                let counts = worktree_counts(&history.changes);
+                let progress = backend.history_progress();
+                let rewrite = if previous_tip.as_ref().is_some_and(|(branch, oid)| {
+                    branch == &history.checkout && oid == &history.head
+                }) {
+                    previous_rewrite
+                } else {
+                    backend.rewrite_record(history.checkout.as_deref(), history.head.as_deref())
+                };
+                Ok::<_, anyhow::Error>((history, counts, paths, progress, rewrite, check_commit))
+            });
             let result = task.await;
             _ = this.update_in(cx, move |this, window, cx| {
                 this.history_loading = false;
                 match result {
-                    Ok((history, counts, paths)) => {
+                    Ok((history, counts, paths, progress, rewrite, check_commit)) => {
+                        if check_commit {
+                            this.refresh_commit_state(window, cx);
+                        }
+                        this.history_progress = progress;
+                        this.history_rewrite = rewrite;
+                        if this.history.as_ref().is_some_and(|old| {
+                            old.head != history.head || old.checkout != history.checkout
+                        }) {
+                            this.history_pick.clear();
+                            this.clear_commit_amend(window, cx);
+                        }
                         this.history_error = None;
                         if only_changed && !retry_history && this.history.as_ref() == Some(&history)
                         {
@@ -792,7 +845,10 @@ impl GitPanel {
                             label: branch.label.clone().into(),
                             remote: branch.remote,
                         }));
-                        let restore = this.startup_session.take();
+                        let restore = this
+                            .startup_session
+                            .take()
+                            .filter(|_| this.history_progress.is_none());
                         if let Some(state) = &restore
                             && items.iter().any(|item| item.value == state.reference)
                         {
@@ -986,6 +1042,7 @@ impl GitPanel {
             .as_ref()
             .is_some_and(Selection::includes_worktree);
         self.selection = None;
+        self.history_pick.clear();
         self.branch = branch;
         self.restore_history = None;
         self.history_scroll.reset(0);
@@ -1004,6 +1061,7 @@ impl GitPanel {
             return;
         }
         self.query = query;
+        self.history_pick.clear();
         self.restore_history = None;
         self.history_scroll.reset(0);
         self.commits = Rc::default();
@@ -1095,7 +1153,10 @@ impl GitPanel {
     }
 
     pub(super) fn commit_draft(&self, cx: &App) -> SharedString {
-        self.commit_message.read(cx).value()
+        self.commit_amend.as_ref().map_or_else(
+            || self.commit_message.read(cx).value(),
+            |amend| amend.draft.clone(),
+        )
     }
 
     pub(super) fn capture_panel_preferences(&self, panels: &mut crate::session::PanelPreferences) {
@@ -1213,6 +1274,8 @@ impl GitPanel {
             .selection
             .as_ref()
             .map(|selection| selection.target_commit().map(str::to_owned));
+        let picked = self.history_pick.rows.clone();
+        let selected_count = picked.as_ref().map_or(0, |rows| rows.len());
         let comparison_target = target.as_ref().map(|target| {
             target.as_deref().map_or_else(
                 || t!("git.current_worktree").into_owned(),
@@ -1300,7 +1363,10 @@ impl GitPanel {
                         })
                     })
                     .on_click(move |_, window, cx| {
-                        _ = view.update(cx, |this, cx| this.select_worktree(window, cx));
+                        _ = view.update(cx, |this, cx| {
+                            this.history_focus.focus(window, cx);
+                            this.select_worktree(window, cx);
+                        });
                     })
                     .child(
                         graph::worktree(connected, mode)
@@ -1321,12 +1387,19 @@ impl GitPanel {
             }
             let ix = index - usize::from(show_worktree);
             let commit = &commits[ix];
-            let selected =
-                target.as_ref().and_then(|target| target.as_deref()) == Some(commit.oid.as_str());
+            let selected = picked.as_ref().map_or_else(
+                || {
+                    target.as_ref().and_then(|target| target.as_deref())
+                        == Some(commit.oid.as_str())
+                },
+                |rows| rows.contains(&commit.oid),
+            );
             let oid = commit.oid.clone();
             let view = weak.clone();
             let menu_view = weak.clone();
             let base = oid.clone();
+            let subject = commit.subject.clone();
+            let merge = commit.merge;
             let left = history_rows::LEFT_INSET + graph[ix].width() + history_rows::GRAPH_GAP;
             let content_width = (width - px(1.) - left - history_rows::right_inset()).max(px(0.));
             v_flex()
@@ -1349,9 +1422,10 @@ impl GitPanel {
                         history_preview::PreviewContent::commit(&commit, &refs)
                     })
                 })
-                .on_click(move |_, window, cx| {
+                .on_click(move |event: &ClickEvent, window, cx| {
                     _ = view.update(cx, |this, cx| {
-                        this.select_history_target(Some(&oid), window, cx);
+                        this.history_focus.focus(window, cx);
+                        this.pick_commit(&oid, event.modifiers(), true, window, cx);
                     });
                 })
                 .child(
@@ -1372,21 +1446,31 @@ impl GitPanel {
                     title_y,
                 ))
                 .map(|row| {
-                    let Some(target) = comparison_target.clone() else {
-                        return row.into_any_element();
-                    };
-                    row.context_menu(move |menu, _, _| {
-                        let view = menu_view.clone();
-                        let base = base.clone();
-                        menu.item(
-                            PopupMenuItem::new(t!("git.compare_with", target = target))
-                                .icon(IconName::GitCompareArrows)
-                                .on_click(move |_, window, cx| {
-                                    _ = view.update(cx, |this, cx| {
-                                        this.compare_with_base(&base, window, cx)
-                                    });
-                                }),
-                        )
+                    let comparison_target = comparison_target.clone();
+                    row.context_menu(move |mut menu, _, cx| {
+                        if let Some(target) = comparison_target.clone() {
+                            let view = menu_view.clone();
+                            let base = base.clone();
+                            menu = menu.item(
+                                PopupMenuItem::new(t!("git.compare_with", target = target))
+                                    .icon(IconName::GitCompareArrows)
+                                    .on_click(move |_, window, cx| {
+                                        _ = view.update(cx, |this, cx| {
+                                            this.compare_with_base(&base, window, cx)
+                                        });
+                                    }),
+                            );
+                        }
+                        if let Ok(items) = menu_view.read_with(cx, |panel, cx| {
+                            panel.history_commands(&base, &subject, merge, &menu_view, cx)
+                        }) && !items.is_empty()
+                        {
+                            menu = menu.separator();
+                            for item in items {
+                                menu = menu.item(item);
+                            }
+                        }
+                        menu
                     })
                     .into_any_element()
                 })
@@ -1415,7 +1499,14 @@ impl GitPanel {
                                     .flex_1()
                                     .font_semibold()
                                     .text_size(pane_title_size(cx))
-                                    .child(t!("git.history")),
+                                    .when(selected_count > 1, |title| {
+                                        title.debug_selector(|| "git-history-selected-count".into())
+                                    })
+                                    .child(if selected_count > 1 {
+                                        t!("git.history_edit_selected", count = selected_count)
+                                    } else {
+                                        t!("git.history")
+                                    }),
                             )
                             .child(
                                 icon_control(
@@ -1482,6 +1573,9 @@ impl GitPanel {
                 panel.child(
                     div()
                         .relative()
+                        .track_focus(&self.history_focus)
+                        .tab_stop(true)
+                        .on_key_down(cx.listener(Self::history_key_down))
                         .flex_1()
                         .min_h_0()
                         .w_full()
@@ -1610,6 +1704,7 @@ impl GitPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.history_pick.clear();
         let current = self
             .selection
             .as_ref()

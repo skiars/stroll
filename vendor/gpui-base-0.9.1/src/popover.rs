@@ -209,6 +209,7 @@ pub struct Popover {
     on_position: Option<Box<dyn Fn(ResolvedPosition, gpui::Bounds<gpui::Pixels>)>>,
     default_open: bool,
     motion_kind: PopupMotionKind,
+    popup_priority: Option<usize>,
     open: Option<bool>,
     tracked_focus_handle: Option<FocusHandle>,
     trigger: Option<TriggerBuilder>,
@@ -228,6 +229,7 @@ impl Popover {
             on_position: None,
             default_open: false,
             motion_kind: PopupMotionKind::Popover,
+            popup_priority: None,
             open: None,
             tracked_focus_handle: None,
             trigger: None,
@@ -240,6 +242,12 @@ impl Popover {
 
     pub fn motion_kind(mut self, kind: PopupMotionKind) -> Self {
         self.motion_kind = kind;
+        self
+    }
+
+    #[doc(hidden)]
+    pub fn popup_priority(mut self, priority: usize) -> Self {
+        self.popup_priority = Some(priority);
         self
     }
 
@@ -364,6 +372,7 @@ impl RenderOnce for Popover {
         let popup = Popup::new(self.id, trigger(open, window, cx))
             .refine_style(&self.style)
             .anchor(self.anchor)
+            .when_some(self.popup_priority, Popup::priority)
             .offset(self.offset)
             .occlude(open)
             .when(self.motion_kind == PopupMotionKind::Dropdown, |popup| {

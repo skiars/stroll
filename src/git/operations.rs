@@ -373,13 +373,13 @@ impl DiskVersion {
     }
 }
 
-struct OperationLock {
+pub(super) struct OperationLock {
     directory: PathBuf,
     file: File,
 }
 
 impl OperationLock {
-    fn acquire(root: &Path) -> Result<Self> {
+    pub(super) fn acquire(root: &Path) -> Result<Self> {
         let directory = git_dir(root).join("stroll");
         let mut builder = fs::DirBuilder::new();
         #[cfg(unix)]

@@ -2,11 +2,24 @@ use std::path::Path;
 
 use gpui_component::{
     WindowExt as _,
+    button::DropdownButton,
     input::{InputGroup, InputGroupAddon, InputGroupAddonAlignment, Textarea},
 };
 
 use super::*;
-use crate::git::FileAction;
+use crate::git::{FileAction, HistoryEdit, HistoryTip};
+
+pub(super) struct CommitAmend {
+    tip: HistoryTip,
+    pub(super) draft: SharedString,
+}
+
+pub(super) fn commit_message_editor(state: &Entity<TextareaState>, cx: &App) -> Textarea {
+    Textarea::new(state)
+        .aria_label(t!("git.commit_message"))
+        .text_size(px(text_base_size(cx)))
+        .line_height(relative(MESSAGE_LINE_HEIGHT))
+}
 
 impl GitPanel {
     pub(super) fn current_worktree(&self) -> bool {
@@ -53,7 +66,7 @@ impl GitPanel {
         }
     }
 
-    fn commit_unavailable(&self, cx: &App) -> Option<Cow<'static, str>> {
+    fn commit_unavailable(&self, cx: &App, amend: bool) -> Option<Cow<'static, str>> {
         if !self.backend.supports_git_operations() {
             return Some(t!("git.upgrade_operations"));
         }
@@ -64,21 +77,81 @@ impl GitPanel {
             None => return Some(t!("git.loading_changes")),
             Some(Err(error)) => return Some(error.clone().into()),
             Some(Ok(state)) if state.blocked => return Some(t!("git.commit_blocked")),
-            Some(Ok(state)) if !state.ready => return Some(t!("git.nothing_to_commit")),
+            Some(Ok(state)) if !amend && !state.ready => {
+                return Some(t!("git.nothing_to_commit"));
+            }
             Some(Ok(_)) => {}
         }
         None
     }
 
     fn commit_disabled_reason(&self, cx: &App) -> Option<Cow<'static, str>> {
-        self.commit_unavailable(cx).or_else(|| {
-            self.commit_message
-                .read(cx)
-                .text()
-                .chars()
-                .all(char::is_whitespace)
+        if self.history_preparing {
+            return Some(t!("git.loading_changes"));
+        }
+        let amend = self.commit_amend.as_ref();
+        if amend.is_some_and(|amend| self.editable_tip().as_ref() != Some(&amend.tip)) {
+            return Some(t!("git.history_edit_stale"));
+        }
+        self.commit_unavailable(cx, amend.is_some()).or_else(|| {
+            (!git::valid_message(&self.commit_message.read(cx).value()))
                 .then(|| t!("git.commit_message_required"))
         })
+    }
+
+    pub(super) fn clear_commit_amend(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(amend) = self.commit_amend.take() {
+            self.commit_message
+                .update(cx, |input, cx| input.set_value(amend.draft, window, cx));
+            cx.notify();
+        }
+    }
+
+    fn toggle_commit_amend(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.current_worktree() || self.writes_busy(cx) || self.history_preparing {
+            return;
+        }
+        if self.commit_amend.is_some() {
+            self.clear_commit_amend(window, cx);
+            return;
+        }
+        let (Some(tip), Some(Ok(expected))) = (self.editable_tip(), self.commit_state.clone())
+        else {
+            return;
+        };
+        self.cancel_ai_commit();
+        self.history_preparing = true;
+        let backend = self.backend.clone();
+        let work = cx.background_spawn(async move {
+            let message = backend.amend_message(&tip, &expected);
+            (tip, message)
+        });
+        cx.spawn_in(window, async move |panel, cx| {
+            let (tip, message) = work.await;
+            _ = panel.update_in(cx, |panel, window, cx| {
+                panel.history_preparing = false;
+                cx.notify();
+                if !panel.current_worktree()
+                    || panel.writes_busy(cx)
+                    || panel.editable_tip().as_ref() != Some(&tip)
+                {
+                    return;
+                }
+                match message {
+                    Ok(message) => {
+                        let draft = panel.commit_message.read(cx).value();
+                        panel.commit_amend = Some(CommitAmend { tip, draft });
+                        panel.commit_message.update(cx, |input, cx| {
+                            input.set_value(message, window, cx);
+                            input.focus_handle(cx).focus(window, cx);
+                        });
+                    }
+                    Err(error) => panel.report_operation_error(error, window, cx),
+                }
+            });
+        })
+        .detach();
+        cx.notify();
     }
 
     fn commit_ai(&self, cx: &App) -> Option<crate::ai::Snapshot> {
@@ -89,7 +162,7 @@ impl GitPanel {
     }
 
     fn ai_disabled_reason(&self, cx: &App) -> Option<Cow<'static, str>> {
-        self.commit_unavailable(cx).or_else(|| {
+        self.commit_unavailable(cx, false).or_else(|| {
             if !self.backend.supports_ai_context() {
                 Some(t!("ai.upgrade_helper"))
             } else if !self
@@ -168,9 +241,52 @@ impl GitPanel {
     }
 
     pub(super) fn commit_controls(&self, cx: &Context<Self>) -> impl IntoElement {
+        let amend = self.commit_amend.is_some();
         let reason = self.commit_disabled_reason(cx);
         let ai_enabled = self.commit_ai(cx).is_some();
         let ai_reason = ai_enabled.then(|| self.ai_disabled_reason(cx)).flatten();
+        let commit = action_button("git-create-commit")
+            .debug_selector(|| "git-create-commit".into())
+            .secondary()
+            .small()
+            .flex_shrink_0()
+            .label(if amend {
+                t!("git.amend_commit")
+            } else {
+                t!("git.commit_action")
+            })
+            .disabled(reason.is_some())
+            .when_some(reason, |button, reason| button.tooltip(reason))
+            .on_click(cx.listener(|this, _, window, cx| this.submit_commit(window, cx)));
+        let commit = if self.backend.supports_history_edit() {
+            let owner = cx.weak_entity();
+            let amend_unavailable = self.history_preparing
+                || if amend {
+                    self.writes_busy(cx)
+                } else {
+                    self.editable_tip().is_none() || self.commit_unavailable(cx, true).is_some()
+                };
+            let split = DropdownButton::new("git-commit-split")
+                .button(commit)
+                .dropdown_menu(move |menu, _, _| {
+                    let owner = owner.clone();
+                    menu.min_w(px(132.)).item_with_check(
+                        PopupMenuItem::new(t!("git.amend_commit"))
+                            .disabled(amend_unavailable)
+                            .on_click(move |_, window, cx| {
+                                _ = owner
+                                    .update(cx, |panel, cx| panel.toggle_commit_amend(window, cx));
+                            }),
+                        amend,
+                    )
+                });
+            div()
+                .debug_selector(|| "git-commit-split".into())
+                .child(split)
+                .into_any_element()
+        } else {
+            commit.into_any_element()
+        };
         div()
             .w_full()
             .debug_selector(|| "git-commit-message-entry".into())
@@ -179,13 +295,7 @@ impl GitPanel {
                     .small()
                     .w_full()
                     .readonly(self.staging || !self.backend.supports_git_operations())
-                    .input(
-                        Textarea::new(&self.commit_message)
-                            .aria_label(t!("git.commit_message"))
-                            .text_size(px(text_base_size(cx)))
-                            .line_height(relative(MESSAGE_LINE_HEIGHT))
-                            .min_h(px(32.)),
-                    )
+                    .input(commit_message_editor(&self.commit_message, cx).min_h(px(32.)))
                     .addon(
                         InputGroupAddon::new("git-commit-submit")
                             .align(InputGroupAddonAlignment::BlockEnd)
@@ -209,19 +319,7 @@ impl GitPanel {
                                         })),
                                 )
                             })
-                            .child(
-                                action_button("git-create-commit")
-                                    .debug_selector(|| "git-create-commit".into())
-                                    .secondary()
-                                    .small()
-                                    .flex_shrink_0()
-                                    .label(t!("git.commit_action"))
-                                    .disabled(reason.is_some())
-                                    .when_some(reason, |button, reason| button.tooltip(reason))
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.submit_commit(window, cx)
-                                    })),
-                            ),
+                            .child(commit),
                     ),
             )
     }
@@ -234,6 +332,14 @@ impl GitPanel {
             return;
         };
         let message = self.commit_message.read(cx).value().to_string();
+        if let Some(amend) = &self.commit_amend {
+            self.start_history_edit(
+                HistoryEdit::Amend(amend.tip.clone(), expected, message),
+                window,
+                cx,
+            );
+            return;
+        }
         let backend = self.backend.clone();
         self.cancel_ai_commit();
         self.staging = true;

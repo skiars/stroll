@@ -1059,6 +1059,10 @@ pub(super) fn worktree_restore_items(
             if !panel.current_worktree() || !panel.backend.supports_git_operations() {
                 return Vec::new();
             }
+            let resolutions = files.iter().filter_map(|&ix| {
+                let file = &detail.files[ix];
+                panel.stage_resolution_item(&file.path, owner, cx)
+            });
             let (untracked, tracked): (Vec<_>, Vec<_>) = files
                 .iter()
                 .filter_map(|&ix| {
@@ -1083,31 +1087,34 @@ pub(super) fn worktree_restore_items(
             } else {
                 t!("git.restore_file")
             };
-            [
-                (untracked, t!("git.discard_changes"), IconName::Trash),
-                (tracked, restore_label, IconName::RotateCcw),
-            ]
-            .into_iter()
-            .filter(|(targets, _, _)| !targets.is_empty())
-            .map(|(targets, label, icon)| {
-                let path = path.to_owned();
-                let owner = owner.clone();
-                PopupMenuItem::new(format!("{label}…"))
-                    .icon(icon)
-                    .disabled(busy)
-                    .on_click(move |_, window, cx| {
-                        _ = owner.update(cx, |panel, cx| {
-                            panel.prepare_worktree_restore(
-                                path.clone(),
-                                targets.clone(),
-                                directory,
-                                window,
-                                cx,
-                            );
-                        });
-                    })
-            })
-            .collect()
+            resolutions
+                .chain(
+                    [
+                        (untracked, t!("git.discard_changes"), IconName::Trash),
+                        (tracked, restore_label, IconName::RotateCcw),
+                    ]
+                    .into_iter()
+                    .filter(|(targets, _, _)| !targets.is_empty())
+                    .map(|(targets, label, icon)| {
+                        let path = path.to_owned();
+                        let owner = owner.clone();
+                        PopupMenuItem::new(format!("{label}…"))
+                            .icon(icon)
+                            .disabled(busy)
+                            .on_click(move |_, window, cx| {
+                                _ = owner.update(cx, |panel, cx| {
+                                    panel.prepare_worktree_restore(
+                                        path.clone(),
+                                        targets.clone(),
+                                        directory,
+                                        window,
+                                        cx,
+                                    );
+                                });
+                            })
+                    }),
+                )
+                .collect()
         })
         .unwrap_or_default()
 }

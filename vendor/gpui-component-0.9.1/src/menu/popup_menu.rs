@@ -775,6 +775,12 @@ impl PopupMenu {
         self
     }
 
+    /// Add an item whose checked and unchecked states are exposed to accessibility.
+    pub fn item_with_check(mut self, item: impl Into<PopupMenuItem>, checked: bool) -> Self {
+        self.checkable.insert(self.menu_items.len());
+        self.item(item.into().checked(checked))
+    }
+
     /// Replace all menu items by re-running a builder on this menu, keeping its
     /// identity (focus, parent menu, layer priority).
     ///
@@ -1664,6 +1670,7 @@ impl Render for PopupMenu {
 
         let element = v_flex()
             .id("popup-menu")
+            .debug_selector(|| "popup-menu-surface".into())
             .test_support()
             .role(Role::Menu)
             .key_context(CONTEXT)
