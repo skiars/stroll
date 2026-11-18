@@ -51,6 +51,10 @@ dialogs in a Wayland window after changes to paint order or focus handling.
 - Fold candidates are remapped through edits and replaced when the background
   highlighter publishes its completed parse. The editor editing integration test
   checks candidate continuity, line remapping, and removal.
+- Pointer-triggered editor documentation waits 500 ms for each symbol.
+  Moving to another symbol resets the timer, including within a shared
+  diagnostic range. Diagnostic rows can appear before documentation.
+  The popup integration tests cover timing, cancellation, and scrolling.
 - Interactive code editor edits reveal the caret with minimal scrolling before shaping the
   viewport. Programmatic replacements and history replay use the existing caret-follow margin.
   Removing inline Git deleted rows keeps the visible source anchored. The workspace

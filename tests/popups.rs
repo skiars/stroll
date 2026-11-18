@@ -744,9 +744,9 @@ fn editor_hover_waits_for_pointer_motion_after_scrolling(cx: &mut gpui::TestAppC
         });
         cx.update(|window, cx| window.draw(cx).clear(cx));
     };
-    let wait = |cx: &mut gpui::VisualTestContext| {
+    let advance = |cx: &mut gpui::VisualTestContext, millis| {
         cx.run_until_parked();
-        cx.executor().advance_clock(Duration::from_millis(300));
+        cx.executor().advance_clock(Duration::from_millis(millis));
         cx.run_until_parked();
     };
     let active = |cx: &mut gpui::VisualTestContext| {
@@ -758,8 +758,33 @@ fn editor_hover_waits_for_pointer_motion_after_scrolling(cx: &mut gpui::TestAppC
         })
     };
 
+    let next_target = pointer + point(px(0.), line_height);
+    let blank = pointer + point(px(150.), px(0.));
     cx.simulate_mouse_move(pointer, None, Default::default());
-    wait(cx);
+    advance(cx, 400);
+    assert_eq!(active(cx), None);
+    cx.simulate_mouse_move(blank, None, Default::default());
+    advance(cx, 500);
+    assert_eq!(active(cx), None);
+
+    cx.simulate_mouse_move(pointer, None, Default::default());
+    advance(cx, 400);
+    cx.simulate_mouse_move(next_target, None, Default::default());
+    advance(cx, 499);
+    assert_eq!(active(cx), None);
+
+    // Motion inside the same symbol keeps the original timer.
+    cx.simulate_mouse_move(
+        next_target + point(px(1.), px(0.)),
+        None,
+        Default::default(),
+    );
+    advance(cx, 1);
+    assert_eq!(active(cx), Some(21..27));
+
+    cx.update(|_, cx| editor.update(cx, |editor, cx| editor.clear_hover_state(cx)));
+    cx.simulate_mouse_move(pointer, None, Default::default());
+    advance(cx, 500);
     assert_eq!(active(cx), Some(14..20));
     scroll(cx, px(40.));
     assert_eq!(active(cx), Some(14..20));
@@ -769,10 +794,10 @@ fn editor_hover_waits_for_pointer_motion_after_scrolling(cx: &mut gpui::TestAppC
     scroll(cx, px(2.) - line_height);
     assert_eq!(active(cx), None);
     cx.simulate_mouse_move(pointer, None, Default::default());
-    wait(cx);
+    advance(cx, 500);
     assert_eq!(active(cx), None);
     cx.simulate_mouse_move(pointer + point(px(1.), px(0.)), None, Default::default());
-    wait(cx);
+    advance(cx, 500);
     assert_eq!(active(cx), Some(21..27));
 
     // A scroll that invalidates a pending hover must also cancel its task.
@@ -782,7 +807,7 @@ fn editor_hover_waits_for_pointer_motion_after_scrolling(cx: &mut gpui::TestAppC
         Default::default(),
     );
     scroll(cx, -line_height * 2.);
-    wait(cx);
+    advance(cx, 500);
     assert_eq!(active(cx), None);
 }
 
@@ -2118,7 +2143,7 @@ fn editor_hover_appends_documentation_to_web_diagnostics() -> anyhow::Result<()>
     move_to(&mut cx, symbol.center())?;
     assert_rows(&mut cx, false);
     let (initial_shell, initial_row) = popup(&mut cx)?;
-    cx.advance_clock(Duration::from_millis(150));
+    cx.advance_clock(Duration::from_millis(500));
     cx.run_until_parked();
     assert_rows(&mut cx, false);
 
@@ -2131,7 +2156,7 @@ fn editor_hover_appends_documentation_to_web_diagnostics() -> anyhow::Result<()>
 
     move_to(&mut cx, symbol.center())?;
     assert_rows(&mut cx, false);
-    cx.advance_clock(Duration::from_millis(150));
+    cx.advance_clock(Duration::from_millis(500));
     cx.run_until_parked();
     cx.advance_clock(Duration::from_millis(300));
     cx.run_until_parked();
@@ -2340,7 +2365,7 @@ fn editor_hover_enrichment_preserves_anchor_wraps_and_discards_late_results(
         let anchor =
             visual.update(|_, cx| editor.read(cx).range_to_bounds(&(0..6)).unwrap().center());
         visual.simulate_mouse_move(anchor, None, Default::default());
-        frame(visual, Duration::from_millis(200));
+        frame(visual, Duration::from_millis(500));
         assert_eq!(ready(visual), Some((0..6, false)));
         frame(visual, Duration::from_millis(500));
         assert_eq!(ready(visual), Some((0..6, true)));
@@ -2358,7 +2383,7 @@ fn editor_hover_enrichment_preserves_anchor_wraps_and_discards_late_results(
         }
         visual.update(|_, cx| editor.update(cx, |editor, cx| editor.clear_hover_state(cx)));
         visual.simulate_mouse_move(anchor + point(px(1.), px(0.)), None, Default::default());
-        frame(visual, Duration::from_millis(200));
+        frame(visual, Duration::from_millis(500));
         assert_eq!(ready(visual), Some((0..6, false)));
         visual.update(|_, cx| editor.update(cx, |editor, cx| editor.clear_hover_state(cx)));
         frame(visual, Duration::from_millis(500));

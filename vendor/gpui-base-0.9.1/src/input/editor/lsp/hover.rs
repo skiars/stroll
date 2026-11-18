@@ -2,7 +2,7 @@ use anyhow::Result;
 use gpui::{App, Bounds, Context, MouseMoveEvent, Pixels, Point, SharedString, Task, Window};
 use instant::Duration;
 use ropey::Rope;
-use std::{collections::BTreeMap, rc::Rc, sync::Arc};
+use std::{collections::BTreeMap, ops::Range, rc::Rc, sync::Arc};
 
 use crate::input::{DiagnosticSeverity, EditorMode, HoverPopoverState, InputBaseState, RopeExt};
 
@@ -53,7 +53,19 @@ pub trait HoverProvider {
     }
 }
 
+const DOCUMENTATION_HOVER_DELAY: Duration = Duration::from_millis(500);
+
 impl InputBaseState<EditorMode> {
+    fn documentation_target_at(&self, offset: usize) -> Option<Range<usize>> {
+        self.text.char_at(offset).filter(|c| !c.is_whitespace())?;
+        Some(
+            self.text
+                .word_range(offset)
+                .filter(|word| word.contains(&offset))
+                .unwrap_or(offset..offset),
+        )
+    }
+
     /// Handle hover trigger LSP request.
     pub(super) fn handle_hover_popover(
         &mut self,
@@ -81,28 +93,28 @@ impl InputBaseState<EditorMode> {
             (severity, entry.range.len())
         });
 
-        if let Some(popover) = self.extras.hover_popover.as_ref()
-            && (popover.target_range.contains(&offset) || popover.target_range.start == offset)
-            && diagnostics.iter().copied().eq(popover.diagnostics.iter())
-        {
-            if let Some(pointer) = self
-                .extras
-                .hover_popover
-                .as_mut()
-                .and_then(|p| p.pointer.as_mut())
-            {
-                *pointer = position;
-            }
+        if self.extras.hover_popover.as_ref().is_some_and(|popover| {
+            popover.pointer.is_none()
+                && (popover.target_range.contains(&offset) || popover.target_range.start == offset)
+                && diagnostics.iter().copied().eq(popover.diagnostics.iter())
+        }) {
             return;
         }
 
         let provider = self.extras.lsp.hover_provider.clone();
-        if diagnostics.is_empty() && provider.is_none() {
+        let documentation_target = provider
+            .as_ref()
+            .and_then(|_| self.documentation_target_at(offset));
+        if diagnostics.is_empty() && documentation_target.is_none() {
             self.clear_language_hover(cx);
             return;
         }
-        let should_delay = self.hover_popover().is_none();
-        let word = self.text.word_range(offset).unwrap_or(offset..offset);
+
+        let had_visible_popover = self.hover_popover().is_some();
+        let word = documentation_target
+            .clone()
+            .or_else(|| self.text.word_range(offset))
+            .unwrap_or(offset..offset);
         let target_range = diagnostics
             .first()
             .map_or_else(|| word.clone(), |entry| entry.range.clone());
@@ -117,38 +129,58 @@ impl InputBaseState<EditorMode> {
         } else {
             word
         };
+        if let Some(popover) = self.extras.hover_popover.as_ref()
+            && popover.documentation_target == documentation_target
+            && (documentation_target.is_some() || popover.target_range == target_range)
+        {
+            let changed_diagnostics = (!diagnostics.iter().copied().eq(popover.diagnostics.iter()))
+                .then(|| diagnostics.into_iter().cloned().collect());
+            let popover = self.extras.hover_popover.as_mut().unwrap();
+            popover.pointer = Some(position);
+            if let Some(diagnostics) = changed_diagnostics {
+                popover.diagnostics = diagnostics;
+                popover.target_range = target_range;
+                popover.symbol_range = symbol_range;
+                cx.notify();
+            }
+            return;
+        }
+
         let diagnostics: Rc<[_]> = diagnostics.into_iter().cloned().collect();
+        // Dropping the previous task cancels the timer and any pending results.
         self.extras.lsp._hover_task = Task::ready(Ok(()));
+        let request_documentation = documentation_target.is_some();
         let popover = HoverPopoverState {
             symbol_range,
             target_range,
+            documentation_target,
             pointer: Some(position),
             diagnostics,
             hover: None,
             documentation: None,
         };
-        if popover.visible() || !should_delay {
+        if popover.visible() || had_visible_popover {
             cx.notify();
         }
         self.extras.hover_popover = Some(popover);
 
-        let Some(provider) = provider else {
+        let (Some(provider), true) = (provider, request_documentation) else {
             return;
         };
         let text = self.text.clone();
         let revision = self.document_revision;
-        // Ask the provider only after the initial delay. Movement within the
-        // same hover target keeps the request and the visible diagnostic rows.
         self.extras.lsp._hover_task = cx.spawn_in(window, async move |this, cx| {
-            if should_delay {
-                cx.background_executor()
-                    .timer(Duration::from_millis(150))
-                    .await;
-            }
+            cx.background_executor()
+                .timer(DOCUMENTATION_HOVER_DELAY)
+                .await;
 
-            let task = this.update_in(cx, |_, window, cx| {
-                provider.hover(&text, offset, window, cx)
+            let task = this.update_in(cx, |editor, window, cx| {
+                (editor.document_revision == revision)
+                    .then(|| provider.hover(&text, offset, window, cx))
             })?;
+            let Some(task) = task else {
+                return Ok(());
+            };
             let Some(hover) = task.await? else {
                 return Ok(());
             };
@@ -232,7 +264,11 @@ impl InputBaseState<EditorMode> {
         let valid = self.input_bounds.contains(&pointer)
             && clip.contains(&pointer)
             && self.text_offset_at_point(pointer).is_some_and(|offset| {
-                popover.target_range.contains(&offset) || popover.target_range.start == offset
+                if popover.documentation_target.is_some() {
+                    popover.documentation_target == self.documentation_target_at(offset)
+                } else {
+                    popover.target_range.contains(&offset) || popover.target_range.start == offset
+                }
             })
             && self.range_to_bounds(&popover.symbol_range).is_some();
         if !valid {

@@ -65,6 +65,7 @@ pub struct HoverPopoverState {
     pub documentation: Option<HoverDocumentation>,
     pub diagnostics: Rc<[DiagnosticEntry]>,
     pub(super) target_range: Range<usize>,
+    pub(super) documentation_target: Option<Range<usize>>,
     pub(super) pointer: Option<gpui::Point<gpui::Pixels>>,
 }
 
@@ -132,6 +133,7 @@ impl InputBaseState<EditorMode> {
         self.extras.hover_popover = Some(HoverPopoverState {
             target_range: symbol_range.clone(),
             pointer: None,
+            documentation_target: None,
             symbol_range,
             hover: Some(hover),
             documentation: None,
@@ -148,6 +150,7 @@ impl InputBaseState<EditorMode> {
             .get_or_insert_with(|| HoverPopoverState {
                 target_range: range.clone(),
                 pointer: None,
+                documentation_target: None,
                 symbol_range: range,
                 hover: None,
                 documentation: None,
@@ -258,6 +261,7 @@ impl InputBaseState<EditorMode> {
                 symbol_range: menu.range.start..menu.range.start,
                 target_range: menu.range.clone(),
                 pointer: None,
+                documentation_target: None,
                 hover: None,
                 documentation: None,
                 diagnostics: Rc::default(),
