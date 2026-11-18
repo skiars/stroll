@@ -5,18 +5,20 @@
 
 use std::{
     borrow::Cow,
+    rc::Rc,
     sync::{Arc, Mutex},
+    time::Duration,
 };
 
 use gpui::{
-    AppContext as _, Bounds, Context, DevicePixels, Font, FontId, FontMetrics, FontRun, GlyphId,
-    IntoElement, LineLayout, ParentElement as _, Pixels, PlatformTextSystem, Render,
-    RenderGlyphParams, ShapedGlyph, ShapedRun, SharedString, Size, Styled as _, TestAppContext,
+    AppContext as _, Bounds, Context, DevicePixels, Font, FontId, FontMetrics, FontRun, FontWeight,
+    GlyphId, IntoElement, LineLayout, ParentElement as _, Pixels, PlatformTextSystem, Render,
+    RenderGlyphParams, ShapedGlyph, ShapedRun, Size, Styled as _, Task, TestAppContext,
     TestDispatcher, TextRenderingMode, Window, div, point, px, size,
 };
 use gpui_component::{
-    Root,
-    input::{Editor, EditorState},
+    Root, ThemeMode,
+    input::{Editor, EditorState, HoverDocumentation, HoverParagraph, HoverProvider, Rope},
 };
 use lsp_types::{Hover, HoverContents, MarkupContent, MarkupKind};
 
@@ -25,68 +27,102 @@ const CODE_FONT: &str = "Editor Mono";
 /// Only the hover documentation spells the symbol this way, so what is shaped
 /// with it can only come from the popover.
 const SYMBOL: &str = "hover_doc_symbol";
-const HOVER: &str =
-    "```rust\nfn hover_doc_symbol()\n```\n\nDocumentation for `hover_doc_symbol`.\n";
+const SIGNATURE: &str = "```rust\nfn hover_doc_symbol()\n```\n\n";
+const ORIGINAL: &str = "Returns `true` if the option is a [`None`](https://example.com) value.";
+const TRANSLATION: &str =
+    "若选项为 [`None`](https://example.com)，则返回 `true`，否则返回 `false`。";
+
+struct Documentation;
+
+impl HoverProvider for Documentation {
+    fn hover(
+        &self,
+        _: &Rope,
+        _: usize,
+        _: &mut Window,
+        _: &mut gpui::App,
+    ) -> Task<anyhow::Result<Option<Hover>>> {
+        Task::ready(Ok(Some(Hover {
+            range: None,
+            contents: HoverContents::Markup(MarkupContent {
+                kind: MarkupKind::Markdown,
+                value: format!("{SIGNATURE}{ORIGINAL}"),
+            }),
+        })))
+    }
+
+    fn enrich_hover(
+        &self,
+        _: &Hover,
+        _: usize,
+        _: &mut Window,
+        cx: &mut gpui::App,
+    ) -> Task<Option<HoverDocumentation>> {
+        let timer = cx.background_executor().timer(Duration::from_millis(450));
+        cx.background_spawn(async move {
+            timer.await;
+            Some(HoverDocumentation {
+                paragraphs: Arc::new(std::collections::BTreeMap::from([(
+                    SIGNATURE.len(),
+                    HoverParagraph {
+                        original: ORIGINAL.into(),
+                        translation: TRANSLATION.into(),
+                    },
+                )])),
+                plaintext: None,
+            })
+        })
+    }
+}
 
 /// Font, byte offset and byte length of one shaped run.
 type RunSpan = (FontId, usize, usize);
+type ShapedLine = (String, Pixels, Vec<RunSpan>);
 
-/// A text system that hands every family its own font id and records which
+/// A text system that hands every font its own id and records which
 /// run every shaped line used.
 #[derive(Default)]
 struct RecordingTextSystem {
-    families: Mutex<Vec<(FontId, SharedString)>>,
-    /// `(text, runs)` per shaped line.
-    shaped: Mutex<Vec<(String, Vec<RunSpan>)>>,
+    fonts: Mutex<Vec<(FontId, Font)>>,
+    shaped: Mutex<Vec<ShapedLine>>,
 }
 
 impl RecordingTextSystem {
-    fn family_id(&self, family: SharedString) -> FontId {
-        let mut families = self.families.lock().unwrap();
-        if let Some((id, _)) = families.iter().find(|(_, known)| *known == family) {
+    fn record_font(&self, font: &Font) -> FontId {
+        let mut fonts = self.fonts.lock().unwrap();
+        if let Some((id, _)) = fonts.iter().find(|(_, known)| known == font) {
             return *id;
         }
-        let id = FontId(families.len() + 1);
-        families.push((id, family));
+        let id = FontId(fonts.len() + 1);
+        fonts.push((id, font.clone()));
         id
     }
 
-    fn family(&self, id: FontId) -> Option<SharedString> {
-        self.families
+    fn font(&self, id: FontId) -> Option<Font> {
+        self.fonts
             .lock()
             .unwrap()
             .iter()
             .find(|(known, _)| *known == id)
-            .map(|(_, family)| family.clone())
+            .map(|(_, font)| font.clone())
     }
 
-    /// The shaped lines that contain `needle`.
-    fn lines_containing(&self, needle: &str) -> Vec<String> {
-        self.shaped
-            .lock()
-            .unwrap()
-            .iter()
-            .map(|(text, _)| text.clone())
-            .filter(|text| text.contains(needle))
-            .collect()
-    }
-
-    /// The families of every run that covers `needle` in a shaped line.
-    fn families_covering(&self, needle: &str) -> Vec<SharedString> {
+    /// The font and size of every run that covers `needle`.
+    fn fonts_covering(&self, needle: &str) -> Vec<(Font, Pixels)> {
         let shaped = self.shaped.lock().unwrap();
-        let mut families = Vec::new();
-        for (text, runs) in shaped.iter() {
+        let mut fonts = Vec::new();
+        for (text, size, runs) in shaped.iter() {
             let Some(start) = text.find(needle) else {
                 continue;
             };
             let end = start + needle.len();
             for (font_id, run_start, run_len) in runs {
                 if *run_start < end && start < run_start + run_len {
-                    families.extend(self.family(*font_id));
+                    fonts.extend(self.font(*font_id).map(|font| (font, *size)));
                 }
             }
         }
-        families
+        fonts
     }
 }
 
@@ -100,7 +136,7 @@ impl PlatformTextSystem for RecordingTextSystem {
     }
 
     fn font_id(&self, descriptor: &Font) -> anyhow::Result<FontId> {
-        Ok(self.family_id(descriptor.family.clone()))
+        Ok(self.record_font(descriptor))
     }
 
     fn font_metrics(&self, _: FontId) -> FontMetrics {
@@ -175,7 +211,7 @@ impl PlatformTextSystem for RecordingTextSystem {
         self.shaped
             .lock()
             .unwrap()
-            .push((text.to_owned(), recorded_runs));
+            .push((text.to_owned(), font_size, recorded_runs));
 
         let metrics = self.font_metrics(FontId(0));
         LineLayout {
@@ -213,13 +249,18 @@ fn hover_markdown_shapes_code_in_the_editor_font() {
     );
     cx.update(|cx| {
         gpui_component::init(cx);
+        stroll::workspace::apply_theme(ThemeMode::Light, cx);
         cx.set_reduce_motion(true);
     });
 
     let mut editor = None;
     let (_, visual) = cx.add_window_view(|window, cx| {
         let text = "fn source_line() {}\n".repeat(8);
-        let state = cx.new(|cx| EditorState::new(window, cx).default_value(text));
+        let state = cx.new(|cx| {
+            let mut state = EditorState::new(window, cx).default_value(text);
+            state.lsp_mut().hover_provider = Some(Rc::new(Documentation));
+            state
+        });
         editor = Some(state.clone());
         let probe = cx.new(|_| EditorProbe(state));
         Root::new(probe, window, cx)
@@ -228,42 +269,56 @@ fn hover_markdown_shapes_code_in_the_editor_font() {
     visual.simulate_resize(size(px(600.), px(400.)));
     visual.update(|window, cx| window.draw(cx).clear(cx));
 
-    visual.update(|_, cx| {
-        editor.update(cx, |editor, cx| {
-            editor.present_hover(
-                3..9,
-                Hover {
-                    range: None,
-                    contents: HoverContents::Markup(MarkupContent {
-                        kind: MarkupKind::Markdown,
-                        value: HOVER.to_owned(),
-                    }),
-                },
-                cx,
-            );
-        });
-    });
-    visual.update(|window, cx| window.draw(cx).clear(cx));
+    let anchor = visual.update(|_, cx| editor.read(cx).range_to_bounds(&(3..9)).unwrap().center());
+    visual.simulate_mouse_move(anchor, None, Default::default());
 
-    assert!(visual.update(|_, cx| editor.read(cx).hover_popover().is_some()));
-    let lines = text_system.lines_containing(SYMBOL);
-    assert!(
-        lines.iter().any(|line| line.trim() == SYMBOL),
-        "the inline code span must be shaped: {lines:?}"
-    );
-    assert!(
-        lines
-            .iter()
-            .any(|line| line.starts_with("fn ") && line.contains(SYMBOL)),
-        "the fenced block must be shaped: {lines:?}"
-    );
-    let families = text_system.families_covering(SYMBOL);
-    assert!(
-        !families.is_empty(),
-        "the hover documentation must be shaped at all"
-    );
-    assert!(
-        families.iter().all(|family| family.as_ref() == CODE_FONT),
-        "hover code must be shaped in the editor font, got {families:?}"
-    );
+    for (delay, enriched) in [(500, false), (500, true)] {
+        visual.run_until_parked();
+        visual
+            .executor()
+            .advance_clock(Duration::from_millis(delay));
+        visual.run_until_parked();
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+        assert_eq!(
+            visual.update(|_, cx| editor
+                .read(cx)
+                .hover_popover()
+                .unwrap()
+                .documentation
+                .is_some()),
+            enriched
+        );
+        if enriched {
+            assert!(visual.debug_bounds("hover-original-paragraph").is_some());
+            assert!(visual.debug_bounds("hover-translated-paragraph").is_some());
+        }
+        for needle in [SYMBOL, "true", "None", "Returns"].into_iter().chain(
+            enriched
+                .then_some(["false", "若选项为"])
+                .into_iter()
+                .flatten(),
+        ) {
+            let expected = match needle {
+                "Returns" | "若选项为" => (UI_FONT, px(12.5)),
+                SYMBOL => (CODE_FONT, px(12.5)),
+                _ => (CODE_FONT, px(12.)),
+            };
+            let fonts = text_system.fonts_covering(needle);
+            assert!(
+                !fonts.is_empty()
+                    && fonts
+                        .iter()
+                        .all(|(font, size)| (font.family.as_ref(), *size) == expected),
+                "{needle} should use {expected:?} (enriched: {enriched}), got {fonts:?}"
+            );
+            if matches!(needle, "Returns" | "若选项为") {
+                assert!(
+                    fonts
+                        .iter()
+                        .all(|(font, _)| font.weight == FontWeight::NORMAL),
+                    "{needle} should use the default prose weight, got {fonts:?}"
+                );
+            }
+        }
+    }
 }

@@ -9,7 +9,7 @@ pub(crate) use completion_menu::*;
 pub(crate) use hover_popover::*;
 
 use gpui::{
-    App, Div, ElementId, InteractiveElement as _, IntoElement, SharedString, Stateful,
+    App, Div, ElementId, InteractiveElement as _, IntoElement, Pixels, SharedString, Stateful,
     StyleRefinement, Styled as _, Window, div, px, relative, rems,
 };
 
@@ -24,10 +24,27 @@ pub(super) fn render_markdown(
     window: &mut Window,
     cx: &mut App,
 ) -> TextView {
-    // Every caller renders its popover inside an editor, so the text style
-    // active here is the one the editor was drawn with: code takes that
-    // family, the prose keeps the UI font.
-    let code_font = window.text_style().font().family;
+    render_markdown_with_code_style(id, markdown, window.text_style().font().family, None, cx)
+}
+
+fn render_markdown_with_code_style(
+    id: impl Into<ElementId>,
+    markdown: impl Into<SharedString>,
+    code_font: SharedString,
+    inline_code_size: Option<Pixels>,
+    cx: &mut App,
+) -> TextView {
+    let mut inline_code = StyleRefinement::default()
+        .bg(if cx.theme().is_dark() {
+            gpui::rgb(0x292b33)
+        } else {
+            gpui::rgb(0xf4f5f7)
+        })
+        .border_0()
+        .rounded(px(3.))
+        .px(px(3.))
+        .font_family(code_font.clone());
+    inline_code.text.font_size = inline_code_size.map(Into::into);
     TextView::markdown(id, markdown)
         .style(
             TextViewStyle::default()
@@ -47,24 +64,13 @@ pub(super) fn render_markdown(
                         .p_0()
                         .text_size(px(12.5))
                         .line_height(relative(1.5))
-                        .font_family(code_font.clone()),
+                        .font_family(code_font),
                 ),
         )
         .font_family(cx.theme().font_family.clone())
         .text_size(px(12.5))
         .line_height(relative(1.6))
-        .inline_code_style(
-            StyleRefinement::default()
-                .bg(if cx.theme().is_dark() {
-                    gpui::rgb(0x292b33)
-                } else {
-                    gpui::rgb(0xf4f5f7)
-                })
-                .border_0()
-                .rounded(px(3.))
-                .px(px(3.))
-                .font_family(code_font),
-        )
+        .inline_code_style(inline_code)
         .code_block_actions(|_, _, _| div().into_any_element())
         .selectable(true)
 }

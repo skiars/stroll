@@ -5,9 +5,9 @@ use std::{cell::Cell, ops::Range, rc::Rc, time::Instant};
 use gpui::{
     AnyElement, App, AppContext as _, AvailableSpace, Bounds, Element, ElementId, Entity,
     InteractiveElement, IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
-    ParentElement as _, Pixels, Point, Render, ScrollHandle, StatefulInteractiveElement as _,
-    StyleRefinement, Styled, Window, deferred, div, linear_color_stop, linear_gradient, point,
-    prelude::FluentBuilder as _, px, relative, rems,
+    ParentElement as _, Pixels, Point, Render, ScrollHandle, SharedString,
+    StatefulInteractiveElement as _, StyleRefinement, Styled, Window, deferred, div,
+    linear_color_stop, linear_gradient, point, prelude::FluentBuilder as _, px, relative, rems,
 };
 
 use crate::{
@@ -15,7 +15,10 @@ use crate::{
     highlighter::{DiagnosticEntry, diagnostic_foreground},
     input::{
         EditorState, HoverPopoverState,
-        popovers::{CodeActionMenu, QUICK_FIX_BUTTON_SIZE, quick_fix_button, render_markdown},
+        popovers::{
+            CodeActionMenu, QUICK_FIX_BUTTON_SIZE, quick_fix_button,
+            render_markdown_with_code_style,
+        },
     },
     scroll::{ScrollbarMode, popup_scrollbar},
     text::{MarkdownExtensions, MarkdownNode, TextView},
@@ -31,7 +34,7 @@ pub struct HoverPopover {
     closing: bool,
     actions: Option<Entity<CodeActionMenu>>,
     position: Rc<Cell<Option<Point<Pixels>>>>,
-    documentation: MarkdownExtensions,
+    documentation: Option<(SharedString, MarkdownExtensions)>,
 }
 
 impl HoverPopover {
@@ -41,7 +44,7 @@ impl HoverPopover {
         cx: &mut App,
     ) -> Entity<Self> {
         cx.new(|_| Self {
-            documentation: documentation_extensions(&content),
+            documentation: None,
             editor,
             content,
             motion: PopupMotion::new(PopupMotionKind::Hover, Instant::now()),
@@ -92,7 +95,7 @@ impl HoverPopover {
             && self.content.symbol_range == content.symbol_range
             && self.content.documentation != content.documentation;
         if self.content.documentation != content.documentation {
-            self.documentation = documentation_extensions(&content);
+            self.documentation = None;
         }
         if !appended_documentation && !enriched {
             self.scroll.set_offset(point(px(0.), px(0.)));
@@ -149,7 +152,23 @@ impl Render for HoverPopover {
                 }
                 lsp_types::HoverContents::Markup(markup) => markup.value.clone(),
             });
-        let extensions = self.documentation.clone();
+        // Nested Markdown renderers run under the prose style, so capture the
+        // editor font here and pass it through for all hover code.
+        let code_font = window.text_style().font().family;
+        if self
+            .documentation
+            .as_ref()
+            .is_some_and(|(font, _)| *font != code_font)
+        {
+            self.documentation = None;
+        }
+        let (_, extensions) = self.documentation.get_or_insert_with(|| {
+            (
+                code_font.clone(),
+                documentation_extensions(&self.content, code_font.clone()),
+            )
+        });
+        let extensions = extensions.clone();
         let plaintext = self
             .content
             .documentation
@@ -172,7 +191,7 @@ impl Render for HoverPopover {
             "hover-popover",
             self.editor.clone(),
             self.content.symbol_range.clone(),
-            move |window, cx| {
+            move |_, cx| {
                 let mut content = div().flex().flex_col();
                 for (index, diagnostic) in diagnostics.iter().enumerate() {
                     let last =
@@ -197,9 +216,14 @@ impl Render for HoverPopover {
                             .px(px(12.))
                             .py(px(8.))
                             .child(
-                                render_markdown("message", documentation.clone(), window, cx)
-                                    .code_languages(code_languages.clone())
-                                    .markdown_extensions(extensions.clone()),
+                                render_hover_markdown(
+                                    "message",
+                                    documentation.clone(),
+                                    &code_font,
+                                    cx,
+                                )
+                                .code_languages(code_languages.clone())
+                                .markdown_extensions(extensions.clone()),
                             )
                             .when_some(plaintext.clone(), |view, text| {
                                 view.child(
@@ -235,7 +259,25 @@ impl Render for HoverPopover {
     }
 }
 
-fn documentation_extensions(content: &HoverPopoverState) -> MarkdownExtensions {
+fn render_hover_markdown(
+    id: impl Into<ElementId>,
+    markdown: impl Into<SharedString>,
+    code_font: &SharedString,
+    cx: &mut App,
+) -> TextView {
+    render_markdown_with_code_style(
+        id,
+        markdown,
+        code_font.clone(),
+        cx.theme().hover_inline_code_size,
+        cx,
+    )
+}
+
+fn documentation_extensions(
+    content: &HoverPopoverState,
+    code_font: SharedString,
+) -> MarkdownExtensions {
     use crate::input::HoverParagraph;
     use crate::text::markdown_ast::Node;
 
@@ -261,7 +303,7 @@ fn documentation_extensions(content: &HoverPopoverState) -> MarkdownExtensions {
                     .markdown(cx.node_source(node)?),
             )
         })
-        .block_renderer(PAIRED, |node, window, cx| {
+        .block_renderer(PAIRED, move |node, window, cx| {
             let (offset, pair) = node.data::<(usize, HoverParagraph)>().unwrap();
             div()
                 .id(("hover-paragraph", *offset))
@@ -274,6 +316,7 @@ fn documentation_extensions(content: &HoverPopoverState) -> MarkdownExtensions {
                     *offset,
                     pair.original.clone(),
                     None,
+                    &code_font,
                     window,
                     cx,
                 ))
@@ -282,6 +325,7 @@ fn documentation_extensions(content: &HoverPopoverState) -> MarkdownExtensions {
                     *offset,
                     pair.translation.clone(),
                     Some(cx.theme().muted_foreground),
+                    &code_font,
                     window,
                     cx,
                 ))
@@ -293,26 +337,32 @@ fn documentation_extensions(content: &HoverPopoverState) -> MarkdownExtensions {
 fn hover_prose(
     id: &'static str,
     offset: usize,
-    text: gpui::SharedString,
+    text: SharedString,
     color: Option<gpui::Hsla>,
+    code_font: &SharedString,
     window: &mut Window,
     cx: &mut App,
 ) -> impl IntoElement {
-    let width = render_markdown(format!("{id}-measure-{offset}"), text.clone(), window, cx)
-        .into_any_element()
-        .layout_as_root(
-            gpui::size(AvailableSpace::MaxContent, AvailableSpace::MaxContent),
-            window,
-            cx,
-        )
-        .width;
+    let width = render_hover_markdown(
+        format!("{id}-measure-{offset}"),
+        text.clone(),
+        code_font,
+        cx,
+    )
+    .into_any_element()
+    .layout_as_root(
+        gpui::size(AvailableSpace::MaxContent, AvailableSpace::MaxContent),
+        window,
+        cx,
+    )
+    .width;
     div()
         .debug_selector(move || id.into())
         .w(width)
         .max_w_full()
         .flex_none()
         .child(
-            render_markdown((id, offset), text, window, cx)
+            render_hover_markdown((id, offset), text, code_font, cx)
                 .when_some(color, |view, color| view.text_color(color)),
         )
 }

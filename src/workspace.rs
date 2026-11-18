@@ -449,6 +449,7 @@ fn apply_theme_with_fonts(
         theme.font_size = ui_font_size;
         theme.control_font_size = ui_font_size;
         theme.mono_font_size = px(13.5);
+        theme.hover_inline_code_size = Some(px(12.));
         theme.font_family = ui_font.unwrap_or_else(|| {
             let config = if mode.is_dark() {
                 &theme.dark_theme

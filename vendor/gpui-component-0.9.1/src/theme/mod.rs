@@ -191,6 +191,9 @@ pub struct Theme {
     pub mono_font_family: SharedString,
     /// The monospace font size for the application, default is 13px.
     pub mono_font_size: Pixels,
+    /// Overrides the inline code size in editor hover documentation.
+    #[serde(default)]
+    pub hover_inline_code_size: Option<Pixels>,
     /// Radius for the general elements.
     pub radius: Pixels,
     /// Radius for the large elements, e.g.: Dialog, Notification border radius.
@@ -799,6 +802,7 @@ impl From<&ThemeColor> for Theme {
             control_font_size: default_control_font_size(),
             mono_font_family: mono_font::default_mono_font_family(),
             mono_font_size: px(13.),
+            hover_inline_code_size: None,
             radius: px(6.),
             radius_lg: px(8.),
             window_radius: px(0.),

@@ -189,6 +189,10 @@ dialogs in a Wayland window after changes to paint order or focus handling.
   renderer and wrap independently. Run
   `cargo test --release --locked --test popups editor_hover_enrichment` to
   verify the delayed update, layout and cancellation.
+- Paired hover paragraphs preserve the editor's code font. Applications can
+  set `Theme::hover_inline_code_size` to override the default inline code
+  scaling. Run `cargo test --release --locked --test hover_font` to verify the
+  rendered font families, sizes, and prose weight.
 
 - Tab accepts the selected item in the shared editor completion menu through
   the same edit path as Enter. With no list candidate it retains inline
