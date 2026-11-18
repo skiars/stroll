@@ -17,6 +17,93 @@ fn settle(visual: &mut VisualTestContext) {
 }
 
 #[::core::prelude::v1::test]
+fn single_file_mode_switches_the_diff_and_keeps_wrap_in_the_reading_menu() {
+    let fixture = tempfile::tempdir().unwrap();
+    let root = fixture.path().join("repo");
+    fs::create_dir(&root).unwrap();
+    git(&root, &["init", "-qb", "main"]);
+    fs::write(root.join("first.txt"), "first change\n").unwrap();
+    fs::write(root.join("second.txt"), "second change\n").unwrap();
+
+    let mut app = TestAppContext::build_with_text_system(
+        TestDispatcher::new(0),
+        None,
+        gpui_platform::current_platform(true).text_system(),
+    );
+    app.update(gpui_component::init);
+    let store = Arc::new(Store::new(fixture.path().join("state")).unwrap());
+    let config = crate::config::ConfigFile::load(Some(fixture.path().join("config.toml")));
+    let mut workspace = None;
+    let (_, visual) = app.add_window_view(|window, cx| {
+        let view =
+            cx.new(|cx| Workspace::with_config(store, config, WorkspaceView::Git, window, cx));
+        workspace = Some(view.clone());
+        gpui_component::Root::new(view, window, cx)
+    });
+    let workspace = workspace.unwrap();
+    visual.simulate_resize(size(px(1280.), px(850.)));
+    visual.update(|window, cx| {
+        workspace.update(cx, |workspace, cx| {
+            workspace.open_repository(
+                Location {
+                    root: root.clone(),
+                    file: None,
+                },
+                window,
+                cx,
+            );
+        });
+    });
+    settle(visual);
+    let panel = visual.update(|window, cx| {
+        let panel = workspace.read(cx).git.clone().unwrap();
+        panel.update(cx, |panel, cx| {
+            panel.set_history_visible(false, cx);
+            panel.set_tree_visible(true, cx);
+            panel.select_worktree(window, cx);
+        });
+        panel
+    });
+    settle(visual);
+
+    let click = |visual: &mut VisualTestContext, selector| {
+        let center = visual.debug_bounds(selector).unwrap().center();
+        visual.simulate_click(center, Modifiers::default());
+        settle(visual);
+    };
+    let paths = |visual: &mut VisualTestContext| {
+        visual.update(|_, cx| {
+            panel
+                .read(cx)
+                .diff
+                .read(cx)
+                .files()
+                .iter()
+                .map(|file| file.path().to_string())
+                .collect::<Vec<_>>()
+        })
+    };
+    assert_eq!(paths(visual), ["first.txt", "second.txt"]);
+    click(visual, "git-diff-single-file");
+    assert_eq!(paths(visual), ["first.txt"]);
+    click(visual, "git-tree-row:file:second.txt");
+    assert_eq!(paths(visual), ["second.txt"]);
+    click(visual, "git-tree-row:file:first.txt");
+    assert_eq!(paths(visual), ["first.txt"]);
+
+    let wrap = visual.update(|_, cx| panel.read(cx).wrap);
+    click(visual, "git-reading-options");
+    assert!(visual.debug_bounds("popup-menu-surface").is_some());
+    visual.simulate_keystrokes("down down down enter");
+    settle(visual);
+    assert_eq!(visual.update(|_, cx| panel.read(cx).wrap), !wrap);
+    assert_eq!(paths(visual), ["first.txt"]);
+
+    click(visual, "git-diff-single-file");
+    assert_eq!(paths(visual), ["first.txt", "second.txt"]);
+}
+
+#[::core::prelude::v1::test]
 fn git_menus_confirm_restore_and_discard_for_files_and_filtered_directories() {
     let fixture = tempfile::tempdir().unwrap();
     let root = fixture.path().join("repo");

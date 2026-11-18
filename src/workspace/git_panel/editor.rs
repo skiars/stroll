@@ -1621,7 +1621,8 @@ impl ReviewEditor {
                             if aligned {
                                 panel.pending_file_reveal = None;
                             }
-                            if panel.pending_file_reveal.is_none()
+                            if !panel.single_file
+                                && panel.pending_file_reveal.is_none()
                                 && let Some(review) = &mut panel.review
                             {
                                 review.active =

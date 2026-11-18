@@ -757,6 +757,10 @@ impl GitPanel {
                             .collect::<HashMap<_, _>>();
                         let active = active_path
                             .and_then(|path| by_path.get(path).copied())
+                            .or_else(|| {
+                                let anchor = viewport.as_ref().filter(|_| this.single_file)?;
+                                by_path.get(anchor.path()).copied()
+                            })
                             .or_else(|| (!keep && !detail.files.is_empty()).then_some(0));
                         let patches = detail
                             .files
@@ -1023,17 +1027,32 @@ impl GitPanel {
     }
 
     fn sync_review_documents(&mut self, keep: bool, cx: &mut Context<Self>) {
-        let Some(review) = &self.review else { return };
+        let Some(review) = &mut self.review else {
+            return;
+        };
         let repo = self
             .workspace
             .upgrade()
             .and_then(|workspace| workspace.read(cx).document_repository());
+        let matches_filter = |file: &git::ChangedFile| {
+            !self.only_matching || super::tree::matches(file, &self.filter)
+        };
+        if self.single_file {
+            review.active = review
+                .active
+                .filter(|&ix| matches_filter(&review.detail.files[ix]))
+                .or_else(|| review.detail.files.iter().position(matches_filter));
+        }
         let visible = review
             .documents
             .iter()
             .enumerate()
             .filter(|(ix, _)| {
-                !self.only_matching || super::tree::matches(&review.detail.files[*ix], &self.filter)
+                if self.single_file {
+                    review.active == Some(*ix)
+                } else {
+                    matches_filter(&review.detail.files[*ix])
+                }
             })
             .map(|(_, document)| document.clone())
             .map(|document| scope_diff_document(document, repo.as_deref()))
@@ -1102,11 +1121,8 @@ impl GitPanel {
         };
         let file = &review.detail.files[ix];
         let path = file.path.clone();
-        if self.only_matching && !super::tree::matches(file, &self.filter) {
-            self.only_matching = false;
-            self.sync_documents(cx);
-        }
-        let review = self.review.as_mut().unwrap();
+        let clear_filter = self.only_matching && !super::tree::matches(file, &self.filter);
+        let switch_file = self.single_file && review.active != Some(ix);
         review.active = Some(ix);
         if expand {
             self.pending_editor_open = None;
@@ -1117,6 +1133,12 @@ impl GitPanel {
         self.pending_file_reveal = None;
         self.pending_position = None;
         self.pending_review_anchor = None;
+        if clear_filter {
+            self.only_matching = false;
+        }
+        if clear_filter || switch_file {
+            self.sync_documents(cx);
+        }
         self.diff.update(cx, |diff, cx| {
             if expand {
                 diff.set_file_collapsed(&path, false, cx);
@@ -2272,6 +2294,18 @@ impl GitPanel {
         cx.notify();
     }
 
+    fn toggle_single_file(&mut self, cx: &mut Context<Self>) {
+        let anchor = self.editor.change_anchor(self.diff.read(cx), cx);
+        self.single_file = !self.single_file;
+        self.pending_file_reveal = None;
+        self.sync_review_documents(true, cx);
+        if let Some(anchor) = anchor {
+            self.diff.read(cx).restore_viewport_anchor(&anchor);
+            self.editor.restore_viewport();
+        }
+        cx.notify();
+    }
+
     pub(in crate::workspace) fn toggle_wrap(
         &mut self,
         window: &mut Window,
@@ -2525,12 +2559,13 @@ impl GitPanel {
                 })
                 .child(
                     icon_control(
-                        "git-diff-wrap",
-                        IconName::TextWrap,
-                        t!("git.wrap_diff"),
-                        self.wrap,
+                        "git-diff-single-file",
+                        IconName::FileDiff,
+                        t!("git.single_file_diff"),
+                        self.single_file,
                     )
-                    .on_click(cx.listener(|this, _, window, cx| this.toggle_wrap(window, cx))),
+                    .debug_selector(|| "git-diff-single-file".into())
+                    .on_click(cx.listener(|this, _, _, cx| this.toggle_single_file(cx))),
                 )
                 .child(
                     icon_control(
@@ -2563,14 +2598,17 @@ impl GitPanel {
         let view = cx.weak_entity();
         let whitespace = self.whitespace;
         let split = self.split;
+        let wrap = self.wrap;
         icon_button(
             "git-reading-options",
             IconName::Ellipsis,
             t!("git.review_options"),
         )
+        .debug_selector(|| "git-reading-options".into())
         .dropdown_menu(move |menu, _, _| {
             let whitespace_view = view.clone();
             let split_view = view.clone();
+            let wrap_view = view.clone();
             let previous = view.clone();
             let next = view.clone();
             menu.item(
@@ -2589,6 +2627,13 @@ impl GitPanel {
                             this.split = !this.split;
                             cx.notify();
                         });
+                    }),
+            )
+            .item(
+                PopupMenuItem::new(t!("git.wrap_diff"))
+                    .checked(wrap)
+                    .on_click(move |_, window, cx| {
+                        _ = wrap_view.update(cx, |this, cx| this.toggle_wrap(window, cx));
                     }),
             )
             .separator()

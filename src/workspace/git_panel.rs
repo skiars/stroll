@@ -289,6 +289,7 @@ pub(super) struct GitPanel {
     query: String,
     filter: String,
     only_matching: bool,
+    single_file: bool,
     selection: Option<Selection>,
     review: Option<Review>,
     snapshot: Option<Snapshot>,
@@ -444,6 +445,7 @@ impl GitPanel {
             }),
             cx.subscribe_in(&diff, window, |this, diff, event, window, cx| {
                 if matches!(event, DiffEvent::Scrolled | DiffEvent::VisibleFilesChanged)
+                    && !this.single_file
                     && this.snapshot.is_none()
                     && this.pending_file_reveal.is_none()
                     && let Some(review) = &mut this.review
@@ -543,6 +545,7 @@ impl GitPanel {
             query,
             filter: String::new(),
             only_matching: false,
+            single_file: false,
             selection: None,
             review: None,
             snapshot: None,
