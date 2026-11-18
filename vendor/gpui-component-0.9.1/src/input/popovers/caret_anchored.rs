@@ -117,8 +117,8 @@ impl Element for CaretAnchoredPopup {
         );
         let size = content.layout_as_root(
             Size {
-                width: AvailableSpace::Definite(viewport.width),
-                height: AvailableSpace::Definite(viewport.height),
+                width: AvailableSpace::MaxContent,
+                height: AvailableSpace::MinContent,
             },
             window,
             cx,

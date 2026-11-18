@@ -1066,6 +1066,8 @@ fn workspace_caret_hints_use_the_latest_symbol_and_signature() -> Result<()> {
             })?;
             let bounds = visual.debug_bounds("editor-signature-help").unwrap();
             assert!(bounds.left() >= px(0.) && bounds.top() >= px(0.));
+            assert!(bounds.size.width < px(320.));
+            assert!(bounds.right() <= px(932.));
             visual.simulate_keystrokes("ctrl-space");
             wait(visual, "completion while signature is active", |visual| {
                 labels(visual, editor) == ["candidate"]
