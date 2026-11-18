@@ -10,6 +10,7 @@ mod file_drop;
 mod file_icons;
 mod file_tabs;
 mod file_tree;
+mod folder_icons;
 mod git_history;
 mod git_panel;
 mod image_preview;
@@ -681,6 +682,7 @@ struct TreeRow {
     depth: usize,
     expanded: bool,
     dimmed: bool,
+    guides: file_tree::TreeGuides,
 }
 
 pub struct Workspace {
@@ -1495,17 +1497,24 @@ impl Workspace {
             path: &Path,
             depth: usize,
             ignored_ancestor: bool,
+            continuing_guides: u16,
             expanded: &BTreeSet<PathBuf>,
             rows: &mut Vec<TreeRow>,
         ) {
             if let Some(children) = children_of(path) {
-                for entry in children {
+                for (index, entry) in children.iter().enumerate() {
+                    let guides = file_tree::TreeGuides::new(
+                        continuing_guides,
+                        depth,
+                        index + 1 == children.len(),
+                    );
                     let open = entry.directory && expanded.contains(&entry.path);
                     rows.push(TreeRow {
                         entry: entry.clone(),
                         depth,
                         expanded: open,
                         dimmed: entry.ignored && !ignored_ancestor,
+                        guides,
                     });
                     if open {
                         visit(
@@ -1513,6 +1522,7 @@ impl Workspace {
                             &entry.path,
                             depth + 1,
                             ignored_ancestor || entry.ignored,
+                            guides.continuing(),
                             expanded,
                             rows,
                         );
@@ -1527,6 +1537,7 @@ impl Workspace {
                 Path::new(""),
                 0,
                 false,
+                0,
                 &self.docs_expanded,
                 &mut rows,
             );
@@ -1540,6 +1551,7 @@ impl Workspace {
                 Path::new(""),
                 0,
                 false,
+                0,
                 &self.expanded,
                 &mut rows,
             );
@@ -3464,9 +3476,21 @@ impl Workspace {
         let status = self.tree_status.clone();
         let inline = self.tree_edit.as_ref().and_then(|edit| {
             let (index, depth, replace) = edit.row(&rows)?;
-            Some((index, depth, replace))
+            let guides = if replace {
+                rows[index].guides
+            } else if depth == 0 {
+                file_tree::TreeGuides::default()
+            } else {
+                let has_children = rows.get(index).is_some_and(|row| row.depth == depth);
+                file_tree::TreeGuides::new(
+                    rows[index - 1].guides.continuing(),
+                    depth,
+                    !has_children,
+                )
+            };
+            Some((index, depth, replace, guides))
         });
-        let row_count = rows.len() + usize::from(inline.is_some_and(|(_, _, replace)| !replace));
+        let row_count = rows.len() + usize::from(inline.is_some_and(|(_, _, replace, _)| !replace));
         let active = if self.view == WorkspaceView::Docs {
             self.session.document.clone()
         } else if self.tree_focus.is_focused(window) {
@@ -3492,13 +3516,19 @@ impl Workspace {
             frame,
             move |index, _, cx| {
                 let mut row_index = index;
-                if let Some((edit_index, depth, replace)) = inline {
+                if let Some((edit_index, depth, replace, guides)) = inline {
                     if index == edit_index {
                         return weak
                             .read_with(cx, |this, _| {
-                                this.tree_edit
-                                    .as_ref()
-                                    .map(|edit| edit.element(depth, this.tree_busy, weak.clone()))
+                                this.tree_edit.as_ref().map(|edit| {
+                                    edit.element(
+                                        depth,
+                                        guides,
+                                        colors.muted,
+                                        this.tree_busy,
+                                        weak.clone(),
+                                    )
+                                })
                             })
                             .ok()
                             .flatten();
@@ -3518,36 +3548,26 @@ impl Workspace {
                 let decoration = in_workspace
                     .then(|| status.decoration(&entry, colors, cx))
                     .flatten();
-                let glyph = if entry.directory {
-                    if row.expanded {
-                        Some(IconName::FolderOpen)
-                    } else {
-                        Some(IconName::Folder)
-                    }
-                } else if entry.symlink {
-                    Some(IconName::Link)
+                let icon_color = if selected {
+                    colors.accent
                 } else {
-                    None
+                    colors.muted
                 };
-                let entry_icon = match glyph {
-                    Some(glyph) => icon(
-                        glyph,
-                        if selected {
-                            colors.accent
-                        } else {
-                            colors.muted
-                        },
-                        15.,
-                    ),
-                    None => file_type_icon(&entry.path, colors, 15.),
+                let entry_icon = if directory {
+                    folder_icons::folder_icon(&entry.path, row.expanded, icon_color, colors)
+                } else if entry.symlink {
+                    icon(IconName::Link, icon_color, 15.).into_any_element()
+                } else {
+                    file_type_icon(&entry.path, colors, 15.).into_any_element()
                 };
                 let element = h_flex()
                     .id(SharedString::from(row_id.clone()))
                     .debug_selector(move || row_id.clone())
+                    .relative()
                     .h(tree_motion::ROW_HEIGHT)
                     .w_full()
                     .gap(px(5.))
-                    .pl(px(15. + 14. * row.depth.min(16) as f32))
+                    .pl(file_tree::tree_indent(row.depth))
                     .pr_2()
                     .cursor_pointer()
                     .hover(|style| style.bg(colors.hover))
@@ -3572,6 +3592,7 @@ impl Workspace {
                             this.tree_click(clicked.clone(), event, window, cx)
                         });
                     })
+                    .children(row.guides.element(colors.muted))
                     .child(entry_icon)
                     .child(
                         div()

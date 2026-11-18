@@ -8,6 +8,77 @@ use gpui_component::{
 use super::*;
 use crate::repository::files::{CopyTarget, EntryVersion, FileOperation, valid_name};
 
+const TREE_GUTTER: f32 = 15.;
+const TREE_INDENT: f32 = 14.;
+const MAX_TREE_DEPTH: usize = u16::BITS as usize;
+
+pub(super) fn tree_indent(depth: usize) -> Pixels {
+    px(TREE_GUTTER + TREE_INDENT * depth.min(MAX_TREE_DEPTH) as f32)
+}
+
+#[derive(Clone, Copy, Default)]
+pub(super) struct TreeGuides {
+    full: u16,
+    half: u16,
+}
+
+impl TreeGuides {
+    pub(super) fn new(ancestors: u16, depth: usize, last: bool) -> Self {
+        let branch = match depth {
+            1..=MAX_TREE_DEPTH => 1 << (depth - 1),
+            _ => 0,
+        };
+        if last {
+            Self {
+                full: ancestors,
+                half: branch,
+            }
+        } else {
+            Self {
+                full: ancestors | branch,
+                half: 0,
+            }
+        }
+    }
+
+    pub(super) fn continuing(self) -> u16 {
+        self.full
+    }
+
+    pub(super) fn element(self, color: Hsla) -> Option<impl IntoElement> {
+        (self.full | self.half != 0).then(|| {
+            canvas(
+                |_, _, _| (),
+                move |bounds, (), window, _| {
+                    for level in 0..MAX_TREE_DEPTH {
+                        let bit = 1 << level;
+                        if (self.full | self.half) & bit == 0 {
+                            continue;
+                        }
+                        let height = if self.half & bit != 0 {
+                            bounds.size.height / 2.
+                        } else {
+                            bounds.size.height
+                        };
+                        let x = bounds.left() + px(TREE_GUTTER + TREE_INDENT * level as f32 + 7.);
+                        let mut y = px(0.);
+                        while y < height {
+                            let dash = Bounds::new(
+                                point(x, bounds.top() + y),
+                                size(px(1.), px(2.).min(height - y)),
+                            );
+                            window.paint_quad(fill(dash, color.opacity(0.35)));
+                            y += px(4.);
+                        }
+                    }
+                },
+            )
+            .absolute()
+            .inset_0()
+        })
+    }
+}
+
 pub(super) struct TreeEdit {
     path: PathBuf,
     directory: bool,
@@ -33,13 +104,16 @@ impl TreeEdit {
     pub(super) fn element(
         &self,
         depth: usize,
+        guides: TreeGuides,
+        guide_color: Hsla,
         busy: bool,
         workspace: WeakEntity<Workspace>,
     ) -> AnyElement {
         h_flex()
-            .h(px(28.))
+            .relative()
+            .h(tree_motion::ROW_HEIGHT)
             .w_full()
-            .pl(px(15. + 14. * depth.min(16) as f32))
+            .pl(tree_indent(depth))
             .pr_2()
             .on_key_down(move |event, window, cx| {
                 if event.keystroke.key == "escape" && !busy {
@@ -47,6 +121,7 @@ impl TreeEdit {
                     _ = workspace.update(cx, |this, cx| this.finish_tree_edit(window, cx));
                 }
             })
+            .children(guides.element(guide_color))
             .child(Input::new(&self.input).small().disabled(busy).w_full())
             .into_any_element()
     }

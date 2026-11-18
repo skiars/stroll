@@ -62,7 +62,11 @@ pub(super) fn file_type_icon(path: &Path, colors: Palette, size: f32) -> Icon {
         "yaml" => glyph(IconName::FileCog, 0xaa3135, 0xf17b7d),
         "text" if crate::image_viewer::is_image(path) => glyph(IconName::Image, 0x117065, 0x58c2b6),
         "text" if audio_preview::is_audio(path) => glyph(IconName::Music, 0xa63349, 0xf17d94),
-        "text" => icon(IconName::FileText, colors.muted, size),
+        "text" => Icon::default()
+            .data(include_bytes!("file_icons/text.svg"))
+            .with_size(px(size))
+            .text_color(colors.muted)
+            .flex_shrink_0(),
         _ => icon(IconName::FileCode, colors.muted, size),
     }
 }
