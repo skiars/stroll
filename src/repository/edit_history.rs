@@ -121,7 +121,7 @@ impl Store {
             .optional()?)
     }
 
-    pub(super) fn update_editor_draft(
+    pub(crate) fn update_editor_draft(
         &self,
         repo: Option<&Repository>,
         path: &Path,

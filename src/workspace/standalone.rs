@@ -579,3 +579,96 @@ fn standalone_embedded_images_open_the_original_in_the_preview() -> Result<()> {
 
     Ok(())
 }
+
+#[cfg(all(test, target_os = "linux"))]
+#[::core::prelude::v1::test]
+fn standalone_editor_syncs_external_replacements_and_retains_draft_conflicts() -> Result<()> {
+    use std::time::{Duration, Instant};
+
+    use gpui::{TestAppContext, TestDispatcher, VisualTestContext};
+    use gpui_component::Root;
+
+    let fixture = tempfile::tempdir()?;
+    let path = fixture.path().canonicalize()?.join("notes.txt");
+    fs::write(&path, "Original\n")?;
+    let store = Arc::new(Store::new(fixture.path().join("state"))?);
+    let config = ConfigFile::load(Some(fixture.path().join("config.toml")));
+    let mut app = TestAppContext::build_with_text_system(
+        TestDispatcher::new(0),
+        None,
+        gpui_platform::current_platform(true).text_system(),
+    );
+    app.update(gpui_component::init);
+    let open = |app: &mut TestAppContext| -> Result<_> {
+        app.update(|cx| {
+            Workspace::open_standalone(store.clone(), config.clone(), path.clone(), None, cx)
+        })?;
+        let handle = app.windows()[0];
+        let workspace = app.update_window(handle, |root, _, cx| {
+            root.downcast::<Root>()
+                .unwrap()
+                .read(cx)
+                .view()
+                .clone()
+                .downcast::<Workspace>()
+                .unwrap()
+        })?;
+        Ok((workspace, VisualTestContext::from_window(handle, app)))
+    };
+    let settle = |visual: &mut VisualTestContext,
+                  workspace: &Entity<Workspace>,
+                  ready: &dyn Fn(&Workspace, &App) -> bool| {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            visual.executor().advance_clock(Duration::from_millis(30));
+            visual.run_until_parked();
+            if visual.update(|window, cx| {
+                window.draw(cx).clear(cx);
+                ready(workspace.read(cx), cx)
+            }) {
+                break;
+            }
+            assert!(Instant::now() < deadline, "Timed out waiting for file sync");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    };
+    let replace = |text: &str| -> Result<()> {
+        let staged = path.with_extension("tmp");
+        fs::write(&staged, text)?;
+        fs::rename(staged, &path)?;
+        Ok(())
+    };
+    let (workspace, mut visual) = open(&mut app)?;
+    settle(&mut visual, &workspace, &|this, _| {
+        this.repository_watch_active && this.active_file().is_some()
+    });
+    replace("External edit\n")?;
+    settle(&mut visual, &workspace, &|this, cx| {
+        this.active_file()
+            .is_some_and(|file| file.editor.read(cx).text() == "External edit\n")
+    });
+    visual.simulate_input("Draft: ");
+    replace("Different disk contents\n")?;
+    let conflict = |this: &Workspace, cx: &App| {
+        this.active_file().is_some_and(|file| {
+            file.document.conflict && file.editor.read(cx).text() == "Draft: External edit\n"
+        })
+    };
+    settle(&mut visual, &workspace, &conflict);
+    assert_eq!(fs::read_to_string(&path)?, "Different disk contents\n");
+    visual.update(|window, _| window.remove_window());
+
+    let (workspace, mut visual) = open(&mut app)?;
+    settle(&mut visual, &workspace, &|this, cx| {
+        this.repository_watch_active && conflict(this, cx)
+    });
+    let revision = visual.update(|_, cx| workspace.read(cx).active_file().unwrap().sync_revision);
+    replace("Different disk contents\n")?;
+    settle(&mut visual, &workspace, &|this, _| {
+        this.active_file()
+            .is_some_and(|file| file.sync_revision > revision)
+    });
+    visual.run_until_parked();
+    assert!(visual.update(|_, cx| conflict(workspace.read(cx), cx)));
+    Ok(())
+}

@@ -147,35 +147,11 @@ impl RepoWatcher {
         let git = super::repo::git_dir(root).canonicalize()?;
         let common = common.canonicalize()?;
         let root = root.canonicalize()?;
-        let events = RepoEvents::default();
-        let output = events.clone();
         let worktree = root.clone();
         let admin = git.clone();
         let shared = common.clone();
-        let mut watcher = notify::RecommendedWatcher::new(
-            move |event: notify::Result<notify::Event>| {
-                output.push(match event {
-                    Ok(event) if !event.need_rescan() && !event.kind.is_access() => {
-                        classify(&worktree, &admin, &shared, event)
-                    }
-                    Ok(event) if !event.need_rescan() => return,
-                    Ok(_) => RepoChanges {
-                        rescan: true,
-                        ..Default::default()
-                    },
-                    Err(_) => {
-                        // The consumer will reconcile and switch to its fallback.
-                        output.push(RepoChanges {
-                            rescan: true,
-                            ..Default::default()
-                        });
-                        output.close();
-                        return;
-                    }
-                });
-            },
-            notify::Config::default().with_follow_symlinks(false),
-        )?;
+        let (mut watcher, events) =
+            Self::build(move |event| classify(&worktree, &admin, &shared, event))?;
         watcher
             .watch(&root, RecursiveMode::Recursive)
             .context("Watch worktree")?;
@@ -198,6 +174,51 @@ impl RepoWatcher {
             _watcher: watcher,
             events,
         })
+    }
+
+    pub fn open_file(path: &Path) -> Result<Self> {
+        let file = path.to_owned();
+        let (mut watcher, events) = Self::build(move |event| RepoChanges {
+            rescan: event.paths.iter().any(|path| path == &file),
+            ..Default::default()
+        })?;
+        // An editor may save by replacing the file with a new inode.
+        let parent = path.parent().context("Find watched file directory")?;
+        watcher.watch(parent, RecursiveMode::NonRecursive)?;
+        Ok(Self {
+            _watcher: watcher,
+            events,
+        })
+    }
+
+    fn build(
+        classify: impl Fn(notify::Event) -> RepoChanges + Send + 'static,
+    ) -> Result<(notify::RecommendedWatcher, RepoEvents)> {
+        let events = RepoEvents::default();
+        let output = events.clone();
+        let watcher = notify::RecommendedWatcher::new(
+            move |event: notify::Result<notify::Event>| {
+                output.push(match event {
+                    Ok(event) if !event.need_rescan() && !event.kind.is_access() => classify(event),
+                    Ok(event) if !event.need_rescan() => return,
+                    Ok(_) => RepoChanges {
+                        rescan: true,
+                        ..Default::default()
+                    },
+                    Err(_) => {
+                        // The consumer will reconcile and switch to its fallback.
+                        output.push(RepoChanges {
+                            rescan: true,
+                            ..Default::default()
+                        });
+                        output.close();
+                        return;
+                    }
+                });
+            },
+            notify::Config::default().with_follow_symlinks(false),
+        )?;
+        Ok((watcher, events))
     }
 }
 

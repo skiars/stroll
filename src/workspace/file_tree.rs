@@ -1862,8 +1862,29 @@ mod tests {
                 this.open_file("original.txt".into(), false, window, cx)
             });
         });
+        settle(visual, &workspace, |this| {
+            this.active_file()
+                .is_some_and(|file| file.path == Path::new("original.txt"))
+        });
+        let revision = visual.update(|_, cx| {
+            workspace.update(cx, |this, _| {
+                this.saving.insert(PathBuf::from("original.txt"));
+                this.active_file().unwrap().sync_revision
+            })
+        });
         fs::create_dir(root.join("empty"))?;
-        fs::write(root.join("original.txt"), "external edit\n")?;
+        fs::write(root.join("external.tmp"), "external edit\n")?;
+        fs::rename(root.join("external.tmp"), root.join("original.txt"))?;
+        settle(visual, &workspace, |this| {
+            this.active_file()
+                .is_some_and(|file| file.sync_revision >= revision + 2)
+        });
+        visual.update(|_, cx| {
+            workspace.update(cx, |this, _| {
+                assert_ne!(this.active_file().unwrap().saved, "external edit\n");
+                this.saving.remove(Path::new("original.txt"));
+            });
+        });
         settle(visual, &workspace, |this| {
             this.rows
                 .iter()

@@ -343,6 +343,8 @@ impl Workspace {
                 window,
                 cx,
             );
+        } else if let Some(path) = self.standalone.clone() {
+            self.sync_document_paths(vec![path], window, cx);
         }
     }
 
@@ -509,15 +511,13 @@ impl Workspace {
                             let (from, to) = (Path::new(&from), Path::new(&to));
                             let affected = this.files_for_external_rename(from);
                             this.relocate_tree_path(&repo, from, to, affected, window, cx);
-                            this.sync_open_documents(
-                                &repo,
-                                &RepoChanges {
-                                    paths: [to.to_string_lossy().into_owned()].into(),
-                                    ..Default::default()
-                                },
-                                window,
-                                cx,
-                            );
+                            let paths = this
+                                .files
+                                .keys()
+                                .filter(|path| path.starts_with(to))
+                                .cloned()
+                                .collect();
+                            this.sync_document_paths(paths, window, cx);
                         }
                         if previous_snapshot_changed(this, &repo, &tree) {
                             this.expanded.retain(|path| {
@@ -583,19 +583,26 @@ impl Workspace {
     pub(super) fn watch_repository(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.repository_watch = Task::ready(());
         self.repository_watch_active = false;
-        let Some(repo) = self.repository.clone() else {
+        let repo = self.repository.clone();
+        let standalone = self.standalone.clone();
+        if repo.is_none() && standalone.is_none() {
             return;
-        };
+        }
         let opening = repo.clone();
         let task = cx.background_spawn(async move {
-            if let Some(ssh) = &opening.ssh {
-                return ssh.watch_repository().map(|events| (None, events));
-            }
-            let watch = RepoWatcher::open(&opening.root, &opening.common_dir)?;
+            let watch = if let Some(repo) = opening {
+                if let Some(ssh) = &repo.ssh {
+                    return ssh.watch_repository().map(|events| (None, events));
+                }
+                RepoWatcher::open(&repo.root, &repo.common_dir)?
+            } else {
+                RepoWatcher::open_file(&standalone.unwrap())?
+            };
             let events = watch.events.clone();
             Ok((Some(watch), events))
         });
         self.repository_watch = cx.spawn_in(window, async move |this, cx| {
+            let ssh = repo.as_ref().and_then(|repo| repo.ssh.as_ref());
             if let Ok((_watch, events)) = task.await {
                 _ = this.update_in(cx, |this, window, cx| {
                     this.repository_watch_active = true;
@@ -605,11 +612,13 @@ impl Workspace {
                     }
                 });
                 while events.wake.recv().await.is_ok() {
-                    if repo.ssh.is_none() {
+                    if ssh.is_none() {
                         cx.background_executor().timer(DEBOUNCE).await;
                     }
                     let mut changes = events.take();
-                    if repo.ssh.is_none() && !changes.paths.is_empty() {
+                    if let Some(repo) = repo.as_ref().filter(|repo| repo.ssh.is_none())
+                        && !changes.paths.is_empty()
+                    {
                         let root = repo.root.clone();
                         changes = cx
                             .background_spawn(async move {
@@ -618,10 +627,7 @@ impl Workspace {
                             })
                             .await;
                     }
-                    if repo
-                        .ssh
-                        .as_ref()
-                        .is_some_and(|ssh| !ssh.supports_workspace_files())
+                    if ssh.is_some_and(|ssh| !ssh.supports_workspace_files())
                         && !changes.paths.is_empty()
                     {
                         changes.structure = true;
@@ -632,7 +638,11 @@ impl Workspace {
                     if !changes.is_empty()
                         && this
                             .update_in(cx, |this, window, cx| {
-                                this.apply_repository_changes(&repo, changes, window, cx)
+                                if let Some(repo) = &repo {
+                                    this.apply_repository_changes(repo, changes, window, cx);
+                                } else {
+                                    this.rescan_workspace(window, cx);
+                                }
                             })
                             .is_err()
                     {
@@ -649,7 +659,7 @@ impl Workspace {
             }
             loop {
                 cx.background_executor().timer(Duration::from_secs(5)).await;
-                if repo.ssh.as_ref().is_some_and(|ssh| ssh.failure().is_some()) {
+                if ssh.is_some_and(|ssh| ssh.failure().is_some()) {
                     break;
                 }
                 if this
@@ -686,14 +696,6 @@ impl Workspace {
                 .file_name()
                 .is_some_and(|name| name == ".gitignore")
         });
-        if !changes.paths.is_empty() || changes.refs || changes.rescan {
-            self.sync_open_documents(repo, &changes, window, cx);
-        }
-        if changes.rescan || changes.refs || changes.structure {
-            self.docs_tree_dirty = true;
-            self.load_docs_tree(window, cx);
-        }
-        self.queue_workspace_refresh(changes.clone(), window, cx);
         let changed = |path: &Path| {
             !path.is_absolute()
                 && (changes.rescan
@@ -703,6 +705,20 @@ impl Workspace {
                         .iter()
                         .any(|changed| path.starts_with(changed)))
         };
+        if !changes.paths.is_empty() || changes.refs || changes.rescan {
+            let paths = self
+                .files
+                .keys()
+                .filter(|path| changed(path))
+                .cloned()
+                .collect();
+            self.sync_document_paths(paths, window, cx);
+        }
+        if changes.rescan || changes.refs || changes.structure {
+            self.docs_tree_dirty = true;
+            self.load_docs_tree(window, cx);
+        }
+        self.queue_workspace_refresh(changes.clone(), window, cx);
         if self.view == WorkspaceView::Docs
             && let Some(path) = self.session.document.clone().filter(|path| changed(path))
         {
@@ -801,68 +817,67 @@ impl Workspace {
         });
     }
 
-    fn sync_open_documents(
+    fn sync_document_paths(
         &mut self,
-        repo: &Arc<Repository>,
-        changes: &RepoChanges,
+        paths: Vec<PathBuf>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let paths = self
-            .files
-            .iter_mut()
-            .filter(|(path, _)| {
-                !path.is_absolute()
-                    && (changes.refs
-                        || changes.rescan
-                        || changes
-                            .paths
-                            .iter()
-                            .any(|changed| path.starts_with(changed)))
-            })
-            .map(|(path, file)| {
+        let paths = paths
+            .into_iter()
+            .filter_map(|path| {
+                let file = self.files.get_mut(&path)?;
                 file.sync_revision += 1;
-                (
-                    path.clone(),
+                Some((
+                    path,
+                    file.editor.entity_id(),
                     file.document.draft_baseline(),
                     file.sync_revision,
-                )
+                ))
             })
             .collect::<Vec<_>>();
         if paths.is_empty() {
             return;
         }
-        let origin = repo.clone();
-        let repo = repo.clone();
+        let origin = self.repository.clone();
+        let repo = origin.clone();
         let read = cx.background_spawn(async move {
             paths
                 .into_iter()
-                .map(|(path, baseline, revision)| {
-                    let disk = Document::read_for_sync(&repo, &path);
-                    (path, baseline, revision, disk)
+                .map(|(path, editor, baseline, revision)| {
+                    let disk = Document::read_for_sync(repo.as_deref(), &path);
+                    (path, editor, baseline, revision, disk)
                 })
                 .collect::<Vec<_>>()
         });
         cx.spawn_in(window, async move |this, cx| {
             let documents = read.await;
-            _ = this.update_in(cx, |this, window, cx| {
-                if !this
-                    .repository
-                    .as_ref()
-                    .is_some_and(|current| Arc::ptr_eq(current, &origin))
-                {
-                    return;
+            let same_repository = |workspace: &Self| match (&workspace.repository, &origin) {
+                (Some(current), Some(origin)) => Arc::ptr_eq(current, origin),
+                (None, None) => true,
+                _ => false,
+            };
+            let retry = this.update_in(cx, |this, window, cx| {
+                if !same_repository(this) {
+                    return Vec::new();
                 }
                 let mut changed = false;
-                for (path, baseline, revision, disk) in documents {
-                    if this.git_edit.contains(&path) || this.saving.contains(&path) {
-                        continue;
-                    }
+                let mut retry = Vec::new();
+                for (path, editor_id, baseline, revision, disk) in documents {
                     let Some(file) = this.files.get_mut(&path).filter(|file| {
-                        file.sync_revision == revision && file.document.draft_baseline() == baseline
+                        file.editor.entity_id() == editor_id && file.sync_revision == revision
                     }) else {
                         continue;
                     };
+                    let editor = file.editor.read(cx);
+                    if this.git_edit.contains(&path)
+                        || this.saving.contains(&path)
+                        || file.document.draft_baseline() != baseline
+                        || editor.is_composing()
+                    {
+                        retry.push((path, editor_id, revision));
+                        continue;
+                    }
                     let disk = match disk {
                         Ok(Some(disk)) => disk,
                         Ok(None) => {
@@ -882,7 +897,11 @@ impl Workspace {
                     let was_missing = file.missing;
                     changed |= was_missing;
                     file.missing = false;
-                    if disk.draft_baseline() == baseline {
+                    // A recovered conflict already loaded the newer disk baseline.
+                    // A matching file event must not unlock the original draft.
+                    if disk.draft_baseline() == baseline
+                        && !(file.document.restored && file.document.conflict)
+                    {
                         if was_missing || file.document.conflict {
                             file.document.conflict = false;
                             changed = true;
@@ -894,11 +913,17 @@ impl Workspace {
                         }
                         continue;
                     }
-                    changed = true;
-                    if file.is_dirty() && file.committed.to_string() != disk.saved_text {
+                    if editor.text() != &file.saved && editor.text() != disk.saved_text.as_str() {
                         if !file.document.conflict {
-                            if file.flush_draft(&origin, &this.store).is_ok() {
+                            if file.committed != *editor.text() {
+                                file.committed = editor.text().clone();
+                                file.pending_draft = true;
+                                file.revision += 1;
+                            }
+                            if file.flush_draft(origin.as_deref(), &this.store).is_ok() {
                                 file.document.conflict = true;
+                                file.document.restored = false;
+                                changed = true;
                                 if let Some(panel) = &this.git {
                                     panel.update(cx, |panel, cx| {
                                         panel.repository_source_changed(path, cx)
@@ -908,10 +933,13 @@ impl Workspace {
                         }
                         continue;
                     }
+                    changed = true;
                     let text = disk.saved_text.clone();
+                    let update_editor = editor.text() != text.as_str();
+                    let persist = file.is_dirty();
                     file.saved = Rope::from(text.as_str());
-                    if file.committed != file.saved {
-                        file.committed = file.saved.clone();
+                    file.committed = file.saved.clone();
+                    if update_editor {
                         file.editor.update(cx, |editor, cx| {
                             let selection = editor.selected_range();
                             let reversed = editor.is_selection_reversed();
@@ -925,6 +953,7 @@ impl Workspace {
                     }
                     file.document = disk;
                     file.dirty = false;
+                    file.pending_draft = persist;
                     file.revision += 1;
                     if let Some(server) = &file.language_server {
                         server.document.changed(file.saved.clone());
@@ -935,6 +964,7 @@ impl Workspace {
                     }
                 }
                 if changed {
+                    this.queue_drafts(window, cx);
                     if this.view == WorkspaceView::Editor {
                         if this
                             .active_file()
@@ -946,7 +976,26 @@ impl Workspace {
                     }
                     cx.notify();
                 }
+                retry
             });
+            let Ok(retry) = retry else { return };
+            if !retry.is_empty() {
+                cx.background_executor().timer(DEBOUNCE).await;
+                _ = this.update_in(cx, |this, window, cx| {
+                    if same_repository(this) {
+                        let paths = retry
+                            .into_iter()
+                            .filter_map(|(path, editor_id, revision)| {
+                                let file = this.files.get(&path)?;
+                                (file.editor.entity_id() == editor_id
+                                    && file.sync_revision == revision)
+                                    .then_some(path)
+                            })
+                            .collect();
+                        this.sync_document_paths(paths, window, cx);
+                    }
+                });
+            }
         })
         .detach();
     }

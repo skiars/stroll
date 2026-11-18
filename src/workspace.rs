@@ -639,7 +639,7 @@ impl OpenFile {
         self.dirty || self.pending_draft
     }
 
-    fn flush_draft(&mut self, repo: &Repository, store: &Store) -> Result<()> {
+    fn flush_draft(&mut self, repo: Option<&Repository>, store: &Store) -> Result<()> {
         if !self.pending_draft || self.document.conflict {
             return Ok(());
         }
@@ -653,8 +653,17 @@ impl OpenFile {
             _ => {
                 let text = self.committed.to_string();
                 let dirty = self.committed != self.saved;
-                self.document
-                    .persist_draft(repo, &self.path, store, &text, dirty)?;
+                if let Some(repo) = repo {
+                    self.document
+                        .persist_draft(repo, &self.path, store, &text, dirty)?;
+                } else {
+                    store.update_editor_draft(
+                        None,
+                        &self.path,
+                        Some(self.document.draft_baseline()),
+                        dirty.then_some(text.as_str()),
+                    )?;
+                }
                 dirty
             }
         };
@@ -981,6 +990,15 @@ impl Workspace {
         .detach();
         workspace.start_session_writer(cx);
         workspace.observe_window_geometry(window, cx);
+        cx.observe_window_activation(window, |this, window, cx| {
+            if window.is_window_active() && !this.repository_watch_active {
+                this.rescan_workspace(window, cx);
+            }
+        })
+        .detach();
+        if workspace.standalone.is_some() {
+            workspace.watch_repository(window, cx);
+        }
         workspace
     }
 
@@ -1300,11 +1318,11 @@ impl Workspace {
                                 file.dirty = file.committed != file.saved;
                                 file.pending_draft = true;
                                 file.revision += 1;
-                                if let Err(error) = file.flush_draft(&repo, &this.store) {
+                                if let Err(error) = file.flush_draft(Some(&repo), &this.store) {
                                     toast::error(window, cx, format!("{error:#}"));
                                 }
                             } else {
-                                if let Err(error) = file.flush_draft(&repo, &this.store) {
+                                if let Err(error) = file.flush_draft(Some(&repo), &this.store) {
                                     toast::error(window, cx, format!("{error:#}"));
                                 }
                                 file.document.conflict = true;

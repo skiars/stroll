@@ -620,7 +620,7 @@ impl Workspace {
                     file.revision += 1;
                     file.pending_draft = true;
                     if let Some(repo) = &self.repository
-                        && let Err(error) = file.flush_draft(repo, &self.store)
+                        && let Err(error) = file.flush_draft(Some(repo), &self.store)
                     {
                         toast::error(window, cx, format!("{error:#}"));
                     }

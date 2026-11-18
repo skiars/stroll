@@ -527,8 +527,21 @@ impl Document {
     }
 
     #[cfg(feature = "desktop")]
-    pub(crate) fn read_for_sync(repo: &Repository, path: &Path) -> Result<Option<Self>> {
-        repo.bytes_if_present(path)?.map(Self::decode).transpose()
+    pub(crate) fn read_for_sync(repo: Option<&Repository>, path: &Path) -> Result<Option<Self>> {
+        if let Some(repo) = repo {
+            return repo.bytes_if_present(path)?.map(Self::decode).transpose();
+        }
+        match Self::read_local(path) {
+            Ok(document) => Ok(Some(document)),
+            Err(error)
+                if error
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|error| error.kind() == ErrorKind::NotFound) =>
+            {
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        }
     }
 
     #[cfg_attr(not(feature = "desktop"), allow(dead_code))]
