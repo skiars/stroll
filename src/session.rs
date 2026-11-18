@@ -76,6 +76,11 @@ pub(crate) struct OpenDocument {
 
 impl WorktreeSession {
     pub fn select_document(&mut self, path: &Path) {
+        self.remember_document(path);
+        self.document = Some(path.to_owned());
+    }
+
+    pub(crate) fn remember_document(&mut self, path: &Path) -> &mut OpenDocument {
         let documents = self.open_documents.get_or_insert_with(|| {
             self.document
                 .iter()
@@ -83,13 +88,15 @@ impl WorktreeSession {
                 .map(|path| OpenDocument { path, title: None })
                 .collect()
         });
-        if !documents.iter().any(|document| document.path == path) {
+        let index = documents.iter().position(|document| document.path == path);
+        let index = index.unwrap_or_else(|| {
             documents.push(OpenDocument {
                 path: path.to_owned(),
                 title: None,
             });
-        }
-        self.document = Some(path.to_owned());
+            documents.len() - 1
+        });
+        &mut documents[index]
     }
 
     pub fn close_document(&mut self, path: &Path) -> Option<usize> {

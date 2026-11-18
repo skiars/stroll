@@ -438,7 +438,7 @@ pub(crate) fn resolve_file(root: &Path, path: &Path) -> Result<PathBuf> {
     Ok(target)
 }
 
-fn canonical_local_file(path: &Path) -> Result<PathBuf> {
+pub(crate) fn canonical_local_file(path: &Path) -> Result<PathBuf> {
     let target = path.canonicalize()?;
     ensure!(
         target.is_file() && target.components().all(|part| part.as_os_str() != ".git"),

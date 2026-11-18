@@ -94,7 +94,12 @@ impl Workspace {
             self.session.panels = panels;
             self.session_revision += 1;
         }
-        if self.session.view != Some(self.view) {
+        if self.session.view != Some(self.view)
+            && self
+                .standalone
+                .as_deref()
+                .is_none_or(|anchor| self.standalone_active_path() == Some(anchor))
+        {
             self.session.view = Some(self.view);
             self.session_revision += 1;
         }

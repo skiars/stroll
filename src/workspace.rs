@@ -738,12 +738,12 @@ pub struct Workspace {
     files: HashMap<PathBuf, OpenFile>,
     tab_scroll: ScrollHandle,
     tab_viewport_width: Pixels,
-    reveal_tab: bool,
     tabs_overflow: bool,
     open_files_list: bool,
     open_files_scroll: UniformListScrollHandle,
     close_queue: VecDeque<PathBuf>,
     confirming_close: bool,
+    closing_standalone_window: bool,
     view: WorkspaceView,
     git: Option<Entity<GitPanel>>,
     git_edit: HashSet<PathBuf>,
@@ -923,12 +923,12 @@ impl Workspace {
             files: HashMap::new(),
             tab_scroll: ScrollHandle::new(),
             tab_viewport_width: px(0.),
-            reveal_tab: false,
             tabs_overflow: false,
             open_files_list: false,
             open_files_scroll: UniformListScrollHandle::new(),
             close_queue: VecDeque::new(),
             confirming_close: false,
+            closing_standalone_window: false,
             view: view.unwrap_or_default(),
             git: None,
             git_edit: HashSet::new(),
@@ -1418,7 +1418,6 @@ impl Workspace {
         self.lsp_panel_open = false;
         self.tab_scroll = ScrollHandle::new();
         self.tab_viewport_width = px(0.);
-        self.reveal_tab = false;
         self.tabs_overflow = false;
         self.open_files_list = false;
         self.open_files_scroll = UniformListScrollHandle::new();
@@ -1624,7 +1623,7 @@ impl Workspace {
     fn switch_view_to(
         &mut self,
         view: WorkspaceView,
-        document: Option<PathBuf>,
+        document: Option<(PathBuf, Option<Task<Result<docs::PreparedDocument>>>)>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -1660,8 +1659,8 @@ impl Workspace {
         self.rebuild_tree();
         if view == WorkspaceView::Docs {
             self.load_docs_tree(window, cx);
-            if let Some(path) = document.filter(|path| docs::is_markdown(path)) {
-                self.open_doc(path, None, window, cx);
+            if let Some((path, prepared)) = document {
+                self.open_doc_at(path, None, None, prepared, window, cx);
             } else if self.doc.is_none() && self.doc_loading.is_none() && self.doc_error.is_none() {
                 let path = self
                     .session
@@ -1745,7 +1744,7 @@ impl Workspace {
         if self.view == WorkspaceView::Docs {
             self.open_doc(path, None, window, cx);
         } else {
-            self.switch_view_to(WorkspaceView::Docs, Some(path), window, cx);
+            self.switch_view_to(WorkspaceView::Docs, Some((path, None)), window, cx);
         }
     }
 
@@ -1759,7 +1758,7 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         if self.repository_ui.opening.is_some()
-            || (self.repository.is_none() && self.standalone.as_ref() != Some(&path))
+            || (self.repository.is_none() && !(self.standalone.is_some() && path.is_absolute()))
         {
             return;
         }
@@ -1794,17 +1793,7 @@ impl Workspace {
         }
         let repo = self.repository.clone();
         let standalone = self.standalone.is_some();
-        let local_text = self
-            .files
-            .get(&path)
-            .filter(|_| path.is_absolute())
-            .map(|file| {
-                if standalone {
-                    file.saved.clone()
-                } else {
-                    file.committed.clone()
-                }
-            });
+        let local_text = self.local_document_text(&path);
         let store = self.store.clone();
         self.capture_document_position(cx);
         let saved_position = self.session.documents.get(&path).copied();
@@ -1819,13 +1808,7 @@ impl Workspace {
         let load = prepared.unwrap_or_else(|| {
             let path = path.clone();
             cx.background_spawn(async move {
-                match (local_text, &repo) {
-                    (Some(text), _) => docs::PreparedDocument::new(text.to_string()),
-                    (None, Some(repo)) if path.is_absolute() => Document::open(repo, &path, &store)
-                        .and_then(|document| docs::PreparedDocument::new(document.text)),
-                    (None, Some(repo)) => docs::load(repo, &path),
-                    (None, None) => docs::load_local(&path),
-                }
+                Self::prepare_document(repo.as_deref(), &path, &store, local_text)
             })
         });
         self.doc_loading = Some(DocumentOpen {
@@ -1973,13 +1956,6 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.standalone.as_ref() == Some(&path) {
-            self.switch_view(WorkspaceView::Editor, window, cx);
-            if self.view == WorkspaceView::Editor && self.tabs.active().is_none() {
-                self.request_file(path, FileOpen::Startup, window, cx);
-            }
-            return;
-        }
         self.switch_view(WorkspaceView::Editor, window, cx);
         if self.view == WorkspaceView::Editor {
             if position.is_some() {
@@ -2091,7 +2067,7 @@ impl Workspace {
         }
         let load = if let Some(repo) = self.repository.clone() {
             self.load_file_buffer(repo, path.clone(), cx)
-        } else if self.standalone.as_ref() == Some(&path) {
+        } else if self.standalone.is_some() && path.is_absolute() {
             let path = path.clone();
             let store = self.store.clone();
             cx.background_spawn(async move {
@@ -2752,7 +2728,7 @@ impl Workspace {
             return;
         }
         let repo = self.repository.clone();
-        if repo.is_none() && self.standalone.as_ref() != Some(&path) {
+        if repo.is_none() && self.standalone.is_none() {
             return;
         }
         if let Err(error) = self.flush_drafts(cx) {
@@ -2848,7 +2824,16 @@ impl Workspace {
                             if !path.is_absolute() {
                                 this.refresh_git_after_change(&path, window, cx);
                             }
-                            if this.standalone.is_some() && docs::is_markdown(&path) {
+                            if this.standalone.is_some()
+                                && (this
+                                    .doc
+                                    .as_ref()
+                                    .is_some_and(|doc| doc.read(cx).path == path)
+                                    || this
+                                        .doc_loading
+                                        .as_ref()
+                                        .is_some_and(|doc| doc.path == path))
+                            {
                                 this.capture_document_position(cx);
                                 this.doc = None;
                                 this.doc_task = Task::ready(());
@@ -2929,7 +2914,7 @@ impl Workspace {
             return;
         }
         let repo = self.repository.clone();
-        if repo.is_none() && self.standalone.as_deref() != Some(path) {
+        if repo.is_none() && self.standalone.is_none() {
             return;
         }
         let store = self.store.clone();
@@ -2974,9 +2959,17 @@ impl Workspace {
                     editor.set_value(text.clone(), window, cx);
                     editor.set_readonly(false, cx);
                 });
-                if this.standalone.is_some() {
+                if this.standalone.is_some()
+                    && this
+                        .doc
+                        .as_ref()
+                        .is_some_and(|doc| doc.read(cx).path == target)
+                {
                     this.capture_document_position(cx);
                     this.doc = None;
+                    if this.view == WorkspaceView::Docs {
+                        this.open_doc(target.clone(), None, window, cx);
+                    }
                 }
                 if let Some(server) = this
                     .files
@@ -3087,8 +3080,10 @@ impl Workspace {
         cx.notify();
     }
 
-    fn reveal_active_tab(&mut self) {
-        self.reveal_tab = true;
+    fn reveal_active_tab(&self) {
+        if let Some(index) = self.tabs.active().and_then(|path| self.tabs.index(path)) {
+            self.tab_scroll.scroll_to_item(index);
+        }
     }
 
     fn keep_tab(&mut self, path: &Path, cx: &mut Context<Self>) {
@@ -3111,11 +3106,7 @@ impl Workspace {
     }
 
     fn close_active_tab(&mut self, _: &CloseTab, window: &mut Window, cx: &mut Context<Self>) {
-        if self.standalone.is_some() {
-            if self.request_window_close(window, cx) {
-                window.remove_window();
-            }
-        } else if let Some(path) = self.tabs.active().map(Path::to_owned) {
+        if let Some(path) = self.tabs.active().map(Path::to_owned) {
             self.close_tabs(vec![path], window, cx);
         }
     }
@@ -3139,11 +3130,16 @@ impl Workspace {
             .into_iter()
             .filter(|path| !self.saving.contains(path))
             .collect();
-        self.drain_close_queue(window, cx);
+        let previous = self.tabs.active().map(Path::to_owned);
+        self.drain_close_queue(previous.as_deref(), window, cx);
     }
 
-    fn drain_close_queue(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let previous = self.tabs.active().map(Path::to_owned);
+    fn drain_close_queue(
+        &mut self,
+        previous: Option<&Path>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let mut pending = None;
         while let Some(path) = self.close_queue.pop_front() {
             if self.tab_is_dirty(&path) {
@@ -3154,7 +3150,12 @@ impl Workspace {
         }
         if let Some(path) = pending {
             self.confirm_tab_close(path, window, cx);
-        } else if previous.as_deref() != self.tabs.active()
+        } else if std::mem::take(&mut self.closing_standalone_window) {
+            if self.request_window_close(window, cx) {
+                window.remove_window();
+                return;
+            }
+        } else if previous != self.tabs.active()
             || (self.active_file().is_none() && self.active_image_tab().is_none())
         {
             self.restore_active_file(window, cx);
@@ -3254,6 +3255,7 @@ impl Workspace {
 
     fn cancel_tab_close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.confirming_close = false;
+        self.closing_standalone_window = false;
         self.close_queue.clear();
         if self.active_file().is_none() && self.active_image_tab().is_none() {
             self.restore_active_file(window, cx);
@@ -3303,12 +3305,9 @@ impl Workspace {
     fn finish_tab_close(&mut self, path: &Path, window: &mut Window, cx: &mut Context<Self>) {
         self.confirming_close = false;
         window.close_dialog(cx);
+        let previous = self.tabs.active().map(Path::to_owned);
         self.remove_tab(path, window, cx);
-        if self.standalone.is_some() {
-            window.remove_window();
-        } else {
-            self.drain_close_queue(window, cx);
-        }
+        self.drain_close_queue(previous.as_deref(), window, cx);
     }
 
     fn topbar(&self, window: &Window, cx: &Context<Self>, colors: Palette) -> impl IntoElement {
@@ -3777,7 +3776,7 @@ impl Workspace {
             .unwrap_or_else(|| cx.theme().mono_font_family.clone())
     }
 
-    fn content(&self, window: &Window, cx: &Context<Self>, colors: Palette) -> impl IntoElement {
+    fn content(&self, window: &Window, cx: &Context<Self>, colors: Palette) -> Stateful<Div> {
         let editor_background =
             code_theme::surface(self.config.current().appearance.code_theme, cx.theme().mode);
         let maximum = ((window.viewport_size().height - px(68.)) * 0.65).max(px(100.));
@@ -4122,9 +4121,11 @@ impl Workspace {
                         row.child(self.sidebar(tree_width.min(tree_limit), window, cx, colors))
                     })
                     .child(if docs {
-                        self.docs_content(window, cx, colors).into_any_element()
+                        self.file_drop_area(self.docs_content(window, cx, colors), cx, colors)
+                            .into_any_element()
                     } else {
-                        self.content(window, cx, colors).into_any_element()
+                        self.file_drop_area(self.content(window, cx, colors), cx, colors)
+                            .into_any_element()
                     }),
             )
             .when(!docs && !self.terminal_maximized(), |body| {
@@ -4217,12 +4218,7 @@ impl Workspace {
             )
     }
 
-    fn docs_content(
-        &self,
-        window: &Window,
-        cx: &Context<Self>,
-        colors: Palette,
-    ) -> impl IntoElement {
+    fn docs_content(&self, window: &Window, cx: &Context<Self>, colors: Palette) -> Stateful<Div> {
         v_flex()
             .id("docs")
             .flex_1()
@@ -4309,7 +4305,6 @@ impl Render for Workspace {
         let picker_opacity = self.repository_ui.picker_opacity(window, cx);
         let locator_overlay = self.locator_overlay(window, cx);
         let switching = self.repository_overlay_open();
-        let radii = window_corner_radii(window, cx);
         v_flex()
             .id("workspace")
             .size_full()
@@ -4317,17 +4312,6 @@ impl Render for Workspace {
             .text_color(colors.ink)
             .text_size(px(13.5))
             .track_focus(&self.focus)
-            .when(self.accepts_file_drop(), |view| {
-                view.drag_over::<ExternalPaths>(move |style, _, _, _| {
-                    style
-                        .bg(colors.soft)
-                        .rounded_tl(radii.top_left)
-                        .rounded_tr(radii.top_right)
-                        .rounded_bl(radii.bottom_left)
-                        .rounded_br(radii.bottom_right)
-                })
-                .on_drop(cx.listener(Self::drop_files))
-            })
             .on_action(cx.listener(Self::toggle_settings))
             .on_action(cx.listener(|this, _: &OpenLocator, window, cx| {
                 if this.standalone.is_none() && !this.terminal_focused(window, cx) {
@@ -4358,8 +4342,8 @@ impl Render for Workspace {
                         this.cycle_tabs(false, window, cx);
                     }))
             })
-            .child(if let Some(path) = &self.standalone {
-                self.standalone_topbar(path, window, cx, colors)
+            .child(if self.standalone.is_some() {
+                self.standalone_topbar(window, cx, colors)
                     .into_any_element()
             } else {
                 self.topbar(window, cx, colors).into_any_element()
@@ -4390,14 +4374,20 @@ impl Render for Workspace {
                 },
             )
             .child(if self.repository.is_none() && self.standalone.is_none() {
-                self.repository_start(window, cx, colors).into_any_element()
-            } else if self.view == WorkspaceView::Git {
-                div()
-                    .flex_1()
-                    .min_h_0()
-                    .w_full()
-                    .children(self.git.clone())
+                self.file_drop_area(self.repository_start(window, cx, colors), cx, colors)
                     .into_any_element()
+            } else if self.view == WorkspaceView::Git {
+                self.file_drop_area(
+                    div()
+                        .id("git-content")
+                        .flex_1()
+                        .min_h_0()
+                        .w_full()
+                        .children(self.git.clone()),
+                    cx,
+                    colors,
+                )
+                .into_any_element()
             } else {
                 self.workspace_body(window, cx, colors).into_any_element()
             })

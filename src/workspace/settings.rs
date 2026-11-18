@@ -337,12 +337,21 @@ impl Workspace {
     }
 
     pub fn request_window_close(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        if let Some(path) = self.standalone.clone() {
+        if self.standalone.is_some() {
             if self.confirming_close || !self.saving.is_empty() {
                 return false;
             }
-            if self.tab_is_dirty(&path) {
-                self.confirm_tab_close(path, window, cx);
+            let dirty = self
+                .tabs
+                .paths()
+                .iter()
+                .filter(|path| self.tab_is_dirty(path));
+            self.close_queue = dirty.cloned().collect();
+            if !self.close_queue.is_empty() {
+                self.capture_session(cx);
+                self.closing_standalone_window = true;
+                let previous = self.tabs.active().map(ToOwned::to_owned);
+                self.drain_close_queue(previous.as_deref(), window, cx);
                 return false;
             }
         }

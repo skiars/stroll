@@ -1635,7 +1635,7 @@ impl Workspace {
         window: &Window,
         cx: &Context<Self>,
         colors: Palette,
-    ) -> AnyElement {
+    ) -> Stateful<Div> {
         let radii = window_corner_radii(window, cx);
         v_flex()
             .id("repository-start")
@@ -1659,7 +1659,6 @@ impl Workspace {
                         cx.listener(|this, _, window, cx| this.choose_local_file(window, cx)),
                     ),
             )
-            .into_any_element()
     }
 
     pub(super) fn repository_popup(

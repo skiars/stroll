@@ -9,6 +9,17 @@ impl Workspace {
         fragment: Option<String>,
         cx: &mut App,
     ) -> Result<()> {
+        Self::open_standalone_in_view(store, config, path, fragment, None, cx)
+    }
+
+    pub(super) fn open_standalone_in_view(
+        store: Arc<Store>,
+        config: ConfigFile,
+        path: PathBuf,
+        fragment: Option<String>,
+        view: Option<WorkspaceView>,
+        cx: &mut App,
+    ) -> Result<()> {
         let path = path.canonicalize()?;
         anyhow::ensure!(path.is_file(), t!("storage.local_regular_file"));
         for handle in cx.windows() {
@@ -25,7 +36,10 @@ impl Workspace {
                         return false;
                     }
                     workspace.update(cx, |this, cx| {
-                        this.activate_standalone(path.clone(), fragment.clone(), window, cx)
+                        this.activate_standalone(path.clone(), fragment.clone(), window, cx);
+                        if view == Some(WorkspaceView::Editor) {
+                            this.open_document_source(path.clone(), window, cx);
+                        }
                     });
                     true
                 })
@@ -43,15 +57,17 @@ impl Workspace {
                 StandaloneSession::default()
             }
         };
-        let view = if docs::is_markdown(&path) {
-            if fragment.is_none() && session.view == Some(WorkspaceView::Editor) {
-                WorkspaceView::Editor
+        let view = view.unwrap_or_else(|| {
+            if docs::is_markdown(&path) {
+                if fragment.is_none() && session.view == Some(WorkspaceView::Editor) {
+                    WorkspaceView::Editor
+                } else {
+                    WorkspaceView::Docs
+                }
             } else {
-                WorkspaceView::Docs
+                WorkspaceView::Editor
             }
-        } else {
-            WorkspaceView::Editor
-        };
+        });
         let prepared = (view == WorkspaceView::Docs).then(|| {
             let path = path.clone();
             cx.background_spawn(async move { docs::load_local(&path) })
@@ -112,7 +128,7 @@ impl Workspace {
     ) {
         window.activate_window();
         if fragment.is_some() && docs::is_markdown(&path) {
-            self.switch_view_to(WorkspaceView::Docs, Some(path.clone()), window, cx);
+            self.switch_view_to(WorkspaceView::Docs, Some((path.clone(), None)), window, cx);
             if self.view == WorkspaceView::Docs {
                 self.open_doc(path, fragment, window, cx);
             }
@@ -187,14 +203,27 @@ impl Workspace {
         self.open_local_window(path, None, window, cx);
     }
 
+    pub(super) fn standalone_active_path(&self) -> Option<&Path> {
+        if self.view == WorkspaceView::Docs {
+            self.session.document.as_deref()
+        } else {
+            self.tabs
+                .active()
+                .or_else(|| self.loading_file.as_ref().map(|(path, _)| path.as_path()))
+        }
+    }
+
     pub(super) fn standalone_topbar(
         &self,
-        path: &Path,
         window: &Window,
         cx: &Context<Self>,
         colors: Palette,
     ) -> impl IntoElement {
+        let path = self.standalone_active_path();
         let editing = self.view == WorkspaceView::Editor;
+        let dirty = path.is_some_and(|path| self.tab_is_dirty(path));
+        let show_tabs = editing && self.tabs.paths().len() > 1;
+        let document_list_title = path.filter(|_| !editing && self.shows_document_list());
         let actions = titlebar_actions()
             // Keep Win32 hit testing from reaching the draggable title bar behind the buttons.
             .when(cfg!(target_os = "windows"), |actions| actions.occlude())
@@ -205,19 +234,22 @@ impl Workspace {
                     bar.child(doc.read(cx).toolbar_actions(doc, window))
                 })
             })
-            .when(editing, |bar| {
+            .when(editing && path.is_some(), |bar| {
                 bar.child(
                     icon_button("standalone-find", IconName::Search, t!("common.find"))
                         .on_click(cx.listener(|this, _, window, cx| this.find(window, cx))),
                 )
                 .child(
                     icon_button("standalone-save", IconName::Save, t!("common.save"))
-                        .disabled(!self.tab_is_dirty(path) || self.saving.contains(path))
+                        .disabled(!dirty || path.is_some_and(|path| self.saving.contains(path)))
                         .on_click(
                             cx.listener(|this, _, window, cx| this.save(&SaveFile, window, cx)),
                         ),
                 )
-                .when(docs::is_markdown(path), |bar| {
+            })
+            .when(
+                editing && (path.is_some_and(docs::is_markdown) || self.session.document.is_some()),
+                |bar| {
                     bar.child(
                         icon_button(
                             "standalone-read",
@@ -225,12 +257,16 @@ impl Workspace {
                             t!("docs.read_markdown"),
                         )
                         .on_click(cx.listener(|this, _, window, cx| {
-                            this.switch_view(WorkspaceView::Docs, window, cx);
+                            let document = this
+                                .tabs
+                                .active()
+                                .filter(|path| docs::is_markdown(path))
+                                .map(|path| (path.to_owned(), None));
+                            this.switch_view_to(WorkspaceView::Docs, document, window, cx);
                         })),
                     )
-                })
-                .child(self.workspace_actions(cx))
-            })
+                },
+            )
             .child(self.theme_button(cx));
         TitleBar::new()
             .h(px(36.))
@@ -246,17 +282,31 @@ impl Workspace {
                     .w_full()
                     .min_w_0()
                     .gap_2()
-                    .px_2()
-                    .child(icon(IconName::FileText, colors.muted, 15.))
-                    .child(
-                        div()
-                            .min_w_0()
-                            .flex_1()
-                            .truncate()
-                            .child(file_name(path).to_owned()),
-                    )
-                    .when(self.tab_is_dirty(path), |bar| {
-                        bar.child(div().size(px(6.)).rounded_full().bg(colors.warning))
+                    .pl_1()
+                    .pr_2()
+                    .when(!show_tabs && document_list_title.is_none(), |bar| {
+                        bar.when_some(path, |bar, path| {
+                            bar.child(file_type_icon(path, colors, 15.))
+                        })
+                        .child(
+                            div()
+                                .id("standalone-file-title")
+                                .debug_selector(|| "standalone-file-title".into())
+                                .min_w_0()
+                                .flex_1()
+                                .truncate()
+                                .child(path.map(file_name).unwrap_or("Stroll").to_owned()),
+                        )
+                        .when(dirty, |bar| {
+                            bar.child(div().size(px(6.)).rounded_full().bg(colors.warning))
+                        })
+                    })
+                    .when_some(document_list_title, |bar, path| {
+                        bar.child(self.titlebar_document_list(path, cx, colors))
+                            .child(div().flex_1().min_w_0())
+                    })
+                    .when(show_tabs, |bar| {
+                        bar.h_full().pl_0().child(self.titlebar_tabs(cx, colors))
                     })
                     .child(actions),
             )

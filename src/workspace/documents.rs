@@ -4,14 +4,21 @@ use std::path::{Path, PathBuf};
 
 use gpui::{prelude::FluentBuilder as _, *};
 use gpui_component::{
-    ActiveTheme as _, StyleSized as _, StyledExt as _, h_flex, popover::Popover,
-    scroll::popup_scrollbar, v_flex,
+    ActiveTheme as _, StyleSized as _, StyledExt as _,
+    button::{Button, ButtonVariants as _},
+    h_flex,
+    popover::Popover,
+    scroll::popup_scrollbar,
+    v_flex,
 };
 use gpui_kit_assets::IconName;
 
 use crate::{paths, session::OpenDocument};
 
-use super::{Palette, Workspace, compact_icon_button, file_name, icon, quiet_button};
+use super::{
+    Palette, Workspace, compact_icon_button, file_name, file_type_icon, icon, quiet_button,
+    titlebar_actions,
+};
 
 pub(super) struct CachedDocs {
     pub key: Vec<u8>,
@@ -97,7 +104,7 @@ impl Workspace {
                 self.open_doc(next, None, window, cx);
             }
         }
-        if self.open_documents().is_empty() {
+        if self.open_documents().is_empty() || !self.shows_document_list() {
             self.dismiss_document_list(window, cx);
         } else {
             self.select_document_row(index.min(self.open_documents().len() - 1), cx);
@@ -107,7 +114,11 @@ impl Workspace {
 
     fn dismiss_document_list(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.open_documents_list = false;
-        self.document_list_trigger.focus(window, cx);
+        if self.shows_document_list() {
+            self.document_list_trigger.focus(window, cx);
+        } else {
+            self.focus.focus(window, cx);
+        }
         cx.notify();
     }
 
@@ -154,9 +165,112 @@ impl Workspace {
             .label(title.clone())
             .accessibility_label(format!("{} · {title}", t!("docs.open_documents")))
             .tooltip(title);
+
+        h_flex()
+            .h(super::FILE_TOOLBAR_HEIGHT)
+            .flex_shrink_0()
+            .px_2()
+            .gap_1()
+            .children(self.show_file_tree_button(cx))
+            .child(
+                h_flex()
+                    .id("document-path-controls")
+                    .min_w_0()
+                    .gap(px(2.))
+                    .child(self.document_list_popover(trigger, Anchor::TopLeft, cx, colors))
+                    .when_some(path, |bar, path| {
+                        bar.child(
+                            compact_icon_button(
+                                "copy-document-path",
+                                IconName::Copy,
+                                t!("docs.copy_path"),
+                            )
+                            .debug_selector(|| "copy-document-path".into())
+                            .flex_shrink_0()
+                            .on_click(move |_, _, cx| {
+                                cx.write_to_clipboard(ClipboardItem::new_string(path.clone()));
+                            }),
+                        )
+                    }),
+            )
+            .child(div().flex_1().min_w_0())
+            .when_some(self.doc.as_ref(), |bar, reader| {
+                bar.child(reader.read(cx).toolbar_actions(reader, window))
+            })
+    }
+
+    pub(super) fn shows_document_list(&self) -> bool {
+        self.standalone.is_none() || self.open_documents().len() > 1
+    }
+
+    pub(super) fn titlebar_document_list(
+        &self,
+        path: &Path,
+        cx: &Context<Self>,
+        colors: Palette,
+    ) -> impl IntoElement {
+        let title = file_name(path).to_owned();
+        let trigger = Button::new("open-documents-trigger")
+            .text()
+            .debug_selector(|| "open-documents-trigger".into())
+            .track_focus(&self.document_list_trigger)
+            .h(px(28.))
+            .min_w_0()
+            .px_0()
+            .content_gap(px(8.))
+            .label_size(px(13.5))
+            .icon(file_type_icon(path, colors, 15.))
+            .icon_size(px(15.))
+            .child(
+                div()
+                    .id("standalone-file-title")
+                    .debug_selector(|| "standalone-file-title".into())
+                    .min_w_0()
+                    .truncate()
+                    .text_color(colors.ink)
+                    .child(title.clone()),
+            )
+            .child(
+                div()
+                    .id("standalone-document-caret")
+                    .debug_selector(|| "standalone-document-caret".into())
+                    .flex_shrink_0()
+                    .child(icon(IconName::ChevronDown, colors.muted, 14.)),
+            )
+            .accessibility_label(format!("{} · {title}", t!("docs.open_documents")));
+        titlebar_actions()
+            .id("standalone-document-list")
+            .relative()
+            .group("standalone-document-list")
+            .min_w_0()
+            .when(cfg!(target_os = "windows"), |title| title.occlude())
+            .on_click(|_, _, cx| cx.stop_propagation())
+            .child(self.document_list_popover(trigger, Anchor::TopLeft, cx, colors))
+            .child(
+                div()
+                    .id("standalone-document-hover-line")
+                    .debug_selector(|| "standalone-document-hover-line".into())
+                    .absolute()
+                    .left_0()
+                    .right_0()
+                    .bottom(px(1.))
+                    .h(px(2.))
+                    .rounded(px(1.))
+                    .group_hover("standalone-document-list", |style| style.bg(colors.accent)),
+            )
+    }
+
+    fn document_list_popover(
+        &self,
+        trigger: Button,
+        anchor: Anchor,
+        cx: &Context<Self>,
+        colors: Palette,
+    ) -> impl IntoElement {
         let workspace = cx.weak_entity();
         let list = Popover::new("open-documents")
             .dropdown_motion()
+            .anchor(anchor)
             .scrollable(false)
             .offset(px(6.))
             .p_2()
@@ -181,46 +295,17 @@ impl Workspace {
                     .unwrap_or_else(|_| div().into_any_element())
             });
 
-        h_flex()
-            .h(super::FILE_TOOLBAR_HEIGHT)
-            .flex_shrink_0()
-            .px_2()
-            .gap_1()
-            .children(self.show_file_tree_button(cx))
-            .child(
-                h_flex()
-                    .id("document-path-controls")
-                    .min_w_0()
-                    .gap(px(2.))
-                    .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
-                        if event.keystroke.key == "down"
-                            && this.document_list_trigger.is_focused(window)
-                        {
-                            cx.stop_propagation();
-                            this.open_documents_list = true;
-                            this.focus_active_document_row(cx);
-                        }
-                    }))
-                    .child(list)
-                    .when_some(path, |bar, path| {
-                        bar.child(
-                            compact_icon_button(
-                                "copy-document-path",
-                                IconName::Copy,
-                                t!("docs.copy_path"),
-                            )
-                            .debug_selector(|| "copy-document-path".into())
-                            .flex_shrink_0()
-                            .on_click(move |_, _, cx| {
-                                cx.write_to_clipboard(ClipboardItem::new_string(path.clone()));
-                            }),
-                        )
-                    }),
-            )
-            .child(div().flex_1().min_w_0())
-            .when_some(self.doc.as_ref(), |bar, reader| {
-                bar.child(reader.read(cx).toolbar_actions(reader, window))
-            })
+        div()
+            .id("open-documents-control")
+            .min_w_0()
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                if event.keystroke.key == "down" && this.document_list_trigger.is_focused(window) {
+                    cx.stop_propagation();
+                    this.open_documents_list = true;
+                    this.focus_active_document_row(cx);
+                }
+            }))
+            .child(list)
     }
 
     fn document_list_content(

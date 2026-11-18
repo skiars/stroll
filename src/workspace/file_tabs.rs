@@ -22,13 +22,53 @@ use super::{FILE_TOOLBAR_HEIGHT, Palette, Workspace, file_type_icon, icon_button
 impl Workspace {
     pub(super) fn tab_bar(&self, cx: &Context<Self>, colors: Palette) -> impl IntoElement {
         let labels = labels(self.tabs.paths());
+        let more = self.tabs_overflow || self.open_files_list;
+        h_flex()
+            .id("editor-tab-bar")
+            .debug_selector(|| "workspace-tab-bar".into())
+            .h(FILE_TOOLBAR_HEIGHT)
+            .w_full()
+            .min_w_0()
+            .flex_shrink_0()
+            .gap(px(6.))
+            .px_2()
+            .bg(colors.bg)
+            .children(self.show_file_tree_button(cx))
+            .child(self.tab_strip(&labels, more, cx, colors))
+            .when(more, |bar| {
+                bar.child(self.open_files_popover(labels, cx, colors))
+            })
+            .child(self.workspace_actions(cx))
+    }
+
+    pub(super) fn titlebar_tabs(&self, cx: &Context<Self>, colors: Palette) -> impl IntoElement {
+        div()
+            .id("standalone-title-tabs")
+            .debug_selector(|| "standalone-title-tabs".into())
+            .relative()
+            .flex_1()
+            .min_w_0()
+            .h_full()
+            // Measure the strip in the space left by the title bar controls.
+            .child(h_flex().absolute().inset_0().child(self.tab_strip(
+                &labels(self.tabs.paths()),
+                false,
+                cx,
+                colors,
+            )))
+    }
+
+    fn tab_strip(
+        &self,
+        labels: &[String],
+        overflow_menu_visible: bool,
+        cx: &Context<Self>,
+        colors: Palette,
+    ) -> impl IntoElement {
         let scroll = self.tab_scroll.clone();
         let measure = cx.weak_entity();
         let width = self.tab_viewport_width;
-        let reveal = self.reveal_tab;
-        let active = self.tabs.active().and_then(|path| self.tabs.index(path));
         let was_overflow = self.tabs_overflow;
-        let more = was_overflow || self.open_files_list;
         let strip = h_flex()
             .id("editor-tab-strip")
             .role(Role::TabList)
@@ -43,34 +83,22 @@ impl Workspace {
             .on_prepaint(move |bounds, window, _| {
                 // The trigger uses 28px plus the toolbar gap. Measure against
                 // the space available without it so it can disappear again.
-                let full_width = bounds.size.width + if more { px(34.) } else { px(0.) };
+                let full_width = bounds.size.width
+                    + if overflow_menu_visible {
+                        px(34.)
+                    } else {
+                        px(0.)
+                    };
                 let content_width = bounds.size.width + scroll.max_offset().x;
                 let overflow = content_width > full_width + px(1.);
                 let resized = bounds.size.width != width;
-                let reveal_offset = if reveal || resized {
-                    active
-                        .and_then(|index| scroll.bounds_for_item(index))
-                        .map(|item| {
-                            let offset = scroll.offset().x;
-                            if item.left() + offset < bounds.left() {
-                                bounds.left() - item.left()
-                            } else if item.right() + offset > bounds.right() {
-                                bounds.right() - item.right()
-                            } else {
-                                offset
-                            }
-                        })
-                } else {
-                    None
-                };
-                if resized || reveal || overflow != was_overflow {
+                if resized || overflow != was_overflow {
                     window.on_next_frame(move |_, cx| {
                         _ = measure.update(cx, |this, cx| {
                             this.tab_viewport_width = bounds.size.width;
-                            this.reveal_tab = false;
                             this.tabs_overflow = overflow;
-                            if let Some(offset) = reveal_offset {
-                                this.tab_scroll.set_offset(point(offset, px(0.)));
+                            if resized {
+                                this.reveal_active_tab();
                             }
                             cx.notify();
                         });
@@ -81,41 +109,23 @@ impl Workspace {
                 self.tabs
                     .paths()
                     .iter()
-                    .zip(&labels)
+                    .zip(labels)
                     .map(|(path, label)| self.tab_element(path, label, cx, colors)),
             );
 
-        h_flex()
-            .id("editor-tab-bar")
-            .debug_selector(|| "workspace-tab-bar".into())
-            .h(FILE_TOOLBAR_HEIGHT)
-            .w_full()
+        // Fill the bar so the overflow indicator sits below the tabs.
+        div()
+            .relative()
+            .flex_1()
             .min_w_0()
-            .flex_shrink_0()
-            .gap(px(6.))
-            .px_2()
-            .bg(colors.bg)
-            .children(self.show_file_tree_button(cx))
-            .child(
-                // Fill the bar so the overflow indicator can sit in the gutter
-                // below the 26 px tabs instead of crossing their text.
-                div()
-                    .relative()
-                    .flex_1()
-                    .min_w_0()
-                    .h_full()
-                    .flex()
-                    .items_center()
-                    .child(strip)
-                    .child(ScrollableMask::vertical_wheel(&self.tab_scroll))
-                    .when(self.tabs_overflow, |this| {
-                        this.child(tab_overflow_indicator(&self.tab_scroll, colors))
-                    }),
-            )
-            .when(more, |bar| {
-                bar.child(self.open_files_popover(labels, cx, colors))
+            .h_full()
+            .flex()
+            .items_center()
+            .child(strip)
+            .child(ScrollableMask::vertical_wheel(&self.tab_scroll))
+            .when(self.tabs_overflow, |this| {
+                this.child(tab_overflow_indicator(&self.tab_scroll, colors))
             })
-            .child(self.workspace_actions(cx))
     }
 
     fn tab_element(
@@ -148,6 +158,11 @@ impl Workspace {
             .border_1()
             .border_color(transparent_black())
             .text_color(colors.muted)
+            .when(self.standalone.is_some(), |tab| {
+                tab.when(cfg!(target_os = "windows"), |tab| tab.occlude())
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_click(|_, _, cx| cx.stop_propagation())
+            })
             .when(active, |tab| {
                 tab.bg(colors.elevated)
                     .border_color(colors.surface)
