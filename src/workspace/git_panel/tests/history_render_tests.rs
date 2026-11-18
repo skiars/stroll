@@ -1063,13 +1063,28 @@ fn commit_history_wraps_titles_and_opens_hidden_refs_without_selecting() -> Resu
         ] {
             let y = top.as_f32() as u32 + 1;
             assert_eq!(image.get_pixel(0, y).0, color, "square left edge");
+            // Sample beyond the scrollbar and edge shadow, then check that
+            // the underlying row still paints square all the way to the seam.
             assert_eq!(
                 image
-                    .get_pixel(selected_row.right().as_f32() as u32 - 2, y)
+                    .get_pixel(selected_row.right().as_f32() as u32 - 11, y)
                     .0,
                 color,
-                "square right edge"
+                "row fill beside the right edge overlays"
             );
+            cx.update_window(handle.into(), |_, window, _| {
+                let scale = window.scale_factor();
+                assert!(
+                    window.painted_quads().iter().any(|quad| {
+                        quad.bounds.right().0 == selected_row.right().as_f32() * scale
+                            && quad.bounds.top().0 <= y as f32 * scale
+                            && quad.bounds.bottom().0 > y as f32 * scale
+                            && quad.corner_radii.top_right.0 == 0.
+                            && quad.background.as_solid().map(color_bytes) == Some(color)
+                    }),
+                    "square row fill extends to the right seam"
+                );
+            })?;
         }
         if width == px(230.) {
             assert_track_crosses_seam(&image, 28, wrapped.bottom().as_f32() as u32, 1.);

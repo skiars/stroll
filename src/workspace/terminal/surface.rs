@@ -1276,7 +1276,7 @@ mod tests {
         use gpui::{linear_color_stop, linear_gradient};
         use gpui_component::ThemeMode;
 
-        use crate::workspace::{DARK_PANE_DIVIDER, PANE_SHADOW_OPACITY, Palette, apply_theme};
+        use crate::workspace::{Palette, apply_theme};
 
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("repo");
@@ -1365,41 +1365,52 @@ mod tests {
         let black = Hsla::black();
         let shadow = linear_gradient(
             180.,
-            linear_color_stop(black.opacity(PANE_SHADOW_OPACITY), 0.),
+            linear_color_stop(black.opacity(0.04), 0.),
             linear_color_stop(black.opacity(0.), 1.),
         );
-        visual.update(|window, cx| {
+        let panel_bounds = visual.update(|window, cx| {
             let quads = window.painted_quads();
             let shadow = quads.iter().find(|quad| quad.background == shadow).unwrap();
             let scale = window.scale_factor();
-            assert_eq!(shadow.bounds.size.height.0, 4. * scale);
+            assert_eq!(shadow.bounds.size.height.0, 3. * scale);
             assert!(shadow.bounds.bottom() < settled[0].0.top());
+            let light_border = Palette::for_mode(ThemeMode::Light).border;
+            let top_border = quads
+                .iter()
+                .find(|quad| {
+                    quad.border_color == light_border
+                        && quad.border_widths.top.0 == scale
+                        && quad.bounds.left() == shadow.bounds.left()
+                        && quad.bounds.right() == shadow.bounds.right()
+                        && quad.bounds.top() + quad.border_widths.top == shadow.bounds.top()
+                })
+                .expect("the light shadow starts just below the terminal divider");
             apply_theme(ThemeMode::Dark, cx);
             cx.set_reduce_motion(true);
+            top_border.bounds
         });
         select(visual, 1);
         assert_eq!(paint_indicators(visual).len(), 1);
         visual.update(|window, cx| {
             let quads = window.painted_quads();
             assert!(quads.iter().all(|quad| quad.background != shadow));
-            let divider = Hsla::from(rgb(DARK_PANE_DIVIDER));
+            let divider = Palette::for_mode(ThemeMode::Dark).border;
             let scale = window.scale_factor();
-            let top_border = quads
-                .iter()
-                .find(|quad| quad.border_color == divider && quad.border_widths.top.0 == scale)
-                .unwrap();
-            assert!(top_border.bounds.top() < settled[0].0.top());
+            assert!(quads.iter().any(|quad| {
+                quad.border_color == divider
+                    && quad.border_widths.top.0 == scale
+                    && quad.bounds == panel_bounds
+            }));
             workspace.update(cx, |view, cx| {
                 view.current_terminal_mut().unwrap().maximized = true;
                 cx.notify();
             });
             window.draw(cx).clear(cx);
-            assert!(
-                window
-                    .painted_quads()
-                    .iter()
-                    .all(|quad| quad.border_color != divider)
-            );
+            assert!(!window.painted_quads().iter().any(|quad| {
+                quad.border_color == divider
+                    && quad.border_widths.top.0 == scale
+                    && quad.bounds.size.width == panel_bounds.size.width
+            }));
             apply_theme(ThemeMode::Light, cx);
             window.draw(cx).clear(cx);
             assert!(

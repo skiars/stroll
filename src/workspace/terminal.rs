@@ -20,8 +20,8 @@ use gpui_kit_assets::IconName;
 use crate::{repository::Store, terminal::Process};
 
 use super::{
-    DARK_PANE_DIVIDER, NextTab, PANE_SHADOW_OPACITY, Palette, PreviousTab, ToggleTerminal,
-    Workspace, WorkspaceView, compact_icon_button, icon_button,
+    NextTab, Palette, PreviousTab, ToggleTerminal, Workspace, WorkspaceView, compact_icon_button,
+    icon_button,
 };
 use surface::{Session, SessionEvent, Status};
 
@@ -430,14 +430,8 @@ impl Workspace {
             Status::Exited(code) => Some(t!("terminal.exited", code = code).into_owned().into()),
             Status::Failed(error) => Some(t!("terminal.failed", error = error).into_owned().into()),
         };
-        let resizer = div()
-            .id("terminal-resizer")
-            .absolute()
-            .top(px(-4.))
-            .left_0()
-            .right_0()
-            .h(px(8.))
-            .group("terminal-resizer")
+        let resizer = super::pane_resize_handle("terminal-resizer", Axis::Vertical, false)
+            .with_hit_padding(px(0.), super::PANE_RESIZE_HIT_WIDTH - px(1.))
             .track_focus(&panel.resizer_focus)
             .role(Role::Splitter)
             .aria_orientation(Orientation::Horizontal)
@@ -446,7 +440,6 @@ impl Workspace {
             .aria_max_numeric_value(maximum.to_f64())
             .aria_numeric_value(height.to_f64())
             .aria_numeric_value_step(10.)
-            .cursor(CursorStyle::ResizeRow)
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |this, event: &MouseDownEvent, window, cx| {
@@ -480,24 +473,7 @@ impl Workspace {
                 };
                 this.set_terminal_height(value, maximum, true, cx);
                 cx.stop_propagation();
-            }))
-            .child(
-                div()
-                    .absolute()
-                    .top(px(3.))
-                    .left_1_2()
-                    .ml(px(-12.))
-                    .w(px(24.))
-                    .h(px(2.))
-                    .rounded_full()
-                    .bg(colors.accent)
-                    .opacity(if self.terminals.resizing.is_some() {
-                        1.
-                    } else {
-                        0.
-                    })
-                    .group_hover("terminal-resizer", |style| style.opacity(1.)),
-            );
+            }));
 
         let toolbar = h_flex()
             .id("terminal-toolbar")
@@ -510,6 +486,25 @@ impl Workspace {
             .pl(px(4.))
             .pr(px(2.))
             .text_size(px(12.))
+            .when(!panel.maximized && !dark, |bar| {
+                let black = Hsla::black();
+                let shadow = linear_gradient(
+                    180.,
+                    linear_color_stop(black.opacity(0.04), 0.),
+                    linear_color_stop(black.opacity(0.), 1.),
+                );
+                bar.child(
+                    canvas(
+                        |_, _, _| (),
+                        move |bounds, (), window, _| window.paint_quad(fill(bounds, shadow)),
+                    )
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .right_0()
+                    .h(px(3.)),
+                )
+            })
             .child(
                 div()
                     .flex_shrink_0()
@@ -622,30 +617,7 @@ impl Workspace {
                     el.flex_shrink_0()
                         .h(height)
                         .border_t_1()
-                        .border_color(if dark {
-                            rgb(DARK_PANE_DIVIDER).into()
-                        } else {
-                            colors.border
-                        })
-                })
-                .when(!panel.maximized && !dark, |el| {
-                    let black = Hsla::black();
-                    let shadow = linear_gradient(
-                        180.,
-                        linear_color_stop(black.opacity(PANE_SHADOW_OPACITY), 0.),
-                        linear_color_stop(black.opacity(0.), 1.),
-                    );
-                    el.child(
-                        canvas(
-                            |_, _, _| (),
-                            move |bounds, (), window, _| window.paint_quad(fill(bounds, shadow)),
-                        )
-                        .absolute()
-                        .top_0()
-                        .left_0()
-                        .right_0()
-                        .h(px(4.)),
-                    )
+                        .border_color(colors.border)
                 })
                 .child(toolbar)
                 .child(

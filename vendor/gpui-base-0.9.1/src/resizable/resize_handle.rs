@@ -1,4 +1,8 @@
-use std::{cell::Cell, rc::Rc};
+use std::{
+    cell::Cell,
+    rc::Rc,
+    time::{Duration, Instant},
+};
 
 use gpui::{
     AnyElement, App, Axis, Div, Element, ElementId, Entity, GlobalElementId, Hitbox,
@@ -158,6 +162,10 @@ pub struct ResizeHandle<T: 'static, E: 'static + Render> {
     edge: Option<HandleEdge>,
     drag: Option<(T, DragConstructor<T, E>)>,
     appearance: Option<ResizeHandleRenderer>,
+    hit_padding: Option<(Pixels, Pixels)>,
+    hover_delay: Duration,
+    scroll_passthrough: bool,
+    drag_from_press: bool,
     /// The band itself. Listeners a caller attaches through the interactive
     /// element traits land here, on the element the pointer actually hits;
     /// base places and sizes it when it is laid out.
@@ -172,6 +180,10 @@ impl<T: 'static, E: 'static + Render> ResizeHandle<T, E> {
             edge: None,
             drag: None,
             appearance: None,
+            hit_padding: None,
+            hover_delay: Duration::ZERO,
+            scroll_passthrough: false,
+            drag_from_press: false,
             axis,
             base: div(),
         }
@@ -180,6 +192,36 @@ impl<T: 'static, E: 'static + Render> ResizeHandle<T, E> {
     /// Hand the painted part of this handle to `appearance`.
     pub fn with_appearance(mut self, appearance: ResizeHandleRenderer) -> Self {
         self.appearance = Some(appearance);
+        self
+    }
+
+    /// Size the grab band around its hairline. Edge handles use only the inner
+    /// padding.
+    pub fn with_hit_padding(mut self, before: Pixels, after: Pixels) -> Self {
+        self.hit_padding = Some((before, after));
+        self
+    }
+
+    /// Wait before presenting hover feedback. Press and drag feedback bypass the delay.
+    pub fn with_hover_delay(mut self, delay: Duration) -> Self {
+        self.hover_delay = delay;
+        self
+    }
+
+    /// Let scroll events reach the pane beneath the band.
+    pub fn with_scroll_passthrough(mut self) -> Self {
+        self.scroll_passthrough = true;
+        self
+    }
+
+    /// Start a drag and report the original press offset from the band origin.
+    pub fn on_drag_from_press(
+        mut self,
+        value: T,
+        f: impl Fn(&T, &Point<Pixels>, &mut Window, &mut App) -> Entity<E> + 'static,
+    ) -> Self {
+        self.drag_from_press = true;
+        self.drag = Some((value, Box::new(f)));
         self
     }
 
@@ -196,6 +238,7 @@ impl<T: 'static, E: 'static + Render> ResizeHandle<T, E> {
         value: T,
         f: impl Fn(&T, &Point<Pixels>, &mut Window, &mut App) -> Entity<E> + 'static,
     ) -> Self {
+        self.drag_from_press = false;
         self.drag = Some((value, Box::new(f)));
         self
     }
@@ -228,6 +271,8 @@ impl<T: 'static, E: 'static + Render> InteractiveElementExt for ResizeHandle<T, 
 #[derive(Default, Debug, Clone)]
 struct SharedHandleState {
     state: Rc<Cell<ResizeHandleState>>,
+    hover_since: Rc<Cell<Option<Instant>>>,
+    press_position: Rc<Cell<Option<Point<Pixels>>>>,
 }
 
 impl SharedHandleState {
@@ -237,10 +282,36 @@ impl SharedHandleState {
 
     /// Reports whether the state actually changed, so a listener repaints the
     /// window only when there is something new to paint.
-    fn set(&self, state: ResizeHandleState) -> bool {
-        let changed = self.state.get() != state;
-        self.state.set(state);
-        changed
+    fn set(&self, state: ResizeHandleState, now: Instant) -> bool {
+        let previous = self.state.replace(state);
+        if previous == state {
+            return false;
+        }
+        self.hover_since.set(
+            (previous == ResizeHandleState::Idle && state == ResizeHandleState::Hovered)
+                .then_some(now),
+        );
+        true
+    }
+
+    fn appearance_state(
+        &self,
+        delay: Duration,
+        window: &mut Window,
+        cx: &App,
+    ) -> ResizeHandleState {
+        if let Some(since) = self.hover_since.get()
+            && cx
+                .background_executor()
+                .now()
+                .saturating_duration_since(since)
+                < delay
+        {
+            window.request_animation_frame();
+            ResizeHandleState::Idle
+        } else {
+            self.get()
+        }
     }
 }
 
@@ -272,15 +343,14 @@ impl<T: 'static, E: 'static + Render> Element for ResizeHandle<T, E> {
         window: &mut Window,
         cx: &mut App,
     ) -> (gpui::LayoutId, Self::RequestLayoutState) {
-        let neg_offset = -HANDLE_PADDING;
+        let (before, after) = self.hit_padding.unwrap_or((HANDLE_PADDING, HANDLE_PADDING));
         let axis = self.axis;
         let edge = self.edge;
         // Sizes are border-box: the extent has to name the whole band, padding
         // included, or the content box resolves to zero and the hairline
         // overflows into the padding, landing wherever the padding happens to
         // push it.
-        let hug_extent = HANDLE_SIZE + HANDLE_PADDING;
-        let straddle_extent = HANDLE_SIZE + HANDLE_PADDING * 2.;
+        let straddle_extent = HANDLE_SIZE + before + after;
         // The caller's listeners are already on it; what base adds is where the
         // band goes and what it holds.
         let base = std::mem::replace(&mut self.base, div());
@@ -290,16 +360,28 @@ impl<T: 'static, E: 'static + Render> Element for ResizeHandle<T, E> {
             let state: SharedHandleState = state.unwrap_or_default();
 
             let bg_color = handle_color(&cx.theme(), state.get().is_active());
+            let appearance_state = state.appearance_state(self.hover_delay, window, cx);
 
             let mut el = base
                 .id(self.id.clone())
                 .test_support()
-                .occlude()
+                .map(|this| {
+                    if self.scroll_passthrough {
+                        this.block_mouse_except_scroll()
+                    } else {
+                        this.occlude()
+                    }
+                })
                 .absolute()
                 .flex_shrink_0()
                 .group("handle")
                 .when_some(drag, |this, (value, on_drag)| {
-                    this.on_drag(value, move |value, position, window, cx| {
+                    let press_position = state.press_position.clone();
+                    let use_press_offset = self.drag_from_press;
+                    this.on_drag(value, move |value, mut position, window, cx| {
+                        if use_press_offset && let Some(press) = press_position.get() {
+                            position += press - window.mouse_position();
+                        }
                         on_drag(value, &position, window, cx)
                     })
                 })
@@ -313,44 +395,46 @@ impl<T: 'static, E: 'static + Render> Element for ResizeHandle<T, E> {
                         .top_0()
                         .right_0()
                         .h_full()
-                        .w(hug_extent)
-                        .pl(HANDLE_PADDING),
+                        .w(HANDLE_SIZE + before)
+                        .pl(before),
                     (Some(HandleEdge::Leading), Axis::Horizontal) => this
                         .cursor_col_resize()
                         .top_0()
                         .left_0()
                         .h_full()
-                        .w(hug_extent)
-                        .pr(HANDLE_PADDING),
+                        .w(HANDLE_SIZE + after)
+                        .pr(after),
                     (Some(HandleEdge::Trailing), Axis::Vertical) => this
                         .cursor_row_resize()
                         .bottom_0()
                         .left_0()
                         .w_full()
-                        .h(hug_extent)
-                        .pt(HANDLE_PADDING),
+                        .h(HANDLE_SIZE + before)
+                        .pt(before),
                     (Some(HandleEdge::Leading), Axis::Vertical) => this
                         .cursor_row_resize()
                         .top_0()
                         .left_0()
                         .w_full()
-                        .h(hug_extent)
-                        .pb(HANDLE_PADDING),
+                        .h(HANDLE_SIZE + after)
+                        .pb(after),
                     // Straddling the boundary: half the band on either side.
                     (None, Axis::Horizontal) => this
                         .cursor_col_resize()
                         .top_0()
-                        .left(neg_offset)
+                        .left(-before)
                         .h_full()
                         .w(straddle_extent)
-                        .px(HANDLE_PADDING),
+                        .pl(before)
+                        .pr(after),
                     (None, Axis::Vertical) => this
                         .cursor_row_resize()
-                        .top(neg_offset)
+                        .top(-before)
                         .left_0()
                         .w_full()
                         .h(straddle_extent)
-                        .py(HANDLE_PADDING),
+                        .pt(before)
+                        .pb(after),
                 })
                 .child(
                     // A renderer that declines — or is absent — leaves the
@@ -366,7 +450,7 @@ impl<T: 'static, E: 'static + Render> Element for ResizeHandle<T, E> {
                                 &ResizeHandleContext {
                                     axis,
                                     edge,
-                                    state: state.get(),
+                                    state: appearance_state,
                                 },
                                 window,
                                 cx,
@@ -436,12 +520,15 @@ impl<T: 'static, E: 'static + Render> Element for ResizeHandle<T, E> {
             window.on_mouse_event({
                 let state = state.clone();
                 let hitbox = hitbox.clone();
-                move |ev: &MouseDownEvent, phase, window, _| {
+                move |ev: &MouseDownEvent, phase, window, cx| {
                     if phase.bubble()
+                        && ev.button == gpui::MouseButton::Left
                         && hitbox.is_hovered_at(ev.position, window)
-                        && state.set(ResizeHandleState::Pressed)
                     {
-                        window.refresh();
+                        state.press_position.set(Some(ev.position));
+                        if state.set(ResizeHandleState::Pressed, cx.background_executor().now()) {
+                            window.refresh();
+                        }
                     }
                 }
             });
@@ -449,7 +536,7 @@ impl<T: 'static, E: 'static + Render> Element for ResizeHandle<T, E> {
             window.on_mouse_event({
                 let state = state.clone();
                 let hitbox = hitbox.clone();
-                move |ev: &MouseMoveEvent, phase, window, _| {
+                move |ev: &MouseMoveEvent, phase, window, cx| {
                     let dragging = ev.dragging();
                     if (dragging && !phase.bubble()) || (!dragging && !phase.capture()) {
                         return;
@@ -460,13 +547,20 @@ impl<T: 'static, E: 'static + Render> Element for ResizeHandle<T, E> {
                     // outside this nine-pixel band, so where it is says nothing
                     // about whether the handle is still being dragged.
                     let next = match state.get() {
-                        engaged if engaged.is_active() && dragging => ResizeHandleState::Dragging,
+                        engaged if engaged.is_active() && dragging => {
+                            if cx.has_active_drag() {
+                                ResizeHandleState::Dragging
+                            } else {
+                                engaged
+                            }
+                        }
+                        _ if dragging => ResizeHandleState::Idle,
                         _ if hitbox.is_hovered_at(ev.position, window) => {
                             ResizeHandleState::Hovered
                         }
                         _ => ResizeHandleState::Idle,
                     };
-                    if state.set(next) {
+                    if state.set(next, cx.background_executor().now()) {
                         window.refresh();
                     }
                 }
@@ -475,8 +569,8 @@ impl<T: 'static, E: 'static + Render> Element for ResizeHandle<T, E> {
             window.on_mouse_event({
                 let state = state.clone();
                 let hitbox = hitbox.clone();
-                move |ev: &MouseUpEvent, _, window, _| {
-                    if !state.get().is_active() {
+                move |ev: &MouseUpEvent, _, window, cx| {
+                    if ev.button != gpui::MouseButton::Left || !state.get().is_active() {
                         return;
                     }
 
@@ -488,7 +582,7 @@ impl<T: 'static, E: 'static + Render> Element for ResizeHandle<T, E> {
                     } else {
                         ResizeHandleState::Idle
                     };
-                    if state.set(next) {
+                    if state.set(next, cx.background_executor().now()) {
                         window.refresh();
                     }
                 }
@@ -764,7 +858,7 @@ mod tests {
         // What `paint` hands each mouse listener.
         let listener = stored.clone();
 
-        assert!(listener.set(ResizeHandleState::Pressed));
+        assert!(listener.set(ResizeHandleState::Pressed, std::time::Instant::now()));
 
         // The regression this pins down: the state used to be a bare `Cell`,
         // which clones by value, so a listener wrote into a copy that died
@@ -777,8 +871,13 @@ mod tests {
     fn setting_the_state_it_already_has_asks_for_no_repaint() {
         let state = SharedHandleState::default();
 
-        assert!(state.set(ResizeHandleState::Hovered));
-        assert!(!state.set(ResizeHandleState::Hovered));
+        let now = std::time::Instant::now();
+        assert!(state.set(ResizeHandleState::Hovered, now));
+        assert!(!state.set(ResizeHandleState::Hovered, now));
+        assert_eq!(state.hover_since.get(), Some(now));
+        assert!(state.set(ResizeHandleState::Pressed, now));
+        assert!(state.set(ResizeHandleState::Hovered, now));
+        assert_eq!(state.hover_since.get(), None);
     }
 
     #[test]

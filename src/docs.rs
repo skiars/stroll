@@ -16,7 +16,7 @@ use gpui_component::{
     button::Button,
     h_flex,
     input::{Input, InputEvent, InputState},
-    scroll::ScrollableElement as _,
+    scroll::ScrollbarViewport as _,
     text::{
         MarkdownExtensions, MarkdownNode, MarkdownParseContext, MarkdownPlugin, RangeHighlight,
         TextView, TextViewState, TextViewStyle, data_url_image, markdown_ast::Node,
@@ -33,8 +33,8 @@ use crate::{
     repository::{Entry, Repository},
     session::DocumentPosition,
     workspace::{
-        Palette, PaneDrag, Workspace, compact_icon_button, icon, icon_button, panel_resize,
-        scroll_viewport_background,
+        Palette, PaneDrag, Workspace, compact_icon_button, icon, icon_button, pane_scrollbar,
+        panel_resize, scroll_viewport_background,
     },
 };
 
@@ -991,7 +991,6 @@ impl DocReader {
             .max_w(relative(0.45))
             .flex_shrink_0()
             .pl_2()
-            .pr_1()
             .pt_3()
             .child(panel_resize(
                 "document-outline-resize",
@@ -1014,9 +1013,10 @@ impl DocReader {
                     .flex_1()
                     .min_h_0()
                     .w_full()
+                    .pr_1()
                     .overflow_y_scroll()
                     .track_scroll(&self.outline_scroll)
-                    .vertical_scrollbar(&self.outline_scroll)
+                    .scrollbar_overlay(pane_scrollbar(&self.outline_scroll))
                     .children(headings),
             )
     }
@@ -1247,7 +1247,8 @@ impl Render for DocReader {
                             return;
                         }
                         let maximum = event.bounds.size.width * 0.45;
-                        let width = event.bounds.right() - event.event.position.x;
+                        let width =
+                            event.bounds.right() - event.event.position.x + event.drag(cx).offset();
                         this.outline_width = width.clamp(px(120.).min(maximum), maximum);
                         _ = this.workspace.update(cx, |workspace, _| {
                             workspace.outline_width = this.outline_width;

@@ -859,16 +859,11 @@ impl GitPanel {
                             })
                             .child(list)
                             .child(
-                                // The tree's resize band is on its left edge.
-                                div()
-                                    .absolute()
-                                    .inset_0()
-                                    .left(super::GIT_RESIZE_GUTTER)
-                                    .child(
-                                        thin_scrollbar(&self.tree_scroll)
-                                            .id("git-tree-scroll")
-                                            .viewport_from_layout(),
-                                    ),
+                                div().absolute().inset_0().child(
+                                    crate::workspace::pane_scrollbar(&self.tree_scroll)
+                                        .id("git-tree-scroll")
+                                        .viewport_from_layout(),
+                                ),
                             )
                     }),
             )

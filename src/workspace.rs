@@ -43,6 +43,7 @@ use repository_ui::RepositoryUi;
 use settings::SettingsWindow;
 
 use std::{
+    cell::Cell,
     collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
     env, fs,
     path::{Path, PathBuf},
@@ -60,8 +61,8 @@ use gpui_component::{
     h_flex,
     input::{Editor, EditorState, Enter, IndentInline, InputEvent, Rope, Search},
     menu::{DropdownMenu, PopupMenuItem},
-    resizable::{HandleEdge, resize_handle},
-    scroll::thin_scrollbar,
+    resizable::HandleEdge,
+    scroll::{Scrollbar, ScrollbarHandle, thin_scrollbar},
     v_flex, window_corner_radii, window_paddings,
 };
 use gpui_kit_assets::IconName;
@@ -100,9 +101,16 @@ actions!(
     ]
 );
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub(crate) struct PaneDrag {
     pub(crate) edge: HandleEdge,
+    offset: Rc<Cell<Pixels>>,
+}
+
+impl PaneDrag {
+    pub(crate) fn offset(&self) -> Pixels {
+        self.offset.get()
+    }
 }
 
 impl Render for PaneDrag {
@@ -113,25 +121,104 @@ impl Render for PaneDrag {
 
 const FILE_TOOLBAR_HEIGHT: Pixels = px(36.);
 const PANE_RESIZE_GUTTER: Pixels = px(5.);
+const PANE_RESIZE_HIT_WIDTH: Pixels = px(4.);
 const PANE_SHADOW_OPACITY: f32 = 0.09;
 const DARK_PANE_DIVIDER: u32 = 0x3d4048;
 const RECENT_REPOSITORY_LIMIT: usize = 3;
 const EDITOR_JUMP_CONTEXT_LINES: usize = 5;
+
+fn pane_resize_handle<T: 'static, E: 'static + Render>(
+    id: &'static str,
+    axis: Axis,
+    draw_divider: bool,
+) -> gpui_base::ResizeHandle<T, E> {
+    gpui_base::resize_handle(id, axis)
+        .with_hover_delay(Duration::from_millis(120))
+        .with_scroll_passthrough()
+        .with_appearance(Rc::new(move |handle, window, cx| {
+            use gpui_base::{ResizeHandleState, Transition, transition};
+
+            let (length, opacity) = match handle.state() {
+                ResizeHandleState::Idle => (px(0.), 0.),
+                ResizeHandleState::Hovered => (px(32.), 0.7),
+                ResizeHandleState::Pressed => (px(44.), 0.9),
+                ResizeHandleState::Dragging => (px(52.), 1.),
+            };
+            let theme = cx.theme();
+            let (border, accent, radius) = (theme.border, theme.accent, theme.radius_full());
+            let motion = theme.motion_tokens();
+            let policy = Transition::new(motion.duration_fast).easing(motion.easing_move.clone());
+            let length = transition("pane-thumb-length", length, policy.clone(), window, cx);
+            let opacity =
+                transition("pane-thumb-opacity", opacity, policy, window, cx).clamp(0., 1.);
+            let thickness = px(4.);
+            let offset = (px(1.) - thickness) * 0.5;
+
+            Some(
+                div()
+                    .flex_none()
+                    .flex()
+                    .when(draw_divider, |line| line.bg(border))
+                    .map(|line| match axis {
+                        Axis::Horizontal => line.w(px(1.)).h_full().items_center(),
+                        Axis::Vertical => line.h(px(1.)).w_full().items_start().justify_center(),
+                    })
+                    .when(length > px(0.5), |line| {
+                        // Draw above both panes and their borders, below popups.
+                        line.child(deferred(
+                            div()
+                                .flex_none()
+                                .rounded(radius)
+                                .bg(accent)
+                                .opacity(opacity)
+                                .map(|pill| match axis {
+                                    Axis::Horizontal => pill.w(thickness).h(length).ml(offset),
+                                    Axis::Vertical => pill.h(thickness).w(length).mt(offset),
+                                }),
+                        ))
+                    })
+                    .into_any_element(),
+            )
+        }))
+}
+
+#[track_caller]
+pub(crate) fn pane_scrollbar<H: ScrollbarHandle + Clone>(handle: &H) -> Scrollbar {
+    thin_scrollbar(handle).styles(|styles| styles.thumb(|thumb| thumb.inset(px(4.))))
+}
 
 pub(crate) fn panel_resize(id: &'static str, edge: HandleEdge, top: Pixels) -> impl IntoElement {
     div()
         .absolute()
         .top(top)
         .bottom_0()
-        .w(PANE_RESIZE_GUTTER)
+        .w(PANE_RESIZE_HIT_WIDTH)
         .map(|band| match edge {
             HandleEdge::Leading => band.left_0(),
             HandleEdge::Trailing => band.right_0(),
         })
         .child(
-            resize_handle::<PaneDrag, PaneDrag>(id, Axis::Horizontal)
+            pane_resize_handle(id, Axis::Horizontal, true)
                 .inside(edge)
-                .on_drag(PaneDrag { edge }, |drag, _, _, cx| cx.new(|_| *drag)),
+                .with_hit_padding(
+                    PANE_RESIZE_HIT_WIDTH - px(1.),
+                    PANE_RESIZE_HIT_WIDTH - px(1.),
+                )
+                .on_drag_from_press(
+                    PaneDrag {
+                        edge,
+                        offset: Rc::new(Cell::new(px(0.))),
+                    },
+                    |drag, position, _, cx| {
+                        let offset = match drag.edge {
+                            HandleEdge::Leading => position.x,
+                            HandleEdge::Trailing => position.x - PANE_RESIZE_HIT_WIDTH,
+                        };
+                        // GPUI retains the payload separately from the drag view.
+                        drag.offset.set(offset);
+                        cx.new(|_| drag.clone())
+                    },
+                ),
         )
 }
 
@@ -3644,8 +3731,10 @@ impl Workspace {
                         list.into_any_element()
                     })
                     .child(
-                        div().absolute().inset_0().right(PANE_RESIZE_GUTTER).child(
-                            thin_scrollbar(&self.tree_scroll).id("workspace-file-tree-scroll"),
+                        div().absolute().inset_0().child(
+                            pane_scrollbar(&self.tree_scroll)
+                                .id("workspace-file-tree-scroll")
+                                .viewport_from_layout(),
                         ),
                     ),
             )
@@ -3997,7 +4086,9 @@ impl Workspace {
                             if event.drag(cx).edge != HandleEdge::Trailing {
                                 return;
                             }
-                            let pointer = event.event.position.x - event.bounds.left();
+                            let pointer = event.event.position.x
+                                - event.bounds.left()
+                                - event.drag(cx).offset();
                             if docs {
                                 this.docs_tree_width = pointer.clamp(px(160.), tree_limit);
                             } else {
@@ -4608,10 +4699,11 @@ mod tests {
                 .expect("light theme paints the file tree shadow")
                 .bounds
         });
-        let drag_start = visual.update(|window, cx| {
+        let (drag_start, divider_x) = visual.update(|window, cx| {
             let scale = window.scale_factor();
             assert_eq!(px(shadow.size.width.0 / scale), px(4.));
             apply_theme(ThemeMode::Dark, cx);
+            cx.set_reduce_motion(true);
             window.draw(cx).clear(cx);
             let quads = window.painted_quads();
             assert!(quads.iter().all(|quad| quad.background != gradient));
@@ -4624,11 +4716,41 @@ mod tests {
             assert_eq!(shadow.right(), line.left());
             assert_eq!(shadow.top(), line.top());
             assert_eq!(shadow.bottom(), line.bottom());
-            point(
-                px(line.left().0 / scale - 2.),
-                px(line.center().y.0 / scale),
+            (
+                point(
+                    px(line.right().0 / scale - 3.),
+                    px(line.center().y.0 / scale),
+                ),
+                line.center().x,
             )
         });
+        let draw_thumb = |visual: &mut VisualTestContext| {
+            visual.update(|window, cx| {
+                window.draw(cx).clear(cx);
+                let scale = window.scale_factor();
+                let accent = Palette::for_mode(ThemeMode::Dark).accent;
+                window.painted_quads().iter().find_map(|quad| {
+                    let color = quad.background.as_solid()?;
+                    (quad.bounds.size.width.0 == 4. * scale
+                        && quad.bounds.size.height.0 == 32. * scale
+                        && color == accent.opacity(color.a))
+                    .then_some(quad.bounds)
+                })
+            })
+        };
+        // Hovering across the seam does not engage the handle.
+        visual.simulate_mouse_move(
+            point(drag_start.x + px(5.), drag_start.y),
+            None,
+            Modifiers::default(),
+        );
+        visual.executor().advance_clock(Duration::from_millis(121));
+        assert!(draw_thumb(visual).is_none());
+        visual.simulate_mouse_move(drag_start, None, Modifiers::default());
+        assert!(draw_thumb(visual).is_none());
+        visual.executor().advance_clock(Duration::from_millis(121));
+        let thumb = draw_thumb(visual).expect("hovering inside the four-pixel band");
+        assert!((thumb.center().x.0 - divider_x.0).abs() <= 1.);
         let initial_width = visual.update(|_, cx| workspace.read(cx).editor_tree_width);
         visual.simulate_mouse_down(drag_start, MouseButton::Left, Modifiers::default());
         for offset in [10., 40.] {
@@ -4644,7 +4766,10 @@ mod tests {
             MouseButton::Left,
             Modifiers::default(),
         );
-        assert!(visual.update(|_, cx| workspace.read(cx).editor_tree_width) > initial_width);
+        assert_eq!(
+            visual.update(|_, cx| workspace.read(cx).editor_tree_width),
+            initial_width + px(40.),
+        );
     }
 
     #[gpui::test]

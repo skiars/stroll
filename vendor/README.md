@@ -29,6 +29,10 @@ dialogs in a Wayland window after changes to paint order or focus handling.
 - Default inputs and dropdowns are twice the UI font size. Custom
   heights are respected, and fixed-height input groups fit the inner field inside
   the group's border. The popup and Git integration tests check control geometry.
+- Resize handles support configurable hit padding and hover delay, scroll
+  passthrough, and drag callbacks anchored at the initial press. These options
+  let consumers customize a splitter through the existing appearance hook.
+  The resize handle tests cover default behavior and opt-in geometry and input.
 - The shared editor search and replace fields use the default input height.
 - CMake uses the shared Tree-sitter highlighter with a query that uses Rust
   Tree-sitter predicates. Run `cargo test --release --locked --test cmake_highlighting`

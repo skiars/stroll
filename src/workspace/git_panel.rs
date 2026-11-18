@@ -31,7 +31,7 @@ use gpui_component::{
     input::{EditorState, Input, InputEvent, InputState, TextareaState},
     menu::{ContextMenuExt as _, PopupMenuItem},
     resizable::HandleEdge,
-    scroll::{Scrollbar, ScrollbarMode, thin_scrollbar},
+    scroll::{Scrollbar, ScrollbarMode},
     select::{SearchableVec, Select, SelectEvent, SelectItem, SelectState},
     tooltip::{ManagedTooltipExt as _, Tooltip},
     v_flex,
@@ -1537,8 +1537,8 @@ impl GitPanel {
                                 ))
                         })
                         .child(
-                            div().absolute().inset_0().right(GIT_RESIZE_GUTTER).child(
-                                thin_scrollbar(&self.history_scroll)
+                            div().absolute().inset_0().child(
+                                super::pane_scrollbar(&self.history_scroll)
                                     .id("git-history-scroll")
                                     .viewport_from_layout(),
                             ),
@@ -1696,7 +1696,8 @@ impl Render for GitPanel {
             .overflow_hidden()
             .on_drag_move(
                 cx.listener(move |this, event: &DragMoveEvent<PaneDrag>, _, cx| {
-                    let pointer = event.event.position.x - event.bounds.left();
+                    let pointer =
+                        event.event.position.x - event.bounds.left() - event.drag(cx).offset();
                     match event.drag(cx).edge {
                         HandleEdge::Trailing => {
                             this.history_width =
