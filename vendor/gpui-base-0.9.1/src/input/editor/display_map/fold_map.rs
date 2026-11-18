@@ -6,6 +6,8 @@
 /// - Handling fold state changes and rebuilding the projection
 use std::ops::Range;
 
+use crate::input::Point;
+
 use super::folding::FoldRange;
 use super::wrap_map::WrapMap;
 
@@ -194,17 +196,20 @@ impl FoldMap {
         &mut self,
         edit_start_line: usize,
         edit_end_line: usize,
-        new_candidates: Vec<FoldRange>,
+        mut new_candidates: Vec<FoldRange>,
     ) {
-        // Remove old candidates within the edit range (already done by adjust_folds_for_edit)
-        // But do it again in case adjust wasn't called or range differs
+        // An asynchronous highlighter publishes its full list when parsing completes.
+        if new_candidates.is_empty() {
+            return;
+        }
         self.candidates
             .retain(|c| c.start_line < edit_start_line || c.start_line > edit_end_line);
 
-        // Add new candidates
-        self.candidates.extend(new_candidates);
-        self.candidates.sort_by_key(|r| r.start_line);
-        self.candidates.dedup_by_key(|r| r.start_line);
+        // Prefer fresh ranges when their headers match remapped candidates.
+        new_candidates.append(&mut self.candidates);
+        new_candidates.sort_by_key(|r| r.start_line);
+        new_candidates.dedup_by_key(|r| r.start_line);
+        self.candidates = new_candidates;
     }
 
     /// Set a fold at the given start_line (must be in candidates)
@@ -262,16 +267,18 @@ impl FoldMap {
 
     /// Adjust folds and candidates after a text edit.
     ///
-    /// - Folds/candidates overlapping the edited line range are removed
-    /// - Folds/candidates after the edit are shifted by line_delta
-    ///
-    /// This avoids expensive full tree traversal on every keystroke.
+    /// Open any collapsed ranges touched by the edit. Remap surviving candidates
+    /// until the highlighter validates them against the new text.
     pub(super) fn adjust_folds_for_edit(
         &mut self,
-        edit_start_line: usize,
-        edit_end_line: usize,
-        line_delta: isize,
+        edit_start: Point,
+        edit_end: Point,
+        new_end_line: usize,
     ) {
+        let edit_start_line = edit_start.row;
+        let edit_end_line = edit_end.row;
+        let line_delta = new_end_line as isize - edit_end_line as isize;
+
         // Adjust folded ranges
         if !self.folded.is_empty() {
             self.folded.retain(|fold| {
@@ -288,20 +295,29 @@ impl FoldMap {
             }
         }
 
-        // Adjust candidates the same way
-        if !self.candidates.is_empty() {
-            self.candidates
-                .retain(|c| !(c.start_line <= edit_end_line && c.end_line >= edit_start_line));
-
-            if line_delta != 0 {
-                for c in &mut self.candidates {
-                    if c.start_line > edit_end_line {
-                        c.start_line = (c.start_line as isize + line_delta).max(0) as usize;
-                        c.end_line = (c.end_line as isize + line_delta).max(0) as usize;
-                    }
-                }
+        self.candidates.retain_mut(|candidate| {
+            let header = candidate.start_line;
+            if header > edit_end_line {
+                candidate.start_line = header.saturating_add_signed(line_delta);
+            } else if header == edit_end_line && edit_end.column == 0 {
+                // Insertion before a header or deletion ending at its first byte.
+                candidate.start_line = new_end_line;
+            } else if header > edit_start_line
+                || (header == edit_start_line
+                    && edit_start.column == 0
+                    && edit_start_line != edit_end_line)
+            {
+                return false;
             }
-        }
+
+            if candidate.end_line >= edit_end_line {
+                candidate.end_line = candidate.end_line.saturating_add_signed(line_delta);
+            } else if candidate.end_line >= edit_start_line {
+                candidate.end_line = new_end_line;
+            }
+            candidate.start_line < candidate.end_line
+        });
+        self.candidates.dedup_by_key(|range| range.start_line);
 
         self.needs_rebuild = true;
     }

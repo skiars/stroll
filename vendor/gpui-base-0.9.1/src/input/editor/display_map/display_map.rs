@@ -232,15 +232,11 @@ impl DisplayMap {
             return;
         }
 
-        let edit_start_line = old_text.offset_to_point(range.start).row;
-        let edit_end_line = old_text.offset_to_point(range.end.min(old_text.len())).row;
-
-        let old_lines_in_range = edit_end_line.saturating_sub(edit_start_line);
-        let new_lines_in_range = new_text.chars().filter(|c| *c == '\n').count();
-        let line_delta = new_lines_in_range as isize - old_lines_in_range as isize;
-
+        let edit_start = old_text.offset_to_point(range.start);
+        let edit_end = old_text.offset_to_point(range.end.min(old_text.len()));
+        let new_end_line = edit_start.row + new_text.bytes().filter(|&byte| byte == b'\n').count();
         self.fold_map
-            .adjust_folds_for_edit(edit_start_line, edit_end_line, line_delta);
+            .adjust_folds_for_edit(edit_start, edit_end, new_end_line);
     }
 
     /// Incrementally update fold candidates after a text edit.

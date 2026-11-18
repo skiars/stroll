@@ -48,6 +48,9 @@ dialogs in a Wayland window after changes to paint order or focus handling.
 - After input changes, run `cargo test --release --locked --test touchpad_scroll --test smooth_scroll`
   to check logical document offsets and device-pixel paint offsets. Check continuous scrolling
   in documents, editors, and lists in a native Wayland session.
+- Fold candidates are remapped through edits and replaced when the background
+  highlighter publishes its completed parse. The editor editing integration test
+  checks candidate continuity, line remapping, and removal.
 - Interactive code editor edits reveal the caret with minimal scrolling before shaping the
   viewport. Programmatic replacements and history replay use the existing caret-follow margin.
   Removing inline Git deleted rows keeps the visible source anchored. The workspace

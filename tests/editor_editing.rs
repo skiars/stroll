@@ -571,3 +571,69 @@ fn programmatic_replacement_and_undo_redo_keep_the_existing_scroll_margin() {
         assert_eq!(&text(visual, editor)[caret..caret + 1], "x");
     });
 }
+
+#[gpui::test]
+fn fold_candidates_survive_edits_while_the_highlighter_reparses(cx: &mut TestAppContext) {
+    use std::time::Duration;
+
+    const SOURCE: &str = "fn main() {\n    let number = 1;\n    println!(\"{number}\");\n}\n";
+
+    let mut editor = None;
+    let (_, visual) = cx.add_window_view(|window, cx| {
+        gpui_component::init(cx);
+        let state = cx.new(|cx| {
+            let mut state = EditorState::new(window, cx)
+                .language("rust")
+                .folding(true)
+                .default_value(SOURCE);
+            state.ensure_highlighter_factory(
+                gpui_component::highlighter::input_highlighter_factory(),
+            );
+            state.prepare_language(window, cx);
+            state
+        });
+        editor = Some(state.clone());
+        let root = cx.new(|_| EditorView {
+            editor: state,
+            readonly: false,
+        });
+        Root::new(root, window, cx)
+    });
+    let editor = editor.unwrap();
+    let finish_parse = |visual: &mut VisualTestContext| {
+        visual.run_until_parked();
+        visual.executor().advance_clock(Duration::from_millis(100));
+        visual.run_until_parked();
+        draw(visual);
+    };
+    let is_candidate = |visual: &mut VisualTestContext, row| {
+        visual.update(|_, cx| editor.read(cx).display_map().is_fold_candidate(row))
+    };
+
+    finish_parse(visual);
+    assert!(is_candidate(visual, 0));
+
+    let number = SOURCE.find("1;").unwrap();
+    visual.update(|window, cx| {
+        editor.update(cx, |state, cx| {
+            state.replace_text_in_range(Some(number..number + 1), "42", window, cx);
+            assert!(state.display_map().is_fold_candidate(0));
+            state.replace_text_in_range(Some(0..0), "\n", window, cx);
+            assert!(!state.display_map().is_fold_candidate(0));
+            assert!(state.display_map().is_fold_candidate(1));
+            state.replace_text_in_range(Some(0..1), "", window, cx);
+            assert!(state.display_map().is_fold_candidate(0));
+        });
+    });
+    finish_parse(visual);
+    assert!(is_candidate(visual, 0));
+
+    visual.update(|window, cx| {
+        editor.update(cx, |state, cx| {
+            let end = state.text().len();
+            state.replace_text_in_range(Some(0..end), "fn main() {}\n", window, cx);
+        });
+    });
+    finish_parse(visual);
+    assert!(!is_candidate(visual, 0));
+}
