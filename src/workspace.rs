@@ -3561,6 +3561,7 @@ impl Workspace {
                 let entry = row.entry.clone();
                 let directory = entry.directory;
                 let selected = active.as_ref() == Some(&entry.path);
+                let dimmed = row.dimmed && !selected;
                 let view = weak.clone();
                 let clicked = entry.clone();
                 let row_id = format!("workspace-tree-row:{}", paths::display(&entry.path));
@@ -3570,6 +3571,8 @@ impl Workspace {
                     .flatten();
                 let icon_color = if selected {
                     colors.accent
+                } else if directory && !dimmed {
+                    colors.ink.blend(colors.muted.opacity(0.25))
                 } else {
                     colors.muted
                 };
@@ -3619,9 +3622,7 @@ impl Workspace {
                             .min_w_0()
                             .truncate()
                             .text_size(px(file_name_font_size(cx)))
-                            .when(in_workspace && row.dimmed && !selected, |name| {
-                                name.text_color(colors.muted)
-                            })
+                            .when(dimmed, |name| name.text_color(colors.muted))
                             .when_some(decoration.as_ref(), |name, (color, _)| {
                                 name.text_color(*color)
                             })
