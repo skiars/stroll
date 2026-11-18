@@ -268,32 +268,7 @@ impl GitPanel {
         self.stage_error = Some(message);
     }
 
-    pub(super) fn confirm_file_restore(
-        &self,
-        path: &str,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if !self.current_worktree() || self.writes_busy(cx) {
-            return;
-        }
-        let Some(review) = &self.review else { return };
-        let Some(&index) = review.by_path.get(path) else {
-            return;
-        };
-        let Some(version) = review.versions.get(&index) else {
-            return;
-        };
-        let edit = git::FileEdit {
-            path: path.to_owned(),
-            version: version.clone(),
-            action: FileAction::Restore,
-            block: None,
-        };
-        self.confirm_restore_edits(path.to_owned(), vec![edit], None, window, cx);
-    }
-
-    pub(super) fn prepare_tree_restore(
+    pub(super) fn prepare_worktree_restore(
         &mut self,
         path: String,
         targets: Vec<(String, git::WorktreeFile, bool)>,
@@ -325,7 +300,7 @@ impl GitPanel {
                 let version = version
                     .filter(|version| version.status.as_ref() == Some(&status))
                     .ok_or_else(|| anyhow::anyhow!("{path}: {}", t!("git.worktree_changed")))?;
-                if version.has_restorable_index_entry() {
+                if status.untracked || version.has_restorable_index_entry() {
                     hidden += usize::from(is_hidden);
                     edits.push(git::FileEdit {
                         path,
@@ -374,18 +349,33 @@ impl GitPanel {
             super::super::toast::error(window, cx, error.to_string());
             return;
         }
+        let untracked = edits
+            .iter()
+            .filter(|edit| {
+                edit.version
+                    .status
+                    .as_ref()
+                    .is_some_and(|status| status.untracked)
+            })
+            .map(|edit| edit.path.clone())
+            .collect::<Vec<_>>();
+        let discarding = !untracked.is_empty();
         let panel = cx.weak_entity();
         let selection = self.selection.clone();
         window.open_dialog(cx, move |dialog, _, _| {
             let panel = panel.clone();
             let selection = selection.clone();
-            let title = if hidden.is_some() {
+            let title = if discarding {
+                t!("git.discard_changes")
+            } else if hidden.is_some() {
                 t!("git.restore_directory_title")
             } else {
                 t!("git.restore_file_title")
             };
             let count = edits.len();
-            let detail = if hidden.is_some() {
+            let detail = if discarding {
+                t!("git.discard_untracked_detail")
+            } else if hidden.is_some() {
                 t!("git.restore_directory_detail", path = &path, count = count)
             } else {
                 t!("git.restore_file_detail", path = &path)
@@ -400,6 +390,21 @@ impl GitPanel {
                         .debug_selector(|| format!("git-restore-count:{count}"))
                         .child(detail),
                 )
+                .when(discarding, |dialog| {
+                    dialog.child(
+                        v_flex()
+                            .id("git-discard-untracked-files")
+                            .max_h(px(224.))
+                            .overflow_scroll()
+                            .text_size(GIT_TEXT_SIZE)
+                            .children(untracked.iter().map(|path| {
+                                div()
+                                    .debug_selector(|| format!("git-discard-untracked:{path}"))
+                                    .whitespace_nowrap()
+                                    .child(path.escape_debug().to_string())
+                            })),
+                    )
+                })
                 .when_some(hidden, |dialog, hidden| {
                     dialog.child(
                         div()
@@ -424,7 +429,11 @@ impl GitPanel {
                                 .debug_selector(|| "git-confirm-file-restore".into())
                                 .danger()
                                 .label_size(GIT_TEXT_SIZE)
-                                .label(t!("git.restore"))
+                                .label(if discarding {
+                                    t!("git.discard_changes")
+                                } else {
+                                    t!("git.restore")
+                                })
                                 .on_click(move |_, window, cx| {
                                     window.close_dialog(cx);
                                     _ = panel.update(cx, |this, cx| {

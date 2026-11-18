@@ -516,7 +516,7 @@ impl GitPanel {
                                         );
                                     }
                                 }
-                                if let Some(item) = tree_restore_item(
+                                for item in worktree_restore_items(
                                     &context_view,
                                     &menu_detail,
                                     &files,
@@ -659,7 +659,7 @@ impl GitPanel {
                                         );
                                     }
                                 }
-                                if let Some(item) = tree_restore_item(
+                                for item in worktree_restore_items(
                                     &menu_view,
                                     &menu_detail,
                                     &[ix],
@@ -1052,34 +1052,33 @@ fn stage_paths(detail: &Changes, files: &[usize], staged: bool, allowed: bool) -
         .collect()
 }
 
-fn tree_restore_item(
+pub(super) fn worktree_restore_items(
     owner: &WeakEntity<GitPanel>,
     detail: &Changes,
     files: &[usize],
     path: &str,
     directory: bool,
     cx: &App,
-) -> Option<PopupMenuItem> {
+) -> Vec<PopupMenuItem> {
     if !matches!(
         detail.comparison.worktree_mode(),
         Some(Mode::All | Mode::Unstaged)
     ) {
-        return None;
+        return Vec::new();
     }
-    let (targets, busy) = owner
+    owner
         .read_with(cx, |panel, cx| {
             if !panel.current_worktree() || !panel.backend.supports_git_operations() {
-                return (Vec::new(), false);
+                return Vec::new();
             }
-            let targets = files
+            let (untracked, tracked): (Vec<_>, Vec<_>) = files
                 .iter()
                 .filter_map(|&ix| {
                     let file = &detail.files[ix];
                     let status = file.worktree.as_ref()?;
-                    // An intent-to-add file has an unstaged A status and no staged contents to restore.
+                    // An intent-to-add file has no staged contents to restore.
                     (!file.submodule()
-                        && !status.untracked
-                        && status.code != 'A'
+                        && (status.untracked || status.code != 'A')
                         && git::FileAction::Restore.available(status))
                     .then(|| {
                         (
@@ -1089,34 +1088,38 @@ fn tree_restore_item(
                         )
                     })
                 })
-                .collect::<Vec<_>>();
-            (targets, panel.writes_busy(cx))
+                .partition(|(_, status, _)| status.untracked);
+            let busy = panel.writes_busy(cx);
+            let restore_label = if directory {
+                t!("git.restore_directory")
+            } else {
+                t!("git.restore_file")
+            };
+            [
+                (untracked, t!("git.discard_changes"), IconName::Trash),
+                (tracked, restore_label, IconName::RotateCcw),
+            ]
+            .into_iter()
+            .filter(|(targets, _, _)| !targets.is_empty())
+            .map(|(targets, label, icon)| {
+                let path = path.to_owned();
+                let owner = owner.clone();
+                PopupMenuItem::new(format!("{label}…"))
+                    .icon(icon)
+                    .disabled(busy)
+                    .on_click(move |_, window, cx| {
+                        _ = owner.update(cx, |panel, cx| {
+                            panel.prepare_worktree_restore(
+                                path.clone(),
+                                targets.clone(),
+                                directory,
+                                window,
+                                cx,
+                            );
+                        });
+                    })
+            })
+            .collect()
         })
-        .ok()?;
-    if targets.is_empty() {
-        return None;
-    }
-    let label = if directory {
-        t!("git.restore_directory")
-    } else {
-        t!("git.restore_file")
-    };
-    let path = path.to_owned();
-    let owner = owner.clone();
-    Some(
-        PopupMenuItem::new(format!("{label}…"))
-            .icon(IconName::RotateCcw)
-            .disabled(busy)
-            .on_click(move |_, window, cx| {
-                _ = owner.update(cx, |panel, cx| {
-                    panel.prepare_tree_restore(
-                        path.clone(),
-                        targets.clone(),
-                        directory,
-                        window,
-                        cx,
-                    );
-                });
-            }),
-    )
+        .unwrap_or_default()
 }

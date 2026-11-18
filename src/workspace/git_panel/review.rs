@@ -2122,6 +2122,13 @@ impl GitPanel {
         let task = cx.background_spawn(async move {
             let mut completed = Vec::new();
             let total = edits.len();
+            let discarding_untracked = action == git::FileAction::Restore
+                && edits.iter().all(|edit| {
+                    edit.version
+                        .status
+                        .as_ref()
+                        .is_some_and(|status| status.untracked)
+                });
             let result = (|| {
                 if total > 1 {
                     let versions = repo.git_backend().file_versions(&work_paths);
@@ -2149,8 +2156,13 @@ impl GitPanel {
             })();
             let error = result.err().map(|error| {
                 if total > 1 {
+                    let key = if discarding_untracked {
+                        "git.discard_batch_failed"
+                    } else {
+                        "git.restore_batch_failed"
+                    };
                     t!(
-                        "git.restore_batch_failed",
+                        key,
                         completed = completed.len(),
                         total = total,
                         error = error.to_string()
@@ -3120,7 +3132,6 @@ impl GitPanel {
         let detail = review.detail.clone();
         let stage_allowed = detail.status.is_some() && self.current_worktree();
         let stage_busy = self.writes_busy(cx);
-        let supports_operations = self.backend.supports_git_operations();
         let by_path = review.by_path.clone();
         let selected = self.diff.read(cx).selected_lines();
         let font_size = self
@@ -3139,7 +3150,7 @@ impl GitPanel {
                 return div().into_any_element();
             };
             let file = &detail.files[ix];
-            let Some((display, counts, can_open, layer, layered, version_ready)) = view
+            let Some((display, counts, can_open, layer, layered)) = view
                 .read_with(cx, |this, _| {
                     let review = this.review.as_ref()?;
                     if !Arc::ptr_eq(&review.detail, &detail) {
@@ -3155,7 +3166,6 @@ impl GitPanel {
                         review.openable[ix],
                         this.document_layer(ix, path),
                         review.secondary.contains_key(&ix),
-                        review.versions.contains_key(&ix),
                     ))
                 })
                 .ok()
@@ -3181,11 +3191,12 @@ impl GitPanel {
                 .filter(|old| *old != &path)
                 .map_or_else(|| path.clone(), |old| format!("{old} → {path}"));
             let state = file.worktree.clone();
-            let file_submodule = file.submodule();
             let show_stage = stage_allowed && state.as_ref().is_some_and(|state| !state.conflict);
             let editor_view = view.clone();
             let editor_path = path.clone();
             let editor_selector = format!("git-open-file-in-editor:{path}");
+            let menu_selector = format!("git-file-menu:{path}");
+            let menu_detail = detail.clone();
             let line = selected
                 .as_ref()
                 .filter(|range| range.path().as_str() == path)
@@ -3254,13 +3265,14 @@ impl GitPanel {
                         IconName::Ellipsis,
                         t!("git.file_actions"),
                     )
+                    .debug_selector(move || menu_selector)
                     .tooltip(
                         display
                             .error
                             .filter(|_| display.truncated.is_some())
                             .unwrap_or_else(|| t!("git.file_actions").into()),
                     )
-                    .dropdown_menu(move |mut menu, _, _| {
+                    .dropdown_menu(move |mut menu, _, cx| {
                         let path_copy = path.clone();
                         menu = menu.item(PopupMenuItem::new(t!("git.copy_path")).on_click(
                             move |_, _, cx| {
@@ -3316,6 +3328,11 @@ impl GitPanel {
                                 let path = path.clone();
                                 menu = menu.item(
                                     PopupMenuItem::new(label)
+                                        .icon(if staged {
+                                            IconName::Plus
+                                        } else {
+                                            IconName::Minus
+                                        })
                                         .disabled(!allowed || stage_busy)
                                         .on_click(move |_, window, cx| {
                                             _ = view.update(cx, |this, cx| {
@@ -3329,24 +3346,15 @@ impl GitPanel {
                                         }),
                                 );
                             }
-                            if !file_submodule && git::FileAction::Restore.available(state) {
-                                let view = view_for_menu.clone();
-                                let path = path.clone();
-                                menu = menu.item(
-                                    PopupMenuItem::new(if supports_operations {
-                                        t!("git.restore_file")
-                                    } else {
-                                        t!("git.upgrade_operations")
-                                    })
-                                    .disabled(stage_busy || !version_ready || !supports_operations)
-                                    .on_click(
-                                        move |_, window, cx| {
-                                            _ = view.update(cx, |this, cx| {
-                                                this.confirm_file_restore(&path, window, cx)
-                                            });
-                                        },
-                                    ),
-                                );
+                            for item in super::tree::worktree_restore_items(
+                                &view_for_menu,
+                                &menu_detail,
+                                &[ix],
+                                &path,
+                                false,
+                                cx,
+                            ) {
+                                menu = menu.item(item);
                             }
                         }
                         menu

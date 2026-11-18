@@ -17,13 +17,16 @@ fn settle(visual: &mut VisualTestContext) {
 }
 
 #[::core::prelude::v1::test]
-fn tree_restore_confirms_files_and_filtered_directories() {
+fn git_menus_confirm_restore_and_discard_for_files_and_filtered_directories() {
     let fixture = tempfile::tempdir().unwrap();
     let root = fixture.path().join("repo");
     fs::create_dir_all(root.join("folder/nested")).unwrap();
     let visible = "folder/visible.txt";
     let hidden = "folder/nested/hidden.txt";
     let untracked = "folder/untracked.txt";
+    let hidden_untracked = "folder/nested/new.txt";
+    let single_untracked = "new.txt";
+    let ignored = "folder/ignored.txt";
     let deleted = "deleted.txt";
     for path in [visible, hidden, deleted] {
         fs::write(root.join(path), "original\n").unwrap();
@@ -48,7 +51,10 @@ fn tree_restore_confirms_files_and_filtered_directories() {
     git(&root, &["add", visible]);
     fs::write(root.join(visible), "unstaged\n").unwrap();
     fs::write(root.join(hidden), "changed\n").unwrap();
-    fs::write(root.join(untracked), "keep\n").unwrap();
+    for path in [untracked, hidden_untracked, single_untracked, ignored] {
+        fs::write(root.join(path), "new\n").unwrap();
+    }
+    fs::write(root.join(".git/info/exclude"), format!("{ignored}\n")).unwrap();
     fs::remove_file(root.join(deleted)).unwrap();
 
     let platform = gpui_platform::current_platform(true);
@@ -93,12 +99,12 @@ fn tree_restore_confirms_files_and_filtered_directories() {
     });
     settle(visual);
 
-    let open_restore = |visual: &mut VisualTestContext, row| {
+    let open_action = |visual: &mut VisualTestContext, row, keys| {
         let pos = visual.debug_bounds(row).unwrap().center();
         visual.simulate_mouse_down(pos, MouseButton::Right, Modifiers::default());
         visual.simulate_mouse_up(pos, MouseButton::Right, Modifiers::default());
         settle(visual);
-        visual.simulate_keystrokes("up enter");
+        visual.simulate_keystrokes(keys);
         settle(visual);
         assert!(visual.debug_bounds("git-confirm-file-restore").is_some());
     };
@@ -108,10 +114,10 @@ fn tree_restore_confirms_files_and_filtered_directories() {
         visual.simulate_click(pos, Modifiers::default());
         settle(visual);
     };
-    open_restore(visual, "git-tree-row:file:deleted.txt");
+    open_action(visual, "git-tree-row:file:deleted.txt", "up enter");
     click_dialog(visual, "git-cancel-file-restore");
     assert!(!root.join(deleted).exists());
-    open_restore(visual, "git-tree-row:file:deleted.txt");
+    open_action(visual, "git-tree-row:file:deleted.txt", "up enter");
     click_dialog(visual, "git-confirm-file-restore");
     assert_eq!(
         fs::read_to_string(root.join(deleted)).unwrap(),
@@ -133,7 +139,7 @@ fn tree_restore_confirms_files_and_filtered_directories() {
             .debug_bounds("git-tree-row:file:folder/nested/hidden.txt")
             .is_none()
     );
-    open_restore(visual, "git-tree-row:folder:folder");
+    open_action(visual, "git-tree-row:folder:folder", "up enter");
     assert!(visual.debug_bounds("git-restore-count:2").is_some());
     assert!(visual.debug_bounds("git-restore-hidden:1").is_some());
 
@@ -155,11 +161,12 @@ fn tree_restore_confirms_files_and_filtered_directories() {
         );
     });
 
-    open_restore(visual, "git-tree-row:folder:folder");
+    open_action(visual, "git-tree-row:folder:folder", "up enter");
     click_dialog(visual, "git-confirm-file-restore");
     assert_eq!(fs::read_to_string(root.join(visible)).unwrap(), "staged\n");
     assert_eq!(fs::read_to_string(root.join(hidden)).unwrap(), "original\n");
-    assert_eq!(fs::read_to_string(root.join(untracked)).unwrap(), "keep\n");
+    assert!(root.join(untracked).is_file());
+    assert!(root.join(hidden_untracked).is_file());
     visual.update(|_, cx| {
         let status = panel
             .read(cx)
@@ -188,6 +195,77 @@ fn tree_restore_confirms_files_and_filtered_directories() {
             assert!(file.is_dirty());
         });
     }
+
+    visual.update(|window, cx| {
+        panel.update(cx, |panel, cx| {
+            panel.filter_input.update(cx, |input, cx| {
+                input.set_value("untracked", window, cx);
+            });
+            panel.filter = "untracked".into();
+            panel.load_review(Selection::Worktree(Mode::Unstaged), false, window, cx);
+        });
+    });
+    settle(visual);
+
+    open_action(visual, "git-tree-row:file:folder/untracked.txt", "up enter");
+    assert!(visual.debug_bounds("git-restore-count:1").is_some());
+    assert!(
+        visual
+            .debug_bounds("git-discard-untracked:folder/untracked.txt")
+            .is_some()
+    );
+    click_dialog(visual, "git-cancel-file-restore");
+    assert!(root.join(untracked).is_file());
+
+    open_action(visual, "git-tree-row:folder:folder", "up enter");
+    assert!(visual.debug_bounds("git-restore-count:2").is_some());
+    assert!(visual.debug_bounds("git-restore-hidden:1").is_some());
+    for selector in [
+        "git-discard-untracked:folder/untracked.txt",
+        "git-discard-untracked:folder/nested/new.txt",
+    ] {
+        assert!(visual.debug_bounds(selector).is_some(), "{selector}");
+    }
+    click_dialog(visual, "git-confirm-file-restore");
+    for path in [untracked, hidden_untracked] {
+        assert!(!root.join(path).exists(), "{path}");
+    }
+    for path in [ignored, single_untracked, visible, hidden] {
+        assert!(root.join(path).is_file(), "{path}");
+    }
+
+    visual.update(|window, cx| {
+        panel.update(cx, |panel, cx| {
+            panel.filter_input.update(cx, |input, cx| {
+                input.set_value("", window, cx);
+            });
+            panel.filter.clear();
+            cx.notify();
+        });
+    });
+    settle(visual);
+    let row = visual
+        .debug_bounds("git-tree-row:file:new.txt")
+        .unwrap()
+        .center();
+    visual.simulate_click(row, Modifiers::default());
+    settle(visual);
+    let menu = visual
+        .debug_bounds("git-file-menu:new.txt")
+        .unwrap()
+        .center();
+    visual.simulate_mouse_move(menu, None, Modifiers::default());
+    visual.simulate_click(menu, Modifiers::default());
+    settle(visual);
+    visual.simulate_keystrokes("up enter");
+    settle(visual);
+    assert!(
+        visual
+            .debug_bounds("git-discard-untracked:new.txt")
+            .is_some()
+    );
+    click_dialog(visual, "git-confirm-file-restore");
+    assert!(!root.join(single_untracked).exists());
 }
 
 #[::core::prelude::v1::test]
