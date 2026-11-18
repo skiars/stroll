@@ -762,6 +762,7 @@ impl Workspace {
     pub(super) fn language_service_status(
         &self,
         file: &OpenFile,
+        label_size: Pixels,
         colors: Palette,
         cx: &Context<Self>,
     ) -> impl IntoElement {
@@ -784,7 +785,8 @@ impl Workspace {
             }))
             .trigger(
                 status_button("language-service-trigger")
-                    .w(px(48.))
+                    .min_w(px(48.))
+                    .label_size(label_size)
                     .accessibility_label(tooltip.clone())
                     .tooltip(tooltip)
                     .when(status.pending(), |button| {

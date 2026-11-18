@@ -4045,7 +4045,7 @@ impl Workspace {
         let radii = window_corner_radii(window, cx);
         let locked =
             file.document.conflict || file.document.mixed_newlines || self.git_edit.contains(path);
-        let status_size = 11.;
+        let status_size = text_base_size(cx) - 0.5;
         let language = self
             .source_resources(path)
             .display_name_for_path(path)
@@ -4062,7 +4062,7 @@ impl Workspace {
             .rounded_br(radii.bottom_right)
             .px_3()
             .gap_3()
-            .text_size(px(11.))
+            .text_size(px(status_size))
             .text_color(colors.muted)
             .child(
                 h_flex()
@@ -4121,7 +4121,8 @@ impl Workspace {
                                     status_size,
                                     status_size,
                                     status_button("editor-wrap")
-                                        .w(px(58.))
+                                        .min_w(px(58.))
+                                        .label_size(px(status_size))
                                         .toggled(file.wrap)
                                         .label(if file.wrap {
                                             t!("workspace.wrap_on")
@@ -4147,7 +4148,12 @@ impl Workspace {
                                             cx,
                                             status_size,
                                             status_size,
-                                            self.language_service_status(file, colors, cx),
+                                            self.language_service_status(
+                                                file,
+                                                px(status_size),
+                                                colors,
+                                                cx,
+                                            ),
                                         )
                                         .flex_shrink_0(),
                                     )
