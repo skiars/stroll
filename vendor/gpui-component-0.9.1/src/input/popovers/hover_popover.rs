@@ -3,10 +3,10 @@ use rust_i18n::t;
 use std::{cell::Cell, ops::Range, rc::Rc, time::Instant};
 
 use gpui::{
-    AnyElement, App, AppContext as _, AvailableSpace, Bounds, Element, ElementId, Entity,
-    InteractiveElement, IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
-    ParentElement as _, Pixels, Point, Render, ScrollHandle, SharedString,
-    StatefulInteractiveElement as _, StyleRefinement, Styled, Window, deferred, div,
+    AnyElement, App, AppContext as _, AvailableSpace, Bounds, ClickEvent, Element, ElementId,
+    Entity, InteractiveElement, IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent,
+    MouseUpEvent, ParentElement as _, Pixels, Point, Render, ScrollHandle, SharedString,
+    StatefulInteractiveElement as _, StyleRefinement, Styled, WeakEntity, Window, deferred, div,
     linear_color_stop, linear_gradient, point, prelude::FluentBuilder as _, px, relative, rems,
 };
 
@@ -162,10 +162,11 @@ impl Render for HoverPopover {
         {
             self.documentation = None;
         }
+        let editor = self.editor.downgrade();
         let (_, extensions) = self.documentation.get_or_insert_with(|| {
             (
                 code_font.clone(),
-                documentation_extensions(&self.content, code_font.clone()),
+                documentation_extensions(&self.content, code_font.clone(), editor.clone()),
             )
         });
         let extensions = extensions.clone();
@@ -184,7 +185,6 @@ impl Render for HoverPopover {
             .hover_provider
             .as_ref()
             .and_then(|provider| provider.code_languages());
-        let editor = self.editor.downgrade();
         let can_fix = self.editor.read(cx).can_open_code_actions();
 
         let mut popover = Popover::new(
@@ -213,6 +213,7 @@ impl Render for HoverPopover {
                     }
                     content = content.child(
                         div()
+                            .debug_selector(|| "hover-markdown".into())
                             .px(px(12.))
                             .py(px(8.))
                             .child(
@@ -220,6 +221,7 @@ impl Render for HoverPopover {
                                     "message",
                                     documentation.clone(),
                                     &code_font,
+                                    &editor,
                                     cx,
                                 )
                                 .code_languages(code_languages.clone())
@@ -263,8 +265,10 @@ fn render_hover_markdown(
     id: impl Into<ElementId>,
     markdown: impl Into<SharedString>,
     code_font: &SharedString,
+    editor: &WeakEntity<EditorState>,
     cx: &mut App,
 ) -> TextView {
+    let editor = editor.clone();
     render_markdown_with_code_style(
         id,
         markdown,
@@ -272,11 +276,45 @@ fn render_hover_markdown(
         cx.theme().hover_inline_code_size,
         cx,
     )
+    .on_link_click(move |url, event, window, cx| {
+        let activate = match event {
+            ClickEvent::Mouse(click) => {
+                matches!(click.up.button, MouseButton::Left | MouseButton::Middle)
+            }
+            ClickEvent::Keyboard(_) => true,
+            ClickEvent::Touch(click) => !click.long_press,
+        };
+        if !activate {
+            return;
+        }
+        if let Ok(uri) = url.parse::<lsp_types::Uri>()
+            && uri
+                .scheme()
+                .is_some_and(|scheme| scheme.as_str().eq_ignore_ascii_case("file"))
+            && let Some(handler) = editor
+                .upgrade()
+                .and_then(|editor| editor.read(cx).lsp().show_document.clone())
+            && handler(
+                &lsp_types::ShowDocumentParams {
+                    uri,
+                    external: Some(false),
+                    take_focus: Some(true),
+                    selection: None,
+                },
+                window,
+                cx,
+            )
+        {
+            return;
+        }
+        cx.open_url(url);
+    })
 }
 
 fn documentation_extensions(
     content: &HoverPopoverState,
     code_font: SharedString,
+    editor: WeakEntity<EditorState>,
 ) -> MarkdownExtensions {
     use crate::input::HoverParagraph;
     use crate::text::markdown_ast::Node;
@@ -317,6 +355,7 @@ fn documentation_extensions(
                     pair.original.clone(),
                     None,
                     &code_font,
+                    &editor,
                     window,
                     cx,
                 ))
@@ -326,6 +365,7 @@ fn documentation_extensions(
                     pair.translation.clone(),
                     Some(cx.theme().muted_foreground),
                     &code_font,
+                    &editor,
                     window,
                     cx,
                 ))
@@ -340,6 +380,7 @@ fn hover_prose(
     text: SharedString,
     color: Option<gpui::Hsla>,
     code_font: &SharedString,
+    editor: &WeakEntity<EditorState>,
     window: &mut Window,
     cx: &mut App,
 ) -> impl IntoElement {
@@ -347,6 +388,7 @@ fn hover_prose(
         format!("{id}-measure-{offset}"),
         text.clone(),
         code_font,
+        editor,
         cx,
     )
     .into_any_element()
@@ -362,7 +404,7 @@ fn hover_prose(
         .max_w_full()
         .flex_none()
         .child(
-            render_hover_markdown((id, offset), text, code_font, cx)
+            render_hover_markdown((id, offset), text, code_font, editor, cx)
                 .when_some(color, |view, color| view.text_color(color)),
         )
 }

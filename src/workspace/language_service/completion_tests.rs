@@ -480,6 +480,169 @@ fn workspace_completion_with_clangd() -> Result<()> {
 }
 
 #[test]
+fn hover_source_links_use_workspace_navigation() -> Result<()> {
+    use gpui::point;
+
+    let fixture = tempfile::tempdir()?;
+    let root = fixture.path().join("repository");
+    fs::create_dir(&root)?;
+    let script = fixture.path().join("server.py");
+    fs::write(
+        &script,
+        include_str!("../../../tests/fixtures/lsp_hover_links.py"),
+    )?;
+    let header = fixture.path().join("external # header.hpp");
+    let declaration = "namespace sample {\n/* 😀 */ struct External {};\n}\n";
+    fs::write(&header, declaration)?;
+    let header = header.canonicalize()?;
+    let source = "struct Local {};\n\nvoid inspect() {}\n";
+    let caret = source.find("inspect").unwrap();
+    let configuration = format!(
+        "[lsp.clangd]\ncommand = 'python3 -u {}'\n",
+        script.display()
+    );
+    with_workspace_editor(
+        fixture.path(),
+        "main.cpp",
+        &configuration,
+        source,
+        caret,
+        |visual, workspace, editor| {
+            let hover_link = |visual: &mut VisualTestContext, url: &str| -> Result<_> {
+                fs::write(
+                    script.with_extension("md"),
+                    format!("[Definition](<{url}>)"),
+                )?;
+                let pointer = visual.update(|_, cx| {
+                    editor
+                        .read(cx)
+                        .range_to_bounds(&(caret..caret + "inspect".len()))
+                        .unwrap()
+                        .center()
+                });
+                visual.simulate_mouse_move(point(px(2.), px(2.)), None, Default::default());
+                visual.simulate_mouse_move(pointer, None, Default::default());
+                wait(visual, "hover link", |visual| {
+                    visual.debug_bounds("hover-markdown").is_some()
+                        && visual.update(|_, cx| {
+                            matches!(
+                                editor.read(cx).hover_popover().and_then(|popover| popover.hover.as_ref()),
+                                Some(lsp_types::Hover { contents: lsp_types::HoverContents::Markup(markup), .. })
+                                    if markup.value.contains(url)
+                            )
+                        })
+                })?;
+                let link =
+                    visual.debug_bounds("hover-markdown").unwrap().origin + point(px(17.), px(17.));
+                visual.simulate_mouse_move(link, None, Default::default());
+                frame(visual);
+                visual.simulate_click(link, Default::default());
+                frame(visual);
+                Ok(())
+            };
+            let main = Path::new("main.cpp");
+            let local_uri = url::Url::from_file_path(root.join(main)).unwrap();
+            let header_uri = url::Url::from_file_path(&header).unwrap();
+            for (url, path, offset) in [
+                (
+                    format!("{local_uri}#L1,8"),
+                    main,
+                    source.find("Local").unwrap(),
+                ),
+                (
+                    format!("{header_uri}#L2,17"),
+                    header.as_path(),
+                    declaration.find("External").unwrap(),
+                ),
+                (
+                    format!("{header_uri}#L3"),
+                    header.as_path(),
+                    declaration.rfind('}').unwrap(),
+                ),
+            ] {
+                hover_link(visual, &url)?;
+                wait(visual, "linked source position", |visual| {
+                    visual.update(|_, cx| {
+                        workspace.read(cx).active_file().is_some_and(|file| {
+                            file.path == path && file.editor.read(cx).cursor() == offset
+                        })
+                    })
+                })?;
+                assert!(visual.opened_url().is_none());
+                visual.update(|window, cx| {
+                    workspace.update(cx, |workspace, cx| {
+                        workspace.source_back(
+                            &super::super::source_history::SourceBack,
+                            window,
+                            cx,
+                        );
+                    });
+                });
+                wait(visual, "return to hover source", |visual| {
+                    visual.update(|_, cx| {
+                        workspace.read(cx).active_file().is_some_and(|file| {
+                            file.path == main && file.editor.read(cx).cursor() == caret
+                        })
+                    })
+                })?;
+            }
+
+            hover_link(visual, "https://example.com/reference")?;
+            assert_eq!(
+                visual.opened_url().as_deref(),
+                Some("https://example.com/reference")
+            );
+            Ok(())
+        },
+    )
+}
+
+#[test]
+#[ignore = "requires clangd on PATH"]
+fn workspace_definition_opens_header_outside_worktree_with_clangd() -> Result<()> {
+    let fixture = tempfile::tempdir()?;
+    let include = fixture.path().join("include");
+    fs::create_dir(&include)?;
+    let header = include.join("shared header.hpp");
+    let declaration = "namespace sample {\ninline int external_value() { return 42; }\n}\n";
+    fs::write(&header, declaration)?;
+    let header = header.canonicalize()?;
+    let source = "#include \"../include/shared header.hpp\"\nint main() { return sample::external_value(); }\n";
+    let caret = source.find("external_value").unwrap() + 1;
+    with_workspace_editor(
+        fixture.path(),
+        "main.cpp",
+        "[lsp.clangd]\ncommand = 'clangd'\n",
+        source,
+        caret,
+        |visual, workspace, _| {
+            visual.simulate_keystrokes("f12");
+            let definition = declaration.find("external_value").unwrap();
+            wait(visual, "definition in an external header", |visual| {
+                visual.update(|_, cx| {
+                    workspace.read(cx).active_file().is_some_and(|file| {
+                        file.path == header && file.editor.read(cx).cursor() == definition
+                    })
+                })
+            })?;
+
+            visual.update(|window, cx| {
+                workspace.update(cx, |workspace, cx| {
+                    workspace.source_back(&super::super::source_history::SourceBack, window, cx);
+                });
+            });
+            wait(visual, "source caret after navigating back", |visual| {
+                visual.update(|_, cx| {
+                    workspace.read(cx).active_file().is_some_and(|file| {
+                        file.path == Path::new("main.cpp") && file.editor.read(cx).cursor() == caret
+                    })
+                })
+            })
+        },
+    )
+}
+
+#[test]
 fn editor_annotations_handle_delayed_out_of_order_and_empty_results() -> Result<()> {
     use serde_json::{Value, json};
 

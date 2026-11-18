@@ -196,6 +196,10 @@ dialogs in a Wayland window after changes to paint order or focus handling.
   set `Theme::hover_inline_code_size` to override the default inline code
   scaling. Run `cargo test --release --locked --test hover_font` to verify the
   rendered font families, sizes, and prose weight.
+- Markdown file links in hover documentation use the editor's existing
+  show-document hook. Web links keep their default URL behavior. Run
+  `cargo test --release --locked --lib hover_source_links_use_workspace_navigation`
+  to verify link clicks, source positions, and navigation history.
 
 - Tab accepts the selected item in the shared editor completion menu through
   the same edit path as Enter. With no list candidate it retains inline

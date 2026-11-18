@@ -2629,10 +2629,12 @@ impl Workspace {
             && self
                 .active_file()
                 .is_some_and(|file| docs::is_markdown(&file.path));
-        let fragment = markdown_source
-            .then(|| uri.split_once('#'))
-            .flatten()
-            .and_then(|(_, fragment)| {
+        let fragment = params
+            .uri
+            .fragment()
+            .filter(|_| markdown_source || params.selection.is_none())
+            .map(|fragment| fragment.as_str())
+            .and_then(|fragment| {
                 percent_encoding::percent_decode_str(fragment)
                     .decode_utf8()
                     .ok()
@@ -2642,7 +2644,12 @@ impl Workspace {
             && self
                 .active_file()
                 .is_some_and(|file| file.path.is_absolute());
-        let path = Self::language_source_path(self.repository.as_deref(), uri, local_source);
+        let repo = self.repository.as_deref();
+        let path = Self::language_source_path(repo, uri, local_source).or_else(|| {
+            let repo =
+                repo.filter(|repo| !local_source && !markdown_source && repo.ssh.is_none())?;
+            Self::language_source_path(Some(repo), uri, true)
+        });
         let Some(path) = path else {
             toast::info(window, cx, t!("workspace.external_definition"));
             return;
@@ -2662,11 +2669,15 @@ impl Workspace {
 
         let position = fragment
             .and_then(|fragment| {
-                if docs::is_markdown(&path) {
+                if markdown_source && docs::is_markdown(&path) {
                     Some(SourcePosition::MarkdownFragment(fragment.into_owned()))
                 } else {
-                    docs::line_fragment(&fragment)
-                        .map(|line| SourcePosition::Lsp(lsp_types::Position::new(line, 0)))
+                    let (line, column) = match fragment.split_once(',') {
+                        Some((line, column)) => (line, column.parse::<u32>().ok()?.checked_sub(1)?),
+                        None => (fragment.as_ref(), 0),
+                    };
+                    let line = docs::line_fragment(line)?;
+                    Some(SourcePosition::Lsp(lsp_types::Position::new(line, column)))
                 }
             })
             .or_else(|| {
