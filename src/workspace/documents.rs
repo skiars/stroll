@@ -219,7 +219,12 @@ impl Workspace {
             .px_0()
             .content_gap(px(8.))
             .label_size(px(13.5))
-            .icon(file_type_icon(path, colors, 15.))
+            .icon(file_type_icon(
+                self.repository.as_deref(),
+                path,
+                colors,
+                15.,
+            ))
             .icon_size(px(15.))
             .child(
                 div()

@@ -2441,11 +2441,7 @@ impl Workspace {
     }
 
     fn source_resources(&self, path: &Path) -> &crate::language_resources::LanguageResources {
-        if let Some(repo) = self.repository.as_ref().filter(|_| !path.is_absolute()) {
-            repo.language_resources()
-        } else {
-            crate::language_resources::LanguageResources::installed()
-        }
+        crate::language_resources::LanguageResources::for_file(self.repository.as_deref(), path)
     }
 
     fn source_language(&self, path: &Path, source: &Rope) -> SharedString {
@@ -3570,6 +3566,7 @@ impl Workspace {
         let drag_repo = self
             .tree_transfer_available()
             .then(|| self.repository.as_ref().unwrap().clone());
+        let repository = self.repository.clone();
         let status = self.tree_status.clone();
         let inline = self.tree_edit.as_ref().and_then(|edit| {
             let (index, depth, replace) = edit.row(&rows)?;
@@ -3658,7 +3655,8 @@ impl Workspace {
                 } else if entry.symlink {
                     icon(IconName::Link, icon_color, 15.).into_any_element()
                 } else {
-                    file_type_icon(&entry.path, colors, 15.).into_any_element()
+                    file_type_icon(repository.as_deref(), &entry.path, colors, 15.)
+                        .into_any_element()
                 };
                 let element = h_flex()
                     .id(SharedString::from(row_id.clone()))

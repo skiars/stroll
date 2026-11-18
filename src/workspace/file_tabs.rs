@@ -202,12 +202,12 @@ impl Workspace {
                             this.keep_tab(&select, cx);
                         }
                     }))
-                    .child(
-                        div()
-                            .flex_shrink_0()
-                            .mr_1()
-                            .child(file_type_icon(path, colors, 12.)),
-                    )
+                    .child(div().flex_shrink_0().mr_1().child(file_type_icon(
+                        self.repository.as_deref(),
+                        path,
+                        colors,
+                        12.,
+                    )))
                     .child(
                         div()
                             .truncate()
@@ -344,7 +344,12 @@ impl Workspace {
                             .min_w_0()
                             .text_size(px(13.))
                             .gap(px(3.))
-                            .child(file_type_icon(path, colors, 14.))
+                            .child(file_type_icon(
+                                self.repository.as_deref(),
+                                path,
+                                colors,
+                                14.,
+                            ))
                             .child(
                                 div()
                                     .min_w_0()

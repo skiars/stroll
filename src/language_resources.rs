@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs::File,
     io::Read as _,
     ops::Range,
@@ -72,6 +72,7 @@ struct TextMateGrammar {
 pub(crate) struct LanguageResources {
     languages: Vec<Language>,
     names: HashMap<String, SharedString>,
+    source_languages: HashSet<String>,
     registered: Vec<SharedString>,
     code_languages: Option<gpui_component::text::CodeLanguages>,
 }
@@ -85,6 +86,14 @@ impl Drop for LanguageResources {
 }
 
 impl LanguageResources {
+    pub(crate) fn for_file<'a>(repo: Option<&'a Repository>, path: &Path) -> &'a Self {
+        if let Some(repo) = repo.filter(|_| !path.is_absolute()) {
+            repo.language_resources()
+        } else {
+            Self::installed()
+        }
+    }
+
     pub(crate) fn installed() -> &'static Self {
         static INSTALLED: std::sync::OnceLock<LanguageResources> = std::sync::OnceLock::new();
         INSTALLED.get_or_init(|| Self::load(None))
@@ -262,7 +271,7 @@ impl LanguageResources {
         textmate.registry.link_grammars();
         let registry = Arc::new(textmate.registry);
         let palette = Arc::new(palette);
-        for (language, name) in textmate.languages {
+        for (language, (name, is_source)) in textmate.languages {
             let key = self.register_name(&language);
             let options =
                 giallo::HighlightOptions::new(name, giallo::ThemeVariant::Single("stroll"))
@@ -274,6 +283,9 @@ impl LanguageResources {
                 &key,
                 Arc::new(move |source| tokenize(source, &registry, &options, &palette)),
             );
+            if is_source {
+                self.source_languages.insert(language);
+            }
         }
     }
 
@@ -303,6 +315,11 @@ impl LanguageResources {
 
     pub(crate) fn for_path(&self, path: &Path) -> Option<SharedString> {
         self.names.get(&self.match_path(path)?.id).cloned()
+    }
+
+    pub(crate) fn is_source_file(&self, path: &Path) -> bool {
+        self.match_path(path)
+            .is_some_and(|language| self.source_languages.contains(&language.id))
     }
 
     pub(crate) fn configure_editor(&self, path: &Path, cx: &mut gpui::App) {
@@ -405,8 +422,8 @@ impl EditorConfiguration {
 #[derive(Default)]
 struct TextMate {
     registry: giallo::Registry,
-    languages: HashMap<String, String>,
-    scopes: std::collections::HashSet<String>,
+    languages: HashMap<String, (String, bool)>,
+    scopes: HashSet<String>,
 }
 
 impl TextMate {
@@ -424,9 +441,10 @@ impl TextMate {
         value["name"] = json!(&name);
         self.registry
             .add_grammar_from_bytes(value.to_string().as_bytes())?;
+        let is_source = contribution.scope_name.starts_with("source.");
         self.scopes.insert(contribution.scope_name);
         if let Some(language) = contribution.language {
-            self.languages.entry(language).or_insert(name);
+            self.languages.entry(language).or_insert((name, is_source));
         }
         Ok(())
     }
@@ -603,6 +621,39 @@ mod tests {
                 .for_path(Path::new("sample.example"))
                 .is_none()
         );
+        Ok(())
+    }
+
+    #[test]
+    fn textmate_source_files_use_the_same_language_match_as_highlighting() -> Result<()> {
+        let mut resources = LanguageResources::default();
+        resources.languages = serde_json::from_value(json!([
+            {"id": "code", "extensions": [".example"]},
+            {"id": "prose", "filenames": ["README.example"]},
+            {"id": "unregistered", "extensions": [".incomplete.example"]}
+        ]))?;
+        let mut textmate = TextMate::default();
+        for (id, scope) in [("code", "source.example"), ("prose", "text.example")] {
+            textmate.add(
+                TextMateGrammar {
+                    language: Some(id.into()),
+                    scope_name: scope.into(),
+                    path: PathBuf::new(),
+                    inject_to: None,
+                },
+                json!({"scopeName": scope, "patterns": []}),
+            )?;
+        }
+        resources.register_textmate(textmate);
+
+        assert!(resources.is_source_file(Path::new("sample.example")));
+        assert!(!resources.is_source_file(Path::new("sample.txt")));
+        let prose = Path::new("README.example");
+        assert!(resources.for_path(prose).is_some());
+        assert!(!resources.is_source_file(prose));
+        let unregistered = Path::new("sample.incomplete.example");
+        assert!(resources.for_path(unregistered).is_none());
+        assert!(!resources.is_source_file(unregistered));
         Ok(())
     }
 }

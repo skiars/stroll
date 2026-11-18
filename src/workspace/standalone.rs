@@ -286,7 +286,12 @@ impl Workspace {
                     .pr_2()
                     .when(!show_tabs && document_list_title.is_none(), |bar| {
                         bar.when_some(path, |bar, path| {
-                            bar.child(file_type_icon(path, colors, 15.))
+                            bar.child(file_type_icon(
+                                self.repository.as_deref(),
+                                path,
+                                colors,
+                                15.,
+                            ))
                         })
                         .child(
                             div()

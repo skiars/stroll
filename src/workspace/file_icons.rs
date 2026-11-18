@@ -4,9 +4,16 @@ use gpui::{Styled as _, px, rgb};
 use gpui_component::{Icon, Sizable as _};
 use gpui_kit_assets::IconName;
 
+use crate::{language_resources::LanguageResources, repository::Repository};
+
 use super::{Palette, audio_preview, icon, language_for};
 
-pub(super) fn file_type_icon(path: &Path, colors: Palette, size: f32) -> Icon {
+pub(super) fn file_type_icon(
+    repository: Option<&Repository>,
+    path: &Path,
+    colors: Palette,
+    size: f32,
+) -> Icon {
     // File types use a Material-inspired palette on both workspace themes.
     let tint = |light, dark| rgb(if colors.bg.l < 0.5 { dark } else { light }).into();
     let glyph = |name, light, dark| icon(name, tint(light, dark), size);
@@ -62,6 +69,9 @@ pub(super) fn file_type_icon(path: &Path, colors: Palette, size: f32) -> Icon {
         "yaml" => glyph(IconName::FileCog, 0xaa3135, 0xf17b7d),
         "text" if crate::image_viewer::is_image(path) => glyph(IconName::Image, 0x117065, 0x58c2b6),
         "text" if audio_preview::is_audio(path) => glyph(IconName::Music, 0xa63349, 0xf17d94),
+        "text" if LanguageResources::for_file(repository, path).is_source_file(path) => {
+            icon(IconName::FileCode, colors.muted, size)
+        }
         "text" => Icon::default()
             .data(include_bytes!("file_icons/text.svg"))
             .with_size(px(size))
