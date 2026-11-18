@@ -730,7 +730,7 @@ fn syntax_style(colors: &Colors, semantics: bool) -> Value {
         ("punctuation", &colors.text),
         ("punctuation.bracket", &colors.text),
         ("punctuation.delimiter", &colors.text),
-        ("punctuation.list_marker", &colors.dim),
+        ("punctuation.list_marker", &colors.function),
         ("punctuation.special", &colors.text),
         ("string", &colors.string),
         ("string.escape", &colors.string),

@@ -16,15 +16,20 @@ use gpui_component::{
 use gpui_wgpu::WgpuHeadlessRenderer;
 use stroll::workspace::apply_theme;
 
-const EDITOR_HEIGHT: f32 = 160.;
+const EDITOR_HEIGHT: f32 = 284.;
 const DELIMITER: &str = "punctuation.delimiter.code";
+const LIST_MARKER: &str = "punctuation.list_marker";
 const INLINE_CODE: &str = "text.code.span";
-const SOURCE: &str =
-    "Use `new` and ``a`b`` in prose.\n\n```bash\nif true; then echo new; fi\n```\n";
+const SOURCE: &str = "Use `new` and ``a`b`` in prose.\n\n```bash\nif true; then echo new; fi\n```\n\n- Hyphen\n* Asterisk\n+ Plus\n1. Ordered\n";
 const PATCH: &str = concat!(
-    "--- a/guide.markdown\n+++ b/guide.markdown\n@@ -1,5 +1,5 @@\n",
+    "--- a/guide.markdown\n+++ b/guide.markdown\n@@ -1,10 +1,10 @@\n",
     "-Use `old` and ``a`b`` in prose.\n+Use `new` and ``a`b`` in prose.\n",
     " \n ```bash\n-if true; then echo old; fi\n+if true; then echo new; fi\n ```\n",
+    " \n",
+    " - Hyphen\n",
+    "-* Old asterisk\n+* Asterisk\n",
+    " + Plus\n",
+    "-1. Old numbered item\n+1. Ordered\n",
 );
 
 struct MarkdownSurfaces {
@@ -99,7 +104,7 @@ fn color(syntax: &SyntaxColors, capture: &str) -> Hsla {
 }
 
 #[test]
-fn paints_markdown_code_in_editor_and_diff_in_both_themes() -> anyhow::Result<()> {
+fn paints_markdown_code_and_list_markers_in_editor_and_diff() -> anyhow::Result<()> {
     let glyphs = GlyphColors::default();
     let mut app = HeadlessAppContext::with_platform(
         gpui_platform::current_platform(true).text_system(),
@@ -118,7 +123,7 @@ fn paints_markdown_code_in_editor_and_diff_in_both_themes() -> anyhow::Result<()
         gpui_component::init(cx);
         apply_theme(ThemeMode::Light, cx);
     });
-    let window = app.open_window(size(px(820.), px(440.)), |window, cx| {
+    let window = app.open_window(size(px(820.), px(720.)), |window, cx| {
         let editor = cx.new(|cx| {
             let mut state = EditorState::new(window, cx)
                 .language("markdown")
@@ -144,7 +149,7 @@ fn paints_markdown_code_in_editor_and_diff_in_both_themes() -> anyhow::Result<()
         }
         let screenshot = app.capture_screenshot(window.into())?;
         if let Some(output) = &output {
-            screenshot.save(output.join(format!("markdown-code-{label}.png")))?;
+            screenshot.save(output.join(format!("markdown-highlighting-{label}.png")))?;
         }
         let (syntax, removed, added, editor_bottom) =
             app.update_window(window.into(), |_, window, cx| {
@@ -163,9 +168,13 @@ fn paints_markdown_code_in_editor_and_diff_in_both_themes() -> anyhow::Result<()
                 .filter(|(y, color)| (*y >= editor_bottom) == in_diff && colors.contains(color))
                 .count()
         };
-        for (capture, editor_count, diff_count) in
-            [(DELIMITER, 12, 18), (INLINE_CODE, 6, 12), ("keyword", 2, 4)]
-        {
+        assert_ne!(color(&syntax, LIST_MARKER), color(&syntax, DELIMITER));
+        for (capture, editor_count, diff_count) in [
+            (DELIMITER, 12, 18),
+            (INLINE_CODE, 6, 12),
+            ("keyword", 2, 4),
+            (LIST_MARKER, 5, 5),
+        ] {
             let editor_color = color(&syntax, capture);
             assert_ne!(
                 editor_color,
