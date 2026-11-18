@@ -185,19 +185,6 @@ fn update_ime_cursor_rectangle(
     text_input.commit_ime_state();
 }
 
-fn set_ime_cursor_rectangle_after_done(
-    text_input: &impl ImeCursorRectangleSink,
-    last_ime_cursor_rectangle: &mut Option<ImeCursorRectangle>,
-    bounds: Bounds<Pixels>,
-    should_commit: bool,
-) {
-    if should_commit {
-        update_ime_cursor_rectangle(text_input, last_ime_cursor_rectangle, bounds);
-    } else {
-        set_ime_cursor_rectangle(text_input, ImeCursorRectangle::from(bounds));
-    }
-}
-
 /// Pacing for retry ticks: a fixed 60Hz interval. Retries only occur for throttled or
 /// failed-present frames, so matching the output's actual refresh rate wouldn't be observable.
 const FRAME_RETRY_INTERVAL: Duration = Duration::from_micros(16_667);
@@ -2365,7 +2352,7 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for WaylandClientStatePtr {
 impl Dispatch<zwp_text_input_v3::ZwpTextInputV3, ()> for WaylandClientStatePtr {
     fn event(
         this: &mut Self,
-        text_input: &zwp_text_input_v3::ZwpTextInputV3,
+        _: &zwp_text_input_v3::ZwpTextInputV3,
         event: <zwp_text_input_v3::ZwpTextInputV3 as Proxy>::Event,
         _: &(),
         _: &Connection,
@@ -2393,6 +2380,7 @@ impl Dispatch<zwp_text_input_v3::ZwpTextInputV3, ()> for WaylandClientStatePtr {
                     // IBus Intercepts keys like `a`, `b`, but those keys are needed for vim mode.
                     // We should only send ASCII characters to Zed, otherwise a user could remap a letter like `か` or `相`.
                     if commit_text.len() == 1 {
+                        window.defer_ime_position();
                         window.handle_input(PlatformInput::KeyDown(KeyDownEvent {
                             keystroke: Keystroke {
                                 modifiers: Modifiers::default(),
@@ -2412,7 +2400,6 @@ impl Dispatch<zwp_text_input_v3::ZwpTextInputV3, ()> for WaylandClientStatePtr {
                 state.ime_pre_edit = text;
             }
             zwp_text_input_v3::Event::Done { serial } => {
-                let last_serial = state.serial_tracker.get(SerialKind::InputMethod);
                 state.serial_tracker.update(SerialKind::InputMethod, serial);
                 let Some(window) = state.keyboard_focused_window.clone() else {
                     return;
@@ -2421,15 +2408,6 @@ impl Dispatch<zwp_text_input_v3::ZwpTextInputV3, ()> for WaylandClientStatePtr {
                 if let Some(text) = state.ime_pre_edit.take() {
                     drop(state);
                     window.handle_ime(ImeInput::SetMarkedText(text));
-                    if let Some(area) = window.get_ime_area() {
-                        let mut state = client.borrow_mut();
-                        set_ime_cursor_rectangle_after_done(
-                            text_input,
-                            &mut state.last_ime_cursor_rectangle,
-                            area,
-                            last_serial.as_raw() == serial,
-                        );
-                    }
                 } else {
                     state.composing = false;
                     drop(state);
@@ -3564,41 +3542,23 @@ mod tests {
     }
 
     #[test]
-    fn caches_cursor_rectangle_committed_after_done() {
+    fn publishes_changed_cursor_rectangles_once() {
         let text_input = FakeImeCursorRectangleSink::default();
         let mut last_ime_cursor_rectangle = None;
-        let initial_bounds = ime_cursor_bounds(10.0);
-        let updated_bounds = ime_cursor_bounds(20.0);
 
-        update_ime_cursor_rectangle(&text_input, &mut last_ime_cursor_rectangle, initial_bounds);
-        set_ime_cursor_rectangle_after_done(
-            &text_input,
-            &mut last_ime_cursor_rectangle,
-            updated_bounds,
-            true,
-        );
-        update_ime_cursor_rectangle(&text_input, &mut last_ime_cursor_rectangle, updated_bounds);
+        for x in [10., 20., 20.] {
+            update_ime_cursor_rectangle(
+                &text_input,
+                &mut last_ime_cursor_rectangle,
+                ime_cursor_bounds(x),
+            );
+        }
 
         assert_eq!(text_input.commit_count.get(), 2);
-        assert_eq!(text_input.cursor_rectangles.borrow().len(), 2);
-    }
-
-    #[test]
-    fn skips_unchanged_cursor_rectangle_after_done() {
-        let text_input = FakeImeCursorRectangleSink::default();
-        let mut last_ime_cursor_rectangle = None;
-        let bounds = ime_cursor_bounds(10.0);
-
-        update_ime_cursor_rectangle(&text_input, &mut last_ime_cursor_rectangle, bounds);
-        set_ime_cursor_rectangle_after_done(
-            &text_input,
-            &mut last_ime_cursor_rectangle,
-            bounds,
-            true,
+        assert_eq!(
+            text_input.cursor_rectangles.borrow().as_slice(),
+            &[(10, 20, 1, 18), (20, 20, 1, 18)]
         );
-
-        assert_eq!(text_input.commit_count.get(), 1);
-        assert_eq!(text_input.cursor_rectangles.borrow().len(), 1);
     }
 
     #[test]

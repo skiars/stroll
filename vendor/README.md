@@ -48,6 +48,11 @@ dialogs in a Wayland window after changes to paint order or focus handling.
 - After input changes, run `cargo test --release --locked --test touchpad_scroll --test smooth_scroll`
   to check logical document offsets and device-pixel paint offsets. Check continuous scrolling
   in documents, editors, and lists in a native Wayland session.
+- Wayland IME edits retain the last submitted candidate rectangle until GPUI
+  lays out the updated text. The platform tests cover deferred updates and
+  protocol rectangle deduplication. For native verification, compose across
+  a wrap boundary near the end of a long file and check that the rectangle
+  does not alternate between rows in a `WAYLAND_DEBUG=client` trace.
 - Fold candidates are remapped through edits and replaced when the background
   highlighter publishes its completed parse. The editor editing integration test
   checks candidate continuity, line remapping, and removal.

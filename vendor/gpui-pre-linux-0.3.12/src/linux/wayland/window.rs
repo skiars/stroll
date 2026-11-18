@@ -100,6 +100,30 @@ struct InProgressConfigure {
     tiling: Tiling,
 }
 
+#[derive(Default, PartialEq, Eq)]
+enum ImePositionUpdate {
+    #[default]
+    Idle,
+    AwaitingLayout,
+    AfterLayout,
+}
+
+impl ImePositionUpdate {
+    fn layout_started(&mut self) {
+        if *self == Self::AwaitingLayout {
+            *self = Self::AfterLayout;
+        }
+    }
+
+    fn take_after_layout(&mut self) -> bool {
+        if *self != Self::AfterLayout {
+            return false;
+        }
+        *self = Self::Idle;
+        true
+    }
+}
+
 pub struct WaylandWindowState {
     surface_state: WaylandSurfaceState,
     parent: Option<WaylandWindowStatePtr>,
@@ -121,6 +145,7 @@ pub struct WaylandWindowState {
     bounds: Bounds<Pixels>,
     scale: f32,
     input_handler: Option<PlatformInputHandler>,
+    ime_position_update: ImePositionUpdate,
     decorations: WindowDecorations,
     background_appearance: WindowBackgroundAppearance,
     fullscreen: bool,
@@ -624,6 +649,7 @@ impl WaylandWindowState {
             bounds: options.bounds,
             scale: 1.0,
             input_handler: None,
+            ime_position_update: ImePositionUpdate::Idle,
             decorations: WindowDecorations::Client,
             background_appearance: WindowBackgroundAppearance::Opaque,
             fullscreen: false,
@@ -971,6 +997,7 @@ impl WaylandWindowStatePtr {
         self.update_ime_enabled();
         drop(callbacks);
 
+        self.update_ime_position_after_layout();
         self.complete_frame();
     }
 
@@ -1490,6 +1517,26 @@ impl WaylandWindowStatePtr {
         }
     }
 
+    pub(super) fn defer_ime_position(&self) {
+        self.state.borrow_mut().ime_position_update = ImePositionUpdate::AwaitingLayout;
+        self.schedule_frame();
+    }
+
+    fn update_ime_position_after_layout(&self) {
+        let mut state = self.state.borrow_mut();
+        if !state.ime_position_update.take_after_layout() || !state.active {
+            return;
+        }
+        let client = state.client.clone();
+        drop(state);
+
+        if client.ime_enabled() == Some(true)
+            && let Some(bounds) = self.get_ime_area()
+        {
+            client.update_ime_position(bounds);
+        }
+    }
+
     pub fn handle_ime(&self, ime: ImeInput) {
         if self.is_blocked() {
             return;
@@ -1497,23 +1544,32 @@ impl WaylandWindowStatePtr {
         let mut state = self.state.borrow_mut();
         if let Some(mut input_handler) = state.input_handler.take() {
             drop(state);
-            match ime {
+            let changed = match ime {
                 ImeInput::InsertText(text) => {
                     input_handler.replace_text_in_range(None, &text);
+                    true
                 }
                 ImeInput::SetMarkedText(text) => {
                     input_handler.replace_and_mark_text_in_range(None, &text, None);
+                    true
                 }
                 ImeInput::UnmarkText => {
                     input_handler.unmark_text();
+                    true
                 }
                 ImeInput::DeleteText => {
                     if let Some(marked) = input_handler.marked_text_range() {
                         input_handler.replace_text_in_range(Some(marked), "");
+                        true
+                    } else {
+                        false
                     }
                 }
-            }
+            };
             self.state.borrow_mut().input_handler = Some(input_handler);
+            if changed {
+                self.defer_ime_position();
+            }
         }
     }
 
@@ -2035,6 +2091,11 @@ impl PlatformWindow for WaylandWindow {
         self.0.callbacks.borrow_mut().button_layout_changed = Some(callback);
     }
 
+    fn prepare_frame(&self) -> bool {
+        self.borrow_mut().ime_position_update.layout_started();
+        false
+    }
+
     fn draw(&self, scene: &Scene) {
         let mut state = self.borrow_mut();
         let state = &mut *state;
@@ -2267,7 +2328,9 @@ impl PlatformWindow for WaylandWindow {
 
     fn update_ime_position(&self, bounds: Bounds<Pixels>) {
         let state = self.borrow();
-        if !state.active {
+        // A next-frame callback can run before this frame lays out the new
+        // preedit. Until then the compositor keeps the last committed rectangle.
+        if !state.active || state.ime_position_update != ImePositionUpdate::Idle {
             return;
         }
         state.client.update_ime_position(bounds);
@@ -2644,4 +2707,25 @@ fn inset_by_tiling(mut bounds: Bounds<Pixels>, inset: Pixels, tiling: Tiling) ->
     }
 
     bounds
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ImePositionUpdate;
+
+    #[test]
+    fn ime_position_waits_for_the_latest_layout() {
+        let mut update = ImePositionUpdate::AwaitingLayout;
+        assert!(!update.take_after_layout());
+
+        update.layout_started();
+        assert!(matches!(update, ImePositionUpdate::AfterLayout));
+        // New input supersedes the layout before its geometry is published.
+        update = ImePositionUpdate::AwaitingLayout;
+        assert!(!update.take_after_layout());
+        update.layout_started();
+
+        assert!(update.take_after_layout());
+        assert!(!update.take_after_layout());
+    }
 }
