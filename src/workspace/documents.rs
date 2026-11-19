@@ -197,7 +197,7 @@ impl Workspace {
             )
             .child(div().flex_1().min_w_0())
             .when_some(self.doc.as_ref(), |bar, reader| {
-                bar.child(reader.read(cx).toolbar_actions(reader, window))
+                bar.child(reader.read(cx).toolbar_actions(reader, window, cx))
             })
     }
 

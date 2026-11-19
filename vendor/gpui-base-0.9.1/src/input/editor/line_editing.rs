@@ -118,15 +118,6 @@ impl<M: InputModeKind> InputBaseState<M> {
             .collect()
     }
 
-    fn line_content_end(&self, row: usize) -> usize {
-        let next = self.text.line_start_offset(row + 1);
-        if row + 1 < self.text.lines_len() {
-            self.preceding_line_break_start(next)
-        } else {
-            next
-        }
-    }
-
     fn duplicate_lines(
         &mut self,
         runs: &[Range<usize>],

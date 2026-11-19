@@ -12,10 +12,10 @@ use anyhow::{Context as _, Result};
 use core::prelude::v1::test;
 use gpui::{prelude::FluentBuilder as _, *};
 use gpui_component::{
-    ActiveTheme, Disableable as _, Selectable as _, StyledExt,
+    ActiveTheme, Selectable as _, StyledExt,
     button::Button,
     h_flex,
-    input::{Input, InputEvent, InputState},
+    input::{DocumentFind, Escape},
     scroll::ScrollbarViewport as _,
     text::{
         MarkdownExtensions, MarkdownNode, MarkdownParseContext, MarkdownPlugin, RangeHighlight,
@@ -474,10 +474,9 @@ pub struct DocReader {
     image_thumbnails: Entity<ImageThumbnails>,
     embedded_images: EmbeddedImages,
     text: Entity<TextViewState>,
-    search: Entity<InputState>,
+    search: Entity<DocumentFind>,
     workspace: WeakEntity<Workspace>,
     _subscriptions: [Subscription; 2],
-    show_search: bool,
     show_outline: Option<bool>,
     outline_width: Pixels,
     standalone: bool,
@@ -488,8 +487,6 @@ pub struct DocReader {
     heading_jump_block: Option<usize>,
     pending_heading: Option<usize>,
     pending_position: Option<DocumentPosition>,
-    matches: Vec<Range<usize>>,
-    current_match: usize,
 }
 
 impl DocReader {
@@ -501,6 +498,7 @@ impl DocReader {
         &self,
         reader: &Entity<Self>,
         window: &Window,
+        cx: &App,
     ) -> impl IntoElement + use<> {
         let show_outline = self.outline_visible(window);
         let path = self.path.clone();
@@ -509,8 +507,8 @@ impl DocReader {
             .gap_1()
             .child(
                 icon_button("document-find", IconName::Search, t!("docs.search"))
-                    .selected(self.show_search)
-                    .toggled(self.show_search)
+                    .selected(self.search.read(cx).is_open())
+                    .toggled(self.search.read(cx).is_open())
                     .on_click({
                         let reader = reader.clone();
                         move |_, window, cx| {
@@ -598,14 +596,17 @@ impl DocReader {
             .scrollable(true)
         });
         text.read(cx).list_state().set_pixel_aligned_scroll(true);
-        let search = cx.new(|cx| InputState::new(window, cx).placeholder(t!("docs.find")));
+        let search = DocumentFind::for_document(text.clone(), window, cx);
+        search.update(cx, |search, cx| {
+            search.set_placeholder(t!("docs.find"), window, cx)
+        });
         let text_subscription = cx.observe(&text, |this: &mut Self, _, cx| this.reveal_pending(cx));
-        let search_subscription =
-            cx.subscribe(&search, |this: &mut Self, _, event, cx| match event {
-                InputEvent::Change => this.find_matches(cx),
-                InputEvent::PressEnter { shift, .. } => this.step_match(*shift, cx),
-                _ => {}
-            });
+        let search_subscription = cx.observe(&search, |this: &mut Self, search, cx| {
+            if search.read(cx).has_matches() {
+                this.heading_jump_block = None;
+            }
+            cx.notify();
+        });
         let mut reader = Self {
             typography: crate::config::Docs::default(),
             root,
@@ -618,7 +619,6 @@ impl DocReader {
             search,
             workspace,
             _subscriptions: [text_subscription, search_subscription],
-            show_search: false,
             show_outline: None,
             outline_width: px(195.),
             standalone: false,
@@ -629,8 +629,6 @@ impl DocReader {
             heading_jump_block: None,
             pending_heading: None,
             pending_position: None,
-            matches: Vec::new(),
-            current_match: 0,
         };
         if let Some(fragment) = fragment {
             reader.jump_to_fragment(&fragment, cx);
@@ -698,76 +696,8 @@ impl DocReader {
     }
 
     pub fn toggle_find(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.show_search {
-            self.close_find(window, cx);
-        } else {
-            self.show_search = true;
-            self.search
-                .update(cx, |search, cx| search.focus(window, cx));
-            self.find_matches(cx);
-        }
-        cx.notify();
-    }
-
-    fn close_find(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.show_search = false;
-        self.text
-            .update(cx, |text, cx| text.clear_range_highlights(cx));
-        self.text.read(cx).focus_handle().clone().focus(window, cx);
-        cx.notify();
-    }
-
-    fn find_matches(&mut self, cx: &mut Context<Self>) {
-        let query = self.search.read(cx).value();
-        let rendered = self.text.read(cx).rendered_text();
-        self.matches.clear();
-        if !query.is_empty() {
-            let pattern = regex::RegexBuilder::new(&regex::escape(&query))
-                .case_insensitive(true)
-                .build();
-            if let Ok(pattern) = pattern {
-                self.matches.extend(
-                    pattern
-                        .find_iter(rendered.as_str())
-                        .take(5000)
-                        .map(|m| m.range()),
-                );
-            }
-        }
-        self.current_match = 0;
-        self.paint_matches(cx);
-    }
-
-    fn step_match(&mut self, previous: bool, cx: &mut Context<Self>) {
-        let count = self.matches.len();
-        if count > 0 {
-            self.current_match =
-                (self.current_match + if previous { count - 1 } else { 1 }) % count;
-            self.paint_matches(cx);
-        }
-    }
-
-    fn paint_matches(&mut self, cx: &mut Context<Self>) {
-        let accent = cx.theme().accent;
-        let active = self.current_match;
-        if self.matches.get(active).is_some() {
-            self.heading_jump_block = None;
-        }
-        self.text.update(cx, |text, cx| {
-            _ = text.set_range_highlights(
-                self.matches.iter().enumerate().map(|(i, range)| {
-                    RangeHighlight::new(
-                        range.clone(),
-                        accent.opacity(if i == active { 0.48 } else { 0.22 }),
-                    )
-                }),
-                cx,
-            );
-            if let Some(range) = self.matches.get(active) {
-                _ = text.reveal_range(range.clone(), cx);
-            }
-        });
-        cx.notify();
+        self.search
+            .update(cx, |search, cx| search.toggle(window, cx));
     }
 
     pub(crate) fn locate_source(
@@ -912,49 +842,6 @@ impl DocReader {
             self.select_heading(index);
             cx.notify();
         }
-    }
-
-    fn search_bar(&self, cx: &Context<Self>, colors: Palette) -> impl IntoElement {
-        let count = self.matches.len();
-        let counter = if count == 0 {
-            "0 / 0".to_owned()
-        } else {
-            format!("{} / {count}", self.current_match + 1)
-        };
-        h_flex()
-            .flex_shrink_0()
-            .gap_1()
-            .px_3()
-            .py_1()
-            .bg(colors.elevated)
-            .border_b_1()
-            .border_color(colors.border)
-            .child(
-                Input::new(&self.search)
-                    .w(px(210.))
-                    .aria_label(t!("docs.find")),
-            )
-            .child(
-                div()
-                    .px_2()
-                    .text_xs()
-                    .text_color(colors.muted)
-                    .child(counter),
-            )
-            .child(
-                icon_button("find-prev", IconName::ChevronUp, t!("docs.previous_match"))
-                    .disabled(count == 0)
-                    .on_click(cx.listener(|this, _, _, cx| this.step_match(true, cx))),
-            )
-            .child(
-                icon_button("find-next", IconName::ChevronDown, t!("docs.next_match"))
-                    .disabled(count == 0)
-                    .on_click(cx.listener(|this, _, _, cx| this.step_match(false, cx))),
-            )
-            .child(
-                icon_button("close-find", IconName::X, t!("docs.close_find"))
-                    .on_click(cx.listener(|this, _, window, cx| this.close_find(window, cx))),
-            )
     }
 
     fn outline(&self, cx: &Context<Self>, colors: Palette) -> impl IntoElement {
@@ -1234,7 +1121,14 @@ impl Render for DocReader {
             .flex_1()
             .min_w_0()
             .overflow_hidden()
-            .when(self.show_search, |el| el.child(self.search_bar(cx, colors)))
+            .when(self.search.read(cx).is_open(), |el| {
+                el.key_context("DocumentFind")
+                    .on_action(cx.listener(|this, _: &Escape, window, cx| {
+                        this.search
+                            .update(cx, |search, cx| search.dismiss(window, cx));
+                    }))
+                    .child(self.search.clone())
+            })
             .child(
                 h_flex()
                     .flex_1()
@@ -1474,18 +1368,42 @@ mod tests {
         assert_eq!(selected(visual), 20);
         assert!(outline.intersects(&row(20)));
 
-        visual.update(|window, cx| {
-            let search = reader.read(cx).search.clone();
-            search.update(cx, |search, cx| {
-                search.replace_all("Section 34", window, cx)
-            });
-        });
+        visual.update(|window, cx| reader.update(cx, |reader, cx| reader.toggle_find(window, cx)));
+        draw(visual);
+        visual.simulate_input("Section 34");
         draw(visual);
         // Reveal preserves the minimum body scroll, so the previous section may
         // still own the reading line with the match visible at the bottom.
         let after_find = selected(visual);
         assert!((33..=34).contains(&after_find));
         assert!(outline.intersects(&row(after_find)));
+
+        let assert_closed = |visual: &mut VisualTestContext| {
+            visual.update(|window, cx| {
+                let reader = reader.read(cx);
+                assert!(!reader.search.read(cx).is_open());
+                assert!(reader.text.read(cx).focus_handle().is_focused(window));
+            });
+        };
+        visual.simulate_keystrokes("escape");
+        draw(visual);
+        assert_closed(visual);
+
+        visual.update(|window, cx| reader.update(cx, |reader, cx| reader.toggle_find(window, cx)));
+        draw(visual);
+        visual.update(|window, cx| {
+            let reader = reader.read(cx);
+            assert!(reader.search.read(cx).has_matches());
+            reader
+                .text
+                .read(cx)
+                .focus_handle()
+                .clone()
+                .focus(window, cx);
+        });
+        visual.simulate_keystrokes("escape");
+        draw(visual);
+        assert_closed(visual);
     }
 
     #[test]

@@ -26,7 +26,7 @@ impl<M: OverlayMode> Default for InputOverlayRegistry<M> {
 impl<M: OverlayMode> Global for InputOverlayRegistry<M> {}
 
 struct InputOverlayHost<M: OverlayMode> {
-    search: Entity<SearchPanel<M>>,
+    search: Entity<SearchPanel<InputBaseState<M>>>,
     search_signature: SearchSignature,
     /// The language-feature popovers. Only a code editor has them.
     lsp: Option<LspOverlays>,
@@ -35,17 +35,14 @@ struct InputOverlayHost<M: OverlayMode> {
 /// Identifies one version of the search session, as the search panel shows it.
 ///
 /// Everything the panel renders from is here, so an unchanged frame compares
-/// equal and rebuilds nothing. `activation_revision` is what separates "the
-/// session is open" from "the user just asked for search again": re-invoking an
-/// open session leaves every other field alone, and without the revision the
-/// second request would compare equal and be dropped.
+/// equal and rebuilds nothing. Explicit focus requests are tracked by the
+/// editor across mounts.
 #[derive(PartialEq, Eq, Default)]
 struct SearchSignature {
     open: bool,
     replace_mode: bool,
     query: String,
     anchor_offset: Option<usize>,
-    activation_revision: u64,
 }
 
 /// Identifies one version of an overlay's content.
@@ -341,13 +338,13 @@ impl<M: OverlayMode> InputOverlayHost<M> {
         cx: &mut App,
     ) -> InputOverlays {
         let snapshot = M::lsp_snapshot(state.read(cx), cx);
-        let (search_open, replace_mode, activation_revision, search_session) = {
+        let (search_open, replace_mode, focus_requested, search_session) = {
             let state = state.read(cx);
             let search = state.search_session();
             (
                 search.open,
                 search.replace_mode,
-                state.search_activation_revision(),
+                state.take_search_focus_request(),
                 search.clone(),
             )
         };
@@ -361,9 +358,8 @@ impl<M: OverlayMode> InputOverlayHost<M> {
             replace_mode,
             query: search_session.query.clone(),
             anchor_offset: search_session.anchor_offset,
-            activation_revision,
         };
-        if search_signature != self.search_signature {
+        if focus_requested || search_signature != self.search_signature {
             // The panel writes query and replacement-mode changes back into the
             // session. Re-showing it for that echo would select the query or steal
             // focus from replacement, so preserve changes the panel already holds.
@@ -378,7 +374,7 @@ impl<M: OverlayMode> InputOverlayHost<M> {
                 && was.open
                 && (was.replace_mode == search_signature.replace_mode
                     || panel_replace_mode == search_signature.replace_mode)
-                && was.activation_revision == search_signature.activation_revision
+                && !focus_requested
                 && self.search.read(cx).query(cx) == search_session.query;
             self.search_signature = search_signature;
             if !query_echo {
@@ -390,12 +386,13 @@ impl<M: OverlayMode> InputOverlayHost<M> {
                             &selected,
                             replace_mode,
                             visible,
-                            !cfg!(test),
+                            focus_requested && !cfg!(test),
                             window,
                             cx,
                         );
                     } else {
-                        panel.hide_with_focus(!cfg!(test), window, cx);
+                        let was_focused = panel.has_focus(window, cx);
+                        panel.hide_with_focus(was_focused && !cfg!(test), window, cx);
                     }
                 });
             }

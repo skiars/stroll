@@ -14,6 +14,8 @@ env -u DISPLAY -u WAYLAND_DISPLAY cargo test --release --locked --test popups
 
 The [scroll test](../tests/smooth_scroll.rs) sends input, advances frames, and checks layout. The Linux GPU cases in the [popup test](../tests/popups.rs) use pixel assertions to verify blur, clipping, and partial repaint.
 
+The [editor interaction audit](editor-issues.md#automated-audit) runs Stroll and Zed on a private virtual display and compares keyboard, mouse, and workspace behavior.
+
 On macOS and Windows, run `cargo test --release --locked --test smooth_scroll`. The wgpu screenshot example below uses a Linux-only test dependency. On Windows, `directx_blurs_the_scene_under_the_popup` opens a hidden Win32 window and reads back the DirectX render. Use the following command in sessions where no system windows are allowed.
 
 ```powershell

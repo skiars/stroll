@@ -518,6 +518,7 @@ pub struct InputBaseState<M: InputModeKind> {
     /// Advances every time search is explicitly invoked. See
     /// [`InputBaseState::search_activation_revision`].
     pub(super) search_activation_revision: u64,
+    pub(super) presented_search_activation_revision: Cell<u64>,
     pub(super) searchable: bool,
     pub(super) replaceable: bool,
     pub(super) soft_wrap: bool,
@@ -1040,6 +1041,7 @@ impl<M: InputModeKind> InputBaseState<M> {
             display_map: DisplayMap::new(text_style.font(), window.rem_size(), None),
             search_session: super::SearchSession::default(),
             search_activation_revision: 0,
+            presented_search_activation_revision: Cell::new(0),
             searchable: false,
             replaceable: true,
             soft_wrap: true,
@@ -2021,9 +2023,15 @@ impl<M: InputModeKind> InputBaseState<M> {
 
         let target = UnicodeSegmentation::split_word_bound_indices(left_part.as_str())
             .rfind(|(_, s)| !s.trim_start().is_empty())
-            .map(|(i, _)| i)
+            .map(|(i, word)| {
+                let member_start = self
+                    .member_access_dots(word)
+                    .next_back()
+                    .map_or(0, |dot| dot + 1);
+                i + member_start
+            })
             .unwrap_or(0);
-        self.token_boundary(target, Bias::Left)
+        self.grapheme_boundary(target, Bias::Left)
     }
 
     /// Return the next end offset of the word after `offset`.
@@ -2038,9 +2046,23 @@ impl<M: InputModeKind> InputBaseState<M> {
 
         let target = UnicodeSegmentation::split_word_bound_indices(right_part.as_str())
             .find(|(_, s)| !s.trim_start().is_empty())
-            .map(|(i, s)| offset + i + s.len())
+            .map(|(i, word)| {
+                offset + i + self.member_access_dots(word).next().unwrap_or(word.len())
+            })
             .unwrap_or(self.text.len());
-        self.token_boundary(target, Bias::Right)
+        self.grapheme_boundary(target, Bias::Right)
+    }
+
+    /// UAX word segments can contain dots in both identifiers and decimal numbers.
+    /// Retain decimal segments and put a boundary before member names in code.
+    fn member_access_dots<'a>(&self, word: &'a str) -> impl DoubleEndedIterator<Item = usize> + 'a {
+        let code_editor = self.is_code_editor();
+        word.match_indices('.').filter_map(move |(dot, _)| {
+            (code_editor
+                && dot > 0
+                && word[dot + 1..].starts_with(|ch: char| ch.is_alphabetic() || ch == '_'))
+            .then_some(dot)
+        })
     }
 
     /// Get start of line byte offset for the given `offset`.
@@ -2438,7 +2460,7 @@ impl<M: InputModeKind> InputBaseState<M> {
         self.delete_selections(
             false,
             EditIntent::Backspace,
-            |s, offset| s.previous_boundary(offset)..offset,
+            |s, offset| s.previous_boundary(offset)..s.grapheme_boundary(offset, Bias::Right),
             window,
             cx,
         );
@@ -2448,7 +2470,7 @@ impl<M: InputModeKind> InputBaseState<M> {
         self.delete_selections(
             false,
             EditIntent::DeleteForward,
-            |s, offset| offset..s.next_boundary(offset),
+            |s, offset| s.grapheme_boundary(offset, Bias::Left)..s.next_boundary(offset),
             window,
             cx,
         );
@@ -2505,7 +2527,17 @@ impl<M: InputModeKind> InputBaseState<M> {
         self.delete_selections(
             true,
             EditIntent::Atomic,
-            |s, offset| s.previous_start_of_word_at(offset)..offset,
+            |s, offset| {
+                if s.is_code_editor() {
+                    let row = s.text.offset_to_point(offset).row;
+                    let start = s.text.line_start_offset(row);
+                    let end = s.line_content_end(row);
+                    if s.text.slice(start..end).chars().all(char::is_whitespace) {
+                        return s.preceding_line_break_start(start)..end;
+                    }
+                }
+                s.previous_start_of_word_at(offset)..offset
+            },
             window,
             cx,
         );
@@ -2695,6 +2727,9 @@ impl<M: InputModeKind> InputBaseState<M> {
 
         if self.ime_marked_range.is_some() {
             self.unmark_text(window, cx);
+        } else if self.search_session().open {
+            self.close_search(cx);
+            return;
         }
 
         // Android delivers its back button as escape, and back leaves a field's
@@ -3410,6 +3445,15 @@ impl<M: InputModeKind> InputBaseState<M> {
         rows.sort_unstable();
         rows.dedup();
         rows
+    }
+
+    pub(super) fn line_content_end(&self, row: usize) -> usize {
+        let next = self.text.line_start_offset(row + 1);
+        if row + 1 < self.text.lines_len() {
+            self.preceding_line_break_start(next)
+        } else {
+            next
+        }
     }
 
     pub(super) fn preceding_line_break_start(&self, line_start: usize) -> usize {
@@ -4515,7 +4559,7 @@ impl<M: InputModeKind> InputBaseState<M> {
         M::clear_inline_completion(self, cx);
 
         self.cursor_line_end_affinity = line_end_affinity;
-        let offset = self.cursor_boundary(offset, Bias::Left);
+        let offset = self.grapheme_boundary(offset, Bias::Left);
         let word_range = self.selected_word_range;
         Self::extend_selection(self.active_selection_mut(), offset, word_range);
         let range = self.normalize_token_range(self.selected_range());
@@ -4558,7 +4602,7 @@ impl<M: InputModeKind> InputBaseState<M> {
                 if sel.id == self.active_selection().id {
                     active_affinity = affinity;
                 }
-                let offset = self.cursor_boundary(offset, Bias::Left);
+                let offset = self.grapheme_boundary(offset, Bias::Left);
                 let mut new_sel = *sel;
                 Self::extend_selection(&mut new_sel, offset, None);
                 let range = self.normalize_token_range(new_sel.start..new_sel.end);
@@ -4658,13 +4702,55 @@ impl<M: InputModeKind> InputBaseState<M> {
         }
     }
 
+    /// Snap an interactive caret to a whole grapheme. Rope chunks are fed to the
+    /// segmenter as needed so a cluster can span nodes without flattening the buffer.
+    pub(super) fn grapheme_boundary(&self, offset: usize, bias: Bias) -> usize {
+        let offset = self.cursor_boundary(offset, bias);
+        if offset == 0 || offset == self.text.len() {
+            return offset;
+        }
+        let mut cursor = GraphemeCursor::new(offset, self.text.len(), true);
+        let (mut chunk, mut start) = self.text.chunk(offset);
+        let mut checking = true;
+        loop {
+            let result = if checking {
+                match cursor.is_boundary(chunk, start) {
+                    Ok(true) => return offset,
+                    Ok(false) => {
+                        checking = false;
+                        continue;
+                    }
+                    Err(incomplete) => Err(incomplete),
+                }
+            } else if bias == Bias::Left {
+                cursor.prev_boundary(chunk, start)
+            } else {
+                cursor.next_boundary(chunk, start)
+            };
+            match result {
+                Ok(Some(boundary)) => return self.token_boundary(boundary, bias),
+                Err(GraphemeIncomplete::PreContext(end)) => {
+                    let (context, context_start) = self.text.chunk(end - 1);
+                    cursor.provide_context(context, context_start);
+                }
+                Err(GraphemeIncomplete::PrevChunk) => {
+                    (chunk, start) = self.text.chunk(start - 1);
+                }
+                Err(GraphemeIncomplete::NextChunk) => {
+                    (chunk, start) = self.text.chunk(start + chunk.len());
+                }
+                Ok(None) | Err(GraphemeIncomplete::InvalidOffset) => unreachable!(),
+            }
+        }
+    }
+
     pub(super) fn previous_boundary(&self, offset: usize) -> usize {
-        let offset = self.cursor_boundary(offset.saturating_sub(1), Bias::Left);
+        let offset = self.grapheme_boundary(offset.saturating_sub(1), Bias::Left);
         self.clamp_offset_to_visible_backward(offset)
     }
 
     pub(super) fn next_boundary(&self, offset: usize) -> usize {
-        let offset = self.cursor_boundary(offset.saturating_add(1), Bias::Right);
+        let offset = self.grapheme_boundary(offset.saturating_add(1), Bias::Right);
         self.clamp_offset_to_visible_forward(offset)
     }
 

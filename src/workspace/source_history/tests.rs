@@ -167,6 +167,16 @@ fn source_history_replays_files_jumps_and_worktree_positions() -> Result<()> {
         });
     });
     frame(visual);
+    visual.update(|window, cx| {
+        workspace.update(cx, |workspace, cx| workspace.find(window, cx));
+    });
+    frame(visual);
+    visual.update(|window, cx| {
+        let editor = workspace.read(cx).active_file().unwrap().editor.clone();
+        assert!(Editor::search_has_focus(&editor, window, cx));
+        editor.update(cx, |state, cx| state.focus(window, cx));
+    });
+    frame(visual);
     let first = visual.update(|_, cx| position(cx));
     assert_eq!(first.selection_start, (70, 2));
     assert!(first.reversed);
@@ -178,6 +188,12 @@ fn source_history_replays_files_jumps_and_worktree_positions() -> Result<()> {
     wait_for(visual, |cx| {
         active(cx, &root, alpha) && position(cx) == first
     })?;
+    visual.update(|window, cx| {
+        let editor = &workspace.read(cx).active_file().unwrap().editor;
+        let state = editor.read(cx);
+        assert!(state.search_session().open);
+        assert!(state.focus_handle(cx).is_focused(window));
+    });
     visual.simulate_keystrokes("alt-right");
     wait_for(visual, |cx| active(cx, &root, beta))?;
     let before_jump = visual.update(|_, cx| position(cx));

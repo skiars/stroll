@@ -1,11 +1,12 @@
+use gpui_base::input::{InputModeKind, SearchSession};
 use ropey::Rope;
 use rust_i18n::t;
 use std::ops::Range;
 
 use gpui::{
     App, AppContext as _, Context, Empty, Entity, FocusHandle, Focusable, Half,
-    InteractiveElement as _, IntoElement, ParentElement as _, Pixels, Render, Styled, Subscription,
-    WeakEntity, Window, actions, div, prelude::FluentBuilder as _, px,
+    InteractiveElement as _, IntoElement, KeyBinding, ParentElement as _, Pixels, Render, Styled,
+    Subscription, WeakEntity, Window, actions, div, prelude::FluentBuilder as _, px,
 };
 
 use crate::{
@@ -17,12 +18,130 @@ use crate::{
         Replace,
     },
     label::Label,
+    text::{RangeHighlight, TextViewState},
     v_flex,
 };
 
 const CONTEXT: &'static str = "SearchPanel";
 
 actions!(input, [Tab]);
+
+pub(super) fn init(cx: &mut App) {
+    cx.bind_keys([KeyBinding::new("escape", Escape, Some("DocumentFind"))]);
+}
+
+pub type DocumentFind = SearchPanel<TextViewState>;
+
+/// A surface that supplies text and presents the shared panel's matches.
+#[doc(hidden)]
+pub trait SearchTarget: Sized + 'static {
+    fn update_query(&mut self, query: &str, session: &mut SearchSession, cx: &mut Context<Self>);
+    fn step_match(&mut self, previous: bool, session: &mut SearchSession, cx: &mut Context<Self>);
+    fn close_search(&mut self, cx: &mut Context<Self>);
+    fn focus_search_target(&mut self, window: &mut Window, cx: &mut Context<Self>);
+    fn can_replace(&self) -> bool {
+        false
+    }
+    fn set_replace_mode(&mut self, _: bool, _: &mut Context<Self>) {}
+    fn replace_match(&mut self, _: &str, _: bool, _: &mut Window, _: &mut Context<Self>) {}
+}
+
+impl<M: InputModeKind> SearchTarget for InputBaseState<M> {
+    fn update_query(&mut self, query: &str, session: &mut SearchSession, cx: &mut Context<Self>) {
+        self.set_search_query(query, session.case_insensitive, cx);
+        *session = self.search_session().clone();
+    }
+
+    fn step_match(&mut self, previous: bool, session: &mut SearchSession, cx: &mut Context<Self>) {
+        if previous {
+            self.previous_search_match(cx);
+        } else {
+            self.next_search_match(cx);
+        }
+        *session = self.search_session().clone();
+    }
+
+    fn close_search(&mut self, cx: &mut Context<Self>) {
+        InputBaseState::close_search(self, cx);
+    }
+
+    fn focus_search_target(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.focus(window, cx);
+    }
+
+    fn can_replace(&self) -> bool {
+        self.is_replaceable()
+    }
+
+    fn set_replace_mode(&mut self, replace: bool, cx: &mut Context<Self>) {
+        self.set_search_replace_mode(replace, cx);
+    }
+
+    fn replace_match(
+        &mut self,
+        replacement: &str,
+        all: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if all {
+            self.replace_all_search_matches(replacement, window, cx);
+        } else {
+            self.replace_current_search_match(replacement, window, cx);
+        }
+    }
+}
+
+impl SearchTarget for TextViewState {
+    fn update_query(&mut self, query: &str, session: &mut SearchSession, cx: &mut Context<Self>) {
+        session.matcher.update_document(
+            Rope::from(self.rendered_text().as_str()),
+            query,
+            session.case_insensitive,
+            5000,
+        );
+        paint_document_matches(self, session, cx);
+    }
+
+    fn step_match(&mut self, previous: bool, session: &mut SearchSession, cx: &mut Context<Self>) {
+        if previous {
+            session.matcher.next_back();
+        } else {
+            session.matcher.next();
+        }
+        paint_document_matches(self, session, cx);
+    }
+
+    fn close_search(&mut self, cx: &mut Context<Self>) {
+        self.clear_range_highlights(cx);
+    }
+
+    fn focus_search_target(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.focus_handle().clone().focus(window, cx);
+    }
+}
+
+fn paint_document_matches(
+    text: &mut TextViewState,
+    session: &SearchSession,
+    cx: &mut Context<TextViewState>,
+) {
+    let accent = cx.theme().accent;
+    let ranges = session.matcher.matched_ranges();
+    let active = session.matcher.current_match_index();
+    _ = text.set_range_highlights(
+        ranges.iter().enumerate().map(|(index, range)| {
+            RangeHighlight::new(
+                range.clone(),
+                accent.opacity(if index == active { 0.48 } else { 0.22 }),
+            )
+        }),
+        cx,
+    );
+    if let Some(range) = ranges.get(active) {
+        _ = text.reveal_range(range.clone(), cx);
+    }
+}
 
 #[cfg(test)]
 use gpui_base::input::SearchMatcher;
@@ -58,8 +177,9 @@ fn prev_scroll_direction(
     }
 }
 
-pub(super) struct SearchPanel<M: crate::input::overlay::OverlayMode> {
-    editor: WeakEntity<InputBaseState<M>>,
+#[doc(hidden)]
+pub struct SearchPanel<T: SearchTarget> {
+    target: WeakEntity<T>,
     search_input: Entity<InputState>,
     replace_input: Entity<InputState>,
     session: gpui_base::input::SearchSession,
@@ -68,7 +188,7 @@ pub(super) struct SearchPanel<M: crate::input::overlay::OverlayMode> {
     _subscriptions: Vec<Subscription>,
 }
 
-impl<M: crate::input::overlay::OverlayMode> SearchPanel<M> {
+impl<T: SearchTarget> SearchPanel<T> {
     pub(super) fn replace_mode(&self) -> bool {
         self.session.replace_mode
     }
@@ -89,11 +209,7 @@ impl<M: crate::input::overlay::OverlayMode> SearchPanel<M> {
         &self.search_input
     }
 
-    pub(crate) fn new(
-        editor: Entity<InputBaseState<M>>,
-        window: &mut Window,
-        cx: &mut App,
-    ) -> Entity<Self> {
+    pub(crate) fn new(target: Entity<T>, window: &mut Window, cx: &mut App) -> Entity<Self> {
         let search_input = cx.new(|cx| InputState::new(window, cx));
         let replace_input = cx.new(|cx| InputState::new(window, cx));
 
@@ -112,7 +228,7 @@ impl<M: crate::input::overlay::OverlayMode> SearchPanel<M> {
                 ];
 
             Self {
-                editor: editor.downgrade(),
+                target: target.downgrade(),
                 search_input,
                 replace_input,
                 session: gpui_base::input::SearchSession::default(),
@@ -160,13 +276,9 @@ impl<M: crate::input::overlay::OverlayMode> SearchPanel<M> {
         cx: &mut Context<Self>,
     ) {
         let query = self.search_input.read(cx).value();
-        let editor = self.editor.clone();
-        let _ = editor.update(cx, |state, cx| {
-            state.set_search_query(query.clone(), self.session.case_insensitive, cx);
+        _ = self.target.update(cx, |target, cx| {
+            target.update_query(&query, &mut self.session, cx);
         });
-        if let Ok(session) = editor.read_with(cx, |state, _| state.search_session().clone()) {
-            self.session = session;
-        }
         if let Some(visible_range_offset) = visible_range_offset {
             self.session
                 .matcher
@@ -176,8 +288,8 @@ impl<M: crate::input::overlay::OverlayMode> SearchPanel<M> {
     }
 
     fn replaceable(&self, cx: &App) -> bool {
-        self.editor
-            .read_with(cx, |editor, _| editor.is_replaceable())
+        self.target
+            .read_with(cx, |target, _| target.can_replace())
             .unwrap_or(false)
     }
 
@@ -192,20 +304,20 @@ impl<M: crate::input::overlay::OverlayMode> SearchPanel<M> {
         cx: &mut Context<Self>,
     ) {
         self.session.open = false;
-        let _ = self.editor.update(cx, |state, cx| {
-            state.close_search(cx);
+        _ = self.target.update(cx, |target, cx| {
+            target.close_search(cx);
             if focus_editor {
-                state.focus(window, cx);
+                target.focus_search_target(window, cx);
             }
         });
         cx.notify();
     }
 
-    fn on_action_enter(&mut self, action: &Enter, window: &mut Window, cx: &mut Context<Self>) {
+    fn on_action_enter(&mut self, action: &Enter, _: &mut Window, cx: &mut Context<Self>) {
         if action.shift {
-            self.prev(window, cx);
+            self.step(true, cx);
         } else {
-            self.next(window, cx);
+            self.step(false, cx);
         }
     }
 
@@ -256,9 +368,9 @@ impl<M: crate::input::overlay::OverlayMode> SearchPanel<M> {
 
         self.session.replace_mode = !self.session.replace_mode;
         let replace_mode = self.session.replace_mode;
-        let _ = self.editor.update(cx, |state, cx| {
-            state.set_search_replace_mode(replace_mode, cx);
-        });
+        _ = self
+            .target
+            .update(cx, |target, cx| target.set_replace_mode(replace_mode, cx));
         let focus_handle = if self.session.replace_mode {
             self.replace_input.read(cx).focus_handle(cx)
         } else {
@@ -268,16 +380,11 @@ impl<M: crate::input::overlay::OverlayMode> SearchPanel<M> {
         cx.notify();
     }
 
-    fn prev(&mut self, _: &mut Window, cx: &mut Context<Self>) {
-        let _ = self.editor.update(cx, |state, cx| {
-            _ = state.previous_search_match(cx);
+    fn step(&mut self, previous: bool, cx: &mut Context<Self>) {
+        _ = self.target.update(cx, |target, cx| {
+            target.step_match(previous, &mut self.session, cx);
         });
-    }
-
-    fn next(&mut self, _: &mut Window, cx: &mut Context<Self>) {
-        let _ = self.editor.update(cx, |state, cx| {
-            _ = state.next_search_match(cx);
-        });
+        cx.notify();
     }
 
     fn replace_next(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -288,8 +395,8 @@ impl<M: crate::input::overlay::OverlayMode> SearchPanel<M> {
         }
 
         let replacement = self.replace_input.read(cx).value();
-        let _ = self.editor.update(cx, |state, cx| {
-            _ = state.replace_current_search_match(&replacement, window, cx);
+        _ = self.target.update(cx, |target, cx| {
+            target.replace_match(&replacement, false, window, cx)
         });
     }
 
@@ -301,13 +408,57 @@ impl<M: crate::input::overlay::OverlayMode> SearchPanel<M> {
         }
 
         let replacement = self.replace_input.read(cx).value();
-        let _ = self.editor.update(cx, |state, cx| {
-            _ = state.replace_all_search_matches(&replacement, window, cx);
+        _ = self.target.update(cx, |target, cx| {
+            target.replace_match(&replacement, true, window, cx)
         });
     }
 }
 
-impl<M: crate::input::overlay::OverlayMode> SearchPanel<M> {
+impl DocumentFind {
+    pub fn for_document(
+        target: Entity<TextViewState>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Entity<Self> {
+        Self::new(target, window, cx)
+    }
+
+    pub fn is_open(&self) -> bool {
+        self.session.open
+    }
+
+    pub fn set_placeholder(
+        &mut self,
+        label: impl Into<gpui::SharedString>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.search_input
+            .update(cx, |input, cx| input.set_placeholder(label, window, cx));
+    }
+
+    pub fn has_matches(&self) -> bool {
+        self.session.open && !self.session.matcher.is_empty()
+    }
+
+    pub fn toggle(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.is_open() {
+            self.dismiss(window, cx);
+        } else {
+            self.show_with_focus(&Rope::new(), false, None, true, window, cx);
+        }
+    }
+
+    pub fn dismiss(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.is_open() {
+            self.hide(window, cx);
+        } else {
+            cx.propagate();
+        }
+    }
+}
+
+impl<T: SearchTarget> SearchPanel<T> {
     pub(super) fn has_focus(&self, window: &Window, cx: &App) -> bool {
         self.search_input
             .read(cx)
@@ -321,13 +472,13 @@ impl<M: crate::input::overlay::OverlayMode> SearchPanel<M> {
     }
 }
 
-impl<M: crate::input::overlay::OverlayMode> Focusable for SearchPanel<M> {
+impl<T: SearchTarget> Focusable for SearchPanel<T> {
     fn focus_handle(&self, cx: &App) -> FocusHandle {
         self.search_input.read(cx).focus_handle(cx)
     }
 }
 
-impl<M: crate::input::overlay::OverlayMode> Render for SearchPanel<M> {
+impl<T: SearchTarget> Render for SearchPanel<T> {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if !self.session.open {
             return Empty.into_any_element();
@@ -370,6 +521,7 @@ impl<M: crate::input::overlay::OverlayMode> Render for SearchPanel<M> {
                             .gap_1()
                             .child(
                                 Input::new(&self.search_input)
+                                    .aria_label(t!("ComboBox.search_placeholder"))
                                     .focus_bordered(false)
                                     .suffix(
                                         Button::new("case-insensitive")
@@ -418,8 +570,8 @@ impl<M: crate::input::overlay::OverlayMode> Render for SearchPanel<M> {
                             .ghost()
                             .icon(IconName::ChevronLeft)
                             .disabled(!has_matches)
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.prev(window, cx);
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.step(true, cx);
                             })),
                     )
                     .child(
@@ -429,8 +581,8 @@ impl<M: crate::input::overlay::OverlayMode> Render for SearchPanel<M> {
                             .ghost()
                             .icon(IconName::ChevronRight)
                             .disabled(!has_matches)
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.next(window, cx);
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.step(false, cx);
                             })),
                     )
                     .child(

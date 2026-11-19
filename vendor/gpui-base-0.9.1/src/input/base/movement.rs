@@ -84,7 +84,7 @@ impl<M: InputModeKind> InputBaseState<M> {
     ) {
         self.undo_manager.break_transaction_coalescing();
         self.selections.remove_all_but_active();
-        let offset = self.cursor_boundary(offset, Bias::Left);
+        let offset = self.grapheme_boundary(offset, Bias::Left);
         self.cursor_line_end_affinity = line_end_affinity;
         self.set_cursor_to(offset);
         self.scroll_to(offset, direction, cx);
@@ -214,7 +214,7 @@ impl<M: InputModeKind> InputBaseState<M> {
                     active_affinity = line_end_affinity;
                 }
                 let mut new_sel = *sel;
-                new_sel.place_at(self.cursor_boundary(offset, Bias::Left), anchor);
+                new_sel.place_at(self.grapheme_boundary(offset, Bias::Left), anchor);
                 new_sel
             })
             .collect();

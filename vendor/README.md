@@ -34,6 +34,20 @@ dialogs in a Wayland window after changes to paint order or focus handling.
   let consumers customize a splitter through the existing appearance hook.
   The resize handle tests cover default behavior and opt-in geometry and input.
 - The shared editor search and replace fields use the default input height.
+- The editor, Git diff, and Markdown reader mount the same Find panel.
+  The Markdown target searches rendered text and delegates highlights and reveal
+  to the text view. It uses Unicode case matching with a 5000-match limit.
+  The reader outline and Git history layout tests cover Find and Escape.
+- Escape in the editor dismisses its built-in Find session after transient
+  editor overlays. An explicit Find action requests focus once. Remounting a
+  retained Find session restores its query without moving focus from the editor.
+  The editor editing and workspace source history tests cover both routes.
+- Interactive caret motion and deletion use extended Unicode graphemes across
+  rope chunks. Code-editor word commands recognize dots before member names
+  while keeping decimal segments intact. The editor editing tests cover both.
+- Backward word deletion on a whitespace-only code-editor line removes that
+  row up to the previous line's end and keeps the preceding text. It shares the
+  line-ending and undo handling with the editor's other deletions.
 - CMake uses the shared Tree-sitter highlighter with a query that uses Rust
   Tree-sitter predicates. Run `cargo test --release --locked --test cmake_highlighting`
   to check highlighting in the source editor, Git diff, and Markdown code fences.

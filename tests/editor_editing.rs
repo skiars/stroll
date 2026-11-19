@@ -1,8 +1,9 @@
 #![cfg(any(target_os = "linux", target_os = "windows"))]
 
 use gpui::{
-    AppContext as _, ClipboardItem, Context, Entity, EntityInputHandler as _, Render, Styled as _,
-    TestAppContext, TestDispatcher, VisualTestContext, Window, point, px, size,
+    AppContext as _, ClipboardItem, Context, Entity, EntityInputHandler as _, Focusable as _,
+    Render, Styled as _, TestAppContext, TestDispatcher, VisualTestContext, Window, point, px,
+    size,
 };
 use gpui_component::{
     Root,
@@ -85,6 +86,107 @@ fn select(
 ) {
     visual.update(|_, cx| editor.update(cx, |editor, cx| editor.set_selected_range(range, cx)));
     draw(visual);
+}
+
+#[test]
+fn backward_word_delete_removes_one_whitespace_line() {
+    for (source, caret, expected, destination) in [
+        ("prev  \n \t\nnext", 8, "prev  \nnext", 6),
+        ("prev  \r\n \t\r\nnext", 10, "prev  \r\nnext", 6),
+        ("prev\n\n\nnext", 6, "prev\n\nnext", 5),
+        ("prev\n", 5, "prev", 4),
+        ("  \nnext", 1, "\nnext", 0),
+    ] {
+        with_editor(source, false, false, false, |visual, editor| {
+            select(visual, editor, caret..caret);
+            visual.simulate_keystrokes("ctrl-backspace");
+            assert_eq!(text(visual, editor), expected);
+            visual.update(|_, cx| assert_eq!(editor.read(cx).cursor(), destination));
+            visual.simulate_keystrokes("ctrl-z");
+            assert_eq!(text(visual, editor), source);
+            visual.update(|_, cx| assert_eq!(editor.read(cx).cursor(), caret));
+        });
+    }
+    let source = "first\n \nsecond\n\t\nthird";
+    with_editor(source, false, false, false, |visual, editor| {
+        select(visual, editor, 6..6);
+        visual.update(|_, cx| editor.update(cx, |state, cx| state.add_selection(15..15, cx)));
+        visual.simulate_keystrokes("ctrl-backspace");
+        assert_eq!(text(visual, editor), "first\nsecond\nthird");
+        visual.simulate_keystrokes("ctrl-z");
+        assert_eq!(text(visual, editor), source);
+    });
+}
+
+#[test]
+fn escape_from_editor_dismisses_find_and_preserves_selection() {
+    with_editor("alpha beta alpha", false, false, false, |visual, editor| {
+        visual.update(|_, cx| editor.update(cx, |state, cx| state.set_searchable(true, cx)));
+        select(visual, editor, 0..5);
+        visual.simulate_keystrokes("ctrl-f");
+        draw(visual);
+        visual.update(|window, cx| {
+            assert!(Editor::search_has_focus(editor, window, cx));
+            editor.update(cx, |state, cx| state.focus(window, cx));
+        });
+        visual.simulate_keystrokes("escape");
+        draw(visual);
+        visual.update(|window, cx| {
+            let state = editor.read(cx);
+            assert!(!state.search_session().is_active());
+            assert!(state.focus_handle(cx).is_focused(window));
+            assert_eq!(state.selected_range(), 0..5);
+        });
+    });
+}
+
+#[test]
+fn caret_and_deletion_respect_graphemes_across_rope_chunks() {
+    let across_chunks = format!("a{}", "\u{301}".repeat(1200));
+    for cluster in ["👩‍💻", "e\u{301}", "🇨🇳", across_chunks.as_str()] {
+        let source = format!("x{cluster}y");
+        let before = 1;
+        let after = before + cluster.len();
+        with_editor(&source, false, false, false, |visual, editor| {
+            select(visual, editor, before..before);
+            visual.simulate_keystrokes("shift-right");
+            visual.update(|_, cx| assert_eq!(editor.read(cx).selected_range(), before..after));
+
+            select(visual, editor, after..after);
+            visual.simulate_keystrokes("left");
+            visual.update(|_, cx| assert_eq!(editor.read(cx).cursor(), before));
+            visual.simulate_keystrokes("delete");
+            assert_eq!(text(visual, editor), "xy");
+            visual.simulate_keystrokes("ctrl-z");
+            assert_eq!(text(visual, editor), source);
+
+            select(visual, editor, after..after);
+            visual.simulate_keystrokes("backspace");
+            assert_eq!(text(visual, editor), "xy");
+        });
+    }
+}
+
+#[test]
+fn word_edits_stop_at_member_access_and_keep_decimal_segments() {
+    with_editor(
+        "beta_gamma.delta 12.34",
+        false,
+        false,
+        false,
+        |visual, editor| {
+            let member_end = "beta_gamma.delta".len();
+            select(visual, editor, member_end..member_end);
+            visual.simulate_keystrokes("ctrl-backspace");
+            assert_eq!(text(visual, editor), "beta_gamma. 12.34");
+            visual.simulate_keystrokes("end ctrl-backspace");
+            assert_eq!(text(visual, editor), "beta_gamma. ");
+        },
+    );
+    with_editor("beta_gamma.delta", false, false, false, |visual, editor| {
+        visual.simulate_keystrokes("ctrl-right");
+        visual.update(|_, cx| assert_eq!(editor.read(cx).cursor(), "beta_gamma".len()));
+    });
 }
 
 #[test]

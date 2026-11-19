@@ -157,6 +157,13 @@ impl<M: InputModeKind> InputBaseState<M> {
         self.search_activation_revision
     }
 
+    /// Consume the explicit focus request once, even if the panel is remounted later.
+    #[doc(hidden)]
+    pub fn take_search_focus_request(&self) -> bool {
+        let revision = self.search_activation_revision();
+        self.presented_search_activation_revision.replace(revision) != revision
+    }
+
     #[doc(hidden)]
     pub fn set_search_replace_mode(&mut self, replace_mode: bool, cx: &mut Context<Self>) {
         self.search_session.replace_mode = replace_mode && self.is_replaceable();
@@ -229,6 +236,7 @@ impl<M: InputModeKind> InputBaseState<M> {
     /// query is kept so the next [`InputBaseState::open_search`] resumes it.
     pub fn close_search(&mut self, cx: &mut Context<Self>) {
         self.search_session.close();
+        self.take_search_focus_request();
         cx.notify();
     }
 
@@ -392,6 +400,36 @@ impl SearchMatcher {
                 .build([query])
                 .expect("failed to build input search query")
         });
+        self.update_matches();
+    }
+
+    /// Search rendered document text with Unicode case folding and a match limit.
+    pub fn update_document(
+        &mut self,
+        text: Rope,
+        query: &str,
+        case_insensitive: bool,
+        limit: usize,
+    ) {
+        self.text = text;
+        self.query = None;
+        self.pattern = (!query.is_empty())
+            .then(|| {
+                regex::RegexBuilder::new(&regex::escape(query))
+                    .case_insensitive(case_insensitive)
+                    .build()
+                    .ok()
+            })
+            .flatten()
+            .map(|pattern| {
+                SearchPattern(Rc::new(move |text| {
+                    pattern
+                        .find_iter(text)
+                        .take(limit)
+                        .map(|m| m.range())
+                        .collect()
+                }))
+            });
         self.update_matches();
     }
 

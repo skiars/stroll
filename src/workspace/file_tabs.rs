@@ -641,7 +641,7 @@ mod tests {
     use crate::{
         config::ConfigFile,
         repository::{Repository, Store},
-        session::WorkspaceView,
+        session::{WorkspaceView, WorktreeSession},
     };
 
     struct TabStripProbe {
@@ -692,6 +692,92 @@ mod tests {
     fn advance(visual: &mut VisualTestContext) {
         visual.executor().advance_clock(Duration::from_millis(16));
         draw(visual);
+    }
+
+    #[::core::prelude::v1::test]
+    fn choosing_an_open_local_file_reveals_its_overflowed_tab() -> anyhow::Result<()> {
+        let fixture = tempfile::tempdir()?;
+        let root = fixture.path().join("repo");
+        anyhow::ensure!(
+            Command::new("git")
+                .args(["init", "-q"])
+                .arg(&root)
+                .status()?
+                .success()
+        );
+        let target = PathBuf::from("editor-interactions.ts");
+        fs::write(
+            root.join(&target),
+            include_str!("../../tests/fixtures/editor-interactions.ts"),
+        )?;
+        let mut session = WorktreeSession {
+            view: Some(WorkspaceView::Editor),
+            ..Default::default()
+        };
+        session.tabs.open(target.clone(), false);
+        for index in 1..=20 {
+            let path = PathBuf::from(format!("buffer-{index:02}.ts"));
+            fs::write(root.join(&path), "// overflow fixture\n")?;
+            session.tabs.open(path, false);
+        }
+        let repo = Repository::open(&root)?;
+        let store = Arc::new(Store::new(fixture.path().join("state"))?);
+        let config = ConfigFile::load(Some(fixture.path().join("config.toml")));
+        let mut app = TestAppContext::build_with_text_system(
+            TestDispatcher::new(0),
+            None,
+            gpui_platform::current_platform(true).text_system(),
+        );
+        app.update(gpui_component::init);
+        let mut workspace = None;
+        let (_, visual) = app.add_window_view(|window, cx| {
+            let view = cx
+                .new(|cx| Workspace::with_config(store, config, WorkspaceView::Editor, window, cx));
+            workspace = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        let workspace = workspace.unwrap();
+        visual.simulate_resize(size(px(960.), px(520.)));
+        visual.update(|window, cx| {
+            workspace.update(cx, |this, cx| {
+                this.apply_repository(repo, session, None, None, window, cx);
+            });
+        });
+        for _ in 0..100 {
+            advance(visual);
+            if visual.update(|_, cx| workspace.read(cx).active_file().is_some()) {
+                break;
+            }
+        }
+        draw(visual);
+        let scroll = visual.update(|_, cx| workspace.read(cx).tab_scroll.clone());
+        let viewport = scroll.bounds();
+        let first = scroll.bounds_for_item(0).expect("first tab is laid out");
+        assert!(first.right() + scroll.offset().x <= viewport.left());
+
+        visual.update(|window, cx| {
+            workspace.update(cx, |this, cx| this.choose_local_file(window, cx));
+        });
+        assert!(visual.did_prompt_for_paths());
+        visual.simulate_path_prompt_response(|_| Some(vec![root.join(&target)]));
+        for _ in 0..100 {
+            advance(visual);
+            if visual.update(|_, cx| workspace.read(cx).files.contains_key(&target)) {
+                break;
+            }
+        }
+        draw(visual);
+        visual.update(|_, cx| {
+            let view = workspace.read(cx);
+            assert!(view.files.contains_key(&target));
+            assert_eq!(view.tabs.active(), Some(target.as_path()));
+            assert_eq!(view.tabs.paths().len(), 21);
+        });
+        let viewport = scroll.bounds();
+        let first = scroll.bounds_for_item(0).expect("first tab is laid out");
+        assert!(first.left() + scroll.offset().x >= viewport.left());
+        assert!(first.right() + scroll.offset().x <= viewport.right());
+        Ok(())
     }
 
     #[::core::prelude::v1::test]

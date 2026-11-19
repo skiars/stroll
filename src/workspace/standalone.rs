@@ -231,7 +231,7 @@ impl Workspace {
             .gap_2()
             .when(!editing, |bar| {
                 bar.when_some(self.doc.as_ref(), |bar, doc| {
-                    bar.child(doc.read(cx).toolbar_actions(doc, window))
+                    bar.child(doc.read(cx).toolbar_actions(doc, window, cx))
                 })
             })
             .when(editing && path.is_some(), |bar| {
