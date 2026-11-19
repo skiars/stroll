@@ -35,9 +35,14 @@ dialogs in a Wayland window after changes to paint order or focus handling.
   The resize handle tests cover default behavior and opt-in geometry and input.
 - The shared editor search and replace fields use the default input height.
 - The editor, Git diff, and Markdown reader mount the same Find panel.
-  The Markdown target searches rendered text and delegates highlights and reveal
-  to the text view. It uses Unicode case matching with a 5000-match limit.
-  The reader outline and Git history layout tests cover Find and Escape.
+  All three targets use Unicode case-insensitive literal matching. The Markdown
+  reader counts and navigates every match in rendered text, and the text view
+  highlights the first 5,000 results and the active result wherever it occurs.
+  The reader tests cover wrapping past the highlight limit and Find with Escape.
+- Explicit Find navigation selects the reached match before returning focus to
+  the editor. Single Replace resumes after the inserted text so a replacement
+  containing the query does not consume the next Replace click. The editor
+  editing tests cover both workflows and Unicode matching.
 - Escape in the editor dismisses its built-in Find session after transient
   editor overlays. An explicit Find action requests focus once. Remounting a
   retained Find session restores its query without moving focus from the editor.

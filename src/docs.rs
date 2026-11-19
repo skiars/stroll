@@ -1406,6 +1406,55 @@ mod tests {
         assert_closed(visual);
     }
 
+    #[cfg(target_os = "linux")]
+    #[gpui::test]
+    fn markdown_find_wraps_to_a_match_beyond_the_passive_highlight_limit(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        let mut source = format!("{}\n\n", "hitcount ".repeat(25)).repeat(200);
+        source.push_str(&"Unmatched paragraph.\n\n".repeat(40));
+        let last_match = source.len();
+        source.push_str("hitcount LastAnchor.\n");
+        let (reader, visual) = cx.add_window_view(|window, cx| {
+            DocReader::new(
+                PathBuf::new(),
+                PathBuf::from("README.md"),
+                PreparedDocument::new(source).unwrap(),
+                None,
+                WeakEntity::new_invalid(),
+                window,
+                cx,
+            )
+        });
+        visual.simulate_resize(size(px(1000.), px(430.)));
+        let draw = |visual: &mut VisualTestContext| {
+            for _ in 0..4 {
+                visual.run_until_parked();
+                visual.update(|window, cx| {
+                    window.simulate_next_frame(cx);
+                    window.draw(cx).clear(cx);
+                });
+            }
+        };
+        let last_match_is_visible = |visual: &mut VisualTestContext| {
+            visual.update(|_, cx| {
+                let text = reader.read(cx).text.read(cx);
+                let block = text.block_for_source_offset(last_match).unwrap();
+                text.list_state()
+                    .bounds_for_item(block)
+                    .is_some_and(|bounds| text.bounds().intersects(&bounds))
+            })
+        };
+        draw(visual);
+        visual.update(|window, cx| reader.update(cx, |reader, cx| reader.toggle_find(window, cx)));
+        draw(visual);
+        visual.simulate_input("hitcount");
+        draw(visual);
+        assert!(!last_match_is_visible(visual));
+        visual.simulate_keystrokes("shift-enter");
+        draw(visual);
+        assert!(last_match_is_visible(visual));
+    }
+
     #[test]
     fn only_authored_first_column_body_markers_become_tasks() {
         let source = "| [x] | status |\n| --- | --- |\n| [X] | [x] |\n| [ ] | open |\n| \\[x\\] | escaped |\n";

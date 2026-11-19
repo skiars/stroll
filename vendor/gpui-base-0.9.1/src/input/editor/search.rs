@@ -22,6 +22,7 @@ impl std::fmt::Debug for SearchPattern {
 pub struct SearchMatcher {
     text: Rope,
     pub query: Option<AhoCorasick>,
+    unicode_query: Option<regex::Regex>,
     pattern: Option<SearchPattern>,
     matched_ranges: Rc<Vec<Range<usize>>>,
     current_match_ix: usize,
@@ -243,19 +244,27 @@ impl<M: InputModeKind> InputBaseState<M> {
     pub fn next_search_match(&mut self, cx: &mut Context<Self>) -> Option<Range<usize>> {
         self.sync_search_matcher();
         let range = self.search_session.matcher.next()?;
-        // Match order does not describe viewport direction after a manual
-        // scroll. Always allow search navigation to reveal the active match.
-        self.scroll_to_with_padding(range.end, None, ScrollPadding::SurroundingLines, cx);
+        self.select_search_match(&range, false, cx);
         Some(range)
     }
 
     pub fn previous_search_match(&mut self, cx: &mut Context<Self>) -> Option<Range<usize>> {
         self.sync_search_matcher();
         let range = self.search_session.matcher.next_back()?;
+        self.select_search_match(&range, true, cx);
+        Some(range)
+    }
+
+    fn select_search_match(
+        &mut self,
+        range: &Range<usize>,
+        reversed: bool,
+        cx: &mut Context<Self>,
+    ) {
+        self.set_selected_range_with_direction(range.clone(), reversed, cx);
         // Match order does not describe viewport direction after a manual
         // scroll. Always allow search navigation to reveal the active match.
-        self.scroll_to_with_padding(range.start, None, ScrollPadding::SurroundingLines, cx);
-        Some(range)
+        self.scroll_to_with_padding(self.cursor(), None, ScrollPadding::SurroundingLines, cx);
     }
 
     /// Replace the current match and move on to the next one. Returns whether
@@ -270,7 +279,7 @@ impl<M: InputModeKind> InputBaseState<M> {
             return false;
         }
         self.sync_search_matcher();
-        let matcher = &mut self.search_session.matcher;
+        let matcher = &self.search_session.matcher;
         let Some(range) = matcher
             .matched_ranges()
             .get(matcher.current_match_index())
@@ -281,18 +290,23 @@ impl<M: InputModeKind> InputBaseState<M> {
         if !self.can_edit_ranges(std::slice::from_ref(&range), cx) {
             return false;
         }
-        let matcher = &mut self.search_session.matcher;
-        let next = matcher.peek().unwrap_or_else(|| range.clone());
-        let direction = matcher
-            .has_next_without_wrap()
-            .then_some(MoveDirection::Down);
-        if direction.is_none() {
-            matcher.set_current_match_index(0);
-        }
-        matcher.begin_replacement();
         let range_utf16 = self.range_to_utf16(&range);
-        self.scroll_to(next.end, direction, cx);
         self.replace_text_in_range_silent(Some(range_utf16), replacement, window, cx);
+        self.sync_search_matcher();
+        // Start after the inserted text, even if that text still matches.
+        let end = self.cursor();
+        let matcher = &mut self.search_session.matcher;
+        let next = matcher
+            .matched_ranges
+            .partition_point(|candidate| candidate.start < end);
+        matcher.current_match_ix = if next < matcher.len() { next } else { 0 };
+        if let Some(offset) = matcher
+            .matched_ranges
+            .get(matcher.current_match_ix)
+            .map(|range| range.end)
+        {
+            self.scroll_to_with_padding(offset, None, ScrollPadding::SurroundingLines, cx);
+        }
         true
     }
 
@@ -375,6 +389,7 @@ impl SearchMatcher {
         Self {
             text: "".into(),
             query: None,
+            unicode_query: None,
             pattern: None,
             matched_ranges: Rc::new(Vec::new()),
             current_match_ix: 0,
@@ -394,7 +409,17 @@ impl SearchMatcher {
 
     pub fn update_query(&mut self, query: &str, case_insensitive: bool) {
         self.pattern = None;
-        self.query = (!query.is_empty()).then(|| {
+        self.unicode_query = if !query.is_empty() && case_insensitive {
+            regex::RegexBuilder::new(&regex::escape(query))
+                .case_insensitive(true)
+                .build()
+                .ok()
+        } else {
+            None
+        };
+        self.query = (!query.is_empty() && self.unicode_query.is_none()).then(|| {
+            // Keep the literal matcher as a fallback if the regex size limit
+            // rejects a large query.
             AhoCorasick::builder()
                 .ascii_case_insensitive(case_insensitive)
                 .build([query])
@@ -403,34 +428,10 @@ impl SearchMatcher {
         self.update_matches();
     }
 
-    /// Search rendered document text with Unicode case folding and a match limit.
-    pub fn update_document(
-        &mut self,
-        text: Rope,
-        query: &str,
-        case_insensitive: bool,
-        limit: usize,
-    ) {
+    /// Update the rendered text and the literal query in a single scan.
+    pub fn update_document(&mut self, text: Rope, query: &str, case_insensitive: bool) {
         self.text = text;
-        self.query = None;
-        self.pattern = (!query.is_empty())
-            .then(|| {
-                regex::RegexBuilder::new(&regex::escape(query))
-                    .case_insensitive(case_insensitive)
-                    .build()
-                    .ok()
-            })
-            .flatten()
-            .map(|pattern| {
-                SearchPattern(Rc::new(move |text| {
-                    pattern
-                        .find_iter(text)
-                        .take(limit)
-                        .map(|m| m.range())
-                        .collect()
-                }))
-            });
-        self.update_matches();
+        self.update_query(query, case_insensitive);
     }
 
     pub fn matched_ranges(&self) -> Rc<Vec<Range<usize>>> {
@@ -463,11 +464,6 @@ impl SearchMatcher {
         }
     }
 
-    fn peek(&self) -> Option<Range<usize>> {
-        self.next_index()
-            .and_then(|ix| self.matched_ranges.get(ix).cloned())
-    }
-
     fn has_next_without_wrap(&self) -> bool {
         self.current_match_ix < self.matched_ranges.len().saturating_sub(1)
     }
@@ -486,6 +482,7 @@ impl SearchMatcher {
         self.replacing = true;
     }
 
+    #[cfg(test)]
     fn set_current_match_index(&mut self, index: usize) {
         self.current_match_ix = index.min(self.matched_ranges.len().saturating_sub(1));
     }
@@ -504,6 +501,9 @@ impl SearchMatcher {
         let mut ranges = Vec::new();
         if let Some(pattern) = &self.pattern {
             ranges = (pattern.0)(&self.text.to_string());
+        } else if let Some(query) = &self.unicode_query {
+            let text = self.text.to_string();
+            ranges.extend(query.find_iter(&text).map(|result| result.range()));
         } else if let Some(query) = &self.query {
             let text = self.text.to_string();
             ranges.extend(

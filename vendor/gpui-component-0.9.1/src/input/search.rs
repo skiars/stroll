@@ -23,6 +23,7 @@ use crate::{
 };
 
 const CONTEXT: &'static str = "SearchPanel";
+const DOCUMENT_HIGHLIGHT_LIMIT: usize = 5000;
 
 actions!(input, [Tab]);
 
@@ -98,7 +99,6 @@ impl SearchTarget for TextViewState {
             Rope::from(self.rendered_text().as_str()),
             query,
             session.case_insensitive,
-            5000,
         );
         paint_document_matches(self, session, cx);
     }
@@ -128,17 +128,17 @@ fn paint_document_matches(
 ) {
     let accent = cx.theme().accent;
     let ranges = session.matcher.matched_ranges();
-    let active = session.matcher.current_match_index();
-    _ = text.set_range_highlights(
-        ranges.iter().enumerate().map(|(index, range)| {
-            RangeHighlight::new(
-                range.clone(),
-                accent.opacity(if index == active { 0.48 } else { 0.22 }),
-            )
-        }),
-        cx,
-    );
-    if let Some(range) = ranges.get(active) {
+    let active = session.matcher.current().map(|index| &ranges[index]);
+    // Bound the passive highlights while keeping the entire match list navigable.
+    let passive = ranges
+        .iter()
+        .take(DOCUMENT_HIGHLIGHT_LIMIT)
+        .filter(|range| Some(*range) != active)
+        .map(|range| RangeHighlight::new(range.clone(), accent.opacity(0.22)));
+    let active_highlight =
+        active.map(|range| RangeHighlight::new(range.clone(), accent.opacity(0.48)));
+    _ = text.set_range_highlights(passive.chain(active_highlight), cx);
+    if let Some(range) = active {
         _ = text.reveal_range(range.clone(), cx);
     }
 }

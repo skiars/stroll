@@ -141,6 +141,104 @@ fn escape_from_editor_dismisses_find_and_preserves_selection() {
 }
 
 #[test]
+fn find_navigation_keeps_the_selected_match_for_editing_after_escape() {
+    let source = format!("// StartAnchor\n{}// EndAnchor", "// filler\n".repeat(105));
+    let start = source.find("EndAnchor").unwrap();
+    let hit = start..source.len();
+    with_editor(&source, false, false, false, |visual, editor| {
+        visual.update(|_, cx| editor.update(cx, |state, cx| state.set_searchable(true, cx)));
+        select(visual, editor, 0..0);
+        visual.simulate_keystrokes("ctrl-f");
+        draw(visual);
+        visual.simulate_input("EndAnchor");
+        draw(visual);
+        visual.update(|_, cx| assert_eq!(editor.read(cx).selected_range(), 0..0));
+
+        visual.simulate_keystrokes("shift-enter");
+        draw(visual);
+        visual.update(|window, cx| {
+            assert!(Editor::search_has_focus(editor, window, cx));
+            assert_eq!(editor.read(cx).selected_range(), hit);
+            assert_eq!(editor.read(cx).cursor(), start);
+        });
+        visual.simulate_keystrokes("enter");
+        draw(visual);
+        visual.update(|_, cx| assert_eq!(editor.read(cx).cursor(), hit.end));
+
+        visual.simulate_keystrokes("escape");
+        draw(visual);
+        visual.update(|window, cx| {
+            let state = editor.read(cx);
+            assert!(state.focus_handle(cx).is_focused(window));
+            assert_eq!(state.selected_range(), hit);
+        });
+        visual.simulate_keystrokes("right");
+        visual.simulate_input("PROBEMARK");
+        assert_eq!(text(visual, editor), format!("{source}PROBEMARK"));
+    });
+}
+
+#[test]
+fn single_find_replacement_advances_past_the_inserted_text() {
+    let source = include_str!("fixtures/editor-interactions.ts");
+    with_editor(source, false, false, false, |visual, editor| {
+        visual.update(|window, cx| {
+            editor.update(cx, |state, cx| {
+                state.set_search_query("auditNeedle", true, cx);
+                assert!(state.replace_current_search_match("auditNeedleX", window, cx));
+                assert_eq!(state.search_session().matcher.label(), "2/2");
+                assert!(state.replace_current_search_match("auditNeedleX", window, cx));
+                assert_eq!(state.search_session().matcher.label(), "1/2");
+            });
+        });
+        assert_eq!(
+            text(visual, editor),
+            source.replace("auditNeedle", "auditNeedleX")
+        );
+    });
+
+    for (replacement, expected, next) in [
+        ("", "foo", 0..3),
+        ("foo", "foofoo", 3..6),
+        ("foofoo", "foofoofoo", 6..9),
+    ] {
+        with_editor("foofoo", false, false, false, |visual, editor| {
+            visual.update(|window, cx| {
+                editor.update(cx, |state, cx| {
+                    state.set_search_query("foo", false, cx);
+                    assert!(state.replace_current_search_match(replacement, window, cx));
+                    let matcher = &state.search_session().matcher;
+                    assert_eq!(matcher.matched_ranges()[matcher.current().unwrap()], next);
+                });
+            });
+            assert_eq!(text(visual, editor), expected);
+        });
+    }
+}
+
+#[test]
+fn literal_find_honors_unicode_case_matching() {
+    let source = "CAFÉ café K K a.b axb";
+    with_editor(source, false, false, false, |visual, editor| {
+        visual.update(|_, cx| {
+            editor.update(cx, |state, cx| {
+                for (query, ignore_case, expected) in [
+                    ("café", true, &["CAFÉ", "café"][..]),
+                    ("café", false, &["café"][..]),
+                    ("k", true, &["K", "K"][..]),
+                    ("a.b", true, &["a.b"][..]),
+                ] {
+                    state.set_search_query(query, ignore_case, cx);
+                    let ranges = state.search_session().matcher.matched_ranges();
+                    let hits: Vec<_> = ranges.iter().map(|range| &source[range.clone()]).collect();
+                    assert_eq!(hits, expected);
+                }
+            });
+        });
+    });
+}
+
+#[test]
 fn caret_and_deletion_respect_graphemes_across_rope_chunks() {
     let across_chunks = format!("a{}", "\u{301}".repeat(1200));
     for cluster in ["👩‍💻", "e\u{301}", "🇨🇳", across_chunks.as_str()] {
