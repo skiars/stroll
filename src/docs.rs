@@ -15,7 +15,7 @@ use gpui_component::{
     ActiveTheme, Selectable as _, StyledExt,
     button::Button,
     h_flex,
-    input::{DocumentFind, Escape},
+    input::{DocumentFind, Escape, SelectAll},
     scroll::ScrollbarViewport as _,
     text::{
         MarkdownExtensions, MarkdownNode, MarkdownParseContext, MarkdownPlugin, RangeHighlight,
@@ -700,6 +700,23 @@ impl DocReader {
             .update(cx, |search, cx| search.toggle(window, cx));
     }
 
+    pub(crate) fn find(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let text = self.text.read(cx);
+        let query = if text.focus_handle().contains_focused(window, cx) {
+            text.selected_text()
+        } else {
+            String::new()
+        };
+        let search = self.search.read(cx);
+        if query.is_empty() && search.is_open() {
+            search.focus_handle(cx).focus(window, cx);
+            window.dispatch_action(Box::new(SelectAll), cx);
+        } else {
+            self.search
+                .update(cx, |search, cx| search.open_with_query(&query, window, cx));
+        }
+    }
+
     pub(crate) fn locate_source(
         &mut self,
         range: Range<usize>,
@@ -1378,6 +1395,27 @@ mod tests {
         assert!((33..=34).contains(&after_find));
         assert!(outline.intersects(&row(after_find)));
 
+        // Reissuing Find from the body and from the query retains the current search.
+        visual.update(|window, cx| {
+            reader
+                .read(cx)
+                .text
+                .read(cx)
+                .focus_handle()
+                .clone()
+                .focus(window, cx);
+        });
+        for _ in 0..2 {
+            visual.update(|window, cx| reader.update(cx, |reader, cx| reader.find(window, cx)));
+            draw(visual);
+            visual.update(|window, cx| {
+                let reader = reader.read(cx);
+                assert!(reader.search.read(cx).has_matches());
+                assert!(reader.search.read(cx).focus_handle(cx).is_focused(window));
+            });
+            assert_eq!(selected(visual), after_find);
+        }
+
         let assert_closed = |visual: &mut VisualTestContext| {
             visual.update(|window, cx| {
                 let reader = reader.read(cx);
@@ -1404,6 +1442,76 @@ mod tests {
         visual.simulate_keystrokes("escape");
         draw(visual);
         assert_closed(visual);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[gpui::test]
+    fn markdown_find_seeds_from_rendered_selection_and_reselects_the_query(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(gpui_component::init);
+        let (reader, visual) = cx.add_window_view(|window, cx| {
+            DocReader::new(
+                PathBuf::new(),
+                PathBuf::from("README.md"),
+                PreparedDocument::new("**formattedNeedle**".into()).unwrap(),
+                None,
+                WeakEntity::new_invalid(),
+                window,
+                cx,
+            )
+        });
+        let draw = |visual: &mut VisualTestContext| {
+            visual.run_until_parked();
+            visual.update(|window, cx| window.draw(cx).clear(cx));
+        };
+        let find = |visual: &mut VisualTestContext| {
+            visual.update(|window, cx| reader.update(cx, |reader, cx| reader.find(window, cx)));
+            draw(visual);
+        };
+        let assert_selected_query = |visual: &mut VisualTestContext, expected: &str| {
+            visual.update(|window, cx| {
+                assert!(
+                    reader
+                        .read(cx)
+                        .search
+                        .read(cx)
+                        .focus_handle(cx)
+                        .is_focused(window)
+                );
+                cx.write_to_clipboard(ClipboardItem::new_string("clipboard sentinel".into()));
+            });
+            visual.simulate_keystrokes("ctrl-c");
+            visual.update(|_, cx| {
+                assert_eq!(
+                    cx.read_from_clipboard()
+                        .and_then(|item| item.text())
+                        .as_deref(),
+                    Some(expected)
+                );
+            });
+        };
+        draw(visual);
+        visual.update(|window, cx| {
+            reader.read(cx).text.clone().update(cx, |text, cx| {
+                text.focus_handle().clone().focus(window, cx);
+                text.select_all(cx);
+            });
+        });
+        find(visual);
+        assert_selected_query(visual, "formattedNeedle");
+        visual.update(|_, cx| assert!(reader.read(cx).search.read(cx).has_matches()));
+        visual.simulate_input("missing");
+        find(visual);
+        assert_selected_query(visual, "missing");
+        visual.update(|window, cx| {
+            reader.read(cx).text.clone().update(cx, |text, cx| {
+                text.focus_handle().clone().focus(window, cx);
+                text.clear_selection(cx);
+            });
+        });
+        find(visual);
+        assert_selected_query(visual, "missing");
     }
 
     #[cfg(target_os = "linux")]

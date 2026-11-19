@@ -43,6 +43,12 @@ dialogs in a Wayland window after changes to paint order or focus handling.
   the editor. Single Replace resumes after the inserted text so a replacement
   containing the query does not consume the next Replace click. The editor
   editing tests cover both workflows and Unicode matching.
+- Plain Enter in the replacement field runs Single Replace. The shared Markdown
+  Find panel accepts a seed query from the caller. Stroll's reader handles
+  selection and refocus policy. The reader and editor editing tests cover these
+  actions.
+- Source Find shortcuts navigate relative to the editor selection and reuse a
+  retained query without moving focus into the Find panel.
 - Escape in the editor dismisses its built-in Find session after transient
   editor overlays. An explicit Find action requests focus once. Remounting a
   retained Find session restores its query without moving focus from the editor.

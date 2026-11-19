@@ -255,6 +255,36 @@ impl<M: InputModeKind> InputBaseState<M> {
         Some(range)
     }
 
+    /// Navigate from the editor selection and reopen a retained Find without
+    /// moving keyboard focus away from the editor.
+    #[doc(hidden)]
+    pub fn navigate_search_from_editor(&mut self, previous: bool, cx: &mut Context<Self>) -> bool {
+        if !self.searchable || self.search_session.query.is_empty() {
+            return false;
+        }
+        self.sync_search_matcher();
+        let ranges = self.search_session.matcher.matched_ranges();
+        if ranges.is_empty() {
+            return false;
+        }
+        let selection = self.selected_range();
+        let index = if previous {
+            ranges
+                .partition_point(|range| range.end <= selection.start)
+                .checked_sub(1)
+                .unwrap_or(ranges.len() - 1)
+        } else {
+            ranges.partition_point(|range| range.start < selection.end) % ranges.len()
+        };
+        if !self.search_session.open {
+            self.search_session.open(false, self.is_replaceable());
+            self.search_session.anchor_offset = None;
+        }
+        self.search_session.matcher.current_match_ix = index;
+        self.select_search_match(&ranges[index], previous, cx);
+        true
+    }
+
     fn select_search_match(
         &mut self,
         range: &Range<usize>,

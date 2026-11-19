@@ -313,9 +313,18 @@ impl<T: SearchTarget> SearchPanel<T> {
         cx.notify();
     }
 
-    fn on_action_enter(&mut self, action: &Enter, _: &mut Window, cx: &mut Context<Self>) {
+    fn on_action_enter(&mut self, action: &Enter, window: &mut Window, cx: &mut Context<Self>) {
         if action.shift {
             self.step(true, cx);
+        } else if !action.secondary
+            && self.session.replace_mode
+            && self
+                .replace_input
+                .read(cx)
+                .focus_handle(cx)
+                .is_focused(window)
+        {
+            self.replace_next(window, cx);
         } else {
             self.step(false, cx);
         }
@@ -445,8 +454,13 @@ impl DocumentFind {
         if self.is_open() {
             self.dismiss(window, cx);
         } else {
-            self.show_with_focus(&Rope::new(), false, None, true, window, cx);
+            self.open_with_query("", window, cx);
         }
+    }
+
+    /// Show Find, seeding the field when a nonempty query is supplied.
+    pub fn open_with_query(&mut self, query: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.show_with_focus(&Rope::from(query), false, None, true, window, cx);
     }
 
     pub fn dismiss(&mut self, window: &mut Window, cx: &mut Context<Self>) {

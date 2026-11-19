@@ -141,6 +141,32 @@ fn escape_from_editor_dismisses_find_and_preserves_selection() {
 }
 
 #[test]
+fn enter_replaces_only_when_the_replacement_field_has_focus() {
+    let source = include_str!("fixtures/editor-interactions.ts");
+    with_editor(source, false, false, false, |visual, editor| {
+        visual.update(|_, cx| editor.update(cx, |state, cx| state.set_searchable(true, cx)));
+        visual.simulate_keystrokes("ctrl-h");
+        draw(visual);
+        visual.simulate_input("auditNeedle");
+        draw(visual);
+        visual.simulate_keystrokes("enter");
+        draw(visual);
+        assert_eq!(text(visual, editor), source);
+        visual.simulate_keystrokes("shift-enter tab");
+        draw(visual);
+        visual.simulate_input("FIRST");
+        visual.simulate_keystrokes("enter");
+        draw(visual);
+        assert_eq!(
+            text(visual, editor),
+            source.replacen("auditNeedle", "FIRST", 1)
+        );
+        visual.simulate_keystrokes("enter");
+        assert_eq!(text(visual, editor), source.replace("auditNeedle", "FIRST"));
+    });
+}
+
+#[test]
 fn find_navigation_keeps_the_selected_match_for_editing_after_escape() {
     let source = format!("// StartAnchor\n{}// EndAnchor", "// filler\n".repeat(105));
     let start = source.find("EndAnchor").unwrap();

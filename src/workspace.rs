@@ -90,6 +90,8 @@ actions!(
         PreviousRepositoryPath,
         CompleteRepositoryPath,
         FindInDocument,
+        FindNextMatch,
+        FindPreviousMatch,
         OpenLocator,
         FindReferences,
         FormatDocument,
@@ -859,6 +861,11 @@ impl Workspace {
         let repository_mode = standalone.is_none();
         Self::bind_git_history_keys(cx);
         Self::bind_source_navigation_keys(cx);
+        let find_context = Some("WorkspaceEditor > (Input && mode == editor && !Locator)");
+        cx.bind_keys([
+            KeyBinding::new("f3", FindNextMatch, find_context),
+            KeyBinding::new("shift-f3", FindPreviousMatch, find_context),
+        ]);
         Self::bind_caret_hint_keys(cx);
         Self::bind_tree_keys(cx);
         #[cfg(target_os = "linux")]
@@ -3740,13 +3747,28 @@ impl Workspace {
             }
         } else if self.view == WorkspaceView::Docs {
             if let Some(doc) = &self.doc {
-                doc.update(cx, |doc, cx| doc.toggle_find(window, cx));
+                doc.update(cx, |doc, cx| doc.find(window, cx));
             }
         } else if let Some(file) = self.active_file() {
             file.editor
                 .update(cx, |editor, cx| editor.focus(window, cx));
             window.dispatch_action(Box::new(Search), cx);
         }
+    }
+
+    fn navigate_find_match(&self, previous: bool, window: &Window, cx: &mut Context<Self>) {
+        let Some(file) = self.active_file().filter(|file| {
+            let editor = file.editor.read(cx);
+            editor.focus_handle(cx).is_focused(window)
+        }) else {
+            cx.propagate();
+            return;
+        };
+        file.editor.update(cx, |editor, cx| {
+            if !editor.navigate_search_from_editor(previous, cx) {
+                cx.propagate();
+            }
+        });
     }
 
     fn sidebar(
@@ -4655,6 +4677,12 @@ impl Render for Workspace {
             })
             .when(self.view == WorkspaceView::Editor && !switching, |view| {
                 view.key_context("WorkspaceEditor")
+                    .on_action(cx.listener(|this, _: &FindNextMatch, window, cx| {
+                        this.navigate_find_match(false, window, cx);
+                    }))
+                    .on_action(cx.listener(|this, _: &FindPreviousMatch, window, cx| {
+                        this.navigate_find_match(true, window, cx);
+                    }))
                     .on_action(cx.listener(Self::find_references))
                     .on_action(cx.listener(Self::source_back))
                     .on_action(cx.listener(Self::source_forward))

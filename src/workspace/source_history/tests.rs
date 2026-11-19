@@ -386,5 +386,33 @@ fn source_history_replays_files_jumps_and_worktree_positions() -> Result<()> {
             .all(|location| location.path != Path::new("missing.txt"))
     })?;
     assert!(visual.update(|_, cx| !restored(cx, first)));
+
+    let editor = visual.update(|window, cx| {
+        let editor = reopened.read(cx).active_file().unwrap().editor.clone();
+        editor.update(cx, |state, cx| {
+            state.open_search(false, cx);
+            state.set_search_query("line", true, cx);
+            state.set_selected_range(0..0, cx);
+            state.focus(window, cx);
+        });
+        editor
+    });
+    frame(visual);
+    visual.update(|window, cx| editor.update(cx, |state, cx| state.focus(window, cx)));
+    for (key, selection) in [
+        ("f3", 0..4),
+        ("f3", 15..19),
+        ("shift-f3", 0..4),
+        ("escape f3", 15..19),
+    ] {
+        visual.simulate_keystrokes(key);
+        frame(visual);
+        visual.update(|window, cx| {
+            let state = editor.read(cx);
+            assert!(state.focus_handle(cx).is_focused(window));
+            assert!(state.search_session().open);
+            assert_eq!(state.selected_range(), selection);
+        });
+    }
     Ok(())
 }
