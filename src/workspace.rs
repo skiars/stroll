@@ -4230,6 +4230,9 @@ impl Workspace {
         let locked =
             file.document.conflict || file.document.mixed_newlines || self.git_edit.contains(path);
         let status_size = text_base_size(cx) - 0.5;
+        let caret = file.editor.read(cx).cursor_position();
+        let position = format!("Ln {}:{}", caret.line + 1, caret.character + 1);
+        let line_ending = file.document.line_ending_label();
         let language = self
             .source_resources(path)
             .display_name_for_path(path)
@@ -4270,12 +4273,29 @@ impl Workspace {
                     .flex_shrink_0()
                     .gap_3()
                     .child(
+                        baseline_aligned(
+                            cx,
+                            status_size,
+                            status_size,
+                            div()
+                                .min_w(px(status_size * 5.5))
+                                .text_right()
+                                .child(position.clone()),
+                        )
+                        .debug_selector(|| format!("status-file-position: {position}")),
+                    )
+                    .child(
                         baseline_aligned(cx, status_size, status_size, language)
                             .debug_selector(|| "status-file-language".into()),
                     )
                     .child(
                         baseline_aligned(cx, status_size, status_size, "UTF-8")
                             .debug_selector(|| "status-file-encoding".into()),
+                    )
+                    .child(
+                        baseline_aligned(cx, status_size, status_size, line_ending)
+                            .min_w(px(status_size * 3.))
+                            .debug_selector(|| format!("status-file-line-ending: {line_ending}")),
                     )
                     .when(self.loading_file.is_some(), |bar| {
                         bar.child(baseline_aligned(
@@ -5383,6 +5403,137 @@ mod layout_tests {
     use gpui::{TestAppContext, TestDispatcher, VisualTestContext, px, size};
     use gpui_component::Root;
     use std::process::Command;
+
+    #[::core::prelude::v1::test]
+    fn editor_status_follows_caret_and_file_line_endings() -> Result<()> {
+        let fixture = tempfile::tempdir()?;
+        let root = fixture.path().join("repo");
+        assert!(
+            Command::new("git")
+                .args(["init", "-q"])
+                .arg(&root)
+                .status()?
+                .success()
+        );
+        let lf_file = "a-long-file-name-for-checking-the-editor-status-bar-layout.txt";
+        fs::write(
+            root.join(lf_file),
+            format!("é😀\n{}\n", "word ".repeat(100)),
+        )?;
+        fs::write(root.join("crlf.txt"), "first\r\nsecond\r\n")?;
+        fs::write(root.join("mixed.txt"), "first\r\nsecond\n")?;
+        fs::write(root.join("single-line.txt"), "first")?;
+        let store = Arc::new(Store::new(fixture.path().join("state"))?);
+        let config = ConfigFile::load(Some(fixture.path().join("config.toml")));
+        let mut app = TestAppContext::build_with_text_system(
+            TestDispatcher::new(0),
+            None,
+            gpui_platform::current_platform(true).text_system(),
+        );
+        app.update(gpui_component::init);
+        let mut workspace = None;
+        let (_, visual) = app.add_window_view(|window, cx| {
+            let view = cx
+                .new(|cx| Workspace::with_config(store, config, WorkspaceView::Editor, window, cx));
+            workspace = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        let workspace = workspace.unwrap();
+        visual.simulate_resize(size(px(740.), px(480.)));
+        visual.update(|window, cx| {
+            workspace.update(cx, |this, cx| {
+                this.open_repository(
+                    Location {
+                        root,
+                        file: Some(PathBuf::from(lf_file)),
+                    },
+                    window,
+                    cx,
+                );
+            });
+        });
+        let draw = |visual: &mut VisualTestContext| {
+            visual.run_until_parked();
+            visual.update(|window, cx| {
+                window.simulate_next_frame(cx);
+                window.draw(cx).clear(cx);
+            });
+        };
+        draw(visual);
+        let caret_start = visual.debug_bounds("status-file-position: Ln 1:1").unwrap();
+        assert!(visual.debug_bounds("status-file-line-ending: LF").is_some());
+
+        visual.simulate_keystrokes("right right");
+        draw(visual);
+        assert_eq!(
+            visual.debug_bounds("status-file-position: Ln 1:3"),
+            Some(caret_start)
+        );
+        visual.simulate_keystrokes("right");
+        draw(visual);
+        assert!(
+            visual
+                .debug_bounds("status-file-position: Ln 2:1")
+                .is_some()
+        );
+        visual.update(|window, cx| {
+            let editor = workspace.read(cx).active_file().unwrap().editor.clone();
+            editor.update(cx, |editor, cx| {
+                assert!(editor.projected_wrap_rows(1) > 1);
+                editor.set_cursor_position(
+                    gpui_component::input::Position::new(1, 200),
+                    window,
+                    cx,
+                );
+            });
+        });
+        draw(visual);
+        let position = visual
+            .debug_bounds("status-file-position: Ln 2:201")
+            .unwrap();
+        let path = visual.debug_bounds("status-file-path").unwrap();
+        let language = visual.debug_bounds("status-file-language").unwrap();
+        let encoding = visual.debug_bounds("status-file-encoding").unwrap();
+        let ending = visual.debug_bounds("status-file-line-ending: LF").unwrap();
+        let controls = visual.debug_bounds("status-file-controls").unwrap();
+        for [left, right] in [path, position, language, encoding, ending, controls].array_windows()
+        {
+            assert!(left.right() <= right.left());
+        }
+
+        for (file, ending) in [
+            ("crlf.txt", "status-file-line-ending: CRLF"),
+            ("mixed.txt", "status-file-line-ending: Mixed"),
+            ("single-line.txt", "status-file-line-ending: LF"),
+        ] {
+            visual.update(|window, cx| {
+                workspace.update(cx, |this, cx| {
+                    this.open_file(PathBuf::from(file), false, window, cx);
+                });
+            });
+            draw(visual);
+            assert!(visual.debug_bounds(ending).is_some());
+            assert!(
+                visual
+                    .debug_bounds("status-file-position: Ln 1:1")
+                    .is_some()
+            );
+        }
+
+        visual.update(|window, cx| {
+            workspace.update(cx, |this, cx| {
+                this.activate_tab(Path::new(lf_file), window, cx)
+            });
+        });
+        draw(visual);
+        assert!(visual.debug_bounds("status-file-line-ending: LF").is_some());
+        assert!(
+            visual
+                .debug_bounds("status-file-position: Ln 2:201")
+                .is_some()
+        );
+        Ok(())
+    }
 
     #[::core::prelude::v1::test]
     fn definition_jump_reveals_wrapped_caret_on_open_and_at_eof() -> Result<()> {

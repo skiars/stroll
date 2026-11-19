@@ -658,6 +658,17 @@ impl Document {
         self.bom
     }
 
+    #[cfg(feature = "desktop")]
+    pub(crate) fn line_ending_label(&self) -> &'static str {
+        if self.mixed_newlines {
+            "Mixed"
+        } else if self.crlf {
+            "CRLF"
+        } else {
+            "LF"
+        }
+    }
+
     pub(crate) fn draft_baseline(&self) -> [u8; 32] {
         self.baseline
     }
