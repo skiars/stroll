@@ -554,7 +554,7 @@ pub(super) struct OverviewRulerRows {
 }
 
 enum OverviewColor {
-    Decoration(Option<Hsla>),
+    Decoration { color: Option<Hsla>, fallback: bool },
     Diagnostic(DiagnosticSeverity),
 }
 
@@ -601,6 +601,7 @@ pub(super) struct OverviewRulerMark {
     /// Projected coordinates before expanding the mark to its minimum height.
     target: Range<Pixels>,
     priority: u8,
+    fallback: bool,
 }
 
 fn overview_content_height(layout: &EditorScrollbarLayout) -> Pixels {
@@ -628,7 +629,11 @@ fn overview_target(
                 let distance =
                     (position.y - position.y.clamp(mark.target.start, mark.target.end)).abs();
                 (
+                    mark.lane == OverviewRulerLane::Full
+                        || position.x < mark.quad.bounds.left()
+                        || position.x >= mark.quad.bounds.right(),
                     mark.lane != prefer,
+                    mark.fallback,
                     distance,
                     std::cmp::Reverse(mark.priority),
                 )
@@ -675,7 +680,10 @@ fn layout_overview_ruler<M: InputModeKind>(
             .map(|decoration| {
                 (
                     decoration.lane(),
-                    OverviewColor::Decoration(decoration.color()),
+                    OverviewColor::Decoration {
+                        color: decoration.color(),
+                        fallback: false,
+                    },
                     decoration.range().clone(),
                 )
             })
@@ -689,7 +697,10 @@ fn layout_overview_ruler<M: InputModeKind>(
                     .map(|mark| {
                         (
                             OverviewRulerLane::Left,
-                            OverviewColor::Decoration(mark.color()),
+                            OverviewColor::Decoration {
+                                color: mark.color(),
+                                fallback: mark.is_fallback(),
+                            },
                             mark.range().clone(),
                         )
                     }),
@@ -756,8 +767,10 @@ fn layout_overview_ruler<M: InputModeKind>(
             .min(track.size.height);
         let top =
             ((target.start + target.end - height) / 2.).clamp(track.top(), track.bottom() - height);
-        let (color, priority) = match color {
-            OverviewColor::Decoration(color) => (color.unwrap_or(foreground), 0),
+        let (color, priority, fallback) = match color {
+            OverviewColor::Decoration { color, fallback } => {
+                (color.unwrap_or(foreground), 0, *fallback)
+            }
             OverviewColor::Diagnostic(severity) => (
                 diagnostic_color(*severity, state.editor_style.diagnostics),
                 match severity {
@@ -766,11 +779,13 @@ fn layout_overview_ruler<M: InputModeKind>(
                     DiagnosticSeverity::Info => 2,
                     DiagnosticSeverity::Hint => 1,
                 },
+                false,
             ),
         };
         if let Some(last) = marks.last_mut()
             && last.lane == *lane
             && last.priority == priority
+            && last.fallback == fallback
             && last.quad.background == color.into()
             && top <= last.quad.bounds.bottom() + px(1.)
         {
@@ -799,10 +814,11 @@ fn layout_overview_ruler<M: InputModeKind>(
             lane: *lane,
             target,
             priority,
+            fallback,
         });
     }
     if sources.is_some() {
-        marks.sort_by_key(|mark| mark.priority);
+        marks.sort_by_key(|mark| (!mark.fallback, mark.priority));
     }
     marks
 }
@@ -2138,21 +2154,21 @@ impl<M: InputModeKind> TextElement<M> {
                 }
             }
         }
-        let mouse = window.mouse_position();
         if let Some((top, bottom)) = toolbar_top.zip(toolbar_bottom)
             && top < row_viewport.bottom()
             && bottom > row_viewport.top()
         {
-            hunk.toolbar_hover = Some(Bounds::from_corners(
+            let hover = Bounds::from_corners(
                 point(row_viewport.left(), top),
                 point(row_viewport.right(), bottom),
-            ));
+            )
+            .intersect(&row_viewport);
+            hunk.toolbar_hover = Some(hover);
         }
-        if let Some(y) = hunk
-            .toolbar_hover
-            .and_then(|block| crate::input::hovered_hunk_top(block, row_viewport, mouse))
+        if let Some(hover) = hunk.toolbar_hover
+            && let Some(mut toolbar) =
+                render(hover.contains(&window.mouse_position()), window, cx)
         {
-            let mut toolbar = render(window, cx);
             toolbar.layout_as_root(
                 size(
                     gpui::AvailableSpace::Definite(width),
@@ -2165,7 +2181,7 @@ impl<M: InputModeKind> TextElement<M> {
                 Some(ContentMask {
                     bounds: text_viewport,
                 }),
-                |window| toolbar.prepaint_at(point(left, y), window, cx),
+                |window| toolbar.prepaint_at(point(left, hover.top()), window, cx),
             );
             hunk.toolbar = Some(toolbar);
         }

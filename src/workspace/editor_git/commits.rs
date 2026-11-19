@@ -2,8 +2,6 @@ use super::*;
 use crate::{git::CommitRange, workspace::line_alignment::LineAlignment};
 use gpui_component::input::RopeExt as _;
 
-const COMMIT_ACTION_START: usize = usize::MAX / 2 + 1;
-
 fn commit_tooltip(range: &CommitRange) -> SharedString {
     let mut commits = git::short(&range.oldest).to_owned();
     if range.target != range.oldest {
@@ -231,11 +229,22 @@ pub(super) struct FileCommitMarkers {
 }
 
 impl FileCommitMarkers {
+    pub(super) fn positions(&self, revision: u64) -> impl Iterator<Item = (usize, usize)> + '_ {
+        let ready = self.task.is_none() && self.revision == Some(revision);
+        self.hunks
+            .iter()
+            .enumerate()
+            .filter_map(move |(index, sections)| {
+                ready.then(|| (sections[0].lines.start, COMMIT_ACTION_START + index))
+            })
+    }
+
     pub(super) fn new(editor: &Entity<EditorState>, cx: &mut App) -> Self {
+        let marks = editor.update(cx, |editor, cx| {
+            editor.create_gutter_decorations_collection(Vec::new(), cx)
+        });
         Self {
-            marks: editor.update(cx, |editor, cx| {
-                editor.create_gutter_decorations_collection(Vec::new(), cx)
-            }),
+            marks,
             scope: None,
             patch: None,
             revision: None,
@@ -261,6 +270,7 @@ impl FileCommitMarkers {
         let Some((scope, _)) = &self.scope else {
             return;
         };
+        let color = commit_marker_color(mode);
         let marks = self
             .hunks
             .iter()
@@ -271,10 +281,9 @@ impl FileCommitMarkers {
                         ..text.line_start_offset(section.lines.end);
                     GutterDecoration::new(offsets)
                         .with_action(COMMIT_ACTION_START + index)
-                        .with_color(commit_marker_color(mode))
+                        .with_color(color)
                         .fallback(true)
                         .with_tooltip(scope.tooltip.clone())
-                        .without_overview_marker()
                 })
             })
             .collect();
@@ -284,8 +293,8 @@ impl FileCommitMarkers {
 
 fn commit_marker_color(mode: ThemeMode) -> Hsla {
     match mode {
-        ThemeMode::Dark => rgb(0xb493eb),
-        ThemeMode::Light => rgb(0x7956b4),
+        ThemeMode::Dark => rgb(0xd77bfa),
+        ThemeMode::Light => rgb(0x963bc7),
     }
     .into()
 }
@@ -359,6 +368,9 @@ impl Workspace {
                             if workspace.view == WorkspaceView::Editor {
                                 workspace.refresh_active_commit_markers(window, cx);
                             }
+                        }
+                        if requested {
+                            toast::info(window, cx, t!("git.editor_commit_marked"));
                         }
                     }
                     Ok(None) => {
@@ -499,31 +511,35 @@ impl Workspace {
         if file.git.commits.selected == Some(index) {
             file.git.clear_hunk(&file.editor, cx);
         } else {
-            Self::expand_commit_hunk(file, index, cx);
+            Self::expand_commit_hunk(path, file, index, cx);
         }
         true
     }
 
     pub(super) fn repaint_commit_hunks(&mut self, cx: &mut Context<Self>) {
-        for file in self.files.values_mut() {
+        for (path, file) in &mut self.files {
             if file.git.commits.revision != Some(file.revision) || file.git.commits.task.is_some() {
                 continue;
             }
             file.git.commits.paint(&file.committed, cx.theme().mode, cx);
             if let Some(index) = file.git.commits.selected {
-                Self::expand_commit_hunk(file, index, cx);
+                Self::expand_commit_hunk(path, file, index, cx);
             }
         }
     }
 
-    fn expand_commit_hunk(file: &mut OpenFile, index: usize, cx: &mut App) {
+    pub(super) fn expand_commit_hunk(
+        path: &Path,
+        file: &mut OpenFile,
+        index: usize,
+        cx: &mut Context<Self>,
+    ) -> Option<usize> {
         let marks = &mut file.git.commits;
         if marks.task.is_some() || marks.revision != Some(file.revision) {
-            return;
+            return None;
         }
-        let Some(sections) = marks.hunks.get(index) else {
-            return;
-        };
+        let sections = marks.hunks.get(index)?;
+        let line = sections.first()?.lines.start;
         let mode = cx.theme().mode;
         let palette = code_theme::HunkPalette::for_mode(mode);
         let sections = sections
@@ -539,16 +555,25 @@ impl Workspace {
         file.git.selected = None;
         file.git.pending_hunk = None;
         marks.selected = Some(index);
+        let weak = cx.weak_entity();
+        let path = path.to_owned();
         file.editor.update(cx, |editor, cx| {
-            editor.set_gutter_hunk(
+            editor.set_gutter_hunk_overlay(
                 COMMIT_ACTION_START + index,
                 sections,
                 commit_marker_color(mode),
                 false,
-                |_, _| div().into_any_element(),
+                move |_, _, cx| {
+                    weak.read_with(cx, |workspace, cx| {
+                        workspace.editor_git_toolbar(&path, weak.clone(), cx)
+                    })
+                    .ok()
+                    .flatten()
+                },
                 cx,
             );
         });
+        Some(line)
     }
 }
 

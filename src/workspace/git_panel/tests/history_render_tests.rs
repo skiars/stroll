@@ -2101,7 +2101,8 @@ fn commit_markers_share_the_editor_gutter_and_keep_local_priority() -> Result<()
         fs::write(
             root.join(&path),
             format!(
-                "start\n{first}\n{staged}\nseparator\n{unstaged}\nsecond separator\n{last}\nend\n"
+                "start\n{first}\n{staged}\nseparator\n{unstaged}\nsecond separator\n{last}\nend\n{}",
+                "tail\n".repeat(80)
             ),
         )
     };
@@ -2200,24 +2201,69 @@ fn commit_markers_share_the_editor_gutter_and_keep_local_priority() -> Result<()
 
     let history_color = |cx: &App| {
         let color = if cx.theme().mode == ThemeMode::Dark {
-            rgb(0xb493eb)
+            rgb(0xd77bfa)
         } else {
-            rgb(0x7956b4)
+            rgb(0x963bc7)
         };
         Background::from(Hsla::from(color))
     };
     right_click(visual, newer);
     visual.simulate_keystrokes("up enter");
     draw(visual);
+    assert!(visual.debug_bounds("notification-message").is_some());
+    visual.update(|window, cx| {
+        use gpui_component::WindowExt as _;
+        assert_eq!(window.notifications(cx).len(), 1);
+        window.clear_notifications(cx);
+    });
     switch(visual, WorkspaceView::Editor);
     visual.update(|window, cx| {
+        let editor = workspace.read(cx).files[&path].editor.read(cx);
+        let gutter_limit = editor.input_bounds().left() + px(16.);
+        let x = |value: ScaledPixels| px(value.0 / window.scale_factor());
+        let quads = window.painted_quads();
+        let historical = quads
+            .iter()
+            .filter(|quad| quad.background == history_color(cx));
         assert_eq!(
-            window
-                .painted_quads()
-                .iter()
-                .filter(|quad| quad.background == history_color(cx))
+            historical
+                .clone()
+                .filter(|quad| x(quad.bounds.left()) < gutter_limit)
                 .count(),
             1
+        );
+        let ruler_marks = historical
+            .filter(|quad| x(quad.bounds.left()) > original.right() - px(16.))
+            .collect::<Vec<_>>();
+        assert!(
+            !ruler_marks.is_empty(),
+            "history is also painted on the right track"
+        );
+        let mixed = Background::from(Palette::for_mode(cx.theme().mode).accent);
+        let local_marks = quads.iter().filter(|quad| {
+            quad.background == mixed
+                && x(quad.bounds.left()) > original.right() - px(16.)
+                && x(quad.bounds.size.width) == px(3.)
+        });
+        let left_lane = local_marks
+            .clone()
+            .next()
+            .expect("the local Git overview lane");
+        assert!(
+            ruler_marks
+                .iter()
+                .all(|quad| quad.bounds.left() == left_lane.bounds.left()
+                    && quad.bounds.size.width == left_lane.bounds.size.width),
+            "history shares the local Git overview lane"
+        );
+        assert!(
+            local_marks
+                .into_iter()
+                .any(|local| ruler_marks.iter().any(|history| {
+                    !history.bounds.intersect(&local.bounds).is_empty()
+                        && history.order < local.order
+                })),
+            "local marks paint on top where the overview markers overlap"
         );
     });
     switch(visual, WorkspaceView::Git);
@@ -2262,7 +2308,10 @@ fn commit_markers_share_the_editor_gutter_and_keep_local_priority() -> Result<()
         let history = history_color(cx);
         let purple = quads
             .iter()
-            .filter(|quad| quad.background == history)
+            .filter(|quad| {
+                quad.background == history
+                    && px(quad.bounds.left().0 / scale) < original.left() + px(16.)
+            })
             .collect::<Vec<_>>();
         let x = px(purple
             .first()
@@ -2316,8 +2365,55 @@ fn commit_markers_share_the_editor_gutter_and_keep_local_priority() -> Result<()
         }
     });
     assert!(visual.debug_bounds("git-hunk-action:0").is_none());
+    visual.simulate_mouse_move(markers.3, None, Modifiers::default());
+    draw(visual);
+    assert!(visual.debug_bounds("editor-git-hunk-status").is_some());
+    let previous_x = visual
+        .debug_bounds("editor-git-previous-hunk:history-0")
+        .unwrap()
+        .center()
+        .x;
+    let next_x = visual
+        .debug_bounds("editor-git-next-hunk:history-0")
+        .unwrap()
+        .center()
+        .x;
+    let navigation = |visual: &mut VisualTestContext, selector: &'static str| {
+        let button = visual
+            .debug_bounds(selector)
+            .unwrap_or_else(|| panic!("missing hunk navigation control {selector}"));
+        let toolbar = visual.debug_bounds("editor-git-hunk-controls").unwrap();
+        let expected_x = if selector.starts_with("editor-git-next") {
+            assert_eq!(button.right(), toolbar.right());
+            next_x
+        } else {
+            previous_x
+        };
+        assert_eq!(
+            button.center().x,
+            expected_x,
+            "{selector} keeps the same click column"
+        );
+        visual.simulate_click(button.center(), Modifiers::default());
+        draw(visual);
+        visual.update(|_, cx| {
+            assert_eq!(workspace.read(cx).tabs.active(), Some(path.as_path()));
+        });
+    };
+    navigation(visual, "editor-git-previous-hunk:history-0");
+    navigation(visual, "editor-git-next-hunk:history-0");
+    assert!(visual.debug_bounds("git-hunk-action:1").is_some());
+    navigation(visual, "editor-git-next-hunk:0");
+    assert!(visual.debug_bounds("git-hunk-action:0").is_some());
+    navigation(visual, "editor-git-next-hunk:1");
+    navigation(visual, "editor-git-next-hunk:history-1");
+    navigation(visual, "editor-git-next-hunk:history-2");
+    navigation(visual, "editor-git-previous-hunk:history-2");
+    navigation(visual, "editor-git-previous-hunk:history-1");
+    assert!(visual.debug_bounds("git-hunk-action:0").is_some());
     visual.simulate_keystrokes("escape");
     draw(visual);
+    assert!(visual.debug_bounds("editor-git-hunk-controls").is_none());
     for (mark, action) in [
         (markers.1, "git-hunk-action:1"),
         (markers.2, "git-hunk-action:0"),
@@ -2336,7 +2432,15 @@ fn commit_markers_share_the_editor_gutter_and_keep_local_priority() -> Result<()
     right_click(visual, markers.3);
     visual.simulate_keystrokes("up enter");
     draw(visual);
-    visual.update(|_, cx| assert!(!workspace.read(cx).commit_markers.active()));
+    visual.update(|window, cx| {
+        assert!(!workspace.read(cx).commit_markers.active());
+        assert!(
+            window
+                .painted_quads()
+                .iter()
+                .all(|quad| quad.background != history_color(cx))
+        );
+    });
     Ok(())
 }
 

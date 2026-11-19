@@ -122,7 +122,9 @@ dialogs in a Wayland window after changes to paint order or focus handling.
   the built-in items and the appended action share the same menu and editor focus.
 - The workspace editor opts into a navigable overview ruler that mirrors gutter decorations
   and diagnostics in 3 px lanes. The vertical track resolves clicks by height and uses the
-  track halves to disambiguate overlaps. A press over a mark can still start a thumb drag.
+  painted lanes to disambiguate overlapping markers, falling back to the track halves
+  outside the marks. Mirrored fallback decorations paint underneath ordinary marks
+  and yield to them on clicks in the same lane. A press over a mark can still start a thumb drag.
   Run `cargo test --release --locked --test scrollbars` for paint and mouse interaction coverage.
 - The workspace editor opts into a 16 px Git gutter, including its gap before the line numbers.
   Actionable marks use the entire strip for hit testing and animate their painted width from
@@ -133,6 +135,11 @@ dialogs in a Wayland window after changes to paint order or focus handling.
   the overview ruler. The renderer clips fallback paint and hit targets against ordinary marks,
   including outlined marks, using the same display geometry for collapsed and expanded rows.
   Run `cargo test --release --locked --test scrollbars` and
+  `cargo test --release --locked --lib commit_markers` for coverage.
+- Expanded gutter hunks can render an overlay whenever they intersect the viewport.
+  The renderer reports hover state to the callback and clips the overlay to the
+  editor without reserving a row. The hover-only callback remains available.
+  Run `cargo test --release --locked --lib hunk_toolbar` and
   `cargo test --release --locked --lib commit_markers` for coverage.
 - The Git review generates draft worktree patches in `src/git/changes.rs` and
   passes them to the shared diff parser. Run

@@ -5,7 +5,9 @@ use gpui::{
     ParentElement as _, Render, ScrollHandle, Styled, TestAppContext, TestDispatcher,
     VisualTestContext, Window, div, point, px, rgb, size,
 };
-use gpui_component::input::{Editor, EditorState, GutterDecoration, InputEvent};
+use gpui_component::input::{
+    Editor, EditorState, GutterDecoration, InputEvent, OverviewRulerDecoration, OverviewRulerLane,
+};
 use gpui_component::scroll::{Scrollbar, ScrollbarMode, content_scrollbar, thin_scrollbar};
 use lsp_types::{Diagnostic, DiagnosticSeverity, Position, Range};
 
@@ -269,6 +271,8 @@ fn interactive_editor_gutter_animates_paint_with_fixed_full_width_targets() {
 fn editor_overview_uses_the_full_track_and_distinguishes_click_from_drag(cx: &mut TestAppContext) {
     cx.update(gpui_component::init);
     let git_color = rgb(0x249965);
+    let center_color = rgb(0x963bc7);
+    let fallback_color = rgb(0x825eca);
     let (view, visual) = cx.add_window_view(|window, cx| {
         OverviewProbe(cx.new(|cx| {
             let mut editor = EditorState::new(window, cx)
@@ -281,8 +285,18 @@ fn editor_overview_uses_the_full_track_and_distinguishes_click_from_drag(cx: &mu
             editor.create_gutter_decorations_collection(
                 vec![
                     git(52).with_action(1).with_tooltip("First marker"),
-                    git(121).fallback(true),
+                    git(121),
+                    git(119).with_color(fallback_color.into()).fallback(true),
                     git(149).without_overview_marker(),
+                ],
+                cx,
+            );
+            let center_offset = 122 * "let a = 0;\n".len();
+            editor.create_overview_ruler_decorations_collection(
+                vec![
+                    OverviewRulerDecoration::new(center_offset..center_offset + 1)
+                        .with_lane(OverviewRulerLane::Center)
+                        .with_color(center_color.into()),
                 ],
                 cx,
             );
@@ -301,27 +315,53 @@ fn editor_overview_uses_the_full_track_and_distinguishes_click_from_drag(cx: &mu
     visual.simulate_resize(size(px(360.), px(300.)));
     draw(visual);
     let editor = visual.update(|_, cx| view.read(cx).0.clone());
-    let (git, diagnostics) = visual.update(|window, _| {
+    let (git, fallback, center, diagnostics) = visual.update(|window, _| {
         let mut git = Vec::new();
+        let mut fallback = None;
+        let mut center = None;
         let mut diagnostics = Vec::new();
         for quad in window.painted_quads() {
             let bounds = quad
                 .bounds
                 .map(|value| px(value.as_f32() / window.scale_factor()));
-            if bounds.size.width != px(3.) || bounds.left() < px(340.) {
+            if bounds.left() < px(340.) {
+                continue;
+            }
+            if quad.background.as_solid() == Some(center_color.into()) {
+                assert!(center.replace(bounds).is_none());
+                continue;
+            }
+            if bounds.size.width != px(3.) {
                 continue;
             }
             if quad.background.as_solid() == Some(git_color.into()) {
-                git.push(bounds);
+                git.push((bounds, quad.order));
+            } else if quad.background.as_solid() == Some(fallback_color.into()) {
+                fallback = Some((bounds, quad.order));
             } else if quad.background.as_solid().is_some_and(|color| color.a > 0.) {
                 diagnostics.push(bounds);
             }
         }
-        (git, diagnostics)
+        let (fallback, fallback_order) = fallback.expect("the fallback is mirrored");
+        assert!(
+            git.iter().any(|(bounds, order)| {
+                !bounds.intersect(&fallback).is_empty() && *order > fallback_order
+            }),
+            "fallback marks paint below overlapping ordinary marks"
+        );
+        git.sort_by_key(|(bounds, _)| bounds.top());
+        (
+            git.into_iter()
+                .map(|(bounds, _)| bounds)
+                .collect::<Vec<_>>(),
+            fallback,
+            center.expect("the center-lane decoration is painted"),
+            diagnostics,
+        )
     });
     assert_eq!(git.len(), 2);
     assert_eq!(diagnostics.len(), 2);
-    assert!(git[0].right() < diagnostics[0].left());
+    assert!(git[0].right() < center.left() && center.right() < diagnostics[0].left());
 
     let scroll = |cx: &mut VisualTestContext| cx.update(|_, cx| editor.read(cx).scroll_offset().y);
     let left = git[0].center().x;
@@ -340,6 +380,15 @@ fn editor_overview_uses_the_full_track_and_distinguishes_click_from_drag(cx: &mu
         click(visual, right, diagnostics[0].center().y),
         diagnostic_offset
     );
+    assert_eq!(fallback.left(), git[1].left());
+    let fallback_y = fallback.center().y;
+    assert!(git[1].contains(&point(left, fallback_y)));
+    let overlap_scroll = click(visual, left, fallback_y);
+    let exposed_scroll = click(visual, left, git[1].top() + px(3.));
+    assert!(
+        (overlap_scroll - exposed_scroll).abs() < px(12.),
+        "clicking either part of the ordinary mark reveals its line"
+    );
 
     let overlap = (git[1].bottom().min(diagnostics[1].bottom())
         + git[1].top().max(diagnostics[1].top()))
@@ -347,6 +396,11 @@ fn editor_overview_uses_the_full_track_and_distinguishes_click_from_drag(cx: &mu
     assert!(overlap < git[1].bottom() && overlap > diagnostics[1].top());
     let git_offset = click(visual, left, overlap);
     let diagnostic_offset = click(visual, right, overlap);
+    let center_offset = click(visual, center.center().x, overlap);
+    assert!(
+        diagnostic_offset < center_offset && center_offset < git_offset,
+        "clicking each painted lane reveals its own marker"
+    );
     assert!(
         diagnostic_offset < git_offset,
         "right half reveals the diagnostic"
@@ -357,7 +411,7 @@ fn editor_overview_uses_the_full_track_and_distinguishes_click_from_drag(cx: &mu
         "a click over the thumb reveals the mark"
     );
 
-    let thumb_point = point((left + right) / 2., overlap);
+    let thumb_point = point(center.center().x, overlap);
     visual.simulate_mouse_down(thumb_point, MouseButton::Left, Default::default());
     draw(visual);
     assert_eq!(
@@ -378,7 +432,7 @@ fn editor_overview_uses_the_full_track_and_distinguishes_click_from_drag(cx: &mu
     visual.update(|_, cx| editor.update(cx, |editor, _| editor.diagnostics_mut().unwrap().clear()));
     draw(visual);
     assert_eq!(
-        click(visual, right, overlap),
+        click(visual, left, overlap),
         git_offset,
         "cleared diagnostics leave no stale targets"
     );

@@ -126,7 +126,7 @@ impl CaretHints {
         }
         let (label, parameter) = signature_label(self.signature.as_ref()?)?;
         let editor = editor.downgrade();
-        Some(deferred(
+        let popup = deferred(
             CaretAnchoredPopup::new(editor.clone(), move |_, max_height, size, window, cx| {
                 let Some(editor) = editor.upgrade() else {
                     return div().into_any_element();
@@ -168,7 +168,8 @@ impl CaretHints {
                     .into_any_element()
             })
             .prefer_above(),
-        ))
+        );
+        Some(popup.with_priority(gpui_base::POPUP_PRIORITY))
     }
 }
 

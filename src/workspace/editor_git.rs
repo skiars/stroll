@@ -11,6 +11,7 @@ use std::ops::Range;
 
 const HUNK_TOOLBAR_RADIUS: Pixels = px(8.);
 const GIT_GUTTER_WIDTH: Pixels = px(16.);
+const COMMIT_ACTION_START: usize = usize::MAX / 2 + 1;
 
 pub(super) struct EditorGit {
     marks: GutterDecorationCollection,
@@ -166,14 +167,33 @@ fn hunk_line(changes: &FileChanges, layer: Layer, block: &git::Block) -> usize {
         .unwrap_or(usize::MAX)
 }
 
-/// Hunk ids in working-tree order, independent of their staged or unstaged layer.
-fn hunk_order(changes: &FileChanges) -> Vec<usize> {
-    let mut hunks = editor_hunks(changes)
-        .enumerate()
-        .map(|(id, (patch, block))| (hunk_line(changes, patch.layer, block), id))
+fn hunk_neighbors(file: &OpenFile, selected: usize) -> [Option<usize>; 2] {
+    let local = file
+        .git
+        .changes
+        .as_ref()
+        .filter(|_| !file.git.stale && file.committed == file.saved);
+    let mut hunks = file
+        .git
+        .commits
+        .positions(file.revision)
         .collect::<Vec<_>>();
-    hunks.sort_by_key(|&(line, id)| (line, id));
-    hunks.into_iter().map(|(_, id)| id).collect()
+    if let Some(changes) = local {
+        hunks.extend(
+            editor_hunks(changes)
+                .enumerate()
+                .map(|(id, (patch, block))| (hunk_line(changes, patch.layer, block), id)),
+        );
+    }
+    // At the same working line, the lower local action IDs come before history.
+    hunks.sort_unstable();
+    let Some(index) = hunks.iter().position(|&(_, id)| id == selected) else {
+        return [None, None];
+    };
+    [
+        index.checked_sub(1).map(|index| hunks[index].1),
+        hunks.get(index + 1).map(|&(_, id)| id),
+    ]
 }
 
 fn line_offsets(text: &str) -> Vec<usize> {
@@ -802,19 +822,38 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.tabs.active() != Some(path) {
+            return;
+        }
         let source = self.source_location(cx);
-        let Some(file) = self.files.get_mut(path) else {
-            return;
+        let line = if target >= COMMIT_ACTION_START {
+            self.files.get_mut(path).and_then(|file| {
+                Self::expand_commit_hunk(path, file, target - COMMIT_ACTION_START, cx)
+            })
+        } else {
+            let Some(file) = self
+                .files
+                .get_mut(path)
+                .filter(|file| !file.git.stale && file.saved == file.committed)
+            else {
+                return;
+            };
+            file.git.pending_hunk = None;
+            self.expand_editor_git(path, target, cx)
         };
-        let Some(changes) = file.git.changes.as_ref() else {
-            return;
-        };
-        let Some((patch, block)) = editor_hunks(changes).nth(target) else {
-            return;
-        };
-        let line = hunk_line(changes, patch.layer, block);
-        file.git.pending_hunk = None;
-        self.expand_editor_git(path, target, cx);
+        if let Some(line) = line {
+            self.reveal_git_hunk(path, line, source, window, cx);
+        }
+    }
+
+    fn reveal_git_hunk(
+        &mut self,
+        path: &Path,
+        line: usize,
+        source: Option<crate::session::SourceLocation>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if let Some(file) = self.files.get(path) {
             file.editor.update(cx, |editor, cx| {
                 use gpui_component::input::RopeExt as _;
@@ -839,19 +878,17 @@ impl Workspace {
         }
     }
 
-    fn expand_editor_git(&mut self, path: &Path, action: usize, cx: &mut Context<Self>) {
-        let Some(file) = self.files.get_mut(path) else {
-            return;
-        };
-        let Some(changes) = &file.git.changes else {
-            return;
-        };
-        let Some((patch, block)) = editor_hunks(changes).nth(action) else {
-            return;
-        };
-        let Some(mut deleted) = patch.deleted_lines(block).map(Vec::into_iter) else {
-            return;
-        };
+    fn expand_editor_git(
+        &mut self,
+        path: &Path,
+        action: usize,
+        cx: &mut Context<Self>,
+    ) -> Option<usize> {
+        let file = self.files.get_mut(path)?;
+        let changes = file.git.changes.as_ref()?;
+        let (patch, block) = editor_hunks(changes).nth(action)?;
+        let mut deleted = patch.deleted_lines(block)?.into_iter();
+        let line = hunk_line(changes, patch.layer, block);
         let hunk = code_theme::HunkPalette::for_mode(cx.theme().mode);
         let sections: Vec<_> = block
             .changes
@@ -865,133 +902,126 @@ impl Workspace {
                 added_background: hunk.added_row,
             })
             .collect();
-        let Some(first) = block.changes.first() else {
-            return;
-        };
-        let marker = marker_color(first, cx);
+        let marker = marker_color(block.changes.first()?, cx);
         let outlined = patch.layer == Layer::Staged;
         file.git.commits.selected = None;
         file.git.selected = Some(action);
         let weak = cx.weak_entity();
         let path = path.to_owned();
         file.editor.update(cx, |editor, cx| {
-            editor.set_gutter_hunk(
+            editor.set_gutter_hunk_overlay(
                 action,
                 sections,
                 marker,
                 outlined,
-                move |_, cx| {
+                move |_, _, cx| {
                     weak.read_with(cx, |workspace, cx| {
                         workspace.editor_git_toolbar(&path, weak.clone(), cx)
                     })
-                    .unwrap_or_else(|_| div().into_any_element())
+                    .ok()
+                    .flatten()
                 },
                 cx,
             );
         });
+        Some(line)
     }
 
-    fn editor_git_toolbar(&self, path: &Path, owner: WeakEntity<Self>, cx: &App) -> AnyElement {
-        let Some(file) = self.files.get(path) else {
-            return div().into_any_element();
+    fn editor_git_toolbar(
+        &self,
+        path: &Path,
+        owner: WeakEntity<Self>,
+        cx: &App,
+    ) -> Option<AnyElement> {
+        let file = self.files.get(path)?;
+        let selected = file.git.selected.or_else(|| {
+            file.git
+                .commits
+                .selected
+                .map(|index| COMMIT_ACTION_START + index)
+        })?;
+        let code_font_size = px(self.config.current().editor.font_size as f32);
+        let [previous, next] = hunk_neighbors(file, selected);
+        let (nav_path, nav_owner) = (path.to_owned(), owner.clone());
+        let navigation = editor_hunk_navigation(
+            selected,
+            previous,
+            next,
+            code_font_size,
+            move |target, window, cx| {
+                _ = nav_owner.update(cx, |workspace, cx| {
+                    workspace.navigate_editor_git(&nav_path, target, window, cx);
+                });
+            },
+        );
+        let controls = if selected >= COMMIT_ACTION_START {
+            status_hunk_controls(t!("git.editor_history_hunk").into_owned(), cx)
+        } else {
+            self.local_hunk_controls(path, file, selected, owner, code_font_size, cx)?
         };
-        let Some(git_path) = self
+        let buttons = h_flex().h_full().child(controls).child(navigation);
+        Some(source_hunk_toolbar(buttons.into_any_element(), cx))
+    }
+
+    fn local_hunk_controls(
+        &self,
+        path: &Path,
+        file: &OpenFile,
+        selected: usize,
+        owner: WeakEntity<Self>,
+        code_font_size: Pixels,
+        cx: &App,
+    ) -> Option<AnyElement> {
+        let changes = file.git.changes.as_ref()?;
+        let (patch, block) = editor_hunks(changes).nth(selected)?;
+        let untracked = changes
+            .version
+            .status
+            .as_ref()
+            .is_some_and(|status| status.untracked);
+        let git_path = self
             .repository
             .as_ref()
-            .and_then(|repo| git_path(repo, path))
-        else {
-            return div().into_any_element();
-        };
-        let Some((changes, selected)) = file.git.changes.as_ref().zip(file.git.selected) else {
-            return div().into_any_element();
-        };
-        let Some((patch, block)) = editor_hunks(changes).nth(selected) else {
-            return div().into_any_element();
-        };
-        let code_font_size = px(self.config.current().editor.font_size as f32);
-        let navigation = {
-            let order = hunk_order(changes);
-            let position = order.iter().position(|&id| id == selected).unwrap_or(0);
-            let previous = position.checked_sub(1).map(|ix| order[ix]);
-            let next = order.get(position + 1).copied();
-            let (nav_path, nav_owner) = (path.to_owned(), owner.clone());
-            let nav_button = |id, icon, label, target: Option<usize>| {
-                let nav_path = nav_path.clone();
-                let nav_owner = nav_owner.clone();
-                compact_icon_button((id, selected), icon, t!(label))
-                    .debug_selector(move || format!("{id}:{selected}"))
-                    .min_w(px(32.))
-                    .h_full()
-                    .flex_shrink_0()
-                    .icon_size(code_font_size)
-                    .rounded(px(0.))
-                    .disabled(target.is_none())
-                    .on_click(move |_, window, cx| {
-                        cx.stop_propagation();
-                        let Some(target) = target else {
-                            return;
-                        };
-                        _ = nav_owner.update(cx, |workspace, cx| {
-                            workspace.navigate_editor_git(&nav_path, target, window, cx);
-                        });
-                    })
+            .and_then(|repo| git_path(repo, path));
+        let Some((target, git_path)) = block.target.clone().zip(git_path) else {
+            let label = if untracked {
+                t!("git.editor_untracked_file")
+            } else {
+                patch.layer.mode().label()
             };
-            h_flex()
-                .id("editor-git-hunk-navigation")
-                .h_full()
-                .flex_shrink_0()
-                .child(
-                    nav_button(
-                        "editor-git-previous-hunk",
-                        IconName::ArrowUp,
-                        "git.previous_hunk",
-                        previous,
-                    )
-                    .rounded_bl(HUNK_TOOLBAR_RADIUS),
-                )
-                .child(nav_button(
-                    "editor-git-next-hunk",
-                    IconName::ArrowDown,
-                    "git.next_hunk",
-                    next,
-                ))
-                .into_any_element()
+            return Some(status_hunk_controls(label.into_owned(), cx));
         };
-        let buttons = block.target.as_ref().map(|target| {
-            let available = |action| {
-                (
-                    self.check_git_file(path, action).is_ok(),
-                    file.git.pending_hunk.is_some() || !self.git_edit.is_empty(),
-                )
-            };
-            let path = path.to_owned();
-            let click_owner = owner.clone();
-            let edit_version = changes.version.clone();
-            let target = target.clone();
-            hunk_toolbar(
-                patch.layer.actions(),
-                false,
-                false,
-                Some(navigation),
-                Some(code_font_size),
-                available,
-                move |action, window, cx| {
-                    _ = click_owner.update(cx, |workspace, cx| {
-                        let edit = FileEdit {
-                            path: git_path.clone(),
-                            version: edit_version.clone(),
-                            action,
-                            block: Some(target.clone()),
-                        };
-                        workspace.edit_from_editor(path.clone(), edit, window, cx);
-                    });
-                },
-                |_, _| {},
-                cx,
-                true,
+        let available = |action| {
+            (
+                self.check_git_file(path, action).is_ok(),
+                file.git.pending_hunk.is_some() || !self.git_edit.is_empty(),
             )
-        });
-        hunk_toolbar_row(buttons.map(|buttons| hanging_hunk_toolbar(buttons, cx)))
+        };
+        let path = path.to_owned();
+        let click_owner = owner.clone();
+        let edit_version = changes.version.clone();
+        Some(hunk_toolbar(
+            patch.layer.actions(),
+            false,
+            false,
+            None,
+            Some(code_font_size),
+            available,
+            move |action, window, cx| {
+                _ = click_owner.update(cx, |workspace, cx| {
+                    let edit = FileEdit {
+                        path: git_path.clone(),
+                        version: edit_version.clone(),
+                        action,
+                        block: Some(target.clone()),
+                    };
+                    workspace.edit_from_editor(path.clone(), edit, window, cx);
+                });
+            },
+            |_, _| {},
+            cx,
+            true,
+        ))
     }
 
     pub(super) fn restore_buffer_hunk(
@@ -1139,6 +1169,103 @@ impl Workspace {
     }
 }
 
+fn editor_hunk_navigation(
+    selected: usize,
+    previous: Option<usize>,
+    next: Option<usize>,
+    icon_size: Pixels,
+    navigate: impl Fn(usize, &mut Window, &mut App) + Clone + 'static,
+) -> AnyElement {
+    let button = |id, icon, label, target: Option<usize>| {
+        let navigate = navigate.clone();
+        compact_icon_button((id, selected), icon, label)
+            .debug_selector(move || {
+                if selected >= COMMIT_ACTION_START {
+                    format!("{id}:history-{}", selected - COMMIT_ACTION_START)
+                } else {
+                    format!("{id}:{selected}")
+                }
+            })
+            .w(px(32.))
+            .min_w(px(32.))
+            .h_full()
+            .flex_shrink_0()
+            .icon_size(icon_size)
+            .rounded(px(0.))
+            .disabled(target.is_none())
+            .on_click(move |_, window, cx| {
+                cx.stop_propagation();
+                if let Some(target) = target {
+                    navigate(target, window, cx);
+                }
+            })
+    };
+    h_flex()
+        .id("editor-git-hunk-navigation")
+        .h_full()
+        .flex_shrink_0()
+        .child(button(
+            "editor-git-previous-hunk",
+            IconName::ArrowUp,
+            t!("git.previous_hunk"),
+            previous,
+        ))
+        .child(
+            button(
+                "editor-git-next-hunk",
+                IconName::ArrowDown,
+                t!("git.next_hunk"),
+                next,
+            )
+            .rounded_br(HUNK_TOOLBAR_RADIUS),
+        )
+        .into_any_element()
+}
+
+fn status_hunk_controls(label: String, cx: &App) -> AnyElement {
+    let colors = Palette::for_mode(cx.theme().mode);
+    quiet_button("editor-git-hunk-status")
+        .debug_selector(|| "editor-git-hunk-status".into())
+        .small()
+        .h_full()
+        .rounded(px(0.))
+        .rounded_bl(HUNK_TOOLBAR_RADIUS)
+        .text_xs()
+        .label(label)
+        .text_color(if cx.theme().mode == ThemeMode::Dark {
+            colors.ink
+        } else {
+            colors.muted
+        })
+        .disabled(true)
+        .into_any_element()
+}
+
+fn source_hunk_toolbar(buttons: AnyElement, cx: &App) -> AnyElement {
+    let row = hunk_toolbar_row(Some(hanging_hunk_toolbar(buttons, cx)));
+    canvas(
+        move |bounds, window, cx| {
+            // Paint and hit-test above the deferred inline blame annotation.
+            let clip = window.content_mask();
+            let height = bounds.size.height.min(clip.bounds.bottom() - bounds.top());
+            if height > px(0.) {
+                let mut overlay = div()
+                    .w_full()
+                    .h(height)
+                    .overflow_hidden()
+                    .child(row)
+                    .into_any_element();
+                overlay.layout_as_root(bounds.size.map(AvailableSpace::Definite), window, cx);
+                window.defer_draw(overlay, bounds.origin, 1, Some(clip));
+            }
+        },
+        |_, (), _, _| {},
+    )
+    .w_full()
+    .h(HUNK_TOOLBAR_HEIGHT)
+    .into_any_element()
+}
+
 pub(super) fn hunk_toolbar_row(toolbar: Option<AnyElement>) -> AnyElement {
     h_flex()
         .id("editor-git-hunk")
@@ -1152,6 +1279,7 @@ pub(super) fn hunk_toolbar_row(toolbar: Option<AnyElement>) -> AnyElement {
 }
 
 pub(super) fn hanging_hunk_toolbar(buttons: AnyElement, cx: &App) -> AnyElement {
+    let colors = Palette::for_mode(cx.theme().mode);
     h_flex()
         .id("editor-git-hunk-controls")
         .debug_selector(|| "editor-git-hunk-controls".into())
@@ -1161,7 +1289,11 @@ pub(super) fn hanging_hunk_toolbar(buttons: AnyElement, cx: &App) -> AnyElement 
         .font_family(cx.theme().font_family.clone())
         .rounded_b(HUNK_TOOLBAR_RADIUS)
         .overflow_hidden()
-        .bg(Palette::for_mode(cx.theme().mode).elevated)
+        .bg(if cx.theme().mode == ThemeMode::Dark {
+            colors.surface
+        } else {
+            colors.elevated
+        })
         .shadow_md()
         .child(buttons)
         .into_any_element()
@@ -1396,6 +1528,60 @@ mod tests {
     use super::*;
     use std::process::Command;
 
+    #[::core::prelude::v1::test]
+    fn hunk_toolbar_paints_over_deferred_annotations_in_both_themes() {
+        struct Probe;
+
+        impl Render for Probe {
+            fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+                div()
+                    .relative()
+                    .size_full()
+                    .child(source_hunk_toolbar(
+                        div().w(px(100.)).h_full().into_any_element(),
+                        cx,
+                    ))
+                    .child(deferred(
+                        div()
+                            .absolute()
+                            .top_0()
+                            .right_0()
+                            .w(px(110.))
+                            .h(HUNK_TOOLBAR_HEIGHT)
+                            .bg(rgb(0xee55aa)),
+                    ))
+            }
+        }
+
+        let mut app = TestAppContext::build_with_text_system(
+            TestDispatcher::new(0),
+            None,
+            gpui_platform::current_platform(true).text_system(),
+        );
+        app.update(gpui_component::init);
+        let (_, visual) = app.add_window_view(|_, _| Probe);
+        for (mode, fill) in [(ThemeMode::Light, 0xffffff), (ThemeMode::Dark, 0x3b414e)] {
+            visual.update(|window, cx| {
+                apply_theme(mode, cx);
+                window.draw(cx).clear(cx);
+                let quads = window.painted_quads();
+                let annotation = quads
+                    .iter()
+                    .find(|quad| quad.background.as_solid() == Some(rgb(0xee55aa).into()))
+                    .expect("the deferred annotation was painted");
+                let toolbar = quads
+                    .iter()
+                    .find(|quad| {
+                        quad.background.as_solid() == Some(rgb(fill).into())
+                            && quad.bounds.size.width.0 / window.scale_factor() == 100.
+                    })
+                    .expect("the hunk toolbar has a solid theme background");
+                assert!(!toolbar.bounds.intersect(&annotation.bounds).is_empty());
+                assert!(toolbar.order > annotation.order);
+            });
+        }
+    }
+
     #[cfg(debug_assertions)]
     #[::core::prelude::v1::test]
     fn gutter_expands_in_place_and_restore_keeps_the_staged_hunk() {
@@ -1442,6 +1628,8 @@ mod tests {
         worktree[0] = "LINE0".to_owned();
         worktree[60] = "LINE60".to_owned();
         fs::write(root.join(&path), worktree.join("\n") + "\n").unwrap();
+        let untracked = PathBuf::from("new.txt");
+        fs::write(root.join(&untracked), "New untracked file\n").unwrap();
 
         let store = Arc::new(Store::new(fixture.path().join("state")).unwrap());
         let config = ConfigFile::load(Some(fixture.path().join("config.toml")));
@@ -1491,31 +1679,8 @@ mod tests {
                 }
             });
         }
-        let hover = visual.update(|window, cx| {
-            window.draw(cx).clear(cx);
-            let viewport = workspace.read(cx).files[&path]
-                .editor
-                .read(cx)
-                .input_bounds();
-            let scale = window.scale_factor();
-            let color =
-                Background::from(code_theme::HunkPalette::for_mode(cx.theme().mode).removed_row);
-            let row = window
-                .painted_quads()
-                .into_iter()
-                .filter(|quad| {
-                    quad.background == color
-                        && px(quad.bounds.size.width.0 / scale) >= viewport.size.width
-                })
-                .min_by_key(|quad| quad.bounds.top())
-                .expect("the expanded hunk has a deleted row");
-            point(
-                viewport.left() + px(30.),
-                px(row.bounds.top().0 / scale) + px(2.),
-            )
-        });
-        visual.simulate_mouse_move(hover, None, Modifiers::default());
-        visual.update(|window, cx| window.draw(cx).clear(cx));
+        assert!(visual.debug_bounds("editor-git-hunk-status").is_none());
+        assert!(visual.debug_bounds("git-hunk-action:0").is_some());
         let previous = visual
             .debug_bounds("editor-git-previous-hunk:0")
             .expect("the previous hunk button is painted");
@@ -1569,6 +1734,28 @@ mod tests {
             assert!(git.selected.is_none());
             assert!(git.pending_hunk.is_none());
         });
+
+        visual.update(|window, cx| {
+            workspace.update(cx, |workspace, cx| {
+                workspace.open_file(untracked.clone(), false, window, cx);
+            });
+        });
+        visual.run_until_parked();
+        visual.update(|window, cx| {
+            workspace.update(cx, |workspace, cx| {
+                workspace.toggle_editor_git(&untracked, 0, cx);
+                let file = &workspace.files[&untracked];
+                assert_eq!(file.git.selected, Some(0));
+                let changes = file.git.changes.as_ref().unwrap();
+                assert!(changes.version.status.as_ref().unwrap().untracked);
+                assert!(editor_hunks(changes).next().unwrap().1.target.is_none());
+            });
+            window.draw(cx).clear(cx);
+        });
+        assert!(visual.debug_bounds("editor-git-hunk-status").is_some());
+        assert!(visual.debug_bounds("editor-git-previous-hunk:0").is_some());
+        assert!(visual.debug_bounds("editor-git-next-hunk:0").is_some());
+        assert!(visual.debug_bounds("git-hunk-action:0").is_none());
     }
 
     #[cfg(debug_assertions)]
@@ -1781,11 +1968,11 @@ mod tests {
             }
             let previous = visual.debug_bounds("editor-git-previous-hunk:1").unwrap();
             let next = visual.debug_bounds("editor-git-next-hunk:1").unwrap();
-            assert_eq!(previous.left(), label.left());
-            assert_eq!(previous.right(), next.left());
-            assert_eq!(next.right(), stage.left());
+            assert_eq!(stage.left(), label.left());
             assert_eq!(stage.right(), restore.left());
-            assert_eq!(restore.right(), label.right());
+            assert_eq!(restore.right(), previous.left());
+            assert_eq!(previous.right(), next.left());
+            assert_eq!(next.right(), label.right());
             for button in [previous, next, stage, restore] {
                 assert_eq!(button.top(), label.top());
                 assert_eq!(button.bottom(), label.bottom());

@@ -108,8 +108,11 @@ pub struct GutterHunk {
     pub(crate) outlined: bool,
     pub(crate) fallback: bool,
     pub(crate) tooltip: Option<gpui::SharedString>,
-    pub(crate) render: std::rc::Rc<dyn Fn(&mut gpui::Window, &mut App) -> gpui::AnyElement>,
+    pub(crate) render: std::rc::Rc<RenderGutterHunkOverlay>,
 }
+
+type RenderGutterHunkOverlay =
+    dyn Fn(bool, &mut gpui::Window, &mut App) -> Option<gpui::AnyElement>;
 
 /// Read-only deleted lines before a zero-based working line, followed by
 /// the working lines to highlight. These rows are outside the text buffer.
@@ -1129,6 +1132,27 @@ impl InputBaseState<EditorMode> {
         marker_color: Hsla,
         outlined: bool,
         render: impl Fn(&mut gpui::Window, &mut App) -> gpui::AnyElement + 'static,
+        cx: &mut Context<Self>,
+    ) {
+        self.set_gutter_hunk_overlay(
+            action,
+            sections,
+            marker_color,
+            outlined,
+            move |hovered, window, cx| hovered.then(|| render(window, cx)),
+            cx,
+        );
+    }
+
+    /// Expand a hunk with an optional overlay. The callback runs while the hunk
+    /// intersects the viewport and receives whether the pointer is over it.
+    pub fn set_gutter_hunk_overlay(
+        &mut self,
+        action: usize,
+        sections: Vec<GutterHunkSection>,
+        marker_color: Hsla,
+        outlined: bool,
+        render: impl Fn(bool, &mut gpui::Window, &mut App) -> Option<gpui::AnyElement> + 'static,
         cx: &mut Context<Self>,
     ) {
         let marker = self
