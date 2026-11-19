@@ -897,6 +897,178 @@ fn editor_hover_waits_for_pointer_motion_after_scrolling(cx: &mut gpui::TestAppC
     assert_eq!(active(cx), None);
 }
 
+#[gpui::test]
+fn lsp_hover_stays_open_during_pointer_handoff_and_copies_documentation(
+    cx: &mut gpui::TestAppContext,
+) {
+    use std::rc::Rc;
+
+    use gpui::{
+        App, AppContext as _, ClipboardItem, Context, Entity, MouseButton, ParentElement as _,
+        Render, Styled as _, Task, Window, div, px,
+    };
+    use gpui_component::{
+        Root,
+        input::{Copy, Editor, EditorState, HoverProvider, Rope},
+    };
+    use lsp_types::{Hover, HoverContents, MarkupContent, MarkupKind};
+
+    const MARKDOWN: &str = "Documentation for **symbol**.";
+    const PLAIN_TEXT: &str = "Literal **text** with ``` backticks.";
+
+    struct Documentation;
+    impl HoverProvider for Documentation {
+        fn hover(
+            &self,
+            _: &Rope,
+            offset: usize,
+            _: &mut Window,
+            _: &mut App,
+        ) -> Task<anyhow::Result<Option<Hover>>> {
+            let (kind, value) = if offset < "literal".len() {
+                (MarkupKind::PlainText, PLAIN_TEXT)
+            } else {
+                (MarkupKind::Markdown, MARKDOWN)
+            };
+            Task::ready(Ok(Some(Hover {
+                contents: HoverContents::Markup(MarkupContent {
+                    kind,
+                    value: value.into(),
+                }),
+                range: None,
+            })))
+        }
+    }
+
+    struct Probe(Entity<EditorState>, Entity<EditorState>);
+    impl Render for Probe {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl gpui::IntoElement {
+            div()
+                .flex()
+                .size_full()
+                .child(
+                    div()
+                        .w(px(160.))
+                        .h_full()
+                        .flex_none()
+                        .child(Editor::new(&self.0).size_full()),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .h_full()
+                        .child(Editor::new(&self.1).size_full()),
+                )
+        }
+    }
+
+    cx.update(|cx| {
+        gpui_component::init(cx);
+        cx.set_reduce_motion(true);
+    });
+    let mut editors = None;
+    let (_, cx) = cx.add_window_view(|window, cx| {
+        let state = cx.new(|cx| {
+            let mut state = EditorState::new(window, cx).default_value("literal\nsymbol\nsymbol\n");
+            state.lsp_mut().hover_provider = Some(Rc::new(Documentation));
+            state
+        });
+        let peer = cx.new(|cx| {
+            let mut state = EditorState::new(window, cx).default_value("peers\npeers\npeers\n");
+            state.lsp_mut().hover_provider = Some(Rc::new(Documentation));
+            state
+        });
+        editors = Some((state.clone(), peer.clone()));
+        let probe = cx.new(|_| Probe(state, peer));
+        Root::new(probe, window, cx)
+    });
+    let (editor, peer) = editors.unwrap();
+    let draw = |cx: &mut gpui::VisualTestContext| cx.update(|window, cx| window.draw(cx).clear(cx));
+    draw(cx);
+
+    let clipboard_text = |cx: &mut gpui::VisualTestContext| {
+        cx.update(|_, cx| {
+            cx.read_from_clipboard()
+                .and_then(|item| item.text())
+                .unwrap_or_default()
+        })
+    };
+    for (range, expected) in [(15..21, MARKDOWN), (0..7, PLAIN_TEXT)] {
+        let symbol = cx.update(|_, cx| editor.read(cx).range_to_bounds(&range).unwrap());
+        cx.simulate_mouse_move(symbol.center(), None, Default::default());
+        cx.run_until_parked();
+        cx.executor().advance_clock(Duration::from_millis(500));
+        cx.run_until_parked();
+        draw(cx);
+
+        let docs = cx.debug_bounds("hover-markdown").unwrap();
+        let step = point(symbol.right() + px(20.), symbol.center().y);
+        assert!(docs.union(&symbol).contains(&step));
+        assert!(!docs.contains(&step));
+        cx.simulate_mouse_move(step, None, Default::default());
+        draw(cx);
+        cx.update(|_, cx| {
+            let hover = editor
+                .read(cx)
+                .hover_popover()
+                .expect("hover during handoff");
+            assert_eq!(hover.symbol_range, range);
+        });
+
+        if expected == MARKDOWN {
+            let start = docs.origin + point(px(19.), px(15.));
+            let end = start + point(px(50.), px(0.));
+            cx.simulate_mouse_move(start, None, Default::default());
+            draw(cx);
+            cx.simulate_mouse_down(start, MouseButton::Left, Default::default());
+            cx.simulate_mouse_move(end, MouseButton::Left, Default::default());
+            cx.simulate_mouse_up(end, MouseButton::Left, Default::default());
+            cx.update(|window, cx| {
+                window.draw(cx).clear(cx);
+                cx.write_to_clipboard(ClipboardItem::new_string(String::new()));
+                window.dispatch_action(Box::new(Copy), cx);
+            });
+            let selection = clipboard_text(cx);
+            assert!(!selection.is_empty() && "Documentation".contains(&selection));
+        }
+
+        let copy = cx.debug_bounds("hover-copy-documentation").unwrap();
+        assert_eq!(copy.top() - docs.top(), px(10.));
+        assert_eq!(docs.right() - copy.right(), px(10.));
+        assert_eq!(copy.size, size(px(20.), px(20.)));
+        cx.simulate_mouse_move(copy.center(), None, Default::default());
+        cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+            let scale = window.scale_factor();
+            assert!(window.painted_quads().iter().any(|quad| {
+                quad.bounds == copy.scale(scale)
+                    && quad.corner_radii == Corners::all(px(3.).scale(scale))
+                    && quad.background.as_solid().is_some_and(|color| color.a > 0.)
+            }));
+        });
+        cx.simulate_click(copy.center(), Default::default());
+        assert_eq!(clipboard_text(cx), expected);
+
+        if expected == MARKDOWN {
+            let peer_symbol = cx.update(|_, cx| peer.read(cx).range_to_bounds(&(12..17)).unwrap());
+            let peer_pointer = peer_symbol.center();
+            assert!(docs.union(&symbol).contains(&peer_pointer));
+            assert!(!docs.contains(&peer_pointer));
+            cx.simulate_mouse_move(peer_pointer, None, Default::default());
+            cx.run_until_parked();
+            cx.executor().advance_clock(Duration::from_millis(500));
+            cx.run_until_parked();
+            cx.update(|_, cx| {
+                assert!(editor.read(cx).hover_popover().is_some());
+                assert_eq!(peer.read(cx).hover_popover().unwrap().symbol_range, 12..17);
+            });
+        }
+        cx.simulate_mouse_move(point(px(2.), px(2.)), None, Default::default());
+        draw(cx);
+        cx.update(|_, cx| assert!(editor.read(cx).hover_popover().is_none()));
+    }
+}
+
 #[cfg(target_os = "linux")]
 #[gpui::test]
 fn long_lsp_hover_can_scroll_without_resizing_or_moving_the_editor(cx: &mut gpui::TestAppContext) {

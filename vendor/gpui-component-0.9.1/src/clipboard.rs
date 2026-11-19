@@ -1,7 +1,7 @@
 use std::{rc::Rc, time::Duration};
 
 use gpui::{
-    App, ClipboardItem, ElementId, IntoElement, RenderOnce, SharedString, Window,
+    App, ClipboardItem, ElementId, IntoElement, Pixels, RenderOnce, SharedString, Window,
     prelude::FluentBuilder,
 };
 use rust_i18n::t;
@@ -22,6 +22,7 @@ pub struct Clipboard {
     tooltip_show_delay: Option<Duration>,
     accessibility_label: Option<SharedString>,
     size: Size,
+    button_style: Option<(Pixels, Pixels)>,
 }
 
 impl Sizable for Clipboard {
@@ -43,7 +44,13 @@ impl Clipboard {
             tooltip_show_delay: None,
             accessibility_label: None,
             size: Size::XSmall,
+            button_style: None,
         }
+    }
+
+    pub(crate) fn button_style(mut self, icon_size: Pixels, corner_radius: Pixels) -> Self {
+        self.button_style = Some((icon_size, corner_radius));
+        self
     }
 
     /// Set tooltip text for the clipboard button.
@@ -113,6 +120,9 @@ impl RenderOnce for Clipboard {
             })
             .ghost()
             .with_size(self.size)
+            .when_some(self.button_style, |this, (icon_size, corner_radius)| {
+                this.icon_size(icon_size).rounded(corner_radius)
+            })
             .when_some(self.tooltip_text, |this, text| this.tooltip(text))
             .when_some(self.tooltip_show_delay, |this, delay| {
                 this.tooltip_show_delay(delay)

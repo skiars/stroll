@@ -200,6 +200,14 @@ dialogs in a Wayland window after changes to paint order or focus handling.
   show-document hook. Web links keep their default URL behavior. Run
   `cargo test --release --locked --lib hover_source_links_use_workspace_navigation`
   to verify link clicks, source positions, and navigation history.
+- The editor that owns a documentation popup defers hover retargeting during
+  pointer handoff from the symbol. The documentation uses the shared clipboard
+  button to copy the original LSP text, preserving Markdown and literal
+  plaintext. The square button has equal top and right insets and an icon sized
+  to the documentation text. Run
+  `cargo test --release --locked --test popups lsp_hover_stays_open`
+  to verify pointer handoff across editors, selection, button layout, clipboard
+  content, and dismissal.
 
 - Tab accepts the selected item in the shared editor completion menu through
   the same edit path as Enter. With no list candidate it retains inline

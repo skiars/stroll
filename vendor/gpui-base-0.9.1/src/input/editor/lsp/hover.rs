@@ -176,6 +176,7 @@ impl InputBaseState<EditorMode> {
             target_range,
             documentation_target,
             pointer: Some(position),
+            pointer_handoff: Default::default(),
             diagnostics,
             hover: None,
             documentation: None,
@@ -250,6 +251,12 @@ impl InputBaseState<EditorMode> {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self
+            .hover_popover()
+            .is_some_and(|hover| hover.pointer_handoff.take() == Some(event.position))
+        {
+            return;
+        }
         if event.modifiers.alt {
             self.clear_hover_state(cx);
             return;
@@ -272,6 +279,20 @@ impl InputBaseState<EditorMode> {
             } else {
                 self.clear_language_hover(cx);
             }
+        }
+    }
+
+    /// Marks the current capture-phase mouse move as a handoff to this editor's popup.
+    #[doc(hidden)]
+    pub fn set_hover_pointer_handoff(
+        &self,
+        symbol_range: &Range<usize>,
+        position: Option<Point<Pixels>>,
+    ) {
+        if let Some(hover) = self.hover_popover()
+            && hover.symbol_range == *symbol_range
+        {
+            hover.pointer_handoff.set(position);
         }
     }
 

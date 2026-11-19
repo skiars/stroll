@@ -423,6 +423,13 @@ Input:
     zh-CN: 复制
     zh-HK: 複製
     zh-TW: 複製
+  Copy Documentation:
+    en: Copy documentation
+    pt-BR: "Copiar documentação"
+    ru: "Скопировать документацию"
+    zh-CN: 复制文档
+    zh-HK: 複製文件
+    zh-TW: 複製文件
   Paste:
     en: Paste
     pt-BR: "Colar"

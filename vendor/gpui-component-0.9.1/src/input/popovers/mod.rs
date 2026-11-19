@@ -18,6 +18,8 @@ use crate::{
     text::{TextView, TextViewStyle},
 };
 
+const DOCUMENTATION_FONT_SIZE: Pixels = px(12.5);
+
 pub(super) fn render_markdown(
     id: impl Into<ElementId>,
     markdown: impl Into<SharedString>,
@@ -62,13 +64,13 @@ fn render_markdown_with_code_style(
                         .bg(cx.theme().transparent)
                         .border_0()
                         .p_0()
-                        .text_size(px(12.5))
+                        .text_size(DOCUMENTATION_FONT_SIZE)
                         .line_height(relative(1.5))
                         .font_family(code_font),
                 ),
         )
         .font_family(cx.theme().font_family.clone())
-        .text_size(px(12.5))
+        .text_size(DOCUMENTATION_FONT_SIZE)
         .line_height(relative(1.6))
         .inline_code_style(inline_code)
         .code_block_actions(|_, _, _| div().into_any_element())

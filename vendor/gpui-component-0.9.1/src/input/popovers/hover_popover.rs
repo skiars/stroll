@@ -11,12 +11,13 @@ use gpui::{
 };
 
 use crate::{
-    ActiveTheme as _, Icon, StyledExt, ThemeStyled as _,
+    ActiveTheme as _, Icon, Sizable as _, StyledExt, ThemeStyled as _,
+    clipboard::Clipboard,
     highlighter::{DiagnosticEntry, diagnostic_foreground},
     input::{
         EditorState, HoverPopoverState,
         popovers::{
-            CodeActionMenu, QUICK_FIX_BUTTON_SIZE, quick_fix_button,
+            CodeActionMenu, DOCUMENTATION_FONT_SIZE, QUICK_FIX_BUTTON_SIZE, quick_fix_button,
             render_markdown_with_code_style,
         },
     },
@@ -124,7 +125,7 @@ impl HoverPopover {
 
 impl Render for HoverPopover {
     fn render(&mut self, window: &mut Window, cx: &mut gpui::Context<Self>) -> impl IntoElement {
-        let documentation = self
+        let document_text = self
             .content
             .hover
             .as_ref()
@@ -141,17 +142,27 @@ impl Render for HoverPopover {
                     })
                     .collect::<Vec<_>>()
                     .join("\n\n"),
-                lsp_types::HoverContents::Markup(markup)
-                    if markup.kind == lsp_types::MarkupKind::PlainText =>
-                {
-                    let mut fence = "```".to_owned();
-                    while markup.value.contains(&fence) {
-                        fence.push('`');
-                    }
-                    format!("{fence}\n{}\n{fence}", markup.value)
-                }
                 lsp_types::HoverContents::Markup(markup) => markup.value.clone(),
-            });
+            })
+            .map(SharedString::from);
+        let literal = self.content.hover.as_ref().is_some_and(|hover| {
+            matches!(&hover.contents, lsp_types::HoverContents::Markup(markup)
+                if markup.kind == lsp_types::MarkupKind::PlainText)
+        });
+        let documentation = document_text.as_ref().map(|text| {
+            if literal {
+                let mut fence = "```".to_owned();
+                while text.contains(&fence) {
+                    fence.push('`');
+                }
+                format!("{fence}\n{text}\n{fence}").into()
+            } else {
+                text.clone()
+            }
+        });
+        let copy_text = document_text.filter(|text| !text.trim().is_empty());
+        let copy_button_id = ("copy-hover-documentation", self.content.symbol_range.start);
+        let has_documentation = documentation.is_some();
         // Nested Markdown renderers run under the prose style, so capture the
         // editor font here and pass it through for all hover code.
         let code_font = window.text_style().font().family;
@@ -211,11 +222,17 @@ impl Render for HoverPopover {
                     if has_actions {
                         content = content.child(div().mx(px(12.)).h(px(1.)).bg(cx.theme().border));
                     }
+                    let copy_inset = px(10.);
+                    let copy_button_size = DOCUMENTATION_FONT_SIZE * 1.6;
                     content = content.child(
                         div()
                             .debug_selector(|| "hover-markdown".into())
+                            .relative()
                             .px(px(12.))
                             .py(px(8.))
+                            .when(copy_text.is_some(), |view| {
+                                view.pr(copy_inset + copy_button_size + px(6.))
+                            })
                             .child(
                                 render_hover_markdown(
                                     "message",
@@ -234,6 +251,24 @@ impl Render for HoverPopover {
                                         .whitespace_normal()
                                         .child(text),
                                 )
+                            })
+                            .when_some(copy_text.clone(), |view, text| {
+                                let label = t!("Input.Copy Documentation");
+                                view.child(
+                                    div()
+                                        .absolute()
+                                        .top(copy_inset)
+                                        .right(copy_inset)
+                                        .debug_selector(|| "hover-copy-documentation".into())
+                                        .child(
+                                            Clipboard::new(copy_button_id)
+                                                .with_size(copy_button_size)
+                                                .button_style(DOCUMENTATION_FONT_SIZE, px(3.))
+                                                .value(text)
+                                                .tooltip(label.clone())
+                                                .accessibility_label(label),
+                                        ),
+                                )
                             }),
                     );
                 }
@@ -245,6 +280,7 @@ impl Render for HoverPopover {
         popover.last_trigger_bounds = self.last_trigger_bounds.clone();
         popover.closing = self.closing;
         popover.actions = has_actions;
+        popover.has_documentation = has_documentation;
         popover.prefers_natural_width = self
             .content
             .documentation
@@ -507,6 +543,7 @@ pub(crate) struct Popover {
     last_trigger_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
     closing: bool,
     actions: bool,
+    has_documentation: bool,
     prefers_natural_width: bool,
     position: Option<Rc<Cell<Option<Point<Pixels>>>>>,
     width_limit: Range<Pixels>,
@@ -539,6 +576,7 @@ impl Popover {
             last_trigger_bounds: Rc::default(),
             closing: false,
             actions: false,
+            has_documentation: false,
             prefers_natural_width: false,
             position: None,
             style: StyleRefinement::default(),
@@ -772,6 +810,8 @@ impl Element for Popover {
         let keep_open_region = trigger_bounds.union(&bounds);
         let editor = self.editor.clone();
         let pointer_down = self.pointer_down.clone();
+        let has_documentation = self.has_documentation;
+        let symbol_range = self.range.clone();
         window.on_mouse_event(move |event: &MouseMoveEvent, phase, _, cx| {
             if !phase.capture() {
                 return;
@@ -781,6 +821,16 @@ impl Element for Popover {
             }
             if !pointer_down.get() && !keep_open_region.contains(&event.position) {
                 editor.update(cx, |editor, cx| editor.clear_hover_state(cx));
+            } else if has_documentation {
+                let handing_off = !event.dragging()
+                    && !event.modifiers.alt
+                    && !event.modifiers.secondary(cx)
+                    && !trigger_bounds.contains(&event.position)
+                    && !bounds.contains(&event.position);
+                editor.read(cx).set_hover_pointer_handoff(
+                    &symbol_range,
+                    handing_off.then_some(event.position),
+                );
             }
         });
 
