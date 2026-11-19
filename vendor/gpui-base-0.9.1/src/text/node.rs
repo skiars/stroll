@@ -2680,6 +2680,7 @@ impl CodeBlock {
                     node_cx.link_click_handler.clone(),
                 )
                 .range_backgrounds(node_cx.range_backgrounds(leaf_key).to_vec())
+                .reading_leaf(leaf_key, 0)
                 .reveal(node_cx.reveal_at(leaf_key, 0, self.code().len())),
             );
         let actions = node_cx.code_block_actions.clone().map(|actions| {
@@ -3010,6 +3011,7 @@ impl Paragraph {
                 node_cx.link_click_handler.clone(),
             )
             .range_backgrounds(backgrounds)
+            .reading_leaf(fade_key, 0)
             .reveal(reveal)
             .into_any_element();
         }
@@ -3048,6 +3050,7 @@ impl Paragraph {
                             consumed,
                             consumed + text.len(),
                         ))
+                        .reading_leaf(fade_key, consumed)
                         .reveal(node_cx.reveal_at(fade_key, consumed, consumed + text.len()))
                         .into_any_element(),
                     );
@@ -3144,6 +3147,7 @@ impl Paragraph {
                     node_cx.link_click_handler.clone(),
                 )
                 .range_backgrounds(slice_backgrounds(backgrounds, consumed, text_end))
+                .reading_leaf(fade_key, consumed)
                 .reveal(node_cx.reveal_at(fade_key, consumed, text_end))
                 .into_any_element(),
             );
@@ -3230,6 +3234,7 @@ impl Paragraph {
                     let item_backgrounds =
                         slice_backgrounds(backgrounds, consumed, consumed + text.len());
                     let item_reveal = node_cx.reveal_at(leaf_key, consumed, consumed + text.len());
+                    let reading_leaf = leaf_key.map(|key| (key, consumed));
                     consumed += text.len();
                     items.push(InlineFlowItem::Text {
                         state: inline_node.state.clone(),
@@ -3238,6 +3243,7 @@ impl Paragraph {
                         highlights: fade_highlights(std::mem::take(&mut highlights), &item_fades),
                         backgrounds: item_backgrounds,
                         reveal: item_reveal,
+                        reading_leaf,
                     });
                 }
                 let mut object_style = HighlightStyle::default();
@@ -3295,6 +3301,7 @@ impl Paragraph {
                             consumed + text.len(),
                         ),
                         reveal: node_cx.reveal_at(leaf_key, consumed, consumed + text.len()),
+                        reading_leaf: leaf_key.map(|key| (key, consumed)),
                     });
                 }
 
@@ -3356,6 +3363,7 @@ impl Paragraph {
                 highlights,
                 backgrounds,
                 reveal,
+                reading_leaf: leaf_key.map(|key| (key, consumed)),
             });
         }
 

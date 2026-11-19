@@ -411,7 +411,7 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         self.dismiss_document_list(window, cx);
-        self.open_doc(path, None, window, cx);
+        self.navigate_document(path, None, window, cx);
     }
 
     fn document_list_row(
@@ -840,6 +840,11 @@ mod tests {
             let reader = this.doc.as_ref().unwrap().read(cx);
             assert_eq!(reader.path, readme);
             assert_eq!(reader.session_position(cx), Some(position));
+            let history = &this.session.source_history.entries;
+            assert_eq!(history.len(), 2);
+            assert_eq!(history[0].path.as_ref(), Some(&notes));
+            assert_eq!(history[1].path.as_ref(), Some(&readme));
+            assert!(history.iter().all(|location| location.document.is_some()));
         });
 
         visual.update(|window, cx| {

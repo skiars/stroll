@@ -2293,6 +2293,7 @@ mod tests {
                 position.block = 60;
                 position.source_offset = None;
                 position.inset = 7.;
+                position.line = None;
                 doc.update(cx, |doc, cx| {
                     doc.restore_position(Some(position));
                     cx.notify();

@@ -1249,7 +1249,7 @@ pub struct Window {
     pub(crate) element_opacity: f32,
     paint_only: bool,
     pub(crate) content_mask_stack: Vec<ContentMask<Pixels>>,
-    pub(crate) requested_autoscroll: Option<Bounds<Pixels>>,
+    requested_autoscroll: Option<(Bounds<Pixels>, Option<Pixels>)>,
     /// The [`TextInputConfiguration`] most recently forwarded to the platform
     /// window, so that only actual changes are forwarded (reconfiguring a live
     /// input session can restart the IME connection).
@@ -4607,12 +4607,22 @@ impl Window {
     /// called during the prepaint phase of element drawing.
     pub fn request_autoscroll(&mut self, bounds: Bounds<Pixels>) {
         self.invalidator.debug_assert_prepaint();
-        self.requested_autoscroll = Some(bounds);
+        self.requested_autoscroll = Some((bounds, None));
     }
 
     /// This method can be called from a containing element such as [`crate::List`] to support the autoscroll behavior
     /// described in [`Self::request_autoscroll`].
     pub fn take_autoscroll(&mut self) -> Option<Bounds<Pixels>> {
+        self.take_aligned_autoscroll().map(|(bounds, _)| bounds)
+    }
+
+    /// Request that a containing list align these bounds below its top edge.
+    pub fn request_autoscroll_to_top(&mut self, bounds: Bounds<Pixels>, inset: Pixels) {
+        self.invalidator.debug_assert_prepaint();
+        self.requested_autoscroll = Some((bounds, Some(inset)));
+    }
+
+    pub(crate) fn take_aligned_autoscroll(&mut self) -> Option<(Bounds<Pixels>, Option<Pixels>)> {
         self.invalidator.debug_assert_prepaint();
         self.requested_autoscroll.take()
     }

@@ -126,8 +126,17 @@ pub(crate) struct SourceHistory {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub(crate) struct SourceLocation {
-    pub path: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<PathBuf>,
     pub position: Option<FilePosition>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub document: Option<DocumentLocation>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub(crate) struct DocumentLocation {
+    pub position: Option<DocumentPosition>,
+    pub fragment: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
@@ -145,6 +154,14 @@ pub(crate) struct DocumentPosition {
     pub source_offset: Option<usize>,
     pub block: usize,
     pub inset: f32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line: Option<DocumentLinePosition>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub(crate) struct DocumentLinePosition {
+    pub source_offset: usize,
+    pub viewport_inset: f32,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]

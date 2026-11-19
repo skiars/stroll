@@ -388,6 +388,25 @@ impl RenderedIndex {
         Some(RevealTarget::Block { ix: block_ix })
     }
 
+    pub(super) fn source_offset_at(&self, key: TextLeafKey, offset: usize) -> Option<usize> {
+        let leaf = self.leaves.iter().find(|leaf| leaf.key == key)?;
+        let rendered = leaf.range.start + offset;
+        if !leaf.range.contains(&rendered) {
+            return None;
+        }
+        let ix = self
+            .source_map
+            .partition_point(|segment| segment.rendered.start <= rendered);
+        let segment = self.source_map.get(ix.checked_sub(1)?)?;
+        segment.rendered.contains(&rendered).then(|| {
+            if segment.linear {
+                segment.source.start + rendered - segment.rendered.start
+            } else {
+                segment.source.start
+            }
+        })
+    }
+
     /// The smallest range of the text holding every character whose source
     /// overlaps `source`, a valid, non-empty range of the source.
     fn range_for_source(&self, source: &Range<usize>) -> Option<Range<usize>> {
@@ -1556,6 +1575,7 @@ struct RevealReport {
 pub(super) struct PendingReveal {
     target: RevealTarget,
     requested_at: Instant,
+    top_inset: Option<Pixels>,
     /// What the target's `Inline` reported this frame; `None` when it was not
     /// laid out.
     report: Arc<Mutex<Option<RevealReport>>>,
@@ -1575,10 +1595,16 @@ pub(super) enum RevealProgress {
 impl PendingReveal {
     /// The start of `range` in `text`, asked for at `now`, or `None` when
     /// the range is not a range of it.
-    pub(super) fn new(text: &RenderedText, range: &Range<usize>, now: Instant) -> Option<Self> {
+    pub(super) fn new(
+        text: &RenderedText,
+        range: &Range<usize>,
+        now: Instant,
+        top_inset: Option<Pixels>,
+    ) -> Option<Self> {
         Some(Self {
             target: text.index().locate(range)?,
             requested_at: now,
+            top_inset,
             report: Arc::default(),
             attempts: 0,
         })
@@ -1623,6 +1649,7 @@ impl PendingReveal {
         Some(RevealRequest {
             key,
             offset,
+            top_inset: self.top_inset,
             report: self.report.clone(),
         })
     }
@@ -1660,6 +1687,7 @@ impl PendingReveal {
 pub(crate) struct RevealRequest {
     key: TextLeafKey,
     offset: usize,
+    top_inset: Option<Pixels>,
     report: Arc<Mutex<Option<RevealReport>>>,
 }
 
@@ -1677,6 +1705,7 @@ impl RevealRequest {
         }
         RevealAt {
             offset: self.offset,
+            top_inset: self.top_inset,
             report: self.report.clone(),
         }
         .rebase(start, end)
@@ -1687,6 +1716,7 @@ impl RevealRequest {
 #[derive(Clone, Debug)]
 pub(crate) struct RevealAt {
     offset: usize,
+    pub(crate) top_inset: Option<Pixels>,
     report: Arc<Mutex<Option<RevealReport>>>,
 }
 
@@ -1700,6 +1730,7 @@ impl RevealAt {
     pub(crate) fn rebase(&self, start: usize, end: usize) -> Option<Self> {
         (start..end).contains(&self.offset).then(|| Self {
             offset: self.offset - start,
+            top_inset: self.top_inset,
             report: self.report.clone(),
         })
     }
@@ -1710,6 +1741,7 @@ impl RevealAt {
     pub(crate) fn clamp(&self, start: usize, end: usize) -> Self {
         Self {
             offset: self.offset.clamp(start, end) - start,
+            top_inset: self.top_inset,
             report: self.report.clone(),
         }
     }

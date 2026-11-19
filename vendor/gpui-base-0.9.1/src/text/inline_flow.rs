@@ -22,6 +22,7 @@ use super::{
     inline_object::{InlineObject, MeasuredInlineObject},
     node::LinkMark,
     range_highlight::RevealAt,
+    stream_fade::TextLeafKey,
 };
 
 const IMAGE_LEN: usize = 1;
@@ -65,6 +66,7 @@ pub(super) enum InlineFlowItem {
         backgrounds: Vec<(Range<usize>, Hsla)>,
         /// The start of a pending reveal, when it is in this item.
         reveal: Option<RevealAt>,
+        reading_leaf: Option<(TextLeafKey, usize)>,
     },
     Image {
         source: ImageSource,
@@ -653,6 +655,7 @@ impl Element for InlineFlow {
                         state: source_state,
                         backgrounds,
                         reveal,
+                        reading_leaf,
                         ..
                     } = &self.items[*item_ix]
                     else {
@@ -697,6 +700,11 @@ impl Element for InlineFlow {
                             .map(|reveal| reveal.clamp(source_range.start, source_range.end)),
                     )
                     .text_style(fragment_style.clone());
+                    let element = if let Some((leaf, offset)) = reading_leaf {
+                        element.reading_leaf(Some(*leaf), offset + source_range.start)
+                    } else {
+                        element
+                    };
                     let element = element.editor_piece(
                         editor
                             .as_ref()

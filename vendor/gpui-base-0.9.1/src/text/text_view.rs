@@ -2,10 +2,11 @@ use std::{ops::Range, rc::Rc, sync::Arc};
 
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
-    AnyElement, AnyView, App, Bounds, ClickEvent, ContentMask, Element, ElementId, Entity, Global,
-    GlobalElementId, Hitbox, HitboxBehavior, InspectorElementId, InteractiveElement, IntoElement,
-    LayoutId, MouseButton, ParentElement, Pixels, Refineable as _, SharedString, StyleRefinement,
-    Styled, Window, div, point, px,
+    AnyElement, AnyView, App, AppContext as _, Bounds, ClickEvent, ContentMask, Element, ElementId,
+    Entity, Global, GlobalElementId, Hitbox, HitboxBehavior, InspectorElementId,
+    InteractiveElement, IntoElement, LayoutId, MouseButton, MouseDownEvent, MouseEvent,
+    MouseExitEvent, ParentElement, Pixels, Refineable as _, ScrollEvent, SharedString,
+    StyleRefinement, Styled, Window, div, point, px,
 };
 
 use crate::StyledExt;
@@ -13,9 +14,9 @@ use crate::text::TextViewFormat;
 use crate::text::markdown_ext::{MarkdownExtensions, MarkdownNode, MarkdownPlugin};
 use crate::text::node::{CodeBlock, TableData};
 use crate::text::range_highlight::{PendingReveal, RevealProgress};
-use crate::text::state::{LineSpan, SelectionFormat, TextViewState};
+use crate::text::state::{LineSpan, LinkPreview, SelectionFormat, TextViewState};
 use crate::text::stream_fade::TextViewMotion;
-use crate::{GlobalState, TextSelection, text::TextViewStyle};
+use crate::{GlobalState, TextSelection, TooltipOverlay, text::TextViewStyle};
 
 /// Type for code block actions generator function.
 pub(crate) type CodeBlockActionsFn =
@@ -528,10 +529,9 @@ impl TextView {
         self
     }
 
-    /// Show a tooltip that follows the pointer while it is over a link.
+    /// Show a tooltip beside the pointer after it rests over a link for 300 ms.
     ///
-    /// The builder receives the link's URL. The view caches the tooltip
-    /// until a different destination is shown.
+    /// The builder receives the link's URL.
     pub fn link_tooltip<F>(mut self, builder: F) -> Self
     where
         F: Fn(&SharedString, &mut Window, &mut App) -> AnyView + Send + Sync + 'static,
@@ -863,7 +863,18 @@ impl Element for TextView {
             state.table_actions = self.table_actions.clone();
             state.link_click_handler = self.link_click_handler.clone();
             state.image_click_handler = self.image_click_handler.clone();
-            state.link_tooltip = self.link_tooltip.clone();
+            match (&self.link_tooltip, &mut state.link_preview) {
+                (Some(builder), Some(preview)) => preview.builder = builder.clone(),
+                (Some(builder), slot @ None) => {
+                    *slot = Some(LinkPreview {
+                        builder: builder.clone(),
+                        overlay: cx.new(|_| TooltipOverlay::new()),
+                        target: None,
+                        confirmed: Default::default(),
+                    });
+                }
+                (None, slot) => *slot = None,
+            }
             state.task_toggle_handler = self.task_toggle_handler.clone();
             state.image_source = self.image_source.clone();
             state.set_markdown_extensions(self.markdown_extensions.clone(), cx);
@@ -940,6 +951,13 @@ impl Element for TextView {
                     ),
                 )
             })
+            .children(
+                state
+                    .read(cx)
+                    .link_preview
+                    .as_ref()
+                    .map(|preview| preview.overlay.clone()),
+            )
             .refine_style(&self.style)
             .into_any_element();
         let layout_id = el.request_layout(window, cx);
@@ -1028,10 +1046,19 @@ impl Element for TextView {
         cx: &mut App,
     ) {
         let state = &request_layout.state;
+        if let Some(preview) = &state.read(cx).link_preview {
+            preview.confirmed.set(false);
+            clear_link_tooltip_on::<MouseDownEvent>(state, window);
+            clear_link_tooltip_on::<MouseExitEvent>(state, window);
+            clear_link_tooltip_on::<ScrollEvent>(state, window);
+        }
         if self.selectable {
             state.read(cx).selection_adapter.begin_frame();
         }
 
+        if let Some(line) = &state.read(cx).viewport_line {
+            line.set(None);
+        }
         GlobalState::global(cx).push_text_view_state(state.clone());
         if let Some(clip_bottom) = prepaint.clip_bottom {
             // Snap the `max_lines` clip to the last whole line that fits, so a
@@ -1046,6 +1073,16 @@ impl Element for TextView {
             request_layout.element.paint(window, cx);
         }
         GlobalState::global(cx).pop_text_view_state();
+
+        // A new frame may move, clip, cover, or omit the trigger without a mouse event.
+        if state
+            .read(cx)
+            .link_preview
+            .as_ref()
+            .is_some_and(|preview| preview.target.is_some() && !preview.confirmed.get())
+        {
+            state.update(cx, |state, cx| state.clear_link_tooltip(cx));
+        }
 
         // Every list has scrolled by now, so the line of a reveal is where
         // it ends up this frame.
@@ -1090,6 +1127,15 @@ impl Element for TextView {
             adapter.paint_touch_handles(&prepaint.touch_handles, handle_color, window, cx);
         }
     }
+}
+
+fn clear_link_tooltip_on<E: MouseEvent>(state: &Entity<TextViewState>, window: &mut Window) {
+    let state = state.downgrade();
+    window.on_mouse_event(move |_: &E, phase, _, cx| {
+        if phase.capture() {
+            _ = state.update(cx, |state, cx| state.clear_link_tooltip(cx));
+        }
+    });
 }
 
 #[cfg(test)]
@@ -3764,7 +3810,7 @@ mod tests {
     }
 
     #[gpui::test]
-    fn link_tooltip_follows_the_pointer_and_clears_on_exit(cx: &mut TestAppContext) {
+    fn link_tooltip_checks_occlusion_and_wrapped_rows(cx: &mut TestAppContext) {
         struct Preview;
         impl Render for Preview {
             fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
@@ -3793,7 +3839,10 @@ mod tests {
                     })
             }
         }
-        cx.update(crate::init);
+        cx.update(|cx| {
+            crate::init(cx);
+            cx.set_reduce_motion(true);
+        });
         let (root, cx) = cx.add_window_view(|_, cx| Root {
             covered: true,
             view: cx.new(|cx| {
@@ -3808,9 +3857,15 @@ mod tests {
         assert!(rows.len() > 1, "the native link label wraps");
         let bounds = rows[0];
         let start = point(bounds.left() + px(2.), bounds.center().y);
+        let dwell = |cx: &mut VisualTestContext| {
+            cx.run_until_parked();
+            cx.executor()
+                .advance_clock(std::time::Duration::from_millis(300));
+            cx.run_until_parked();
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+        };
         cx.update(|window, cx| window.simulate_mouse_move(start, cx));
-        cx.run_until_parked();
-        cx.update(|window, cx| window.draw(cx).clear(cx));
+        dwell(cx);
         assert!(
             cx.debug_bounds("link-destination-preview").is_none(),
             "an occluded link cannot activate a preview"
@@ -3819,37 +3874,19 @@ mod tests {
             root.covered = false;
             cx.notify();
         });
-        cx.run_until_parked();
-        cx.update(|window, cx| window.draw(cx).clear(cx));
-        assert_eq!(
-            cx.update(|window, cx| window.simulate_next_frame(cx)),
-            1,
-            "a new hover requests the frame that shows its preview",
+        dwell(cx);
+        assert!(
+            cx.debug_bounds("link-destination-preview").is_none(),
+            "uncovering a link does not start a dwell at a stationary pointer"
         );
-        cx.run_until_parked();
-        cx.update(|window, cx| window.draw(cx).clear(cx));
-        let first = cx
-            .debug_bounds("link-destination-preview")
-            .expect("hovering a native link paints its destination preview");
-        assert_eq!(
-            cx.update(|window, cx| window.simulate_next_frame(cx)),
-            0,
-            "an idle preview does not request more frames",
-        );
-        cx.update(|window, cx| window.simulate_mouse_move(start + point(px(20.), px(0.)), cx));
-        cx.run_until_parked();
-        cx.update(|window, cx| window.draw(cx).clear(cx));
-        let second = cx.debug_bounds("link-destination-preview").unwrap();
-        assert_eq!(second.left() - first.left(), px(20.));
-        assert_eq!(second.top(), first.top());
         cx.update(|window, cx| window.simulate_mouse_move(rows[1].center(), cx));
-        cx.run_until_parked();
-        cx.update(|window, cx| window.draw(cx).clear(cx));
+        dwell(cx);
         assert!(cx.debug_bounds("link-destination-preview").is_some());
         root.update(cx, |root, cx| {
             root.covered = true;
             cx.notify();
         });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
         cx.run_until_parked();
         cx.update(|window, cx| window.draw(cx).clear(cx));
         assert!(

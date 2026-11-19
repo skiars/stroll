@@ -170,6 +170,12 @@ dialogs in a Wayland window after changes to paint order or focus handling.
   A target moved under a stationary pointer waits for a pointer move. The release tests
   `editor_hover_waits_for_pointer_motion_after_scrolling` and
   `commit_preview_waits_for_pointer_motion_after_scrolling` cover this behavior.
+- Markdown link previews wait for 300 ms of pointer rest, validate the link
+  against the current frame, and leave the document's pointer hit targets
+  available. They use the shared tooltip overlay for viewport placement and
+  entrance and exit animation.
+  Run `cargo test --release --locked --test documents` to check
+  pointer timing, switching destinations, and narrow-window placement.
 - Client-decorated roots paint their background under the frame border and use
   concentric content corners to prevent a transparent seam. Check the frame
   and its content against a contrasting background in a native Wayland window.
@@ -293,3 +299,14 @@ dialogs in a Wayland window after changes to paint order or focus handling.
   tests cover URI round trips and the Windows wide path list. See
   [file tree desktop integration](../docs/workspace-file-operations.md) for
   the native round-trip checks.
+
+### Markdown headings and reader scrolling
+
+- The Markdown highlight query exposes separate captures for heading text and
+  heading markers so code themes can style them independently.
+- Scrollable Markdown text views can align a rendered range below the top edge.
+  GPUI lists can reserve half a viewport after the last item and extend that
+  space to preserve an explicit position near the end.
+- Scrollable Markdown text views can also report the source byte and signed
+  viewport inset of the top painted text line. Restoring that source byte
+  resolves it against the new line layout after typography or width changes.

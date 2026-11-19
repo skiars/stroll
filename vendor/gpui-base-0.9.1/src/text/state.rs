@@ -2,6 +2,7 @@ use futures::Stream as _;
 #[cfg(not(target_family = "wasm"))]
 use std::time::Instant;
 use std::{
+    cell::Cell,
     ops::{Range, RangeInclusive},
     pin::Pin,
     sync::{Arc, Mutex, OnceLock},
@@ -12,13 +13,13 @@ use std::{
 use web_time::Instant;
 
 use gpui::{
-    App, AppContext as _, Bounds, Context, EntityId, FocusHandle, IntoElement, KeyBinding,
-    ListState, ParentElement as _, Pixels, Point, Render, SharedString, Styled as _, Task, Window,
-    prelude::FluentBuilder as _, px,
+    App, AppContext as _, Bounds, Context, Entity, EntityId, FocusHandle, IntoElement, KeyBinding,
+    ListOffset, ListState, ParentElement as _, Pixels, Point, Render, SharedString, Styled as _,
+    Task, Window, prelude::FluentBuilder as _, px,
 };
 
 use crate::{
-    AutoScroll, ElementExt, TextSelection,
+    AutoScroll, ElementExt, Placement, TextSelection, TooltipOverlay, TooltipRequest,
     async_util::{Receiver, Sender, unbounded},
     input::{self, SelectAll},
     text::{
@@ -32,7 +33,7 @@ use crate::{
             LeafRemap, PendingReveal, RangeHighlightFrame, RenderedIndex, RevealRequest,
         },
         selection_adapter::TextViewSelectionAdapter,
-        stream_fade::{StreamFadeTracker, TextViewMotion},
+        stream_fade::{StreamFadeTracker, TextLeafKey, TextViewMotion},
     },
     touch_selection::caret_line_box,
     v_flex,
@@ -67,6 +68,20 @@ pub(super) enum TextViewFormat {
     Markdown,
     /// HTML view
     Html,
+}
+
+pub(super) struct LinkTooltipTarget {
+    pub owner: usize,
+    pub url: SharedString,
+    pub position: Point<Pixels>,
+    pub bounds: Bounds<Pixels>,
+}
+
+pub(super) struct LinkPreview {
+    pub builder: Arc<super::text_view::LinkTooltipFn>,
+    pub overlay: Entity<TooltipOverlay>,
+    pub target: Option<LinkTooltipTarget>,
+    pub confirmed: Cell<bool>,
 }
 
 /// The format of the text returned by
@@ -108,11 +123,20 @@ pub(super) struct LineSpan {
     pub(super) line_height: Pixels,
 }
 
+#[derive(Clone, Copy)]
+pub(super) struct ViewportLine {
+    leaf: TextLeafKey,
+    offset: usize,
+    top: Pixels,
+    scroll_top: ListOffset,
+}
+
 /// The state of a TextView.
 pub struct TextViewState {
     entity_id: EntityId,
     pub(super) focus_handle: FocusHandle,
     pub(super) list_state: ListState,
+    pub(super) viewport_line: Option<Cell<Option<ViewportLine>>>,
 
     /// The bounds of the text view
     bounds: Bounds<Pixels>,
@@ -133,9 +157,7 @@ pub struct TextViewState {
     pub(super) image_source: Option<std::sync::Arc<super::text_view::ImageSourceFn>>,
     pub(super) link_click_handler: Option<std::sync::Arc<LinkClickHandlerFn>>,
     pub(super) image_click_handler: Option<std::sync::Arc<ImageClickHandlerFn>>,
-    pub(super) link_tooltip: Option<std::sync::Arc<super::text_view::LinkTooltipFn>>,
-    pub(super) hovered_link_tooltip: Option<(SharedString, gpui::AnyView)>,
-    pub(super) link_tooltip_target: Option<(usize, SharedString)>,
+    pub(super) link_preview: Option<LinkPreview>,
     pub(super) task_toggle_handler: Option<std::sync::Arc<TaskToggleHandlerFn>>,
     pub(super) markdown_extensions: Arc<MarkdownExtensions>,
 
@@ -250,15 +272,14 @@ impl TextViewState {
             // as zero height until scrolled into view, which makes the
             // scrollbar jitter as more blocks get measured during scrolling.
             list_state: ListState::new(0, gpui::ListAlignment::Top, px(1000.)).measure_all(),
+            viewport_line: None,
             text_view_style: Arc::default(),
             code_block_actions: None,
             code_block_highlighter: None,
             table_actions: None,
             link_click_handler: None,
             image_click_handler: None,
-            link_tooltip: None,
-            hovered_link_tooltip: None,
-            link_tooltip_target: None,
+            link_preview: None,
             task_toggle_handler: None,
             image_source: None,
             markdown_extensions,
@@ -737,6 +758,25 @@ impl TextViewState {
         range: Range<usize>,
         cx: &mut Context<Self>,
     ) -> Result<(), RangeHighlightError> {
+        self.reveal_range_with_inset(range, None, cx)
+    }
+
+    /// Align the start of a rendered Markdown range to the top of its scrollable view.
+    pub fn reveal_range_at_top(
+        &mut self,
+        range: Range<usize>,
+        inset: Pixels,
+        cx: &mut Context<Self>,
+    ) -> Result<(), RangeHighlightError> {
+        self.reveal_range_with_inset(range, Some(inset), cx)
+    }
+
+    fn reveal_range_with_inset(
+        &mut self,
+        range: Range<usize>,
+        top_inset: Option<Pixels>,
+        cx: &mut Context<Self>,
+    ) -> Result<(), RangeHighlightError> {
         if self.format != TextViewFormat::Markdown {
             return Err(RangeHighlightError::Unsupported);
         }
@@ -748,7 +788,8 @@ impl TextViewState {
         }
         let now = cx.background_executor().now();
         self.pending_reveal = Some(
-            PendingReveal::new(&text, &range, now).ok_or(RangeHighlightError::InvalidRange(0))?,
+            PendingReveal::new(&text, &range, now, top_inset)
+                .ok_or(RangeHighlightError::InvalidRange(0))?,
         );
         cx.notify();
         Ok(())
@@ -861,6 +902,54 @@ impl TextViewState {
     #[doc(hidden)]
     pub fn list_state(&self) -> &ListState {
         &self.list_state
+    }
+
+    /// Track the first painted text line in the scrollable Markdown viewport.
+    pub fn track_viewport_line(mut self) -> Self {
+        self.viewport_line = Some(Cell::default());
+        self
+    }
+
+    /// The source byte offset and signed viewport inset of the top text line.
+    /// Returns none when the top item has no visible line or awaits a repaint.
+    pub fn viewport_line(&self) -> Option<(usize, Pixels)> {
+        let line = self.viewport_line.as_ref()?.get()?;
+        let scroll_top = self.list_state.logical_scroll_top();
+        if line.scroll_top != scroll_top {
+            return None;
+        }
+        let span = self
+            .parsed_content
+            .document
+            .blocks
+            .get(scroll_top.item_ix)?
+            .span()?;
+        if !(span.start..span.end).contains(&line.leaf.block_start()) {
+            return None;
+        }
+        let offset = self
+            .rendered_text()
+            .index()
+            .source_offset_at(line.leaf, line.offset)?;
+        Some((offset, line.top - self.list_state.viewport_bounds().top()))
+    }
+
+    pub(super) fn report_viewport_line(&self, leaf: TextLeafKey, offset: usize, top: Pixels) {
+        if let Some(line) = &self.viewport_line
+            && line.get().is_none_or(|first| top < first.top)
+        {
+            line.set(Some(ViewportLine {
+                leaf,
+                offset,
+                top,
+                scroll_top: self.list_state.logical_scroll_top(),
+            }));
+        }
+    }
+
+    /// Whether a requested reveal is still waiting for layout.
+    pub fn has_pending_reveal(&self) -> bool {
+        self.pending_reveal.is_some()
     }
 
     /// Byte offset in the Markdown source at the start of a rendered list item.
@@ -1144,6 +1233,39 @@ impl TextViewState {
             window.request_animation_frame();
         }
         (request, reveal_block)
+    }
+}
+
+impl TextViewState {
+    pub(super) fn show_link_tooltip(
+        &mut self,
+        target: LinkTooltipTarget,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(preview) = &mut self.link_preview else {
+            return;
+        };
+        let builder = preview.builder.clone();
+        let url = target.url.clone();
+        let anchor = Bounds::new(target.position, Default::default());
+        let request = TooltipRequest::new(anchor, move |window, cx| builder(&url, window, cx))
+            .with_placement(Placement::Bottom)
+            .with_show_delay(Duration::from_millis(300))
+            .with_restart_delay(true)
+            .paint_only();
+        preview.target = Some(target);
+        preview
+            .overlay
+            .update(cx, |overlay, cx| overlay.request_show(request, window, cx));
+    }
+
+    pub(super) fn clear_link_tooltip(&mut self, cx: &mut Context<Self>) {
+        if let Some(preview) = &mut self.link_preview
+            && preview.target.take().is_some()
+        {
+            preview.overlay.update(cx, |overlay, cx| overlay.hide(cx));
+        }
     }
 }
 

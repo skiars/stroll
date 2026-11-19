@@ -4,8 +4,9 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result, ensure};
 use gpui::{
-    App, Image, ImageFormat, IntoElement, ObjectFit, ParentElement as _, SharedString, Styled,
-    StyledImage as _, Window, div, img, px,
+    App, Asset, DevicePixels, Image, ImageFormat, IntoElement, ObjectFit, ParentElement as _,
+    RenderImage, SharedString, Size, Styled, StyledImage as _, SvgSize, Window, canvas, div, img,
+    px, size,
 };
 use gpui_component::{
     ActiveTheme, ThemeMode, h_flex,
@@ -60,6 +61,56 @@ struct Picture {
     width: f32,
     height: f32,
     baseline: f32,
+}
+
+const MATH_FONT_SIZE: f32 = 16.;
+
+enum FormulaRaster {}
+
+impl Asset for FormulaRaster {
+    type Source = (Arc<Image>, Size<DevicePixels>);
+    type Output = Option<Arc<RenderImage>>;
+
+    fn load(
+        source: Self::Source,
+        cx: &mut App,
+    ) -> impl Future<Output = Self::Output> + Send + 'static {
+        let renderer = cx.svg_renderer();
+        async move {
+            let (image, dimensions) = source;
+            let svg = renderer.parse_svg(image.bytes()).ok()?;
+            renderer
+                .render_parsed(&svg, SvgSize::ExactSize(dimensions))
+                .ok()
+        }
+    }
+}
+
+impl Picture {
+    fn math_element(&self, scale: f32) -> impl IntoElement + use<> {
+        let image = self.image.clone();
+        canvas(
+            |_, _, _| (),
+            move |bounds, (), window, cx| {
+                let width = f32::from(bounds.size.width * window.scale_factor());
+                let height = f32::from(bounds.size.height * window.scale_factor());
+                let limit = (8192. / width.max(height))
+                    .min((16_000_000. / (width * height)).sqrt())
+                    .min(1.);
+                let dimensions = size(
+                    DevicePixels((width * limit).round().max(1.) as i32),
+                    DevicePixels((height * limit).round().max(1.) as i32),
+                );
+                if let Some(Some(raster)) =
+                    window.use_asset::<FormulaRaster>(&(image, dimensions), cx)
+                {
+                    _ = window.paint_image(bounds, bounds, Default::default(), raster, 0, false);
+                }
+            },
+        )
+        .w(px(self.width * scale))
+        .h(px(self.height * scale))
+    }
 }
 
 type ThemedPictures = [Result<Picture, SharedString>; 2];
@@ -140,10 +191,31 @@ impl MarkdownPlugin for GraphicPlugin {
         )
     }
 
-    fn render(&self, node: &MarkdownNode, _: &mut Window, cx: &mut App) -> impl IntoElement {
+    fn render(&self, node: &MarkdownNode, window: &mut Window, cx: &mut App) -> impl IntoElement {
         let source = node.as_text();
         let theme = cx.theme();
         let inner = match self.graphics.get(self.kind, source, cx) {
+            Some(Ok(picture)) if self.kind == GraphicKind::DisplayMath => {
+                let font_size = window.text_style().font_size.to_pixels(window.rem_size());
+                let scale = f32::from(font_size) / MATH_FONT_SIZE;
+                div()
+                    .flex()
+                    .w_full()
+                    .min_w_0()
+                    .h(px(picture.height * scale + 8.))
+                    .overflow_x_content_scrollbar()
+                    .id((
+                        "document-graphic",
+                        node.source_range().map_or(0, |range| range.start),
+                    ))
+                    .child(
+                        div()
+                            .mx_auto()
+                            .flex_shrink_0()
+                            .child(picture.math_element(scale)),
+                    )
+                    .into_any_element()
+            }
             Some(Ok(picture)) => div()
                 .w_full()
                 .min_w_0()
@@ -215,15 +287,10 @@ impl MarkdownPlugin for GraphicPlugin {
             .get(self.kind, node.as_text(), cx)?
             .as_ref()
             .ok()?;
-        let scale = f32::from(context.font_size()) / 16.;
+        let scale = f32::from(context.font_size()) / MATH_FONT_SIZE;
         Some(
-            InlineElement::new(
-                img(picture.image.clone())
-                    .w(px(picture.width * scale))
-                    .h(px(picture.height * scale))
-                    .object_fit(ObjectFit::Contain),
-            )
-            .with_baseline(px(picture.baseline * scale)),
+            InlineElement::new(picture.math_element(scale))
+                .with_baseline(px(picture.baseline * scale)),
         )
     }
 }
@@ -245,13 +312,12 @@ fn formula(source: &str, dark: bool, inline: bool) -> Result<Picture> {
         &nodes,
         &LayoutOptions::default().with_style(style).with_color(color),
     ));
-    let font_size = if inline { 16. } else { 19. };
     let padding = if inline { 1. } else { 4. };
     let svg = render_to_svg_with_color_syntax(
         &list,
         &SvgOptions {
-            font_size: font_size * 2.,
-            padding: padding * 2.,
+            font_size: f64::from(MATH_FONT_SIZE),
+            padding,
             embed_glyphs: true,
             ..SvgOptions::default()
         },
@@ -260,9 +326,9 @@ fn formula(source: &str, dark: bool, inline: bool) -> Result<Picture> {
     let (width, height) = svg_size(&svg)?;
     Ok(Picture {
         image: Arc::new(Image::from_bytes(ImageFormat::Svg, svg.into_bytes())),
-        width: width / 2.,
-        height: height / 2.,
-        baseline: (list.height * font_size + padding) as f32,
+        width,
+        height,
+        baseline: (list.height * f64::from(MATH_FONT_SIZE) + padding) as f32,
     })
 }
 

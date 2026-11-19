@@ -3,6 +3,128 @@ use std::path::Path;
 use stroll::docs::{Destination, destination};
 
 #[cfg(target_os = "linux")]
+#[gpui::test]
+fn markdown_link_preview_waits_for_pointer_rest_and_stays_in_the_window(
+    cx: &mut gpui::TestAppContext,
+) {
+    use std::time::Duration;
+
+    use gpui::{
+        AppContext as _, Context, Entity, InteractiveElement as _, ParentElement as _, Render,
+        Styled as _, Window, div, point, px, size,
+    };
+    use gpui_component::{
+        text::{TextView, TextViewState},
+        tooltip::Tooltip,
+    };
+
+    const EXTERNAL: &str = "https://example.com/releases/desktop/2026/11/build-report.html?machine=linux-x86_64&status=passed";
+    const RELATIVE: &str = "./next.md#section";
+
+    struct Preview {
+        text: Entity<TextViewState>,
+        covered: bool,
+    }
+    impl Render for Preview {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl gpui::IntoElement {
+            div()
+                .relative()
+                .size_full()
+                .child(
+                    TextView::new(&self.text)
+                        .absolute()
+                        .left(px(136.))
+                        .top(px(152.))
+                        .w(px(180.))
+                        .text_size(px(16.))
+                        .link_tooltip(|url, window, cx| {
+                            let url = url.clone();
+                            Tooltip::element(move |_, _| {
+                                div()
+                                    .debug_selector(|| match url.as_ref() {
+                                        EXTERNAL => "external-link-preview".into(),
+                                        RELATIVE => "relative-link-preview".into(),
+                                        _ => panic!("unexpected preview URL: {url}"),
+                                    })
+                                    .child(url.clone())
+                            })
+                            .build(window, cx)
+                        }),
+                )
+                .children(self.covered.then(|| div().absolute().inset_0().occlude()))
+        }
+    }
+
+    cx.update(|cx| {
+        gpui_component::init(cx);
+        cx.set_reduce_motion(true);
+    });
+    let (root, visual) = cx.add_window_view(|_, cx| Preview {
+        text: cx.new(|cx| {
+            TextViewState::markdown(&format!("[First]({EXTERNAL}) and [Second]({RELATIVE})"), cx)
+        }),
+        covered: false,
+    });
+    visual.simulate_resize(size(px(320.), px(190.)));
+    let draw = |visual: &mut gpui::VisualTestContext, millis| {
+        visual.run_until_parked();
+        visual
+            .executor()
+            .advance_clock(Duration::from_millis(millis));
+        for _ in 0..2 {
+            visual.run_until_parked();
+            visual.update(|window, cx| window.draw(cx).clear(cx));
+        }
+    };
+    draw(visual, 0);
+
+    let first = point(px(141.), px(161.));
+    let second = point(px(245.), first.y);
+    visual.simulate_mouse_move(first, None, Default::default());
+    draw(visual, 250);
+    assert!(visual.debug_bounds("external-link-preview").is_none());
+    visual.simulate_mouse_move(first + point(px(4.), px(0.)), None, Default::default());
+    draw(visual, 299);
+    assert!(visual.debug_bounds("external-link-preview").is_none());
+    draw(visual, 1);
+    let popup = visual
+        .debug_bounds("external-link-preview")
+        .expect("the current link's address appears after 300 ms");
+    assert!(popup.size.width >= px(160.), "{popup:?}");
+    assert!(
+        popup.left() >= px(0.)
+            && popup.top() >= px(0.)
+            && popup.right() <= px(320.)
+            && popup.bottom() <= px(190.),
+        "{popup:?}"
+    );
+
+    visual.simulate_mouse_move(second, None, Default::default());
+    draw(visual, 299);
+    assert!(visual.debug_bounds("external-link-preview").is_none());
+    assert!(visual.debug_bounds("relative-link-preview").is_none());
+    draw(visual, 1);
+    let popup = visual.debug_bounds("relative-link-preview").unwrap();
+    assert!(popup.right() <= px(320.), "{popup:?}");
+
+    for covered in [true, false] {
+        root.update(visual, |root, cx| {
+            root.covered = covered;
+            cx.notify();
+        });
+        draw(visual, 0);
+        assert!(visual.debug_bounds("relative-link-preview").is_none());
+    }
+
+    visual.simulate_mouse_move(second + point(px(2.), px(0.)), None, Default::default());
+    draw(visual, 300);
+    assert!(visual.debug_bounds("relative-link-preview").is_some());
+    visual.simulate_mouse_move(point(px(20.), px(20.)), None, Default::default());
+    draw(visual, 0);
+    assert!(visual.debug_bounds("relative-link-preview").is_none());
+}
+
+#[cfg(target_os = "linux")]
 #[test]
 fn clipped_image_does_not_enter_the_atlas_until_visible() -> anyhow::Result<()> {
     use std::sync::Arc;

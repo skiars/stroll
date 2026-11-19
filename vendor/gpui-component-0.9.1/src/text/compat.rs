@@ -208,8 +208,7 @@ impl TextView {
         self.inner = self.inner.on_image_click(f);
         self
     }
-    /// Shows an application-supplied tooltip beside the pointer over a link.
-    /// The tooltip is cached until a different destination is shown.
+    /// Shows an application-supplied tooltip after the pointer rests over a link for 300 ms.
     pub fn link_tooltip<F>(mut self, builder: F) -> Self
     where
         F: Fn(&SharedString, &mut Window, &mut App) -> AnyView + Send + Sync + 'static,

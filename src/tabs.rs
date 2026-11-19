@@ -25,6 +25,11 @@ impl TabSession {
         self.active.as_deref()
     }
 
+    #[cfg(feature = "desktop")]
+    pub(crate) fn deselect(&mut self) -> Option<PathBuf> {
+        self.active.take()
+    }
+
     pub fn is_preview(&self, path: &Path) -> bool {
         self.preview.as_deref() == Some(path)
     }

@@ -77,7 +77,7 @@ use crate::{
     lsp::{self, EditorLsp},
     paths,
     repository::{Document, Entry, Location, Repository, Store, WindowGeometry, WindowSlot},
-    session::{FilePosition, WorktreeSession},
+    session::{FilePosition, SourceLocation, WorktreeSession},
     tabs::TabSession,
 };
 
@@ -536,12 +536,18 @@ enum FileOpen {
         position: Option<SourcePosition>,
     },
     Locate(Option<(std::ops::Range<usize>, [u8; 32])>),
+    DocumentLink {
+        from: crate::session::SourceLocation,
+        line: Option<u32>,
+    },
     History {
         index: usize,
         position: Option<FilePosition>,
     },
     Startup,
-    Restore,
+    Restore {
+        from: Option<SourceLocation>,
+    },
 }
 
 enum SourcePosition {
@@ -572,7 +578,16 @@ fn reveal_editor_range(
     editor.scroll_to_caret_with_context(EDITOR_JUMP_CONTEXT_LINES, leading_block, cx);
 }
 
+enum DocumentNavigation {
+    Record(Option<crate::session::SourceLocation>),
+    Replay {
+        index: usize,
+        location: crate::session::DocumentLocation,
+    },
+}
+
 struct DocumentOpen {
+    navigation: Option<DocumentNavigation>,
     path: PathBuf,
     fragment: Option<String>,
     position: Option<(std::ops::Range<usize>, [u8; 32])>,
@@ -1869,7 +1884,7 @@ impl Workspace {
                 self.preview_audio(entry.path, window, cx);
             }
         } else if self.view == WorkspaceView::Docs {
-            self.open_doc(entry.path, None, window, cx);
+            self.navigate_document(entry.path, None, window, cx);
         } else {
             self.open_file(entry.path, preview_click(event), window, cx);
         }
@@ -1877,6 +1892,43 @@ impl Workspace {
 
     fn switch_view(&mut self, view: WorkspaceView, window: &mut Window, cx: &mut Context<Self>) {
         self.switch_view_to(view, None, window, cx);
+    }
+
+    fn switch_view_from_topbar(
+        &mut self,
+        view: WorkspaceView,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let previous = self.view;
+        let from =
+            (previous != view && previous != WorkspaceView::Git && self.repository.is_some())
+                .then(|| self.topbar_location(cx));
+        self.switch_view(view, window, cx);
+        let Some(from) = from.filter(|_| self.view == view) else {
+            return;
+        };
+        if view == WorkspaceView::Docs {
+            if let Some(pending) = &mut self.doc_loading {
+                pending.navigation = Some(DocumentNavigation::Record(Some(from)));
+                return;
+            }
+            if let Some(reader) = &self.doc
+                && let Some(position) = self.session.documents.get(&reader.read(cx).path).copied()
+            {
+                reader.update(cx, |reader, cx| {
+                    reader.restore_position(Some(position));
+                    cx.notify();
+                });
+            }
+            if self.doc.is_none() && self.doc_error.is_some() {
+                return;
+            }
+        } else if let Some((_, FileOpen::Restore { from: pending })) = &mut self.loading_file {
+            *pending = Some(from);
+            return;
+        }
+        self.record_navigation(Some(from), self.topbar_location(cx));
     }
 
     fn switch_view_to(
@@ -1902,6 +1954,7 @@ impl Workspace {
         }
         self.queue_drafts(window, cx);
         self.capture_session(cx);
+        self.cancel_document_navigation();
         self.cancel_file_open();
         self.tree_scroll = UniformListScrollHandle::new();
         if view != WorkspaceView::Docs
@@ -2000,10 +2053,83 @@ impl Workspace {
         if !docs::is_markdown(&path) {
             return;
         }
-        if self.view == WorkspaceView::Docs {
-            self.open_doc(path, None, window, cx);
-        } else {
-            self.switch_view_to(WorkspaceView::Docs, Some((path, None)), window, cx);
+        self.navigate_document(path, None, window, cx);
+    }
+
+    pub(crate) fn navigate_document(
+        &mut self,
+        path: PathBuf,
+        fragment: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let source = match self.view {
+            WorkspaceView::Docs => self.document_history_location(cx),
+            WorkspaceView::Editor => self.source_location(cx),
+            WorkspaceView::Git => None,
+        };
+        self.open_doc_request(
+            path,
+            fragment,
+            None,
+            None,
+            Some(DocumentNavigation::Record(source)),
+            window,
+            cx,
+        );
+    }
+
+    fn open_history_document(
+        &mut self,
+        path: PathBuf,
+        index: usize,
+        location: crate::session::DocumentLocation,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.cancel_file_open();
+        self.open_doc_request(
+            path,
+            None,
+            None,
+            None,
+            Some(DocumentNavigation::Replay { index, location }),
+            window,
+            cx,
+        );
+    }
+
+    fn cancel_document_navigation(&mut self) {
+        if self
+            .doc_loading
+            .as_ref()
+            .is_some_and(|open| open.navigation.is_some())
+        {
+            self.doc_loading = None;
+            self.doc_task = Task::ready(());
+        }
+    }
+
+    fn finish_document_navigation(
+        &mut self,
+        navigation: DocumentNavigation,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.switch_view(WorkspaceView::Docs, window, cx);
+        if self.view != WorkspaceView::Docs {
+            return;
+        }
+        match navigation {
+            DocumentNavigation::Record(source) => self.record_document_navigation(source, cx),
+            DocumentNavigation::Replay { index, location } => {
+                if let Some(reader) = &self.doc {
+                    reader.update(cx, |reader, cx| {
+                        reader.restore_history_location(location, cx)
+                    });
+                }
+                self.complete_navigation_replay(index);
+            }
         }
     }
 
@@ -2016,7 +2142,21 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.open_doc_request(path, fragment, position, prepared, None, window, cx);
+    }
+
+    fn open_doc_request(
+        &mut self,
+        path: PathBuf,
+        fragment: Option<String>,
+        position: Option<(std::ops::Range<usize>, [u8; 32])>,
+        prepared: Option<Task<Result<docs::PreparedDocument>>>,
+        navigation: Option<DocumentNavigation>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.repository_ui.opening.is_some()
+            || (navigation.is_some() && (self.repository_overlay_open() || self.confirming_close))
             || (self.repository.is_none() && !(self.standalone.is_some() && path.is_absolute()))
         {
             return;
@@ -2025,15 +2165,20 @@ impl Workspace {
             if let Some(pending) = &mut self.doc_loading
                 && pending.path == path
             {
-                if fragment.is_some() || position.is_some() {
+                if navigation.is_some() || fragment.is_some() || position.is_some() {
                     pending.fragment = fragment;
                     pending.position = position;
+                    pending.navigation = navigation;
                 }
                 return;
             }
-            if let Some(doc) = &self.doc
+            if let Some(doc) = self.doc.clone()
                 && doc.read(cx).path == path
             {
+                if navigation.is_some() && self.doc_loading.is_some() {
+                    self.doc_loading = None;
+                    self.doc_task = Task::ready(());
+                }
                 let previous_error = self.doc_error.take();
                 if let Some(fragment) = &fragment {
                     if !doc.update(cx, |doc, cx| doc.jump_to_fragment(fragment, cx)) {
@@ -2043,6 +2188,11 @@ impl Workspace {
                 }
                 if let Some((range, fingerprint)) = position {
                     doc.update(cx, |doc, cx| doc.locate_source(range, fingerprint, cx));
+                }
+                if self.doc_error.is_none()
+                    && let Some(navigation) = navigation
+                {
+                    self.finish_document_navigation(navigation, window, cx);
                 }
                 if self.doc_error != previous_error {
                     cx.notify();
@@ -2056,9 +2206,11 @@ impl Workspace {
         let store = self.store.clone();
         self.capture_document_position(cx);
         let saved_position = self.session.documents.get(&path).copied();
-        self.session.select_document(&path);
-        self.session_revision += 1;
-        self.doc = None;
+        if navigation.is_none() {
+            self.session.select_document(&path);
+            self.session_revision += 1;
+            self.doc = None;
+        }
         self.doc_error = None;
         let root = repo.as_ref().map_or_else(
             || path.parent().unwrap_or(Path::new("")).to_owned(),
@@ -2071,6 +2223,7 @@ impl Workspace {
             })
         });
         self.doc_loading = Some(DocumentOpen {
+            navigation,
             path,
             fragment,
             position,
@@ -2079,6 +2232,7 @@ impl Workspace {
             let result = load.await;
             _ = this.update_in(cx, move |this, window, cx| {
                 let Some(DocumentOpen {
+                    navigation,
                     path,
                     fragment,
                     position,
@@ -2088,6 +2242,19 @@ impl Workspace {
                 };
                 match result {
                     Ok(document) => {
+                        if navigation.is_some() {
+                            if let Some(fragment) = &fragment
+                                && !document.has_fragment(fragment)
+                            {
+                                this.doc_error = Some(
+                                    t!("docs.fragment_missing", fragment = fragment).into_owned(),
+                                );
+                                cx.notify();
+                                return;
+                            }
+                            this.session.select_document(&path);
+                            this.session_revision += 1;
+                        }
                         if let Some(entry) = this
                             .session
                             .open_documents
@@ -2130,10 +2297,25 @@ impl Workspace {
                         });
                         cx.observe(&reader, |_, _, cx| cx.notify()).detach();
                         this.doc = Some(reader);
+                        if let Some(navigation) = navigation {
+                            this.finish_document_navigation(navigation, window, cx);
+                        }
                         this.rebuild_tree();
                     }
                     Err(error) => {
-                        this.doc_error = Some(format!("{error:#}"));
+                        if let Some(DocumentNavigation::Replay { index, .. }) = navigation
+                            && error.chain().any(|cause| {
+                                cause.downcast_ref::<std::io::Error>().is_some_and(|error| {
+                                    error.kind() == std::io::ErrorKind::NotFound
+                                })
+                            })
+                        {
+                            this.skip_missing_source(&path, index, window, cx);
+                        } else if this.view == WorkspaceView::Docs {
+                            this.doc_error = Some(format!("{error:#}"));
+                        } else {
+                            this.show_error(error, window, cx);
+                        }
                     }
                 }
                 cx.notify();
@@ -2174,23 +2356,11 @@ impl Workspace {
                 self.open_local_window(path, fragment, window, cx);
             }
             Some(Destination::Local { path, fragment }) if docs::is_markdown(&path) => {
-                self.open_doc(path, fragment, window, cx);
+                self.navigate_document(path, fragment, window, cx);
             }
             Some(Destination::Local { path, fragment }) => {
-                self.open_document_source(path.clone(), window, cx);
                 let line = fragment.as_deref().and_then(docs::line_fragment);
-                if self.view == WorkspaceView::Editor
-                    && let Some(file) = self.active_file().filter(|file| file.path == path)
-                    && let Some(line) = line
-                {
-                    file.editor.update(cx, |editor, cx| {
-                        editor.set_cursor_position(
-                            gpui_component::input::Position::new(line, 0),
-                            window,
-                            cx,
-                        );
-                    });
-                }
+                self.open_document_source_line(path, line, window, cx);
             }
             None => {
                 self.doc_error = Some(t!("workspace.link_failed").into());
@@ -2205,7 +2375,26 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.open_document_source_at(path, None, window, cx);
+        self.open_document_source_line(path, None, window, cx);
+    }
+
+    fn open_document_source_line(
+        &mut self,
+        path: PathBuf,
+        line: Option<u32>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.view == WorkspaceView::Docs
+            && let Some(from) = self.document_history_location(cx)
+        {
+            self.switch_view(WorkspaceView::Editor, window, cx);
+            if self.view == WorkspaceView::Editor {
+                self.request_file(path, FileOpen::DocumentLink { from, line }, window, cx);
+            }
+        } else {
+            self.open_document_source_at(path, None, window, cx);
+        }
     }
 
     fn open_document_source_at(
@@ -2266,7 +2455,12 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if !matches!(request, FileOpen::Startup | FileOpen::Restore) && self.terminal_maximized() {
+        if !matches!(request, FileOpen::Startup | FileOpen::Restore { .. }) {
+            self.cancel_document_navigation();
+        }
+        if !matches!(request, FileOpen::Startup | FileOpen::Restore { .. })
+            && self.terminal_maximized()
+        {
             self.restore_terminal_split();
             cx.notify();
         }
@@ -2284,16 +2478,17 @@ impl Workspace {
                     position: None,
                 }
                 | FileOpen::Startup
-                | FileOpen::Restore => {}
+                | FileOpen::Restore { from: None } => {}
                 FileOpen::Select {
                     preview: false,
                     position: None,
                 } => match pending {
                     FileOpen::Select { preview, .. } => *preview = false,
                     FileOpen::Locate(_) => {}
-                    FileOpen::History { .. } | FileOpen::Startup | FileOpen::Restore => {
-                        *pending = request
-                    }
+                    FileOpen::DocumentLink { .. }
+                    | FileOpen::History { .. }
+                    | FileOpen::Startup
+                    | FileOpen::Restore { .. } => *pending = request,
                 },
                 _ => *pending = request,
             }
@@ -2363,7 +2558,7 @@ impl Workspace {
                             return;
                         }
                         match request {
-                            FileOpen::Restore => {
+                            FileOpen::Restore { from } => {
                                 if this
                                     .repository
                                     .as_ref()
@@ -2371,13 +2566,17 @@ impl Workspace {
                                     .is_none_or(|ssh| ssh.failure().is_none())
                                 {
                                     this.tabs.close(&path);
-                                    this.restore_active_file(window, cx);
+                                    this.restore_active_file_from_view(from, window, cx);
                                 }
                             }
                             FileOpen::Startup => this.restore_active_file(window, cx),
                             FileOpen::Select { .. }
                             | FileOpen::Locate(_)
                             | FileOpen::History { .. } => {}
+                            FileOpen::DocumentLink { .. } => {
+                                this.switch_view(WorkspaceView::Docs, window, cx);
+                                this.doc_error = Some(format!("{error:#}"));
+                            }
                         }
                         this.show_error(error, window, cx);
                         cx.notify();
@@ -2396,14 +2595,27 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         let navigate = self.view == WorkspaceView::Editor
-            && !matches!(request, FileOpen::Startup | FileOpen::Restore);
-        let source = navigate.then(|| self.source_location(cx)).flatten();
+            && !matches!(
+                request,
+                FileOpen::Startup | FileOpen::Restore { from: None }
+            );
+        let source = match &request {
+            FileOpen::DocumentLink { from, .. } => Some(from.clone()),
+            FileOpen::Restore { from } => from.clone(),
+            _ => navigate.then(|| self.source_location(cx)).flatten(),
+        };
         let same_file = self.tabs.active() == Some(path.as_path());
         let (preview, position, location, replay) = match request {
             FileOpen::Select { preview, position } => (preview, position, None, None),
+            FileOpen::DocumentLink { line, .. } => (
+                true,
+                line.map(|line| SourcePosition::Lsp(lsp_types::Position::new(line, 0))),
+                None,
+                None,
+            ),
             FileOpen::Locate(location) => (false, None, location, None),
             FileOpen::History { index, position } => (true, None, None, Some((index, position))),
-            FileOpen::Startup | FileOpen::Restore => (true, None, None, None),
+            FileOpen::Startup | FileOpen::Restore { .. } => (true, None, None, None),
         };
         self.select_file_tab(&path, preview, window, cx);
         if let Some(position) = position
@@ -2779,11 +2991,23 @@ impl Workspace {
     }
 
     fn restore_active_file(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.restore_active_file_from_view(None, window, cx);
+    }
+
+    fn restore_active_file_from_view(
+        &mut self,
+        from: Option<SourceLocation>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         // Only the selected buffer is needed at startup, even for large tab sets.
         if let Some(path) = self.tabs.active().map(Path::to_owned) {
-            self.request_file(path, FileOpen::Restore, window, cx);
+            self.request_file(path, FileOpen::Restore { from }, window, cx);
         } else {
             self.finish_tab_selection(None, window, cx);
+            if let Some(from) = from {
+                self.record_navigation(Some(from), SourceLocation::empty(WorkspaceView::Editor));
+            }
         }
     }
 
@@ -3624,7 +3848,7 @@ impl Workspace {
                 )
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 .on_click(cx.listener(|this, _, window, cx| {
-                    this.switch_view(WorkspaceView::Docs, window, cx)
+                    this.switch_view_from_topbar(WorkspaceView::Docs, window, cx)
                 })),
             )
             .child(
@@ -3639,7 +3863,7 @@ impl Workspace {
                 )
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 .on_click(cx.listener(|this, _, window, cx| {
-                    this.switch_view(WorkspaceView::Editor, window, cx)
+                    this.switch_view_from_topbar(WorkspaceView::Editor, window, cx)
                 })),
             )
             .child(
@@ -4192,19 +4416,26 @@ impl Workspace {
                 .children(if maximized { None } else { terminal.take() });
         } else {
             main = main
-                .when(self.standalone.is_none(), |main| {
-                    main.child(
-                        h_flex()
-                            .justify_end()
-                            .h(FILE_TOOLBAR_HEIGHT)
-                            .w_full()
-                            .bg(colors.bg)
-                            .px_2()
-                            .children(self.show_file_tree_button(cx))
-                            .child(div().flex_1())
-                            .child(self.workspace_actions(cx)),
-                    )
-                })
+                .when(
+                    self.standalone.is_none() && !self.tabs.paths().is_empty(),
+                    |main| main.child(self.tab_bar(cx, colors)),
+                )
+                .when(
+                    self.standalone.is_none() && self.tabs.paths().is_empty(),
+                    |main| {
+                        main.child(
+                            h_flex()
+                                .justify_end()
+                                .h(FILE_TOOLBAR_HEIGHT)
+                                .w_full()
+                                .bg(colors.bg)
+                                .px_2()
+                                .children(self.show_file_tree_button(cx))
+                                .child(div().flex_1())
+                                .child(self.workspace_actions(cx)),
+                        )
+                    },
+                )
                 .child(
                     v_flex()
                         .flex_1()
@@ -4672,9 +4903,15 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::save))
             .on_action(cx.listener(Self::toggle_wrap))
             .on_action(cx.listener(Self::toggle_terminal_shortcut))
-            .when(self.view != WorkspaceView::Editor && !switching, |view| {
+            .when(self.view == WorkspaceView::Git && !switching, |view| {
                 view.key_context("Reader")
             })
+            .when(self.view == WorkspaceView::Docs && !switching, |view| {
+                view.key_context("Reader WorkspaceDocs")
+            })
+            .on_action(cx.listener(Self::source_back))
+            .on_action(cx.listener(Self::source_forward))
+            .capture_any_mouse_down(cx.listener(Self::source_mouse_down))
             .when(self.view == WorkspaceView::Editor && !switching, |view| {
                 view.key_context("WorkspaceEditor")
                     .on_action(cx.listener(|this, _: &FindNextMatch, window, cx| {
@@ -4684,9 +4921,6 @@ impl Render for Workspace {
                         this.navigate_find_match(true, window, cx);
                     }))
                     .on_action(cx.listener(Self::find_references))
-                    .on_action(cx.listener(Self::source_back))
-                    .on_action(cx.listener(Self::source_forward))
-                    .capture_any_mouse_down(cx.listener(Self::source_mouse_down))
                     .on_action(cx.listener(Self::format_document))
                     .on_action(cx.listener(Self::close_active_tab))
                     .on_action(cx.listener(|this, _: &NextTab, window, cx| {
@@ -4831,6 +5065,7 @@ fn nav_item(
     };
 
     quiet_button(id)
+        .debug_selector(move || id.into())
         .with_size(px(20.))
         .rounded(px(6.))
         .h(px(24.))

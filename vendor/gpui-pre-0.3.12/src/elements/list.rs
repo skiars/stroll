@@ -63,6 +63,9 @@ struct StateInner {
     smooth_scroll: Option<SmoothScroll>,
     last_layout_bounds: Option<Bounds<Pixels>>,
     last_padding: Option<Edges<Pixels>>,
+    scroll_past_end: bool,
+    preserve_end_position: bool,
+    scroll_end_padding: Pixels,
     width_independent_heights: bool,
     pixel_aligned_scroll: bool,
     painted_scroll_offset: Pixels,
@@ -324,6 +327,9 @@ impl ListState {
             smooth_scroll: None,
             last_layout_bounds: None,
             last_padding: None,
+            scroll_past_end: false,
+            preserve_end_position: false,
+            scroll_end_padding: Pixels::ZERO,
             width_independent_heights: false,
             pixel_aligned_scroll: false,
             painted_scroll_offset: Pixels::ZERO,
@@ -513,7 +519,8 @@ impl ListState {
             return None;
         }
         let padding = state.last_padding.unwrap_or_default();
-        let content_height = summary.height + padding.top + padding.bottom;
+        let content_height =
+            summary.height + padding.top + padding.bottom + state.scroll_end_padding;
         let scroll_max = (content_height - bounds.size.height).max(px(0.));
         if scroll_max <= px(0.) {
             return None;
@@ -713,6 +720,17 @@ impl ListState {
             self.0.borrow().follow_state,
             FollowState::Tail { is_following: true }
         )
+    }
+
+    /// Allow the end of the content to scroll to the viewport's midpoint.
+    pub fn set_scroll_past_end(&self, enabled: bool) {
+        self.0.borrow_mut().scroll_past_end = enabled;
+    }
+
+    /// Restore an explicit position, extending existing end padding if needed.
+    pub fn scroll_to_preserving_position(&self, offset: ListOffset) {
+        self.scroll_to(offset);
+        self.0.borrow_mut().preserve_end_position = true;
     }
 
     /// Scroll the list to the given offset
@@ -921,7 +939,8 @@ impl StateInner {
             .scrollbar_drag_start_height
             .unwrap_or_else(|| self.items.summary().height);
         let padding = self.last_padding.unwrap_or_default();
-        (height + padding.top + padding.bottom - bounds.size.height).max(px(0.))
+        (height + padding.top + padding.bottom + self.scroll_end_padding - bounds.size.height)
+            .max(px(0.))
     }
 
     fn visible_range(
@@ -953,7 +972,9 @@ impl StateInner {
 
         let padding = self.last_padding.unwrap_or_default();
         let scroll_max =
-            (self.items.summary().height + padding.top + padding.bottom - height).max(px(0.));
+            (self.items.summary().height + padding.top + padding.bottom + self.scroll_end_padding
+                - height)
+                .max(px(0.));
         let new_scroll_top = (self.scroll_top(scroll_top) - delta.y)
             .max(px(0.))
             .min(scroll_max);
@@ -1363,10 +1384,25 @@ impl StateInner {
                 _ => {}
             }
 
+            self.scroll_end_padding = Pixels::ZERO;
+            if self.scroll_past_end && self.items.summary().count > 0 {
+                self.scroll_end_padding = bounds.size.height * 0.5;
+                if self.preserve_end_position {
+                    let scroll_top = self.scroll_top(&self.logical_scroll_top());
+                    let content_height = self.items.summary().height + padding.top + padding.bottom;
+                    let required_tail = bounds.size.height + scroll_top - content_height;
+                    self.scroll_end_padding = self.scroll_end_padding.max(required_tail);
+                    self.preserve_end_position = required_tail > bounds.size.height * 0.5;
+                }
+            }
+            let layout_padding = Edges {
+                bottom: padding.bottom + self.scroll_end_padding,
+                ..padding
+            };
             let mut layout_response = self.layout_items(
                 Some(item_width),
                 bounds.size.height,
-                &padding,
+                &layout_padding,
                 render_item,
                 window,
                 cx,
@@ -1391,12 +1427,20 @@ impl StateInner {
                         item.element.prepaint_at(item_origin, window, cx);
                     });
 
-                    if let Some(autoscroll_bounds) = window.take_autoscroll()
+                    if let Some((autoscroll_bounds, top_inset)) = window.take_aligned_autoscroll()
                         && autoscroll
                     {
-                        if autoscroll_bounds.top() < bounds.top() {
+                        if top_inset.is_some() || autoscroll_bounds.top() < bounds.top() {
                             let mut item_ix = item.index;
-                            let mut offset_in_item = autoscroll_bounds.top() - item_origin.y;
+                            let mut offset_in_item = autoscroll_bounds.top()
+                                - item_origin.y
+                                - top_inset.unwrap_or_default()
+                                + if top_inset.is_some() {
+                                    padding.top
+                                } else {
+                                    Pixels::ZERO
+                                };
+                            self.preserve_end_position |= top_inset.is_some();
 
                             // The requested top can sit above this item's own
                             // top. Walk into earlier items so the offset stays
@@ -1483,7 +1527,9 @@ impl StateInner {
         let content_height = self
             .scrollbar_drag_start_height
             .unwrap_or_else(|| self.items.summary().height);
-        let scroll_max = (content_height + padding.top + padding.bottom - height).max(px(0.));
+        let scroll_max = (content_height + padding.top + padding.bottom + self.scroll_end_padding
+            - height)
+            .max(px(0.));
         let new_scroll_top = (-point.y).max(px(0.)).min(scroll_max);
 
         // If content grew during the drag, the frozen bottom is below the

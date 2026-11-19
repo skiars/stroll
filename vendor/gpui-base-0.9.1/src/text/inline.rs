@@ -18,7 +18,7 @@ use std::{
 };
 
 use gpui::{
-    AnyTooltip, App, BorderStyle, Bounds, ClickEvent, CursorStyle, Edges, Element, ElementId,
+    App, BorderStyle, Bounds, ClickEvent, CursorStyle, Edges, Element, ElementId,
     ForegroundExecutor, Global, GlobalElementId, Half, HighlightStyle, Hitbox, HitboxBehavior,
     Hsla, InspectorElementId, IntoElement, LayoutId, MouseButton, MouseClickEvent, MouseDownEvent,
     MouseMoveEvent, MouseUpEvent, Pixels, Point, SharedString, StyleRefinement, StyledText, Task,
@@ -33,8 +33,12 @@ use crate::{
     text::node::LinkMark,
     text::range_highlight::RevealAt,
     text::selection::word_range_at,
-    text::state::LineSpan,
+    text::stream_fade::TextLeafKey,
     text::text_view::{LinkClickHandlerFn, handle_link_click},
+    text::{
+        TextViewState,
+        state::{LineSpan, LinkTooltipTarget},
+    },
     text_selection::text_rows_extent,
 };
 
@@ -376,8 +380,8 @@ pub(super) struct Inline {
     range_backgrounds: Vec<(Range<usize>, Hsla)>,
     /// The start of a pending reveal, when it is in this text.
     reveal: Option<RevealAt>,
+    reading_leaf: Option<(TextLeafKey, usize)>,
     link_click_handler: Option<Arc<LinkClickHandlerFn>>,
-    link_tooltip: bool,
     /// What this frame's layout was shaped with, to hand the shaped text to
     /// the next frame (see [`RetainedLayout`]).
     retained_key: Option<(Vec<TextRun>, TextStyle)>,
@@ -764,8 +768,8 @@ impl Inline {
             selection_source: None,
             range_backgrounds: Vec::new(),
             reveal: None,
+            reading_leaf: None,
             link_click_handler,
-            link_tooltip: false,
             retained_key: None,
             handed_over: false,
             editor_piece: None,
@@ -819,6 +823,60 @@ impl Inline {
         self
     }
 
+    /// The leaf and byte offset from which this text was laid out.
+    pub(super) fn reading_leaf(mut self, leaf: Option<TextLeafKey>, offset: usize) -> Self {
+        self.reading_leaf = leaf.map(|leaf| (leaf, offset));
+        self
+    }
+
+    fn report_viewport_line(
+        &self,
+        layout: &TextLayout,
+        clip: Bounds<Pixels>,
+        view: &TextViewState,
+    ) {
+        let Some((leaf, mut offset)) = self.reading_leaf else {
+            return;
+        };
+        if view.viewport_line.is_none()
+            || !clip.intersects(&layout.bounds())
+            || self.text.is_empty()
+        {
+            return;
+        }
+        if let Some(row) = self.selection_bounds {
+            if clip.intersects(&row) {
+                view.report_viewport_line(leaf, offset, row.top());
+            }
+            return;
+        }
+
+        let height = layout.line_height();
+        if height <= Pixels::ZERO {
+            return;
+        }
+        let mut top = layout.bounds().top();
+        for line in layout.line_layouts() {
+            let bottom = top + line.size(height).height;
+            if bottom > clip.top() && line.len() > 0 {
+                let y = (clip.top() - top).max(Pixels::ZERO);
+                let row = (y / height).floor() * height;
+                if top + row < clip.bottom() {
+                    let start =
+                        line.index_for_position(point(px(-1.), row + height.half()), height);
+                    view.report_viewport_line(
+                        leaf,
+                        offset + start.unwrap_or_else(|start| start),
+                        top + row,
+                    );
+                }
+                return;
+            }
+            top = bottom;
+            offset += line.len() + 1;
+        }
+    }
+
     /// Ask the enclosing list to scroll the line of the pending reveal into
     /// view, and report where it is and whether it is inside the visible
     /// area.
@@ -858,99 +916,35 @@ impl Inline {
                 bounds.top() + line_height * (row + 1) as f32,
             ),
         );
-        window.request_autoscroll(line);
-        // A list scrolls the line to its edge, which layout may miss by a
-        // fraction of a pixel.
+        // Align an inline flow by its shared row rather than an individual fragment.
         let visible = window.content_mask().bounds.dilate(px(0.5));
-        reveal.report(
-            line,
-            line.top() >= visible.top() && line.bottom() <= visible.bottom(),
-        );
+        if let Some(inset) = reveal.top_inset {
+            let line = self.selection_bounds.unwrap_or(line);
+            let inset = inset.clamp(
+                px(1.) - line.size.height.max(px(1.)),
+                (visible.size.height - line.size.height).max(Pixels::ZERO),
+            );
+            window.request_autoscroll_to_top(line, inset);
+            reveal.report(
+                line,
+                line.top() < visible.bottom() && line.bottom() > visible.top(),
+            );
+        } else {
+            window.request_autoscroll(line);
+            reveal.report(
+                line,
+                line.top() >= visible.top() && line.bottom() <= visible.bottom(),
+            );
+        }
     }
 
-    /// Get link at given mouse position.
-    fn link_for_position(
+    fn link_at<'a>(
         layout: &TextLayout,
-        links: &Vec<(Range<usize>, LinkMark)>,
+        links: &'a [(Range<usize>, LinkMark)],
         position: Point<Pixels>,
-    ) -> Option<LinkMark> {
+    ) -> Option<&'a (Range<usize>, LinkMark)> {
         let offset = layout.index_for_position(position).ok()?;
-        for (range, link) in links.iter() {
-            if range.contains(&offset) {
-                return Some(link.clone());
-            }
-        }
-
-        None
-    }
-
-    fn prepaint_link_tooltip(&mut self, hitbox: &Hitbox, window: &mut Window, cx: &mut App) {
-        let Some(view) = GlobalState::global(cx).text_view_state() else {
-            return;
-        };
-        let Some(builder) = view.read(cx).link_tooltip.clone() else {
-            return;
-        };
-        self.link_tooltip = !self.links.is_empty();
-        // Hit testing is unavailable during prepaint, as with native GPUI tooltips.
-        let position = window.mouse_position();
-        if !self.link_tooltip
-            || window.last_input_was_keyboard()
-            || !hitbox.bounds.contains(&position)
-            || !hitbox.content_mask.bounds.contains(&position)
-        {
-            return;
-        }
-        let Some(link) = Self::link_for_position(self.styled_text.layout(), &self.links, position)
-        else {
-            return;
-        };
-        let target = (state_key(&self.state), link.url.clone());
-        if view.read(cx).link_tooltip_target.as_ref() != Some(&target) {
-            return;
-        }
-        let cached = view
-            .read(cx)
-            .hovered_link_tooltip
-            .as_ref()
-            .filter(|(url, _)| *url == link.url)
-            .map(|(_, tooltip)| tooltip.clone());
-        let tooltip = match cached {
-            Some(tooltip) => tooltip,
-            None => {
-                let tooltip = builder(&link.url, window, cx);
-                view.update(cx, |state, _| {
-                    state.hovered_link_tooltip = Some((link.url.clone(), tooltip.clone()));
-                });
-                tooltip
-            }
-        };
-        let bounds = hitbox.bounds.intersect(&hitbox.content_mask.bounds);
-        let layout = self.styled_text.layout().clone();
-        let links = self.links.clone();
-        window.set_tooltip(AnyTooltip {
-            view: tooltip,
-            mouse_position: position,
-            check_visible_and_update: Rc::new(move |_, window, _| {
-                let position = window.mouse_position();
-                !window.last_input_was_keyboard()
-                    && bounds.contains(&position)
-                    && Self::link_for_position(&layout, &links, position).is_some()
-            }),
-        });
-    }
-
-    /// Get the range of the link at given mouse position.
-    fn link_range_for_position(
-        layout: &TextLayout,
-        links: &[(Range<usize>, LinkMark)],
-        position: Point<Pixels>,
-    ) -> Option<Range<usize>> {
-        let offset = layout.index_for_position(position).ok()?;
-        links
-            .iter()
-            .find(|(range, _)| range.contains(&offset))
-            .map(|(range, _)| range.clone())
+        links.iter().find(|(range, _)| range.contains(&offset))
     }
 
     /// Paint selected bounds for debug.
@@ -1230,7 +1224,6 @@ impl Element for Inline {
         self.request_reveal(window);
 
         let hitbox = window.insert_hitbox(bounds, HitboxBehavior::Normal);
-        self.prepaint_link_tooltip(&hitbox, window, cx);
         self.retain_styled_text(cx);
         hitbox
     }
@@ -1266,6 +1259,12 @@ impl Element for Inline {
         let (is_selectable, is_selection, selection) =
             self.layout_selections(&text_layout, &bounds, cx);
 
+        if self.reading_leaf.is_some()
+            && let Some(view) = GlobalState::global(cx).text_view_state()
+        {
+            self.report_viewport_line(&text_layout, window.content_mask().bounds, view.read(cx));
+        }
+
         let Ok(mut state) = self.state.lock() else {
             _ = text_layout.paint_foreground(window, cx);
             return;
@@ -1294,39 +1293,26 @@ impl Element for Inline {
         // whenever the pointer moved anywhere.
         let hovered_link = hitbox
             .is_hovered(window)
-            .then(|| {
-                Self::link_range_for_position(&text_layout, &self.links, window.mouse_position())
-            })
+            .then(|| Self::link_at(&text_layout, &self.links, window.mouse_position()))
             .flatten();
-        if hovered_link.is_some() {
+        let tooltip_view = (!self.links.is_empty())
+            .then(|| GlobalState::global(cx).text_view_state())
+            .flatten()
+            .filter(|view| view.read(cx).link_preview.is_some());
+        let owner = state_key(&self.state);
+        if let Some((_, link)) = hovered_link {
             window.set_cursor_style(CursorStyle::PointingHand, &hitbox);
-        }
-
-        if self.link_tooltip
-            && let Some(view) = GlobalState::global(cx).text_view_state()
-        {
-            let key = state_key(&self.state);
-            let target = hovered_link.as_ref().and_then(|range| {
-                self.links
-                    .iter()
-                    .find(|(candidate, _)| candidate == range)
-                    .map(|(_, link)| (key, link.url.clone()))
-            });
-            let changed = view.update(cx, |state, _| {
-                let owns_target = state
-                    .link_tooltip_target
-                    .as_ref()
-                    .is_some_and(|(owner, _)| *owner == key);
-                if (target.is_some() || owns_target) && state.link_tooltip_target != target {
-                    state.link_tooltip_target = target;
-                    true
-                } else {
-                    false
-                }
-            });
-            if changed {
-                cx.notify(current_view);
-                window.request_animation_frame();
+            if let Some(preview) = tooltip_view
+                .as_ref()
+                .and_then(|view| view.read(cx).link_preview.as_ref())
+                && let Some(target) = &preview.target
+                && target.owner == owner
+                && target.bounds == hitbox.bounds
+                && target.position == window.mouse_position()
+                && target.url == link.url
+                && window.content_mask().bounds.contains(&target.position)
+            {
+                preview.confirmed.set(true);
             }
         }
 
@@ -1473,32 +1459,51 @@ impl Element for Inline {
             });
         }
 
-        // Mouse move: repaint only when the pointer enters, leaves or moves
-        // between links, so the link cursor follows it. Hovering plain text
-        // changes nothing painted.
         if !self.links.is_empty() {
             window.on_mouse_event({
                 let hitbox = hitbox.clone();
                 let text_layout = text_layout.clone();
                 let links = self.links.clone();
-                let link_tooltip = self.link_tooltip;
-                let mut hovered_link = hovered_link;
+                let mut hovered_link = hovered_link.map(|(range, _)| range.clone());
                 move |event: &MouseMoveEvent, phase, window, cx| {
                     if !phase.bubble() {
                         return;
                     }
-                    if !hitbox.is_hovered(window) {
-                        if link_tooltip && hovered_link.take().is_some() {
-                            cx.notify(current_view);
-                        }
-                        return;
-                    }
-
-                    let updated =
-                        Self::link_range_for_position(&text_layout, &links, event.position);
-                    if hovered_link != updated || (link_tooltip && updated.is_some()) {
+                    let link = hitbox
+                        .is_hovered(window)
+                        .then(|| Self::link_at(&text_layout, &links, event.position))
+                        .flatten();
+                    let updated = link.map(|(range, _)| range.clone());
+                    if hovered_link != updated {
                         hovered_link = updated;
                         cx.notify(current_view);
+                    }
+
+                    let Some(view) = &tooltip_view else { return };
+                    if let Some((_, link)) =
+                        link.filter(|_| window.is_pointer_motion() && !event.dragging())
+                    {
+                        view.update(cx, |state, cx| {
+                            state.show_link_tooltip(
+                                LinkTooltipTarget {
+                                    owner,
+                                    url: link.url.clone(),
+                                    position: event.position,
+                                    bounds: hitbox.bounds,
+                                },
+                                window,
+                                cx,
+                            );
+                        });
+                    } else if (link.is_none() || event.dragging())
+                        && view
+                            .read(cx)
+                            .link_preview
+                            .as_ref()
+                            .and_then(|preview| preview.target.as_ref())
+                            .is_some_and(|target| target.owner == owner)
+                    {
+                        view.update(cx, |state, cx| state.clear_link_tooltip(cx));
                     }
                 }
             });
@@ -1524,9 +1529,7 @@ impl Element for Inline {
                         return;
                     }
 
-                    if let Some(link) =
-                        Self::link_for_position(&text_layout, &links, event.position)
-                    {
+                    if let Some((_, link)) = Self::link_at(&text_layout, &links, event.position) {
                         TextSelection::end(window, cx);
                         cx.stop_propagation();
                         let click = ClickEvent::Mouse(MouseClickEvent {
@@ -1539,7 +1542,7 @@ impl Element for Inline {
                             },
                             up: event.clone(),
                         });
-                        handle_link_click(&link_click_handler, link.url, click, window, cx);
+                        handle_link_click(&link_click_handler, link.url.clone(), click, window, cx);
                     }
                 }
             });

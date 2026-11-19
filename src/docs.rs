@@ -21,6 +21,7 @@ use gpui_component::{
         MarkdownExtensions, MarkdownNode, MarkdownParseContext, MarkdownPlugin, RangeHighlight,
         TextView, TextViewState, TextViewStyle, data_url_image, markdown_ast::Node,
     },
+    tooltip::Tooltip,
     v_flex,
 };
 use gpui_kit_assets::IconName;
@@ -31,7 +32,7 @@ use crate::{
     doc_graphics::{self, GraphicKind, Graphics},
     paths,
     repository::{Entry, Repository},
-    session::DocumentPosition,
+    session::{DocumentLinePosition, DocumentLocation, DocumentPosition},
     workspace::{
         Palette, PaneDrag, Workspace, compact_icon_button, icon, icon_button, pane_scrollbar,
         panel_resize, scroll_viewport_background,
@@ -172,6 +173,10 @@ pub struct PreparedDocument {
 }
 
 impl PreparedDocument {
+    pub(crate) fn has_fragment(&self, fragment: &str) -> bool {
+        heading_index(&self.headings, fragment).is_some()
+    }
+
     pub(crate) fn title(&self) -> Option<&str> {
         self.headings
             .first()
@@ -486,7 +491,9 @@ pub struct DocReader {
     body_position: Option<ListOffset>,
     heading_jump_block: Option<usize>,
     pending_heading: Option<usize>,
+    history_fragment: Option<String>,
     pending_position: Option<DocumentPosition>,
+    restoring_line: bool,
 }
 
 impl DocReader {
@@ -594,8 +601,10 @@ impl DocReader {
                 cx,
             )
             .scrollable(true)
+            .track_viewport_line()
         });
         text.read(cx).list_state().set_pixel_aligned_scroll(true);
+        text.read(cx).list_state().set_scroll_past_end(true);
         let search = DocumentFind::for_document(text.clone(), window, cx);
         search.update(cx, |search, cx| {
             search.set_placeholder(t!("docs.find"), window, cx)
@@ -628,7 +637,9 @@ impl DocReader {
             body_position: None,
             heading_jump_block: None,
             pending_heading: None,
+            history_fragment: None,
             pending_position: None,
+            restoring_line: false,
         };
         if let Some(fragment) = fragment {
             reader.jump_to_fragment(&fragment, cx);
@@ -639,6 +650,45 @@ impl DocReader {
     pub(crate) fn release_online_images(&mut self, cx: &mut Context<Self>) {
         self.online_images = online_images::DisplayedImages::new(cx);
         self.image_thumbnails = ImageThumbnails::new(cx);
+        cx.notify();
+    }
+
+    pub(crate) fn history_location(&self, cx: &App) -> DocumentLocation {
+        DocumentLocation {
+            position: self.pending_position.or_else(|| {
+                if self.heading_jump_block.is_some() {
+                    None
+                } else {
+                    self.session_position(cx)
+                }
+            }),
+            fragment: self.history_fragment.clone(),
+        }
+    }
+
+    pub(crate) fn restore_history_location(
+        &mut self,
+        location: DocumentLocation,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(position) = location.position {
+            self.pending_heading = None;
+            self.history_fragment = location.fragment;
+            self.restore_position(Some(position));
+        } else if !location
+            .fragment
+            .as_deref()
+            .is_some_and(|fragment| self.jump_to_fragment(fragment, cx))
+        {
+            self.pending_heading = None;
+            self.history_fragment = None;
+            self.restore_position(Some(DocumentPosition {
+                source_offset: None,
+                block: 0,
+                inset: 0.,
+                line: None,
+            }));
+        }
         cx.notify();
     }
 
@@ -656,6 +706,12 @@ impl DocReader {
             source_offset: text.source_offset_for_block(top.item_ix),
             block: top.item_ix,
             inset: top.offset_in_item.into(),
+            line: text
+                .viewport_line()
+                .map(|(source_offset, inset)| DocumentLinePosition {
+                    source_offset,
+                    viewport_inset: inset.into(),
+                }),
         })
     }
 
@@ -664,6 +720,7 @@ impl DocReader {
             self.heading_jump_block = None;
         }
         self.pending_position = position;
+        self.restoring_line = false;
     }
 
     fn apply_saved_position(&mut self, cx: &mut Context<Self>) {
@@ -672,18 +729,45 @@ impl DocReader {
         if list.item_count() == 0 {
             return;
         }
-        if let Some(position) = self.pending_position.take() {
-            let block = position
-                .source_offset
-                .and_then(|offset| text.block_for_source_offset(offset))
-                .unwrap_or(position.block)
-                .min(list.item_count() - 1);
-            list.scroll_to(ListOffset {
-                item_ix: block,
-                offset_in_item: px(position.inset),
-            });
+        let Some(position) = self.pending_position else {
+            return;
+        };
+        if self.restoring_line {
+            if !text.has_pending_reveal() {
+                self.restore_position(None);
+            }
             cx.notify();
+            return;
         }
+        let block = position
+            .source_offset
+            .and_then(|offset| text.block_for_source_offset(offset))
+            .unwrap_or(position.block)
+            .min(list.item_count() - 1);
+        list.scroll_to_preserving_position(ListOffset {
+            item_ix: block,
+            offset_in_item: px(position.inset),
+        });
+        if let Some(line) = position.line {
+            let rendered = text.rendered_text();
+            let offset = line.source_offset;
+            if let Some(character) = rendered
+                .source()
+                .get(offset..)
+                .and_then(|rest| rest.chars().next())
+                && let Some(range) =
+                    rendered.range_for_source(offset..offset + character.len_utf8())
+            {
+                self.restoring_line = self.text.update(cx, |text, cx| {
+                    text.reveal_range_at_top(range, px(line.viewport_inset), cx)
+                        .is_ok()
+                });
+            }
+        }
+        if !self.restoring_line {
+            self.pending_position = None;
+        }
+        cx.notify();
     }
 
     pub(crate) fn set_typography(
@@ -691,7 +775,14 @@ impl DocReader {
         typography: crate::config::Docs,
         cx: &mut Context<Self>,
     ) {
-        self.typography = typography;
+        if self.typography != typography {
+            if self.heading_jump_block.is_none()
+                && let Some(position) = self.session_position(cx)
+            {
+                self.restore_position(Some(position));
+            }
+            self.typography = typography;
+        }
         cx.notify();
     }
 
@@ -742,6 +833,7 @@ impl DocReader {
             source.len()
         };
         let source = to_source_offset(range.start)..to_source_offset(range.end);
+        self.restore_position(None);
         self.heading_jump_block = None;
         let accent = cx.theme().accent.alpha(0.48);
         self.text.update(cx, |text, cx| {
@@ -780,9 +872,10 @@ impl DocReader {
     }
 
     fn jump_to_heading(&mut self, index: usize, cx: &mut Context<Self>) {
-        self.pending_position = None;
+        self.restore_position(None);
         self.heading_jump_block = None;
         self.select_heading(index);
+        self.history_fragment = Some(self.document.headings[index].slug.clone());
         self.pending_heading = Some(index);
         self.reveal_pending(cx);
         cx.notify();
@@ -803,7 +896,7 @@ impl DocReader {
             self.heading_jump_block =
                 text.block_for_source_offset(self.document.headings[index].source.start);
             self.text.update(cx, |text, cx| {
-                _ = text.reveal_range(range.start..range.start, cx);
+                _ = text.reveal_range_at_top(range.start..range.start, px(12.), cx);
             });
         }
     }
@@ -870,6 +963,7 @@ impl DocReader {
             .map(|(index, heading)| {
                 div()
                     .id(("heading", index))
+                    .debug_selector(move || format!("document-heading-{index}"))
                     .flex_shrink_0()
                     .px_2()
                     .py_1()
@@ -883,7 +977,20 @@ impl DocReader {
                     })
                     .cursor_pointer()
                     .hover(|el| el.bg(colors.hover))
-                    .on_click(cx.listener(move |this, _, _, cx| this.jump_to_heading(index, cx)))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        let workspace = this.workspace.clone();
+                        if workspace.upgrade().is_some() {
+                            let path = this.path.clone();
+                            let slug = this.document.headings[index].slug.clone();
+                            window.defer(cx, move |window, cx| {
+                                _ = workspace.update(cx, |workspace, cx| {
+                                    workspace.navigate_document(path, Some(slug), window, cx);
+                                });
+                            });
+                        } else {
+                            this.jump_to_heading(index, cx);
+                        }
+                    }))
                     .child(heading.title.clone())
             });
         v_flex()
@@ -1061,6 +1168,7 @@ impl Render for DocReader {
                     });
                 }
             })
+            .link_tooltip(|target, window, cx| Tooltip::new(target.clone()).build(window, cx))
             .on_link_click({
                 let workspace = workspace.clone();
                 let path = source_path.clone();
@@ -1368,7 +1476,11 @@ mod tests {
             let heading = text
                 .block_for_source_offset(reader.read(cx).document.headings[2].source.start)
                 .unwrap();
-            assert!(body.intersects(&text.list_state().bounds_for_item(heading).unwrap()));
+            let bounds = text.list_state().bounds_for_item(heading).unwrap();
+            assert!(
+                (bounds.top() - body.top()).abs() < px(28.),
+                "{bounds:?} {body:?}"
+            );
         });
 
         visual.update(|_, cx| {
@@ -1377,6 +1489,7 @@ mod tests {
                     source_offset: Some(reader.document.headings[20].source.start),
                     block: 0,
                     inset: 0.,
+                    line: None,
                 }));
                 cx.notify();
             });
@@ -1442,6 +1555,257 @@ mod tests {
         visual.simulate_keystrokes("escape");
         draw(visual);
         assert_closed(visual);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[gpui::test]
+    fn final_nested_heading_aligns_at_top_with_half_screen_of_normal_end_scroll(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(gpui_component::init);
+        let source = format!(
+            "{}> Quoted text.\n>\n> ## Final heading\n>\n> Last line.",
+            "Paragraph.\n\n".repeat(50)
+        );
+        let final_block = source.find("> Quoted").unwrap();
+        let (reader, visual) = cx.add_window_view(|window, cx| {
+            DocReader::new(
+                PathBuf::new(),
+                "README.md".into(),
+                PreparedDocument::new(source).unwrap(),
+                None,
+                WeakEntity::new_invalid(),
+                window,
+                cx,
+            )
+        });
+        let draw = |visual: &mut VisualTestContext| {
+            for _ in 0..4 {
+                visual.run_until_parked();
+                visual.update(|window, cx| window.draw(cx).clear(cx));
+            }
+        };
+        draw(visual);
+        let list = visual.update(|_, cx| reader.read(cx).text.read(cx).list_state().clone());
+        let initial_max = list.max_offset_for_scrollbar().y;
+        list.set_offset_from_scrollbar(point(px(0.), -initial_max));
+        visual.update(|_, cx| reader.update(cx, |_, cx| cx.notify()));
+        draw(visual);
+        let last = list.bounds_for_item(list.item_count() - 1).unwrap();
+        let viewport = list.viewport_bounds();
+        assert!((last.bottom() - viewport.center().y).abs() <= px(1.));
+        visual.update(|_, cx| {
+            reader.update(cx, |reader, cx| {
+                assert!(reader.jump_to_fragment("final-heading", cx));
+            })
+        });
+        draw(visual);
+        let position = visual.update(|_, cx| reader.read(cx).session_position(cx).unwrap());
+        assert_eq!(position.source_offset, Some(final_block));
+        assert!(
+            position.inset > 12.,
+            "a nested title must align within its containing block"
+        );
+        assert!(list.max_offset_for_scrollbar().y > initial_max);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[gpui::test]
+    fn wrapped_reading_line_survives_history_and_reopening_at_new_width_and_font(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(gpui_component::init);
+        let source = (0..220)
+            .map(|ix| format!("Topic {ix:03} has a café and a `unique marker`. "))
+            .collect::<String>();
+        let build = |window: &mut Window, cx: &mut Context<DocReader>| {
+            DocReader::new(
+                PathBuf::new(),
+                "README.md".into(),
+                PreparedDocument::new(source.clone()).unwrap(),
+                None,
+                WeakEntity::new_invalid(),
+                window,
+                cx,
+            )
+        };
+        let draw = |visual: &mut VisualTestContext| {
+            for _ in 0..8 {
+                visual.run_until_parked();
+                visual.update(|window, cx| {
+                    window.simulate_next_frame(cx);
+                    window.draw(cx).clear(cx);
+                });
+            }
+        };
+        let scroll_by =
+            |visual: &mut VisualTestContext, reader: &Entity<DocReader>, delta: Pixels| {
+                visual.update(|_, cx| {
+                    reader.update(cx, |reader, cx| {
+                        let list = reader.text.read(cx).list_state();
+                        let y = list.scroll_px_offset_for_scrollbar().y - delta;
+                        list.set_offset_from_scrollbar(point(px(0.), y));
+                        cx.notify();
+                    })
+                });
+                draw(visual);
+            };
+
+        let (reader, visual) = cx.add_window_view(build);
+        visual.simulate_resize(size(px(520.), px(420.)));
+        draw(visual);
+        scroll_by(visual, &reader, px(716.));
+        let old = visual.update(|_, cx| reader.read(cx).session_position(cx).unwrap());
+        let line = old.line.expect("visible wrapped line");
+        assert_eq!(old.block, 0);
+        assert!(line.source_offset > 500);
+
+        let confirm_anchor = |visual: &mut VisualTestContext, reader: &Entity<DocReader>| {
+            let placed =
+                visual.update(|_, cx| reader.read(cx).session_position(cx).unwrap().line.unwrap());
+            assert!(
+                (placed.viewport_inset - line.viewport_inset).abs() <= 1.5,
+                "expected inset {line:?}, got {placed:?}"
+            );
+            scroll_by(visual, reader, px(42.));
+            let following =
+                visual.update(|_, cx| reader.read(cx).session_position(cx).unwrap().line.unwrap());
+            assert!(
+                placed.source_offset <= line.source_offset
+                    && line.source_offset < following.source_offset,
+                "expected the original character {line:?} in the top row between {placed:?} and {following:?}"
+            );
+        };
+        let typography = crate::config::Docs {
+            body_font_size: 23.,
+            ..Default::default()
+        };
+        visual.simulate_resize(size(px(760.), px(420.)));
+        visual.update(|_, cx| {
+            reader.update(cx, |reader, cx| {
+                reader.set_typography(typography, cx);
+                reader.restore_history_location(
+                    DocumentLocation {
+                        position: Some(old),
+                        fragment: None,
+                    },
+                    cx,
+                );
+            })
+        });
+        draw(visual);
+        confirm_anchor(visual, &reader);
+
+        let (reopened, visual) = cx.add_window_view(build);
+        visual.simulate_resize(size(px(760.), px(420.)));
+        // Reopening a document restores the same serialized reading point as history.
+        let saved = serde_json::from_str(&serde_json::to_string(&old).unwrap()).unwrap();
+        visual.update(|_, cx| {
+            reopened.update(cx, |reader, cx| {
+                reader.set_typography(typography, cx);
+                reader.restore_position(Some(saved));
+            })
+        });
+        draw(visual);
+        confirm_anchor(visual, &reopened);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn display_math_is_centered_and_scales_with_document_typography() -> Result<()> {
+        use gpui_component::ThemeMode;
+        use gpui_wgpu::WgpuHeadlessRenderer;
+
+        let mut app = HeadlessAppContext::with_platform(
+            gpui_platform::current_platform(true).text_system(),
+            Arc::new(gpui_kit_assets::AllAssets),
+            || Ok(Some(Box::new(WgpuHeadlessRenderer::new()?))),
+        );
+        app.update(|cx| {
+            gpui_component::init(cx);
+            crate::workspace::apply_theme(ThemeMode::Light, cx);
+        });
+        let width = 640.;
+        let window = app.open_window(size(px(width), px(240.)), |window, cx| {
+            cx.new(|cx| {
+                DocReader::new(
+                    PathBuf::new(),
+                    "math.md".into(),
+                    PreparedDocument::new(
+                        r"$$
+\frac{\sqrt{2\pi}}{1+x^2}=\sum_{n=1}^{\infty}n^{-2}
+$$"
+                        .into(),
+                    )
+                    .unwrap(),
+                    None,
+                    WeakEntity::new_invalid(),
+                    window,
+                    cx,
+                )
+            })
+        })?;
+        let mut expected_width = None;
+        for (mode, font_size, dpi) in [
+            (ThemeMode::Light, 16., 1.),
+            (ThemeMode::Light, 16., 1.5),
+            (ThemeMode::Dark, 24., 1.5),
+        ] {
+            app.update(|cx| crate::workspace::apply_theme(mode, cx));
+            app.update_window(window.into(), |reader, window, cx| {
+                window.set_scale_factor(dpi);
+                reader
+                    .downcast::<DocReader>()
+                    .unwrap()
+                    .update(cx, |reader, cx| {
+                        reader.set_typography(
+                            crate::config::Docs {
+                                body_font_size: font_size,
+                                ..Default::default()
+                            },
+                            cx,
+                        );
+                    });
+            })?;
+            for _ in 0..5 {
+                app.run_until_parked();
+                app.update_window(window.into(), |_, window, cx| window.draw(cx).clear(cx))?;
+            }
+            let screenshot = app.capture_screenshot(window.into())?;
+            if let Some(directory) = std::env::var_os("STROLL_THEME_SCREENSHOTS") {
+                screenshot.save(
+                    PathBuf::from(directory).join(format!("math-{mode:?}-{font_size}-{dpi}.png")),
+                )?;
+            }
+            // RaTeX ink has a known dark or light base color. Select pixels
+            // near that color to account for the antialiased outline.
+            let mut left = u32::MAX;
+            let mut right = 0;
+            for (x, y, pixel) in screenshot.enumerate_pixels() {
+                if x as f32 >= width * dpi || y as f32 >= 120. * dpi {
+                    continue;
+                }
+                let is_ink = match mode {
+                    ThemeMode::Light => pixel[0] < 100 && pixel[3] > 200,
+                    ThemeMode::Dark => pixel[0] > 160 && pixel[3] > 200,
+                };
+                if is_ink {
+                    left = left.min(x);
+                    right = right.max(x);
+                }
+            }
+            assert!(right > left, "the formula paints ink");
+            let center = (left + right) as f32 / 2. / dpi;
+            assert!((center - width / 2.).abs() < 6., "formula center {center}");
+            let ink_width = (right - left) as f32 / dpi;
+            let baseline = *expected_width.get_or_insert(ink_width);
+            let expected = baseline * font_size as f32 / 16.;
+            assert!(
+                (ink_width - expected).abs() < 3.,
+                "ink width {ink_width}, expected {expected}"
+            );
+        }
+        Ok(())
     }
 
     #[cfg(target_os = "linux")]

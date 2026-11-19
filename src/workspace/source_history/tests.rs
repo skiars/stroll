@@ -68,6 +68,19 @@ fn source_history_replays_files_jumps_and_worktree_positions() -> Result<()> {
     for file in [alpha, beta, gamma] {
         fs::write(root.join(file), "line with text\n".repeat(160))?;
     }
+    let readme = Path::new("README.md");
+    let guide = Path::new("guide.md");
+    fs::write(
+        root.join(readme),
+        format!(
+            "# Readme\n\n{}\n## End\n",
+            "Reading position.\n\n".repeat(25)
+        ),
+    )?;
+    fs::write(
+        root.join(guide),
+        "# Guide\n\n## Target\n\nSee [source](alpha.txt#L42).\n",
+    )?;
     git(&["add", "."])?;
     git(&[
         "-c",
@@ -371,8 +384,9 @@ fn source_history_replays_files_jumps_and_worktree_positions() -> Result<()> {
             history.entries.insert(
                 history.index + 1,
                 SourceLocation {
-                    path: "missing.txt".into(),
+                    path: Some("missing.txt".into()),
                     position: None,
+                    document: None,
                 },
             );
         });
@@ -383,7 +397,7 @@ fn source_history_replays_files_jumps_and_worktree_positions() -> Result<()> {
         history
             .entries
             .iter()
-            .all(|location| location.path != Path::new("missing.txt"))
+            .all(|location| location.path.as_deref() != Some(Path::new("missing.txt")))
     })?;
     assert!(visual.update(|_, cx| !restored(cx, first)));
 
@@ -414,5 +428,157 @@ fn source_history_replays_files_jumps_and_worktree_positions() -> Result<()> {
             assert_eq!(state.selected_range(), selection);
         });
     }
+    let navigate =
+        |visual: &mut VisualTestContext,
+         action: fn(&mut Workspace, &mut Window, &mut Context<Workspace>)| {
+            visual.update(|window, cx| {
+                reopened.update(cx, |workspace, cx| action(workspace, window, cx))
+            });
+        };
+    let reading = |cx: &App, path: &Path, fragment: Option<&str>| {
+        let workspace = reopened.read(cx);
+        workspace.view == WorkspaceView::Docs
+            && workspace
+                .document_history_location(cx)
+                .is_some_and(|location| {
+                    location.path.as_deref() == Some(path)
+                        && location.document.is_some_and(|document| {
+                            document.fragment.as_deref() == fragment && document.position.is_some()
+                        })
+                })
+    };
+    navigate(visual, |workspace, window, cx| {
+        workspace.open_file("README.md".into(), false, window, cx);
+    });
+    wait_for(visual, |cx| {
+        reopened
+            .read(cx)
+            .active_file()
+            .is_some_and(|file| file.path == readme)
+    })?;
+    navigate(visual, |workspace, window, cx| {
+        workspace.open_markdown_in_docs("README.md".into(), window, cx);
+    });
+    wait_for(visual, |cx| reading(cx, readme, None))?;
+    let end = visual.debug_bounds("document-heading-1").unwrap();
+    visual.simulate_click(end.center(), Modifiers::none());
+    wait_for(visual, |cx| reading(cx, readme, Some("end")))?;
+    navigate(visual, |workspace, window, cx| {
+        workspace.follow_document_link(Path::new("README.md"), "guide.md#target", window, cx);
+    });
+    wait_for(visual, |cx| reading(cx, guide, Some("target")))?;
+    navigate(visual, |workspace, window, cx| {
+        workspace.follow_document_link(Path::new("guide.md"), "beta.txt#L42", window, cx);
+    });
+    wait_for(visual, |cx| {
+        let workspace = reopened.read(cx);
+        workspace.view == WorkspaceView::Editor
+            && workspace.source_location(cx).is_some_and(|location| {
+                location.path.as_deref() == Some(beta)
+                    && location
+                        .position
+                        .is_some_and(|position| position.selection_start == (41, 0))
+            })
+    })?;
+    for (path, fragment) in [
+        (guide, Some("target")),
+        (readme, Some("end")),
+        (readme, None),
+    ] {
+        visual.simulate_keystrokes("alt-left");
+        wait_for(visual, |cx| reading(cx, path, fragment))?;
+    }
+    let pointer = point(px(620.), px(240.));
+    visual.simulate_mouse_down(
+        pointer,
+        MouseButton::Navigate(NavigationDirection::Back),
+        Modifiers::none(),
+    );
+    visual.simulate_mouse_up(
+        pointer,
+        MouseButton::Navigate(NavigationDirection::Back),
+        Modifiers::none(),
+    );
+    wait_for(visual, |cx| {
+        let workspace = reopened.read(cx);
+        workspace.view == WorkspaceView::Editor
+            && workspace
+                .active_file()
+                .is_some_and(|file| file.path == readme)
+    })?;
+    visual.simulate_keystrokes("alt-right");
+    wait_for(visual, |cx| reading(cx, readme, None))?;
+    let click_nav = |visual: &mut VisualTestContext, id: &'static str| {
+        let button = visual.debug_bounds(id).unwrap();
+        visual.simulate_click(button.center(), Modifiers::none());
+    };
+    let editor_readme = |cx: &App| {
+        let workspace = reopened.read(cx);
+        workspace.view == WorkspaceView::Editor
+            && workspace
+                .active_file()
+                .is_some_and(|file| file.path == readme)
+    };
+
+    // Go back before a cold topbar switch completes in either direction.
+    visual.update(|window, cx| {
+        reopened.update(cx, |workspace, cx| {
+            let index = workspace.session.source_history.index;
+            assert!(workspace.files.remove(readme).is_some());
+            workspace.switch_view_from_topbar(WorkspaceView::Editor, window, cx);
+            assert!(matches!(
+                workspace.loading_file,
+                Some((_, FileOpen::Restore { from: Some(_) }))
+            ));
+            workspace.source_back(&SourceBack, window, cx);
+            assert_eq!(workspace.view, WorkspaceView::Docs);
+            assert_eq!(workspace.doc.as_ref().unwrap().read(cx).path, readme);
+            assert_eq!(workspace.session.source_history.index, index);
+        });
+    });
+    wait_for(visual, |cx| reading(cx, readme, None))?;
+
+    click_nav(visual, "nav-workspace");
+    wait_for(visual, editor_readme)?;
+    visual.update(|window, cx| {
+        reopened.update(cx, |workspace, cx| {
+            let index = workspace.session.source_history.index;
+            workspace.doc = None;
+            workspace.switch_view_from_topbar(WorkspaceView::Docs, window, cx);
+            assert!(workspace.doc_loading.is_some());
+            workspace.source_back(&SourceBack, window, cx);
+            assert_eq!(workspace.view, WorkspaceView::Editor);
+            assert_eq!(workspace.tabs.active(), Some(readme));
+            assert_eq!(workspace.session.source_history.index, index);
+        });
+    });
+    visual.simulate_keystrokes("alt-left");
+    wait_for(visual, |cx| reading(cx, readme, None))?;
+    visual.simulate_keystrokes("alt-right");
+    wait_for(visual, editor_readme)?;
+    click_nav(visual, "nav-docs");
+    wait_for(visual, |cx| reading(cx, readme, None))?;
+    visual.simulate_keystrokes("alt-left");
+    wait_for(visual, editor_readme)?;
+
+    // An empty editor is a history location too. Replaying it preserves tabs opened since.
+    visual.update(|window, cx| {
+        reopened.update(cx, |workspace, cx| {
+            let previous = workspace.tabs.deselect();
+            workspace.finish_tab_selection(previous.as_deref(), window, cx);
+        })
+    });
+    frame(visual);
+    click_nav(visual, "nav-docs");
+    wait_for(visual, |cx| reading(cx, readme, None))?;
+    visual.simulate_keystrokes("alt-left");
+    wait_for(visual, |cx| {
+        let workspace = reopened.read(cx);
+        workspace.view == WorkspaceView::Editor
+            && workspace.tabs.active().is_none()
+            && workspace.tabs.paths().iter().any(|path| path == readme)
+    })?;
+    visual.simulate_keystrokes("alt-right");
+    wait_for(visual, |cx| reading(cx, readme, None))?;
     Ok(())
 }

@@ -789,6 +789,14 @@ fn syntax_style(colors: &Colors, semantics: bool) -> Value {
     ] {
         additional.insert(name.into(), color(value));
     }
+    additional.insert(
+        "title.markdown".into(),
+        json!({ "color": colors.function, "font_weight": 700 }),
+    );
+    additional.insert(
+        "punctuation.special.markdown_heading".into(),
+        json!({ "color": colors.function, "font_weight": 700 }),
+    );
     if semantics {
         let surface = hsla(&colors.surface);
         let active_line =

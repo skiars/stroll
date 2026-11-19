@@ -1,6 +1,6 @@
 ;From nvim-treesitter/nvim-treesitter
-(atx_heading (inline) @title)
-(setext_heading (paragraph) @title)
+(atx_heading (inline) @title.markdown)
+(setext_heading (paragraph) @title.markdown)
 
 [
   (atx_h1_marker)
@@ -11,7 +11,7 @@
   (atx_h6_marker)
   (setext_h1_underline)
   (setext_h2_underline)
-] @punctuation.special
+] @punctuation.special.markdown_heading
 
 [
   (link_title)

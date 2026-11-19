@@ -20,9 +20,12 @@ const EDITOR_HEIGHT: f32 = 284.;
 const DELIMITER: &str = "punctuation.delimiter.code";
 const LIST_MARKER: &str = "punctuation.list_marker";
 const INLINE_CODE: &str = "text.code.span";
-const SOURCE: &str = "Use `new` and ``a`b`` in prose.\n\n```bash\nif true; then echo new; fi\n```\n\n- Hyphen\n* Asterisk\n+ Plus\n1. Ordered\n";
+const HEADING: &str = "title.markdown";
+const HEADING_MARKER: &str = "punctuation.special.markdown_heading";
+const SOURCE: &str = "## Section\n\nUse `new` and ``a`b`` in prose.\n\n```bash\nif true; then echo new; fi\n```\n\n- Hyphen\n* Asterisk\n+ Plus\n1. Ordered\n";
 const PATCH: &str = concat!(
-    "--- a/guide.markdown\n+++ b/guide.markdown\n@@ -1,10 +1,10 @@\n",
+    "--- a/guide.markdown\n+++ b/guide.markdown\n@@ -1,12 +1,12 @@\n",
+    " ## Section\n \n",
     "-Use `old` and ``a`b`` in prose.\n+Use `new` and ``a`b`` in prose.\n",
     " \n ```bash\n-if true; then echo old; fi\n+if true; then echo new; fi\n ```\n",
     " \n",
@@ -168,12 +171,19 @@ fn paints_markdown_code_and_list_markers_in_editor_and_diff() -> anyhow::Result<
                 .filter(|(y, color)| (*y >= editor_bottom) == in_diff && colors.contains(color))
                 .count()
         };
+        for capture in [HEADING, HEADING_MARKER] {
+            assert_eq!(
+                syntax.style(capture).unwrap().font_weight,
+                Some(gpui::FontWeight::BOLD)
+            );
+        }
         assert_ne!(color(&syntax, LIST_MARKER), color(&syntax, DELIMITER));
         for (capture, editor_count, diff_count) in [
             (DELIMITER, 12, 18),
             (INLINE_CODE, 6, 12),
             ("keyword", 2, 4),
             (LIST_MARKER, 5, 5),
+            (HEADING_MARKER, 2, 2),
         ] {
             let editor_color = color(&syntax, capture);
             assert_ne!(

@@ -15,17 +15,34 @@ const CARET_JUMP_LINES: u32 = 8;
 actions!(workspace, [SourceBack, SourceForward]);
 
 impl SourceLocation {
+    pub(super) fn empty(view: WorkspaceView) -> Self {
+        Self {
+            path: None,
+            position: None,
+            document: (view == WorkspaceView::Docs).then(Default::default),
+        }
+    }
+
+    fn same_document(&self, other: &Self) -> bool {
+        self.path == other.path && self.document.is_some() && other.document.is_some()
+    }
+
     fn same_destination(&self, other: &Self) -> bool {
-        self.path == other.path
-            && match (self.position, other.position) {
-                (Some(first), Some(second)) => {
-                    first.selection_start == second.selection_start
-                        && first.selection_end == second.selection_end
-                        && first.reversed == second.reversed
-                }
-                (None, None) => true,
-                _ => false,
+        if self.path != other.path {
+            return false;
+        }
+        if self.document.is_some() || other.document.is_some() {
+            return self.document == other.document;
+        }
+        match (self.position, other.position) {
+            (Some(first), Some(second)) => {
+                first.selection_start == second.selection_start
+                    && first.selection_end == second.selection_end
+                    && first.reversed == second.reversed
             }
+            (None, None) => true,
+            _ => false,
+        }
     }
 }
 
@@ -44,7 +61,7 @@ impl SourceHistory {
             if let Some(current) = self
                 .entries
                 .back_mut()
-                .filter(|entry| entry.same_destination(&source))
+                .filter(|entry| entry.same_destination(&source) || entry.same_document(&source))
             {
                 *current = source;
             } else {
@@ -70,18 +87,24 @@ impl SourceHistory {
 
     pub(super) fn remap(&mut self, map: impl Fn(&Path) -> PathBuf) {
         for entry in &mut self.entries {
-            entry.path = map(&entry.path);
+            entry.path = entry.path.as_deref().map(&map);
         }
     }
 
     pub(super) fn remove(&mut self, path: &Path) {
+        let removed = |entry: &SourceLocation| {
+            entry
+                .path
+                .as_deref()
+                .is_some_and(|file| file.starts_with(path))
+        };
         let removed_before = self
             .entries
             .iter()
             .take(self.index)
-            .filter(|entry| entry.path.starts_with(path))
+            .filter(|entry| removed(entry))
             .count();
-        self.entries.retain(|entry| !entry.path.starts_with(path));
+        self.entries.retain(|entry| !removed(entry));
         self.index = self
             .index
             .saturating_sub(removed_before)
@@ -96,7 +119,7 @@ impl Workspace {
         } else {
             ("alt-left", "alt-right")
         };
-        let context = Some("WorkspaceEditor && !Terminal && !Locator");
+        let context = Some("(WorkspaceEditor || WorkspaceDocs) && !Terminal && !Locator");
         cx.bind_keys([
             KeyBinding::new(back, SourceBack, context),
             KeyBinding::new(forward, SourceForward, context),
@@ -131,6 +154,9 @@ impl Workspace {
             return;
         };
         // Preserve the focused input when GPUI handles the mouse-down event.
+        if !matches!(self.view, WorkspaceView::Editor | WorkspaceView::Docs) {
+            return;
+        }
         window.prevent_default();
         self.navigate_source(direction == NavigationDirection::Forward, window, cx);
     }
@@ -143,7 +169,7 @@ impl Workspace {
                 editor.is_composing(),
             )
         });
-        if self.view != WorkspaceView::Editor
+        if !matches!(self.view, WorkspaceView::Editor | WorkspaceView::Docs)
             || self.confirming_close
             || self.repository_overlay_open()
             || self.repository_ui.opening.is_some()
@@ -162,9 +188,42 @@ impl Workspace {
             return;
         }
         let history = &self.session.source_history;
+        if !forward {
+            let pending_origin = match self.view {
+                WorkspaceView::Editor => match &self.loading_file {
+                    Some((_, FileOpen::Restore { from })) => from.as_ref(),
+                    _ => None,
+                },
+                WorkspaceView::Docs => {
+                    self.doc_loading
+                        .as_ref()
+                        .and_then(|open| match &open.navigation {
+                            Some(super::DocumentNavigation::Record(Some(from)))
+                                if from.document.is_none() =>
+                            {
+                                Some(from)
+                            }
+                            _ => None,
+                        })
+                }
+                WorkspaceView::Git => None,
+            };
+            if let Some(origin) = pending_origin.cloned() {
+                // The view has switched, but loading has not committed its history entry.
+                self.replay_source_location(history.index, origin, window, cx);
+                return;
+            }
+        }
+        let pending_document = self
+            .doc_loading
+            .as_ref()
+            .and_then(|open| match &open.navigation {
+                Some(super::DocumentNavigation::Replay { index, .. }) => Some(*index),
+                _ => None,
+            });
         let cursor = match &self.loading_file {
             Some((_, FileOpen::History { index, .. })) => *index,
-            _ => history.index,
+            _ => pending_document.unwrap_or(history.index),
         };
         let index = if forward {
             cursor.checked_add(1)
@@ -176,20 +235,138 @@ impl Workspace {
         else {
             return;
         };
-        if index == history.index {
+        if index == history.index
+            && ((self.view == WorkspaceView::Editor && location.document.is_none())
+                || (self.view == WorkspaceView::Docs && location.document.is_some()))
+        {
             self.cancel_file_open();
+            self.cancel_document_navigation();
             cx.notify();
             return;
         }
-        self.request_file(
-            location.path,
-            FileOpen::History {
-                index,
-                position: location.position,
-            },
-            window,
-            cx,
-        );
+        if self.view == WorkspaceView::Docs {
+            self.capture_document_history_position(cx);
+        } else {
+            self.capture_source_viewport(cx);
+        }
+        self.replay_source_location(index, location, window, cx);
+    }
+
+    fn replay_source_location(
+        &mut self,
+        index: usize,
+        location: SourceLocation,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(path) = location.path else {
+            let view = if location.document.is_some() {
+                WorkspaceView::Docs
+            } else {
+                WorkspaceView::Editor
+            };
+            self.restore_empty_view(view, window, cx);
+            self.complete_navigation_replay(index);
+            return;
+        };
+        if let Some(document) = location.document {
+            self.open_history_document(path, index, document, window, cx);
+        } else {
+            if self.view == WorkspaceView::Docs {
+                self.cancel_document_navigation();
+                self.switch_view(WorkspaceView::Editor, window, cx);
+            }
+            if self.view == WorkspaceView::Editor {
+                self.request_file(
+                    path,
+                    FileOpen::History {
+                        index,
+                        position: location.position,
+                    },
+                    window,
+                    cx,
+                );
+            }
+        }
+    }
+
+    fn restore_empty_view(
+        &mut self,
+        view: WorkspaceView,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.cancel_file_open();
+        match view {
+            WorkspaceView::Docs => {
+                self.capture_document_position(cx);
+                self.doc_task = Task::ready(());
+                self.doc_loading = None;
+                self.doc = None;
+                self.doc_error = None;
+                self.session.document = None;
+                self.session.open_documents.get_or_insert_default();
+            }
+            WorkspaceView::Editor => {
+                self.capture_active_file_position(cx);
+                self.cancel_document_navigation();
+                let previous = self.tabs.deselect();
+                if self.view == view {
+                    self.finish_tab_selection(previous.as_deref(), window, cx);
+                }
+            }
+            WorkspaceView::Git => return,
+        }
+        if self.view == view {
+            self.rebuild_tree();
+            cx.notify();
+        } else {
+            self.switch_view(view, window, cx);
+        }
+    }
+
+    pub(super) fn topbar_location(&self, cx: &App) -> SourceLocation {
+        match self.view {
+            WorkspaceView::Docs => self.document_history_location(cx),
+            WorkspaceView::Editor => self.source_location(cx),
+            WorkspaceView::Git => None,
+        }
+        .unwrap_or_else(|| SourceLocation::empty(self.view))
+    }
+
+    pub(super) fn document_history_location(&self, cx: &App) -> Option<SourceLocation> {
+        let reader = self.doc.as_ref()?.read(cx);
+        Some(SourceLocation {
+            path: Some(reader.path.clone()),
+            position: None,
+            document: Some(reader.history_location(cx)),
+        })
+    }
+
+    pub(super) fn capture_document_history_position(&mut self, cx: &App) {
+        let Some(location) = self.document_history_location(cx) else {
+            return;
+        };
+        let history = &mut self.session.source_history;
+        if let Some(current) = history.entries.get_mut(history.index)
+            && current.same_document(&location)
+            && *current != location
+        {
+            *current = location;
+            self.session_revision += 1;
+        }
+    }
+
+    pub(super) fn record_document_navigation(&mut self, source: Option<SourceLocation>, cx: &App) {
+        if let Some(target) = self.document_history_location(cx) {
+            self.record_navigation(source, target);
+        }
+    }
+
+    pub(super) fn complete_navigation_replay(&mut self, index: usize) {
+        if let Some(history) = self.source_history_mut() {
+            history.replay(index, None);
+        }
     }
 
     pub(super) fn skip_missing_source(
@@ -207,7 +384,9 @@ impl Workspace {
     }
 
     pub(super) fn source_history_mut(&mut self) -> Option<&mut SourceHistory> {
-        self.repository.as_ref()?;
+        if self.repository.is_none() && self.standalone.is_none() {
+            return None;
+        }
         self.session_revision += 1;
         Some(&mut self.session.source_history)
     }
@@ -287,7 +466,10 @@ impl Workspace {
         let Some((revision, source)) = self.source_click.take() else {
             return;
         };
-        if let Some(file) = self.active_file().filter(|file| file.path == source.path) {
+        if let Some(file) = self
+            .active_file()
+            .filter(|file| Some(file.path.as_path()) == source.path.as_deref())
+        {
             let editor = file.editor.read(cx);
             if editor.document_revision() == revision
                 && editor.focus_handle(cx).is_focused(window)
@@ -299,7 +481,9 @@ impl Workspace {
     }
 
     pub(super) fn source_location(&self, cx: &App) -> Option<SourceLocation> {
-        self.repository.as_ref()?;
+        if self.repository.is_none() && self.standalone.is_none() {
+            return None;
+        }
         let path = self.tabs.active()?.to_owned();
         let position = if let Some(file) = self.files.get(&path) {
             Some(source_file_position(
@@ -311,13 +495,25 @@ impl Workspace {
         } else {
             return None;
         };
-        Some(SourceLocation { path, position })
+        Some(SourceLocation {
+            path: Some(path),
+            position,
+            document: None,
+        })
     }
 
     pub(super) fn record_source_navigation(&mut self, source: Option<SourceLocation>, cx: &App) {
         let Some(target) = self.source_location(cx) else {
             return;
         };
+        self.record_navigation(source, target);
+    }
+
+    pub(super) fn record_navigation(
+        &mut self,
+        source: Option<SourceLocation>,
+        target: SourceLocation,
+    ) {
         if source
             .as_ref()
             .is_some_and(|source| source.same_destination(&target))
@@ -325,10 +521,13 @@ impl Workspace {
             return;
         }
         let history = &mut self.session.source_history;
-        if history
-            .entries
-            .get(history.index)
-            .is_some_and(|entry| entry.same_destination(&target))
+        if source
+            .as_ref()
+            .is_none_or(|source| source.document.is_none() && target.document.is_none())
+            && history
+                .entries
+                .get(history.index)
+                .is_some_and(|entry| entry.same_destination(&target))
         {
             return;
         }

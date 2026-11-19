@@ -120,7 +120,10 @@ impl Workspace {
                 self.capture_active_file_position(cx);
                 self.capture_source_viewport(cx);
             }
-            WorkspaceView::Docs => self.capture_document_position(cx),
+            WorkspaceView::Docs => {
+                self.capture_document_position(cx);
+                self.capture_document_history_position(cx);
+            }
             WorkspaceView::Git if !disconnected => {
                 if let Some(panel) = &self.git
                     && let Some(state) = panel.read(cx).session(cx)
