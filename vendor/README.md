@@ -59,9 +59,13 @@ dialogs in a Wayland window after changes to paint order or focus handling.
 - Fold candidates are remapped through edits and replaced when the background
   highlighter publishes its completed parse. The editor editing integration test
   checks candidate continuity, line remapping, and removal.
-- Pointer-triggered editor documentation waits 500 ms for each symbol.
+- Pointer-triggered diagnostics and documentation share a 300 ms reveal delay.
+  The editor requests documentation halfway through the delay and adds late
+  results to the same popup, including while its Quick Fix menu is open.
   Moving to another symbol resets the timer, including within a shared
-  diagnostic range. Diagnostic rows can appear before documentation.
+  diagnostic range. Clicking Quick Fix or the inline lightbulb, or using the
+  Code Actions shortcut, opens the menu immediately.
+  Explicit diagnostic presentation replaces a pending pointer hover immediately.
   The popup integration tests cover timing, cancellation, and scrolling.
 - Interactive code editor edits reveal the caret with minimal scrolling before shaping the
   viewport. Programmatic replacements and history replay use the existing caret-follow margin.

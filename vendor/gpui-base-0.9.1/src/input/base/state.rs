@@ -7611,6 +7611,10 @@ mod tests {
             None,
             gpui::Modifiers::default(),
         );
+        cx.run_until_parked();
+        cx.executor()
+            .advance_clock(std::time::Duration::from_millis(300));
+        cx.run_until_parked();
         assert!(
             input.read_with(&cx, |state, _| state.diagnostic_popover().is_some()),
             "no hover at the bottom of a scrolled editor, bounds {bounds:?}"

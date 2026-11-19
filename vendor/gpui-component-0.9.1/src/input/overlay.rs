@@ -250,8 +250,8 @@ impl OverlayMode for crate::input::EditorMode {
             });
         }
 
-        // A code action session inserts its content into the existing hover
-        // surface and freezes the diagnostic/documentation snapshot.
+        // A code action session keeps the existing hover anchor and diagnostic rows.
+        // Documentation can still arrive for that target.
         let hover = {
             let state = state.read(cx);
             state

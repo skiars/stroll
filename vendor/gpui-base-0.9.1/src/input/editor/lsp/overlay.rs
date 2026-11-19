@@ -67,12 +67,13 @@ pub struct HoverPopoverState {
     pub(super) target_range: Range<usize>,
     pub(super) documentation_target: Option<Range<usize>>,
     pub(super) pointer: Option<gpui::Point<gpui::Pixels>>,
+    pub(super) waiting_for_delay: bool,
     pub(super) pointer_handoff: Cell<Option<gpui::Point<gpui::Pixels>>>,
 }
 
 impl HoverPopoverState {
     pub(super) fn visible(&self) -> bool {
-        self.hover.is_some() || !self.diagnostics.is_empty()
+        !self.waiting_for_delay && (self.hover.is_some() || !self.diagnostics.is_empty())
     }
 }
 
@@ -134,8 +135,9 @@ impl InputBaseState<EditorMode> {
         self.extras.hover_popover = Some(HoverPopoverState {
             target_range: symbol_range.clone(),
             pointer: None,
-            pointer_handoff: Cell::default(),
             documentation_target: None,
+            waiting_for_delay: false,
+            pointer_handoff: Cell::default(),
             symbol_range,
             hover: Some(hover),
             documentation: None,
@@ -145,6 +147,15 @@ impl InputBaseState<EditorMode> {
     }
 
     pub fn present_diagnostic(&mut self, diagnostic: DiagnosticEntry, cx: &mut Context<Self>) {
+        if self
+            .extras
+            .hover_popover
+            .as_ref()
+            .is_some_and(|hover| hover.waiting_for_delay)
+        {
+            self.extras.hover_popover = None;
+            self.extras.lsp._hover_task = Task::ready(Ok(()));
+        }
         let range = diagnostic.range.clone();
         let popover = self
             .extras
@@ -152,8 +163,9 @@ impl InputBaseState<EditorMode> {
             .get_or_insert_with(|| HoverPopoverState {
                 target_range: range.clone(),
                 pointer: None,
-                pointer_handoff: Cell::default(),
                 documentation_target: None,
+                waiting_for_delay: false,
+                pointer_handoff: Cell::default(),
                 symbol_range: range,
                 hover: None,
                 documentation: None,
@@ -264,8 +276,9 @@ impl InputBaseState<EditorMode> {
                 symbol_range: menu.range.start..menu.range.start,
                 target_range: menu.range.clone(),
                 pointer: None,
-                pointer_handoff: Cell::default(),
                 documentation_target: None,
+                waiting_for_delay: false,
+                pointer_handoff: Cell::default(),
                 hover: None,
                 documentation: None,
                 diagnostics: Rc::default(),

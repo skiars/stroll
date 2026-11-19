@@ -679,7 +679,7 @@ fn resize_handle_cancels_pending_and_active_drags_when_the_left_button_is_up(
 
 #[gpui::test]
 fn open_diagnostic_updates_in_place_after_an_edit(cx: &mut gpui::TestAppContext) {
-    use gpui::{AppContext as _, Context, Entity, Render, Styled as _, Window};
+    use gpui::{AppContext as _, Context, Entity, Render, Styled as _, Window, px};
     use gpui_component::{
         Root,
         input::{Editor, EditorState},
@@ -734,6 +734,9 @@ fn open_diagnostic_updates_in_place_after_an_edit(cx: &mut gpui::TestAppContext)
                 .map(|entry| entry.message.clone())
         })
     };
+    cx.run_until_parked();
+    cx.executor().advance_clock(Duration::from_millis(300));
+    cx.run_until_parked();
     assert_eq!(visible_message(cx).as_deref(), Some("Previous error"));
     cx.simulate_input(" ");
     assert_eq!(visible_message(cx).as_deref(), Some("Previous error"));
@@ -761,6 +764,35 @@ fn open_diagnostic_updates_in_place_after_an_edit(cx: &mut gpui::TestAppContext)
         });
     });
     assert_eq!(visible_message(cx), None);
+
+    let (pointer, explicit) = cx.update(|window, cx| {
+        let explicit = editor.update(cx, |editor, cx| {
+            let set = editor.diagnostics_mut().unwrap();
+            set.push(diagnostic(0, 4, "Pending hover"));
+            set.push(diagnostic(1, 5, "Explicit diagnostic"));
+            let explicit = set.iter().nth(1).unwrap().clone();
+            cx.notify();
+            explicit
+        });
+        window.draw(cx).clear(cx);
+        let bounds = editor.read(cx).range_to_bounds(&(0..4)).unwrap();
+        (bounds.center() - point(px(1.), px(0.)), explicit)
+    });
+    cx.simulate_mouse_move(pointer, None, Default::default());
+    cx.run_until_parked();
+    cx.executor().advance_clock(Duration::from_millis(299));
+    cx.run_until_parked();
+    assert_eq!(visible_message(cx), None);
+    cx.update(|_, cx| {
+        editor.update(cx, |editor, cx| {
+            editor.present_diagnostic(explicit.clone(), cx);
+            assert_eq!(editor.hover_popover().unwrap().symbol_range, explicit.range);
+        });
+    });
+    assert_eq!(visible_message(cx).as_deref(), Some("Explicit diagnostic"));
+    cx.executor().advance_clock(Duration::from_millis(1));
+    cx.run_until_parked();
+    assert_eq!(visible_message(cx).as_deref(), Some("Explicit diagnostic"));
 }
 
 #[gpui::test]
@@ -847,16 +879,16 @@ fn editor_hover_waits_for_pointer_motion_after_scrolling(cx: &mut gpui::TestAppC
     let next_target = pointer + point(px(0.), line_height);
     let blank = pointer + point(px(150.), px(0.));
     cx.simulate_mouse_move(pointer, None, Default::default());
-    advance(cx, 400);
+    advance(cx, 200);
     assert_eq!(active(cx), None);
     cx.simulate_mouse_move(blank, None, Default::default());
-    advance(cx, 500);
+    advance(cx, 300);
     assert_eq!(active(cx), None);
 
     cx.simulate_mouse_move(pointer, None, Default::default());
-    advance(cx, 400);
+    advance(cx, 200);
     cx.simulate_mouse_move(next_target, None, Default::default());
-    advance(cx, 499);
+    advance(cx, 299);
     assert_eq!(active(cx), None);
 
     // Motion inside the same symbol keeps the original timer.
@@ -870,7 +902,7 @@ fn editor_hover_waits_for_pointer_motion_after_scrolling(cx: &mut gpui::TestAppC
 
     cx.update(|_, cx| editor.update(cx, |editor, cx| editor.clear_hover_state(cx)));
     cx.simulate_mouse_move(pointer, None, Default::default());
-    advance(cx, 500);
+    advance(cx, 300);
     assert_eq!(active(cx), Some(14..20));
     scroll(cx, px(40.));
     assert_eq!(active(cx), Some(14..20));
@@ -880,10 +912,10 @@ fn editor_hover_waits_for_pointer_motion_after_scrolling(cx: &mut gpui::TestAppC
     scroll(cx, px(2.) - line_height);
     assert_eq!(active(cx), None);
     cx.simulate_mouse_move(pointer, None, Default::default());
-    advance(cx, 500);
+    advance(cx, 300);
     assert_eq!(active(cx), None);
     cx.simulate_mouse_move(pointer + point(px(1.), px(0.)), None, Default::default());
-    advance(cx, 500);
+    advance(cx, 300);
     assert_eq!(active(cx), Some(21..27));
 
     // A scroll that invalidates a pending hover must also cancel its task.
@@ -893,7 +925,7 @@ fn editor_hover_waits_for_pointer_motion_after_scrolling(cx: &mut gpui::TestAppC
         Default::default(),
     );
     scroll(cx, -line_height * 2.);
-    advance(cx, 500);
+    advance(cx, 300);
     assert_eq!(active(cx), None);
 }
 
@@ -997,7 +1029,7 @@ fn lsp_hover_stays_open_during_pointer_handoff_and_copies_documentation(
         let symbol = cx.update(|_, cx| editor.read(cx).range_to_bounds(&range).unwrap());
         cx.simulate_mouse_move(symbol.center(), None, Default::default());
         cx.run_until_parked();
-        cx.executor().advance_clock(Duration::from_millis(500));
+        cx.executor().advance_clock(Duration::from_millis(300));
         cx.run_until_parked();
         draw(cx);
 
@@ -1056,7 +1088,7 @@ fn lsp_hover_stays_open_during_pointer_handoff_and_copies_documentation(
             assert!(!docs.contains(&peer_pointer));
             cx.simulate_mouse_move(peer_pointer, None, Default::default());
             cx.run_until_parked();
-            cx.executor().advance_clock(Duration::from_millis(500));
+            cx.executor().advance_clock(Duration::from_millis(300));
             cx.run_until_parked();
             cx.update(|_, cx| {
                 assert!(editor.read(cx).hover_popover().is_some());
@@ -2107,11 +2139,12 @@ fn completion_popup_stays_in_view_and_tab_accepts_the_selected_row() -> anyhow::
 #[cfg(target_os = "linux")]
 #[test]
 fn editor_hover_appends_documentation_to_web_diagnostics() -> anyhow::Result<()> {
-    use std::{rc::Rc, sync::Arc};
+    use std::{cell::Cell, rc::Rc, sync::Arc};
 
     use gpui::{
-        App, AppContext as _, Context, Entity, HeadlessAppContext, InputEvent as _, MouseMoveEvent,
-        Render, Styled as _, Task, Window, linear_color_stop, linear_gradient, px,
+        App, AppContext as _, Context, Entity, HeadlessAppContext, InputEvent as _, MouseButton,
+        MouseDownEvent, MouseMoveEvent, MouseUpEvent, Render, Styled as _, Task, Window,
+        linear_color_stop, linear_gradient, px,
     };
     use gpui_component::{
         ActiveTheme as _, Root, ThemeMode,
@@ -2130,7 +2163,7 @@ fn editor_hover_appends_documentation_to_web_diagnostics() -> anyhow::Result<()>
     );
     const SYMBOL: std::ops::Range<usize> = 45..54;
 
-    struct Documentation;
+    struct Documentation(Rc<Cell<Duration>>);
     impl HoverProvider for Documentation {
         fn hover(
             &self,
@@ -2139,7 +2172,7 @@ fn editor_hover_appends_documentation_to_web_diagnostics() -> anyhow::Result<()>
             _: &mut Window,
             cx: &mut App,
         ) -> Task<anyhow::Result<Option<Hover>>> {
-            let timer = cx.background_executor().timer(Duration::from_millis(300));
+            let timer = cx.background_executor().timer(self.0.get());
             cx.background_spawn(async move {
                 timer.await;
                 Ok(Some(Hover {
@@ -2238,12 +2271,13 @@ fn editor_hover_appends_documentation_to_web_diagnostics() -> anyhow::Result<()>
         stroll::workspace::apply_theme(ThemeMode::Light, cx);
     });
     let mut editor = None;
+    let delay = Rc::new(Cell::new(Duration::from_millis(50)));
     let window = cx.open_window(size(px(760.), px(640.)), |window, cx| {
         let state = cx.new(|cx| {
             let mut state = EditorState::new(window, cx)
                 .language("rust")
                 .default_value(SOURCE);
-            state.lsp_mut().hover_provider = Some(Rc::new(Documentation));
+            state.lsp_mut().hover_provider = Some(Rc::new(Documentation(delay.clone())));
             // Deliberately mix severities and overlap unevenly. A short diagnostic
             // ending before the hit must not hide the enclosing ones.
             for (start, end, severity, message, source) in [
@@ -2398,33 +2432,43 @@ fn editor_hover_appends_documentation_to_web_diagnostics() -> anyhow::Result<()>
         })
     };
 
+    let advance = |cx: &HeadlessAppContext, milliseconds| {
+        cx.advance_clock(Duration::from_millis(milliseconds));
+        cx.run_until_parked();
+    };
+    let assert_hidden = |cx: &mut HeadlessAppContext| {
+        cx.update(|cx| assert!(editor.read(cx).hover_popover().is_none()));
+    };
     move_to(&mut cx, symbol.center())?;
-    assert_rows(&mut cx, false);
-    let (initial_shell, initial_row) = popup(&mut cx)?;
-    cx.advance_clock(Duration::from_millis(500));
-    cx.run_until_parked();
-    assert_rows(&mut cx, false);
+    advance(&cx, 150);
+    advance(&cx, 149);
+    assert_hidden(&mut cx);
+    advance(&cx, 1);
+    assert_rows(&mut cx, true);
+    let (combined_shell, combined_row) = popup(&mut cx)?;
 
     // Leaving while the provider is running must discard its response.
     move_to(&mut cx, point(px(750.), px(550.)))?;
-    cx.advance_clock(Duration::from_millis(500));
-    cx.run_until_parked();
-    cx.update(|cx| assert!(editor.read(cx).hover_popover().is_none()));
-    cx.update_window(window, |_, window, cx| window.draw(cx).clear(cx))?;
-
+    delay.set(Duration::from_millis(300));
     move_to(&mut cx, symbol.center())?;
+    advance(&cx, 150);
+    move_to(&mut cx, point(px(750.), px(550.)))?;
+    advance(&cx, 300);
+    assert_hidden(&mut cx);
+
+    let output = std::env::var_os("STROLL_DIAGNOSTIC_SCREENSHOTS").map(std::path::PathBuf::from);
+    move_to(&mut cx, symbol.center())?;
+    advance(&cx, 150);
+    advance(&cx, 149);
+    assert_hidden(&mut cx);
+    advance(&cx, 1);
     assert_rows(&mut cx, false);
-    cx.advance_clock(Duration::from_millis(500));
-    cx.run_until_parked();
-    cx.advance_clock(Duration::from_millis(300));
-    cx.run_until_parked();
-    assert_rows(&mut cx, true);
-    let (combined_shell, combined_row) = popup(&mut cx)?;
+    let (initial_shell, initial_row) = popup(&mut cx)?;
     assert_eq!(combined_shell.origin, initial_shell.origin);
     assert_eq!(combined_row, initial_row);
     assert!(combined_shell.size.height > initial_shell.size.height);
-
-    let output = std::env::var_os("STROLL_DIAGNOSTIC_SCREENSHOTS").map(std::path::PathBuf::from);
+    advance(&cx, 150);
+    assert_rows(&mut cx, true);
     for (mode, label) in [(ThemeMode::Light, "light"), (ThemeMode::Dark, "dark")] {
         cx.update(|cx| stroll::workspace::apply_theme(mode, cx));
         popup(&mut cx)?;
@@ -2456,13 +2500,57 @@ fn editor_hover_appends_documentation_to_web_diagnostics() -> anyhow::Result<()>
                 .code_action_indicator_bounds(px(22.))
                 .is_some()
         );
-        editor.update(cx, |editor, cx| {
-            editor.open_code_actions(SYMBOL, window, cx)
-        });
+    })?;
+    move_to(&mut cx, point(px(750.), px(550.)))?;
+    move_to(&mut cx, symbol.center())?;
+    advance(&cx, 150);
+    advance(&cx, 150);
+    assert_rows(&mut cx, false);
+    let (_, row) = popup(&mut cx)?;
+    let quick_fix = cx.update_window(window, |_, window, _| {
+        let scale = window.scale_factor();
+        point(
+            px(row.right().0 / scale - 23.),
+            px(row.top().0 / scale + 21.),
+        )
+    })?;
+    move_to(&mut cx, quick_fix)?;
+    cx.update_window(window, |_, window, cx| {
+        window.dispatch_event(
+            MouseDownEvent {
+                button: MouseButton::Left,
+                position: quick_fix,
+                click_count: 1,
+                ..Default::default()
+            }
+            .to_platform_input(),
+            cx,
+        );
+        window.dispatch_event(
+            MouseUpEvent {
+                button: MouseButton::Left,
+                position: quick_fix,
+                click_count: 1,
+                ..Default::default()
+            }
+            .to_platform_input(),
+            cx,
+        );
     })?;
     cx.run_until_parked();
     let (action_shell, _) = popup(&mut cx)?;
     assert_eq!(action_shell.origin, combined_shell.origin);
+    cx.update(|cx| {
+        let menu = editor.read(cx).code_action_menu_state();
+        assert!(menu.open && menu.items.len() == 1);
+        assert!(menu.hover.as_ref().unwrap().hover.is_none());
+    });
+    advance(&cx, 150);
+    cx.update(|cx| {
+        let menu = editor.read(cx).code_action_menu_state();
+        assert!(menu.open && menu.hover.as_ref().unwrap().hover.is_some());
+    });
+    assert_eq!(popup(&mut cx)?.0.origin, action_shell.origin);
     let preview_fix = |cx: &mut HeadlessAppContext| -> anyhow::Result<()> {
         cx.update_window(window, |_, window, cx| {
             editor.update(cx, |editor, cx| {
@@ -2515,6 +2603,9 @@ fn editor_hover_appends_documentation_to_web_diagnostics() -> anyhow::Result<()>
     move_to(&mut cx, point(px(740.), symbol.center().y))?;
     cx.update(|cx| assert!(editor.read(cx).hover_popover().is_none()));
     move_to(&mut cx, symbol.center())?;
+    advance(&cx, 299);
+    assert_hidden(&mut cx);
+    advance(&cx, 1);
     assert_rows(&mut cx, false);
     popup(&mut cx)?;
     Ok(())

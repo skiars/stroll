@@ -134,13 +134,15 @@ impl InputBaseState<EditorMode> {
         let revision = self.document_revision;
         let selection = self.selected_range();
         self.extras.context_menu_content.completion.open = false;
-        self.extras.lsp._hover_task = Task::ready(Ok(()));
         let hover = self
             .hover_popover()
             .filter(|hover| {
                 hover.symbol_range.start <= range.end && range.start <= hover.symbol_range.end
             })
             .cloned();
+        if hover.is_none() {
+            self.clear_hover_state(cx);
+        }
         let menu = &mut self.extras.context_menu_content.code_action;
         menu.open = true;
         menu.range = range.clone();
@@ -198,6 +200,19 @@ impl InputBaseState<EditorMode> {
             })?;
             Ok(())
         });
+    }
+
+    pub(super) fn update_action_hover_documentation(&mut self) {
+        let menu = &mut self.extras.context_menu_content.code_action;
+        if menu.open
+            && let Some(snapshot) = menu.hover.as_mut()
+            && let Some(hover) = self.extras.hover_popover.as_ref()
+            && snapshot.documentation_target.is_some()
+            && snapshot.documentation_target == hover.documentation_target
+        {
+            snapshot.hover = hover.hover.clone();
+            snapshot.documentation = hover.documentation.clone();
+        }
     }
 
     pub fn code_action_can_preview(&self, item: &CodeActionItem) -> bool {

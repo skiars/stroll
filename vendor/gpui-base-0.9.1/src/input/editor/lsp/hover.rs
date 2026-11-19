@@ -2,7 +2,7 @@ use anyhow::Result;
 use gpui::{App, Bounds, Context, MouseMoveEvent, Pixels, Point, SharedString, Task, Window};
 use instant::Duration;
 use ropey::Rope;
-use std::{collections::BTreeMap, ops::Range, rc::Rc, sync::Arc};
+use std::{collections::BTreeMap, ops::Range, rc::Rc, sync::Arc, task::Poll};
 
 use crate::input::{
     DiagnosticEntry, DiagnosticSeverity, EditorMode, HoverPopoverState, InputBaseState, RopeExt,
@@ -57,7 +57,7 @@ pub trait HoverProvider {
     }
 }
 
-const DOCUMENTATION_HOVER_DELAY: Duration = Duration::from_millis(500);
+const HOVER_DELAY: Duration = Duration::from_millis(300);
 
 impl InputBaseState<EditorMode> {
     fn documentation_target_at(&self, offset: usize) -> Option<Range<usize>> {
@@ -170,40 +170,70 @@ impl InputBaseState<EditorMode> {
         let diagnostics: Rc<[_]> = diagnostics.into_iter().cloned().collect();
         // Dropping the previous task cancels the timer and any pending results.
         self.extras.lsp._hover_task = Task::ready(Ok(()));
-        let request_documentation = documentation_target.is_some();
+        let provider = provider.filter(|_| documentation_target.is_some());
         let popover = HoverPopoverState {
             symbol_range,
             target_range,
-            documentation_target,
+            documentation_target: documentation_target.clone(),
             pointer: Some(position),
-            pointer_handoff: Default::default(),
             diagnostics,
             hover: None,
             documentation: None,
+            waiting_for_delay: true,
+            pointer_handoff: Default::default(),
         };
-        if popover.visible() || had_visible_popover {
+        if had_visible_popover {
             cx.notify();
         }
         self.extras.hover_popover = Some(popover);
 
-        let (Some(provider), true) = (provider, request_documentation) else {
-            return;
-        };
         let text = self.text.clone();
         let revision = self.document_revision;
         self.extras.lsp._hover_task = cx.spawn_in(window, async move |this, cx| {
-            cx.background_executor()
-                .timer(DOCUMENTATION_HOVER_DELAY)
-                .await;
-
-            let task = this.update_in(cx, |editor, window, cx| {
-                (editor.document_revision == revision)
+            let reveal = cx.background_executor().timer(HOVER_DELAY);
+            // Give the server a head start without querying briefly crossed symbols.
+            let mut request = if let Some(provider) = provider.as_ref() {
+                cx.background_executor().timer(HOVER_DELAY / 2).await;
+                this.update_in(cx, |editor, window, cx| {
+                    (editor.document_revision == revision
+                        && editor.extras.hover_popover.as_ref().is_some_and(|popover| {
+                            popover.documentation_target == documentation_target
+                        }))
                     .then(|| provider.hover(&text, offset, window, cx))
+                })?
+            } else {
+                None
+            };
+            reveal.await;
+
+            let mut early_hover = None;
+            if let Some(task) = request.as_mut()
+                && let Poll::Ready(result) = futures::poll!(task)
+            {
+                request = None;
+                early_hover = result.ok().flatten();
+            }
+            this.update_in(cx, |editor, _, cx| {
+                if let Some(popover) = editor.extras.hover_popover.as_mut()
+                    && editor.document_revision == revision
+                {
+                    popover.waiting_for_delay = false;
+                    if popover.visible()
+                        && (early_hover.is_none()
+                            || popover.documentation_target != documentation_target)
+                    {
+                        cx.notify();
+                    }
+                }
             })?;
-            let Some(task) = task else {
+            let Some(provider) = provider else {
                 return Ok(());
             };
-            let Some(hover) = task.await? else {
+            let hover = match (early_hover, request) {
+                (None, Some(request)) => request.await?,
+                (hover, _) => hover,
+            };
+            let Some(hover) = hover else {
                 return Ok(());
             };
 
@@ -212,6 +242,9 @@ impl InputBaseState<EditorMode> {
                     return None;
                 }
                 let popover = editor.extras.hover_popover.as_mut()?;
+                if popover.documentation_target != documentation_target {
+                    return None;
+                }
                 if popover.diagnostics.is_empty()
                     && let Some(range) = hover.range
                 {
@@ -224,6 +257,7 @@ impl InputBaseState<EditorMode> {
                 }
                 let enrichment = provider.enrich_hover(&hover, offset, window, cx);
                 popover.hover = Some(hover.clone());
+                editor.update_action_hover_documentation();
                 cx.notify();
                 Some(enrichment)
             })?;
@@ -236,6 +270,7 @@ impl InputBaseState<EditorMode> {
                         && popover.hover.as_ref() == Some(&hover)
                     {
                         popover.documentation = Some(documentation);
+                        editor.update_action_hover_documentation();
                         cx.notify();
                     }
                 })?;
@@ -313,7 +348,8 @@ impl InputBaseState<EditorMode> {
             self.extras.hover_popover = None;
             return;
         };
-        if popover.pointer.is_none() || popover.diagnostics.is_empty() {
+        if popover.waiting_for_delay || popover.pointer.is_none() || popover.diagnostics.is_empty()
+        {
             self.extras.hover_popover = None;
             return;
         }
@@ -355,9 +391,6 @@ impl InputBaseState<EditorMode> {
             self.clear_language_hover(cx);
             return;
         }
-        if !popover.visible() {
-            return;
-        }
         let diagnostics = self.hover_diagnostics_at(offset);
         let diagnostics_changed = !diagnostics.iter().copied().eq(popover.diagnostics.iter());
         if !diagnostics_changed
@@ -390,7 +423,7 @@ impl InputBaseState<EditorMode> {
             popover.hover = None;
             popover.documentation = None;
         }
-        if !popover.visible() && popover.documentation_target.is_none() {
+        if popover.diagnostics.is_empty() && popover.documentation_target.is_none() {
             self.clear_language_hover(cx);
         }
         cx.notify();
