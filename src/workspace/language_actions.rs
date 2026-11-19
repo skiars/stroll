@@ -8,7 +8,7 @@ use std::{
         Arc,
         atomic::{AtomicU64, Ordering},
     },
-    time::SystemTime,
+    time::{Duration, Instant, SystemTime},
 };
 
 use anyhow::{Context as _, Result, anyhow, ensure};
@@ -27,6 +27,7 @@ use lsp_types::{
     WorkspaceEdit,
 };
 use rust_i18n::t;
+use similar::{DiffTag, TextDiff};
 
 use crate::{
     language::LanguageServer,
@@ -732,30 +733,89 @@ fn apply_language_text_edits(
     cx: &mut Context<EditorState>,
 ) {
     let before = editor.text().clone();
-    editor.edit_ranges_mapping_selections(
+    let changes = language_edit_changes(&before, edits);
+    let caret = editor.cursor();
+    let scroll = (editor.visible_row_range().is_some()
+        && !editor
+            .range_to_bounds(&(caret..caret))
+            .is_some_and(|bounds| editor.input_bounds().contains(&bounds.center())))
+    .then(|| editor.scroll_offset());
+    editor.edit_ranges_mapping_selection_ranges(
         edits,
         group,
-        |after, offset| map_language_edit_offset(&before, after, edits, offset),
+        |after, selection| {
+            let start = map_language_edit_offset(&before, after, &changes, selection.start, true);
+            let end = if selection.is_empty() {
+                start
+            } else {
+                map_language_edit_offset(&before, after, &changes, selection.end, false)
+            };
+            start..end
+        },
         window,
         cx,
     );
+    if let Some(scroll) = scroll {
+        editor.set_scroll_offset(scroll, cx);
+    }
+}
+
+// Refine the selection mapping without changing the edits applied to the buffer.
+fn language_edit_changes(before: &Rope, edits: &TextEdits) -> Vec<(Range<usize>, usize)> {
+    let deadline = Instant::now() + Duration::from_millis(25);
+    let mut remaining_bytes = 1024 * 1024;
+    let mut changes = Vec::new();
+    for (range, replacement) in edits {
+        let bytes = range.len().saturating_add(replacement.len());
+        if range.is_empty()
+            || replacement.is_empty()
+            || bytes > remaining_bytes
+            || Instant::now() >= deadline
+        {
+            changes.push((range.clone(), replacement.len()));
+            continue;
+        }
+        remaining_bytes -= bytes;
+        let original = before.slice(range.clone()).to_string();
+        let diff = TextDiff::configure()
+            .deadline(deadline)
+            .diff_chars(&original, replacement);
+        let mut old = range.start;
+        for op in diff.ops() {
+            let old_end = old
+                + diff.old_slices()[op.old_range()]
+                    .iter()
+                    .map(|part| part.len())
+                    .sum::<usize>();
+            if op.tag() != DiffTag::Equal {
+                let inserted_len = diff.new_slices()[op.new_range()]
+                    .iter()
+                    .map(|part| part.len())
+                    .sum::<usize>();
+                changes.push((old..old_end, inserted_len));
+            }
+            old = old_end;
+        }
+    }
+    changes
 }
 
 fn map_language_edit_offset(
     before: &Rope,
     after: &Rope,
-    edits: &TextEdits,
+    changes: &[(Range<usize>, usize)],
     offset: usize,
+    after_insert: bool,
 ) -> usize {
     let mut old_end = 0;
     let mut new_end = 0;
     // Validated LSP edits are sorted and disjoint.
-    for (range, replacement) in edits {
-        if offset <= range.start {
+    for (range, inserted_len) in changes {
+        if offset <= range.start && !(after_insert && range.is_empty() && offset == range.start) {
             break;
         }
         let new_start = new_end + range.start - old_end;
-        new_end = new_start + replacement.len();
+        new_end = new_start + inserted_len;
         old_end = range.end;
         if offset < range.end {
             // A formatter can replace an entire file. Keep the relative line
@@ -1311,14 +1371,18 @@ mod tests {
         let original = before.to_string();
         let updated = after.to_string();
         let edits = vec![
-            (0..0, "// Header\n".into()),
+            (0..0, "// Header\n".len()),
             (
                 original.find('😀').unwrap()..original.find("\nunchanged").unwrap(),
-                "文new\nshort".into(),
+                "文new\nshort".len(),
             ),
         ];
-        let map = |offset| map_language_edit_offset(&before, &after, &edits, offset);
-        assert_eq!(map(0), 0);
+        let map = |offset| map_language_edit_offset(&before, &after, &edits, offset, true);
+        assert_eq!(map(0), "// Header\n".len());
+        assert_eq!(
+            map_language_edit_offset(&before, &after, &edits, 0, false),
+            0
+        );
         assert_eq!(
             map(original.find("old").unwrap()),
             updated.find("new").unwrap()
@@ -1491,6 +1555,7 @@ mod tests {
             point(bulb.right() - px(2.), bulb.center().y),
             Modifiers::default(),
         );
+        visual.update(|_, cx| assert!(editor.read(cx).code_action_menu_state().open));
         pump(visual, "code action menu", |visual| {
             visual.update(|_, cx| editor.read(cx).code_action_menu_state().items.len() == 3)
         })?;
@@ -1644,6 +1709,66 @@ mod tests {
     #[::core::prelude::v1::test]
     fn previews_and_applies_code_actions_and_renames_as_draft_transactions() -> Result<()> {
         workflow(None)
+    }
+
+    #[::core::prelude::v1::test]
+    fn code_action_keeps_caret_and_selection_on_unchanged_text() -> Result<()> {
+        const ORIGINAL: &str = "int old = 0;\nint payload = 1;\n";
+        const UPDATED: &str = "// Header\nint fixed = 0;\nint payload = 1;\n";
+        let mut app = test_app();
+        let (_fixture, workspace, visual) = open_fixture(&mut app, None, |root| {
+            fs::write(root.join("main.cpp"), ORIGINAL)?;
+            Ok(())
+        })?;
+        pump(visual, "code action provider", |visual| {
+            visual.update(|_, cx| {
+                workspace
+                    .read(cx)
+                    .active_file()
+                    .is_some_and(|file| file.editor.read(cx).can_open_code_actions())
+            })
+        })?;
+        let editor =
+            visual.update(|_, cx| workspace.read(cx).active_file().unwrap().editor.clone());
+        let payload = |text: &str| {
+            let start = text.find("payload").unwrap();
+            start..start + "payload".len()
+        };
+        let header_len = "// Header\n".len();
+        for (before, after, reversed) in [
+            (0..0, header_len..header_len, false),
+            (payload(ORIGINAL), payload(UPDATED), true),
+        ] {
+            visual.update(|window, cx| {
+                editor.update(cx, |editor, cx| {
+                    editor.focus(window, cx);
+                    editor.set_selected_range_with_direction(before.clone(), reversed, cx);
+                });
+            });
+            visual.simulate_keystrokes(shortcut());
+            visual.update(|_, cx| assert!(editor.read(cx).code_action_menu_state().open));
+            pump(visual, "code action results", |visual| {
+                visual.update(|_, cx| !editor.read(cx).code_action_menu_state().items.is_empty())
+            })?;
+            visual.simulate_keystrokes("enter");
+            pump(visual, "whole-buffer code action", |visual| {
+                visual.update(|_, cx| editor.read(cx).text() == UPDATED)
+            })?;
+            let assert_selection = |visual: &mut VisualTestContext, range| {
+                visual.update(|_, cx| {
+                    let editor = editor.read(cx);
+                    assert_eq!(editor.selected_range(), range);
+                    assert_eq!(editor.is_selection_reversed(), reversed);
+                });
+            };
+            assert_selection(visual, after.clone());
+            visual.update(|window, cx| window.dispatch_action(Box::new(Undo), cx));
+            assert_selection(visual, before.clone());
+            visual.update(|window, cx| window.dispatch_action(Box::new(Redo), cx));
+            assert_selection(visual, after);
+            visual.update(|window, cx| window.dispatch_action(Box::new(Undo), cx));
+        }
+        Ok(())
     }
 
     /// The loopback host must run the real helper and launch the fixture server

@@ -123,7 +123,7 @@ while message := receive():
             send(id=identifier, result=[])
             continue
         version, text = documents[uri]
-        if "old" not in text or not (params["range"]["start"]["line"] == 0):
+        if "old" not in text or (params["range"]["start"]["line"] != 0 and "int payload" not in text):
             send(id=identifier, result=[])
             continue
         actions = [{
@@ -150,9 +150,15 @@ while message := receive():
         version, text = documents[data["uri"]]
         assert data == {"uri": data["uri"], "version": version}
         assert text[4:7] == "old"
+        edits = [change("fixed")]
+        if "int payload" in text:
+            edits = [{
+                "range": {"start": position(0), "end": {"line": 2, "character": 0}},
+                "newText": "// Header\n" + text.replace("old", "fixed", 1),
+            }]
         send(id=identifier, result={
             **params, "edit": {"documentChanges": [{
-                "textDocument": data, "edits": [change("fixed")],
+                "textDocument": data, "edits": edits,
             }]},
         })
     elif method == "textDocument/hover":

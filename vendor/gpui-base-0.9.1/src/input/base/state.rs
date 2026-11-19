@@ -4073,13 +4073,31 @@ impl<M: InputModeKind> InputBaseState<M> {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.edit_ranges_mapping_selection_ranges(
+            edits,
+            group,
+            |text, range| map_offset(text, range.start)..map_offset(text, range.end),
+            window,
+            cx,
+        );
+    }
+
+    /// Map each selection as a range so the caller can distinguish carets and
+    /// apply different insertion affinities to the two ends of a selection.
+    pub fn edit_ranges_mapping_selection_ranges(
+        &mut self,
+        edits: &[(Range<usize>, String)],
+        group: Option<u64>,
+        map_range: impl Fn(&Rope, Range<usize>) -> Range<usize>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let selections = self.selections.iter().copied().collect::<Vec<_>>();
         let map = |text: &Rope| {
             selections
                 .iter()
                 .map(|&selection| {
-                    let start = map_offset(text, selection.start);
-                    let end = map_offset(text, selection.end);
+                    let Range { start, end } = map_range(text, selection.start..selection.end);
                     CursorSelection {
                         start,
                         end,

@@ -69,6 +69,8 @@ dialogs in a Wayland window after changes to paint order or focus handling.
   The popup integration tests cover timing, cancellation, and scrolling.
 - Interactive code editor edits reveal the caret with minimal scrolling before shaping the
   viewport. Programmatic replacements and history replay use the existing caret-follow margin.
+  Mapped edit transactions support both endpoint and range callbacks. Range
+  callbacks can preserve the original selection and its direction at insertion boundaries.
   Removing inline Git deleted rows keeps the visible source anchored. The workspace
   opts its source editor into whole-line clipboard actions for collapsed selections.
   Clipboard metadata distinguishes whole lines from ordinary text, and multi-line
