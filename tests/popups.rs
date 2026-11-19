@@ -2095,7 +2095,14 @@ fn completion_popup_stays_in_view_and_tab_accepts_the_selected_row() -> anyhow::
                 assert!(shell.right().0 <= (width - 7.) * scale);
                 assert!(shell.bottom().0 <= (height - 7.) * scale);
             }
-            let (list, docs) = (shells[0], shells[1]);
+            let caret = editor.read(cx).prepaint_caret_geometry().unwrap();
+            let caret_y = f32::from(caret.cursor_bounds().top() + caret.scroll_offset().y) * scale;
+            let stacked_above = stacked && shells[1].bottom().0 <= caret_y;
+            let (list, docs) = if stacked_above {
+                (shells[1], shells[0])
+            } else {
+                (shells[0], shells[1])
+            };
             if !stacked {
                 let height = list.size.height.0 / scale;
                 if let Some(previous) = previous_list_height {
@@ -2108,9 +2115,17 @@ fn completion_popup_stays_in_view_and_tab_accepts_the_selected_row() -> anyhow::
             }
             if stacked {
                 assert_eq!(list.left(), docs.left());
-                assert!(list.bottom() < docs.top());
+                if stacked_above {
+                    assert!(docs.bottom() < list.top());
+                } else {
+                    assert!(list.bottom() < docs.top());
+                }
             } else {
-                assert_eq!(list.top(), docs.top());
+                if list.bottom().0 <= caret_y {
+                    assert_eq!(list.bottom(), docs.bottom());
+                } else {
+                    assert_eq!(list.top(), docs.top());
+                }
                 assert!(list.right() < docs.left());
             }
             assert!(docs.size.height.0 > 48. * scale);
@@ -2134,6 +2149,246 @@ fn completion_popup_stays_in_view_and_tab_accepts_the_selected_row() -> anyhow::
         });
     }
     Ok(())
+}
+
+#[gpui::test]
+fn completion_popup_keeps_list_geometry_through_documentation_changes(
+    cx: &mut gpui::TestAppContext,
+) {
+    use gpui::{
+        AppContext as _, Context, Entity, Render, ScrollDelta, ScrollEvent, Styled as _,
+        VisualTestContext, Window, px,
+    };
+    use gpui_component::{
+        Root,
+        input::{Editor, EditorState},
+    };
+    use lsp_types::{CompletionItem, Documentation};
+
+    struct Probe(Entity<EditorState>);
+    impl Render for Probe {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl gpui::IntoElement {
+            Editor::new(&self.0).text_size(px(15.)).size_full()
+        }
+    }
+
+    cx.update(|cx| {
+        gpui_component::init(cx);
+        cx.set_reduce_motion(true);
+    });
+    let prefix = "other();\n".repeat(32);
+    let start = prefix.len() + "batch.ops.".len();
+    let mut editor = None;
+    let (_, visual) = cx.add_window_view(|window, cx| {
+        let source = format!("{prefix}batch.ops.foldl();\n{prefix}");
+        let state = cx.new(|cx| EditorState::new(window, cx).default_value(source));
+        editor = Some(state.clone());
+        let view = cx.new(|_| Probe(state));
+        Root::new(view, window, cx)
+    });
+    let editor = editor.unwrap();
+    let candidates = (0..15)
+        .map(|index| CompletionItem {
+            label: format!("candidate{index:02}"),
+            documentation: match index {
+                0 => Some(Documentation::String("Short documentation.".into())),
+                1 => Some(Documentation::String(
+                    "A paragraph of documentation.\n\n".repeat(30),
+                )),
+                _ => None,
+            },
+            ..Default::default()
+        })
+        .collect::<Vec<_>>();
+    let draw = |visual: &mut VisualTestContext| {
+        for _ in 0..3 {
+            visual.run_until_parked();
+            visual.update(|window, cx| window.draw(cx).clear(cx));
+        }
+    };
+    let present = |visual: &mut VisualTestContext, query: &str, items| {
+        visual.update(|window, cx| {
+            editor.update(cx, |state, cx| {
+                state.focus(window, cx);
+                state.present_completion_items(start, query, items, cx);
+            });
+        });
+        draw(visual);
+    };
+    let scroll_row_to = |visual: &mut VisualTestContext, y| {
+        visual.update(|_, cx| {
+            editor.update(cx, |state, cx| {
+                let row = state.projected_line_bounds(32).unwrap();
+                let offset = state.scroll_offset();
+                state.set_scroll_offset(point(offset.x, offset.y + px(y) - row.top()), cx);
+            });
+        });
+        draw(visual);
+    };
+    let caret_y = |visual: &mut VisualTestContext| {
+        visual.update(|_, cx| {
+            let caret = editor.read(cx).prepaint_caret_geometry().unwrap();
+            caret.cursor_bounds().top() + caret.scroll_offset().y
+        })
+    };
+    let dismiss = |visual: &mut VisualTestContext| {
+        visual.update(|_, cx| {
+            editor.update(cx, |state, cx| state.dismiss_completion_overlay(cx));
+        });
+        draw(visual);
+    };
+
+    for (width, stacked) in [(950., false), (344., true)] {
+        for (height, row, above) in [(420., 350., true), (650., 100., false)] {
+            dismiss(visual);
+            visual.simulate_resize(size(px(width), px(height)));
+            draw(visual);
+            visual.update(|_, cx| {
+                editor.update(cx, |state, cx| {
+                    state.set_selected_range(start..start, cx);
+                })
+            });
+            draw(visual);
+            scroll_row_to(visual, row);
+            present(visual, "", candidates.clone());
+
+            let list = visual.debug_bounds("completion-menu").unwrap();
+            let y = caret_y(visual);
+            if above {
+                assert!(list.bottom() < y);
+            } else {
+                assert!(list.top() > y);
+            }
+            let assert_documentation = |visual: &mut VisualTestContext| {
+                let docs = visual.debug_bounds("completion-documentation").unwrap();
+                assert!(docs.top() >= px(7.) && docs.bottom() <= px(height - 7.));
+                if stacked {
+                    assert_eq!(docs.left(), list.left());
+                    if above {
+                        assert!(docs.bottom() < list.top());
+                    } else {
+                        assert!(list.bottom() < docs.top());
+                    }
+                } else {
+                    assert!(list.right() < docs.left());
+                    if above {
+                        assert_eq!(docs.bottom(), list.bottom());
+                    } else {
+                        assert_eq!(docs.top(), list.top());
+                    }
+                }
+                docs.size.height
+            };
+            let short = assert_documentation(visual);
+            visual.simulate_keystrokes("down");
+            draw(visual);
+            let long = assert_documentation(visual);
+            assert!(long > short);
+            if !stacked {
+                assert!(long > list.size.height);
+            }
+            assert_eq!(visual.debug_bounds("completion-menu"), Some(list));
+            visual.simulate_event(ScrollEvent {
+                position: list.center(),
+                delta: ScrollDelta::Pixels(point(px(0.), px(-80.))),
+                ..Default::default()
+            });
+            draw(visual);
+            assert_eq!(visual.debug_bounds("completion-menu"), Some(list));
+            assert_eq!(assert_documentation(visual), long);
+
+            visual.simulate_keystrokes("down");
+            draw(visual);
+            assert!(visual.debug_bounds("completion-documentation").is_none());
+            assert_eq!(visual.debug_bounds("completion-menu"), Some(list));
+            visual.simulate_keystrokes("up");
+            draw(visual);
+            assert_eq!(assert_documentation(visual), long);
+            assert_eq!(visual.debug_bounds("completion-menu"), Some(list));
+
+            present(visual, "foldl", vec![candidates[2].clone()]);
+            let narrowed = visual.debug_bounds("completion-menu").unwrap();
+            assert!(narrowed.size.height < list.size.height);
+            assert_eq!(narrowed.left(), list.left());
+            if above {
+                assert_eq!(narrowed.bottom(), list.bottom());
+                // Below now has room for the single row. Neither resize nor scroll can flip it.
+                visual.simulate_resize(size(px(width), px(650.)));
+                draw(visual);
+                assert!(visual.debug_bounds("completion-menu").unwrap().bottom() < caret_y(visual));
+                scroll_row_to(visual, 100.);
+                assert!(visual.debug_bounds("completion-menu").unwrap().bottom() < caret_y(visual));
+                for scale in [1.25, 2.] {
+                    visual.simulate_scale_factor_change(scale);
+                    draw(visual);
+                    assert!(
+                        visual.debug_bounds("completion-menu").unwrap().bottom() < caret_y(visual)
+                    );
+                }
+                // End the session when its original side can no longer hold a row.
+                scroll_row_to(visual, 15.);
+                assert!(visual.debug_bounds("completion-menu").is_none());
+                assert!(!visual.update(|_, cx| editor.read(cx).completion_menu_state().open));
+                present(visual, "foldl", vec![candidates[2].clone()]);
+                assert!(visual.debug_bounds("completion-menu").unwrap().top() > caret_y(visual));
+            } else {
+                assert_eq!(narrowed.top(), list.top());
+                scroll_row_to(visual, -40.);
+                assert!(visual.debug_bounds("completion-menu").is_none());
+                assert!(!visual.update(|_, cx| editor.read(cx).completion_menu_state().open));
+            }
+        }
+
+        // Two rows fit below, even though the selected documentation is tall.
+        // The narrow layout preserves both rows and omits documentation here.
+        dismiss(visual);
+        visual.simulate_resize(size(px(width), px(420.)));
+        draw(visual);
+        visual.update(|_, cx| {
+            editor.update(cx, |state, cx| state.set_selected_range(start..start, cx));
+        });
+        draw(visual);
+        scroll_row_to(visual, 318.);
+        present(
+            visual,
+            "",
+            vec![candidates[1].clone(), candidates[0].clone()],
+        );
+        let list = visual.debug_bounds("completion-menu").unwrap();
+        assert!(list.top() > caret_y(visual));
+        assert_eq!(
+            visual.debug_bounds("completion-documentation").is_none(),
+            stacked
+        );
+        visual.simulate_keystrokes("down");
+        draw(visual);
+        assert_eq!(visual.debug_bounds("completion-menu"), Some(list));
+
+        // The reopen can arrive before GPUI draws a frame with the menu hidden.
+        visual.update(|_, cx| {
+            editor.update(cx, |state, cx| {
+                state.dismiss_completion_overlay(cx);
+                state.present_completion_items(start, "", candidates.clone(), cx);
+            });
+        });
+        draw(visual);
+        assert!(visual.debug_bounds("completion-menu").unwrap().bottom() < caret_y(visual));
+        visual.simulate_keystrokes("escape");
+        draw(visual);
+        assert!(visual.debug_bounds("completion-menu").is_none());
+        present(visual, "", vec![candidates[0].clone()]);
+        let single = visual.debug_bounds("completion-menu").unwrap();
+        assert!(single.top() > caret_y(visual));
+        let last_fitting_row = visual.update(|window, cx| {
+            let row = editor.read(cx).projected_line_bounds(32).unwrap();
+            f32::from(row.top() + window.viewport_size().height - single.bottom() - px(8.25))
+        });
+        scroll_row_to(visual, last_fitting_row);
+        assert!(visual.debug_bounds("completion-menu").unwrap().top() > caret_y(visual));
+        scroll_row_to(visual, last_fitting_row + 2.);
+        assert!(visual.debug_bounds("completion-menu").is_none());
+        assert!(!visual.update(|_, cx| editor.read(cx).completion_menu_state().open));
+    }
 }
 
 #[cfg(target_os = "linux")]

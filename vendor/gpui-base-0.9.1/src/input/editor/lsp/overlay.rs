@@ -14,6 +14,7 @@ pub struct CompletionMenuState {
     pub(super) document_revision: u64,
     pub(super) caret: usize,
     revision: u64,
+    placement_session: u64,
 }
 
 impl CompletionMenuState {
@@ -28,6 +29,19 @@ impl CompletionMenuState {
     /// to rebuild, so it never has to compare the item list itself.
     pub fn revision(&self) -> u64 {
         self.revision
+    }
+
+    // The presentation layer can miss a closed frame if the menu reopens
+    // before the next draw.
+    #[doc(hidden)]
+    pub fn placement_session(&self) -> u64 {
+        self.placement_session
+    }
+
+    pub(super) fn end_session(&mut self) {
+        self.open = false;
+        self.open_before_edit = false;
+        self.placement_session = self.placement_session.wrapping_add(1);
     }
 
     pub(super) fn bump(&mut self) {
@@ -102,7 +116,11 @@ impl InputBaseState<EditorMode> {
         menu.trigger_start_offset = Some(trigger_start_offset);
         menu.query = query.into();
         menu.items = items;
-        menu.open = !menu.items.is_empty();
+        if menu.items.is_empty() {
+            menu.end_session();
+        } else {
+            menu.open = true;
+        }
         menu.document_revision = self.document_revision;
         menu.caret = caret;
         menu.bump();
@@ -219,8 +237,9 @@ impl InputBaseState<EditorMode> {
     }
 
     pub fn dismiss_completion_overlay(&mut self, cx: &mut Context<Self>) {
-        if self.extras.context_menu_content.completion.open {
-            self.extras.context_menu_content.completion.open = false;
+        let menu = &mut self.extras.context_menu_content.completion;
+        if menu.open {
+            menu.end_session();
             if let Some(provider) = &self.extras.lsp.completion_provider {
                 provider.completion_dismissed();
             }

@@ -133,7 +133,7 @@ impl InputBaseState<EditorMode> {
         let providers = self.extras.lsp.code_action_providers.clone();
         let revision = self.document_revision;
         let selection = self.selected_range();
-        self.extras.context_menu_content.completion.open = false;
+        self.extras.context_menu_content.completion.end_session();
         let hover = self
             .hover_popover()
             .filter(|hover| {

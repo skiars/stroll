@@ -442,6 +442,9 @@ impl InputBaseState<EditorMode> {
             && menu.trigger_start_offset == Some(start)
             && insertion_start == Some(start + menu.query.len())
             && query.starts_with(&menu.query);
+        if was_open && !menu.open {
+            menu.end_session();
+        }
         self.present_completion_task(start, query, task, window, cx);
         true
     }
@@ -520,7 +523,7 @@ impl InputBaseState<EditorMode> {
             provider.completion_dismissed();
         }
         self.hide_context_menu_for_edit(cx);
-        self.extras.context_menu_content.completion.open_before_edit = false;
+        self.extras.context_menu_content.completion.end_session();
     }
 
     pub(crate) fn hide_context_menu_for_edit(&mut self, cx: &mut Context<Self>) {

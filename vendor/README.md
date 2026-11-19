@@ -218,16 +218,21 @@ dialogs in a Wayland window after changes to paint order or focus handling.
 - Tab accepts the selected item in the shared editor completion menu through
   the same edit path as Enter. With no list candidate it retains inline
   completion and indentation. Candidate rows use completion kind icons and
-  separately truncate the label and detail. The scrollable documentation pane
-  stacks below the list when horizontal space is limited. Run
+  separately truncate the label and detail. Run
   `cargo test --release --locked workspace_completion` for the workspace
   fixture and `cargo test --release --locked --test popups completion_popup`
   for offscreen geometry and selection coverage. Set
   `STROLL_COMPLETION_SCREENSHOTS` to save the popup screenshots.
   Candidate text and kind icons use the current editor font size minus 0.5 px.
   The list stays visible when typing extends its query and keeps the selected
-  candidate when it survives the refresh. The menu validates the document and
-  menu revisions before applying a candidate's edits.
+  candidate when it survives the refresh. The list alone determines its
+  initial side and size, keeps its side for the session, and resizes from
+  the edge nearest the caret. Documentation aligns to that edge when
+  alongside the list and uses remaining space beyond the list when stacked.
+  The session closes if the caret leaves the editor viewport or the retained
+  side can no longer fit a row. A close followed by a reopen before the
+  next render also chooses a fresh side. The menu
+  validates the document and menu revisions before applying a candidate's edits.
 
 - C++ overload names use function captures, and primitive type captures
   recover after declaration macros. Boolean literals `true` and `false` use

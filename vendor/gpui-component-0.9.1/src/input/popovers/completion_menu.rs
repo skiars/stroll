@@ -1,19 +1,16 @@
-use std::{ops::Range, rc::Rc};
+use std::{cell::Cell, ops::Range, rc::Rc};
 
 use gpui::{
     Action, AnyElement, App, AppContext, Context, DismissEvent, Empty, Entity, EventEmitter,
-    Focusable as _, FontWeight, HighlightStyle, InteractiveElement as _, IntoElement,
-    ParentElement, Pixels, Render, RenderOnce, SharedString, Styled, StyledText, Subscription,
-    WeakEntity, Window, deferred, div, prelude::FluentBuilder, px, relative,
+    Focusable as _, FontWeight, HighlightStyle, IntoElement, ParentElement, Pixels, Render,
+    RenderOnce, SharedString, Styled, StyledText, Subscription, WeakEntity, Window, deferred, div,
+    prelude::FluentBuilder, px, relative,
 };
-use gpui_base::TestSupportExt as _;
 use gpui_base::input::CompletionHighlighter;
 use gpui_kit_assets::IconName;
-use lsp_types::{CompletionItem, CompletionItemKind, CompletionItemTag, Documentation};
+use lsp_types::{CompletionItem, CompletionItemKind, CompletionItemTag};
 
-const MAX_MENU_HEIGHT: Pixels = px(240.);
-const MIN_DOCUMENTATION_WIDTH: Pixels = px(200.);
-const POPOVER_GAP: Pixels = px(6.);
+const ROW_HEIGHT_PADDING: Pixels = px(11.);
 
 /// Drop ranges a custom highlighter cannot safely paint, then order the rest.
 ///
@@ -52,16 +49,14 @@ fn retained_highlight_ranges(
 
 use crate::{
     ActiveTheme, Icon, IndexPath, Selectable, actions, h_flex,
-    input::{
-        self, EditorState,
-        popovers::{CaretAnchoredPopup, editor_popover, render_markdown},
-    },
-    list::{List, ListDelegate, ListEvent, ListState},
+    input::{self, EditorState},
+    list::{ListDelegate, ListEvent, ListState},
     menu::MenuItemElement,
-    scroll::ScrollableElement as _,
 };
 
-use super::caret_anchored::CARET_POPUP_MARGIN;
+mod popup;
+
+use popup::{CompletionPopup, Placement};
 
 fn kind_icon(kind: Option<CompletionItemKind>) -> IconName {
     match kind {
@@ -197,7 +192,7 @@ impl RenderOnce for CompletionMenuItem {
             .text_size(text_size)
             .py_0()
             .px_2()
-            .h(text_size + px(11.))
+            .h(text_size + ROW_HEIGHT_PADDING)
             .rounded(cx.theme().radius)
             .child(
                 h_flex()
@@ -290,6 +285,8 @@ pub struct CompletionMenu {
     editor: WeakEntity<EditorState>,
     list: Entity<ListState<ContextMenuDelegate>>,
     open: bool,
+    placement: Cell<Option<Placement>>,
+    placement_session: u64,
 
     /// The offset of the first character that triggered the completion.
     pub(crate) trigger_start_offset: Option<usize>,
@@ -328,6 +325,8 @@ impl CompletionMenu {
                 editor: editor.downgrade(),
                 list,
                 open: false,
+                placement: Cell::default(),
+                placement_session: 0,
                 trigger_start_offset: None,
                 query: SharedString::default(),
                 _subscriptions,
@@ -411,6 +410,7 @@ impl CompletionMenu {
     /// Synchronize a hidden editor menu without dismissing a newer response.
     pub(crate) fn hide(&mut self, cx: &mut Context<Self>) {
         self.open = false;
+        self.placement.set(None);
         self.trigger_start_offset = None;
         cx.notify();
     }
@@ -432,11 +432,18 @@ impl CompletionMenu {
         .detach();
     }
 
-    pub(crate) fn set_revision(&mut self, document: u64, menu: u64) {
+    pub(crate) fn set_revision(&mut self, document: u64, menu: u64, placement_session: u64) {
+        if self.placement_session != placement_session {
+            self.placement.set(None);
+            self.placement_session = placement_session;
+        }
         self.revision = Some((document, menu));
     }
 
     pub(crate) fn update_query(&mut self, start_offset: usize, query: impl Into<SharedString>) {
+        if self.trigger_start_offset != Some(start_offset) {
+            self.placement.set(None);
+        }
         self.trigger_start_offset = Some(start_offset);
         self.query = query.into();
     }
@@ -487,102 +494,13 @@ impl Render for CompletionMenu {
 
         if self.list.read(cx).delegate().items.is_empty() {
             self.open = false;
+            self.placement.set(None);
             return Empty.into_any_element();
         }
 
-        let Some(editor) = self.editor.upgrade() else {
-            return Empty.into_any_element();
-        };
-        // The anchor is resolved in the popup's deferred prepaint from the
-        // input's current-frame geometry; the content below is built there.
-        let configured_max = editor.read(cx).lsp().completion_menu.max_width;
-        let list = self.list.clone();
-        let menu = cx.weak_entity();
-
-        deferred(CaretAnchoredPopup::new(
-            self.editor.clone(),
-            move |anchor, available_height, code_font_size, window, cx| {
-                let viewport_width = window.viewport_size().width;
-                let menu_width =
-                    configured_max.min((viewport_width - CARET_POPUP_MARGIN * 2.).max(px(0.)));
-                let width_to_right = viewport_width
-                    - CARET_POPUP_MARGIN
-                    - anchor.x.max(CARET_POPUP_MARGIN)
-                    - menu_width
-                    - POPOVER_GAP;
-                let selected_documentation = list
-                    .read(cx)
-                    .delegate()
-                    .selected_item()
-                    .and_then(|item| item.documentation.as_ref())
-                    .map(|documentation| match documentation {
-                        Documentation::String(text) => text,
-                        Documentation::MarkupContent(markup) => &markup.value,
-                    })
-                    .filter(|text| !text.trim().is_empty())
-                    .cloned();
-                let stacked =
-                    selected_documentation.is_some() && width_to_right < MIN_DOCUMENTATION_WIDTH;
-                let documentation_width = if stacked {
-                    menu_width
-                } else {
-                    width_to_right.min(configured_max)
-                };
-                let panel_insets = window.rem_size() * 0.5 + px(2.);
-                let viewport_height = (available_height - panel_insets).max(px(0.));
-                let (list_height, documentation_height) = if stacked {
-                    let content_height = (viewport_height - panel_insets - POPOVER_GAP).max(px(0.));
-                    let list_height = MAX_MENU_HEIGHT.min(content_height * 0.55);
-                    (list_height, content_height - list_height)
-                } else {
-                    (MAX_MENU_HEIGHT.min(viewport_height), viewport_height)
-                };
-                let code_font = window.text_style().font().family;
-
-                div()
-                    .flex()
-                    .flex_row()
-                    .gap(POPOVER_GAP)
-                    .items_start()
-                    .when(stacked, |this| this.flex_col())
-                    .child(
-                        editor_popover("completion-menu", cx)
-                            .debug_selector(|| "completion-menu".into())
-                            .test_support()
-                            .font_family(code_font)
-                            .text_size((code_font_size - px(0.5)).max(px(1.)))
-                            .w(menu_width)
-                            .child(List::new(&list).popup_scrollbar().max_h(list_height)),
-                    )
-                    .when_some(selected_documentation, |this, doc| {
-                        this.child(
-                            editor_popover("completion-documentation", cx)
-                                .debug_selector(|| "completion-documentation".into())
-                                .test_support()
-                                .w(documentation_width)
-                                .child(
-                                    div()
-                                        .max_h(documentation_height)
-                                        .px_2()
-                                        .py_0p5()
-                                        .child(render_markdown("doc", doc, window, cx))
-                                        .overflow_y_popup_scrollbar(),
-                                ),
-                        )
-                    })
-                    .on_mouse_down_out({
-                        let menu = menu.clone();
-                        move |_, _, cx: &mut App| {
-                            if let Some(menu) = menu.upgrade() {
-                                menu.update(cx, |menu, cx| menu.dismiss(cx));
-                            }
-                        }
-                    })
-                    .into_any_element()
-            },
-        ))
-        .with_priority(gpui_base::POPUP_PRIORITY)
-        .into_any_element()
+        deferred(CompletionPopup::new(cx.weak_entity()))
+            .with_priority(gpui_base::POPUP_PRIORITY)
+            .into_any_element()
     }
 }
 
