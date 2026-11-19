@@ -72,7 +72,7 @@ pub(crate) fn directory_name(path: &Path) -> String {
         .into_owned()
 }
 
-fn path_from_git(bytes: &[u8]) -> Result<OsString> {
+pub(super) fn path_from_git(bytes: &[u8]) -> Result<OsString> {
     #[cfg(unix)]
     {
         use std::os::unix::ffi::OsStringExt as _;
@@ -101,47 +101,51 @@ impl Repository {
             }
             return Ok(trees);
         }
-        let output = git(&self.root, &["worktree", "list", "--porcelain", "-z"])?;
-        let mut records = output.split(|byte| *byte == 0).peekable();
-        let mut worktrees = Vec::new();
-        let mut first = true;
-        while let Some(header) = records.next() {
-            let Some(path) = header.strip_prefix(b"worktree ") else {
-                continue;
-            };
-            let path = PathBuf::from(path_from_git(path)?);
-            let mut branch = None;
-            let mut head = None;
-            let mut bare = false;
-            let mut prunable = false;
-            while records.peek().is_some_and(|field| !field.is_empty()) {
-                let field = records.next().expect("peeked worktree field");
-                if let Some(name) = field.strip_prefix(b"branch refs/heads/") {
-                    branch = Some(String::from_utf8_lossy(name).into_owned());
-                } else if let Some(oid) = field.strip_prefix(b"HEAD ") {
-                    head = Some(String::from_utf8_lossy(&oid[..oid.len().min(7)]).into_owned());
-                } else if field == b"bare" {
-                    bare = true;
-                } else if field.starts_with(b"prunable") {
-                    prunable = true;
-                }
-            }
-            if !bare {
-                let available = !prunable && path.is_dir();
-                worktrees.push(Worktree {
-                    root: path.canonicalize().unwrap_or(path),
-                    reference: branch.unwrap_or_else(|| match head {
-                        Some(oid) => format!("HEAD · {oid}"),
-                        None => "HEAD".into(),
-                    }),
-                    main: first,
-                    available,
-                });
-            }
-            first = false;
-        }
-        Ok(worktrees)
+        local_worktrees(&self.root)
     }
+}
+
+pub(super) fn local_worktrees(root: &Path) -> Result<Vec<Worktree>> {
+    let output = git(root, &["worktree", "list", "--porcelain", "-z"])?;
+    let mut records = output.split(|byte| *byte == 0).peekable();
+    let mut worktrees = Vec::new();
+    let mut first = true;
+    while let Some(header) = records.next() {
+        let Some(path) = header.strip_prefix(b"worktree ") else {
+            continue;
+        };
+        let path = PathBuf::from(path_from_git(path)?);
+        let mut branch = None;
+        let mut head = None;
+        let mut bare = false;
+        let mut prunable = false;
+        while records.peek().is_some_and(|field| !field.is_empty()) {
+            let field = records.next().expect("peeked worktree field");
+            if let Some(name) = field.strip_prefix(b"branch refs/heads/") {
+                branch = Some(String::from_utf8_lossy(name).into_owned());
+            } else if let Some(oid) = field.strip_prefix(b"HEAD ") {
+                head = Some(String::from_utf8_lossy(&oid[..oid.len().min(7)]).into_owned());
+            } else if field == b"bare" {
+                bare = true;
+            } else if field.starts_with(b"prunable") {
+                prunable = true;
+            }
+        }
+        if !bare {
+            let available = !prunable && path.is_dir();
+            worktrees.push(Worktree {
+                root: path.canonicalize().unwrap_or(path),
+                reference: branch.unwrap_or_else(|| match head {
+                    Some(oid) => format!("HEAD · {oid}"),
+                    None => "HEAD".into(),
+                }),
+                main: first,
+                available,
+            });
+        }
+        first = false;
+    }
+    Ok(worktrees)
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -220,6 +224,8 @@ fn is_repository_root(path: &Path) -> bool {
 pub(crate) struct RecentRepository {
     pub(crate) root: PathBuf,
     pub(crate) common_dir: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) worktree_id: Option<String>,
 }
 
 impl RecentRepository {
@@ -235,6 +241,10 @@ impl RecentRepository {
             Self {
                 root: repo.root.clone(),
                 common_dir: repo.common_dir.clone(),
+                #[cfg(feature = "desktop")]
+                worktree_id: repo.worktree_state.as_ref().map(|state| state.id.clone()),
+                #[cfg(not(feature = "desktop"))]
+                worktree_id: None,
             },
         );
         recents.truncate(30);
@@ -267,7 +277,11 @@ pub(super) struct WorkspaceState {
     pub(super) location: Location,
     // None identifies a legacy workspace.json. An explicit empty list stays empty.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    recents: Option<Vec<RecentRepository>>,
+    pub(super) recents: Option<Vec<RecentRepository>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) worktree_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) common_dir: Option<PathBuf>,
 }
 
 impl WorkspaceState {
@@ -282,6 +296,7 @@ fn legacy_recent(root: &Path) -> Vec<RecentRepository> {
     vec![RecentRepository {
         root: root.to_owned(),
         common_dir,
+        worktree_id: None,
     }]
 }
 
@@ -306,6 +321,11 @@ impl Store {
                 file: None,
             },
             recents: Some(recents),
+            #[cfg(feature = "desktop")]
+            worktree_id: repo.worktree_state.as_ref().map(|state| state.id.clone()),
+            #[cfg(not(feature = "desktop"))]
+            worktree_id: None,
+            common_dir: Some(repo.common_dir.clone()),
         })
     }
 

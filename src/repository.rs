@@ -4,11 +4,15 @@ mod edit_history;
 pub(crate) mod files;
 mod selection;
 #[cfg(feature = "desktop")]
+mod worktree_state;
+#[cfg(feature = "desktop")]
 pub(crate) use edit_history::SavedEditHistory;
 
 pub(crate) use selection::{DirectoryEntry, DirectoryListing, directory_name, repository_root};
 #[cfg(feature = "desktop")]
 pub(crate) use selection::{RecentRepository, Worktree, project_name};
+#[cfg(feature = "desktop")]
+pub(crate) use worktree_state::WorktreeState;
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -47,6 +51,10 @@ pub(crate) const MAX_FILE_BYTES: u64 = 8 * 1024 * 1024;
 pub struct Repository {
     pub(crate) ssh: Option<SshSession>,
     remote_identity: Option<String>,
+    #[cfg(feature = "desktop")]
+    pub(crate) worktree_state: Option<WorktreeState>,
+    #[cfg(feature = "desktop")]
+    local_storage_key: Option<Vec<u8>>,
     #[cfg(feature = "desktop")]
     language_resources:
         std::sync::Arc<std::sync::OnceLock<crate::language_resources::LanguageResources>>,
@@ -106,6 +114,10 @@ impl Repository {
             ssh: Some(ssh),
             remote_identity,
             #[cfg(feature = "desktop")]
+            worktree_state: None,
+            #[cfg(feature = "desktop")]
+            local_storage_key: None,
+            #[cfg(feature = "desktop")]
             language_resources: Default::default(),
             #[cfg(feature = "desktop")]
             worktree_lsp: Default::default(),
@@ -128,6 +140,10 @@ impl Repository {
         Ok(Self {
             ssh: None,
             remote_identity: None,
+            #[cfg(feature = "desktop")]
+            worktree_state: None,
+            #[cfg(feature = "desktop")]
+            local_storage_key: None,
             #[cfg(feature = "desktop")]
             language_resources: Default::default(),
             #[cfg(feature = "desktop")]
@@ -281,11 +297,51 @@ impl Repository {
     }
 
     pub(crate) fn storage_key(&self) -> &[u8] {
+        #[cfg(feature = "desktop")]
+        if let Some(state) = &self.worktree_state {
+            return state.storage_key();
+        }
+        #[cfg(feature = "desktop")]
+        if let Some(key) = &self.local_storage_key {
+            return key;
+        }
         self.remote_identity
             .as_ref()
             .map_or(self.root.as_os_str().as_encoded_bytes(), |key| {
                 key.as_bytes()
             })
+    }
+
+    #[cfg(feature = "desktop")]
+    pub(crate) fn same_worktree(&self, other: &Self) -> bool {
+        match (&self.worktree_state, &other.worktree_state) {
+            (Some(left), Some(right)) => left.id == right.id,
+            (None, None) => self.storage_key() == other.storage_key(),
+            _ => false,
+        }
+    }
+
+    #[cfg(feature = "desktop")]
+    pub(crate) fn checkout_key(&self) -> &[u8] {
+        self.worktree_state
+            .as_ref()
+            .map_or_else(|| self.storage_key(), |state| state.id.as_bytes())
+    }
+
+    fn legacy_local_draft_root(&self) -> Option<&Path> {
+        if self.ssh.is_some() {
+            return None;
+        }
+        #[cfg(feature = "desktop")]
+        {
+            if let Some(state) = &self.worktree_state {
+                return state.legacy_root.as_deref();
+            }
+            if self.local_storage_key.is_some() {
+                return None;
+            }
+        }
+        Some(&self.root)
     }
 
     #[cfg(feature = "desktop")]
@@ -894,6 +950,15 @@ impl Store {
                 ..WorktreeSession::default()
             },
         };
+        self.restore_session_tabs(repo, &mut session)?;
+        Ok(session)
+    }
+
+    pub(crate) fn restore_session_tabs(
+        &self,
+        repo: &Repository,
+        session: &mut WorktreeSession,
+    ) -> Result<()> {
         let remote_files = if let Some(ssh) = &repo.ssh
             && repo.lazy_tree
         {
@@ -931,7 +996,7 @@ impl Store {
                 self.session_file_exists(repo, path)
             }
         });
-        Ok(session)
+        Ok(())
     }
 
     fn read_session(&self, repo: &Repository) -> Result<Option<WorktreeSession>> {

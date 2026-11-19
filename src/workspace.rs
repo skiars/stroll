@@ -34,6 +34,8 @@ mod toast;
 mod tree_motion;
 mod tree_transfer;
 mod window_bounds;
+#[cfg(test)]
+mod worktree_recovery_tests;
 
 pub use window_bounds::{repository_window_bounds, standalone_window_bounds};
 
@@ -795,6 +797,7 @@ pub struct Workspace {
     review_loads: HashMap<PathBuf, Vec<ReviewBufferCallback>>,
     saving: BTreeSet<PathBuf>,
     connection_watch: Task<()>,
+    worktree_watch: Task<()>,
     repository_watch: Task<()>,
     repository_watch_active: bool,
     loading_file: Option<(PathBuf, FileOpen)>,
@@ -806,6 +809,13 @@ pub struct Workspace {
     saved_window: Option<(WindowSlot, WindowGeometry)>,
     pending_window: Option<(WindowSlot, WindowGeometry)>,
     window_write: Task<()>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RepositoryOpen {
+    Direct,
+    Remembered,
+    Recovery,
 }
 
 impl Workspace {
@@ -978,6 +988,7 @@ impl Workspace {
             review_loads: HashMap::new(),
             saving: BTreeSet::new(),
             connection_watch: Task::ready(()),
+            worktree_watch: Task::ready(()),
             repository_watch: Task::ready(()),
             repository_watch_active: false,
             loading_file: None,
@@ -1014,6 +1025,33 @@ impl Workspace {
         workspace
     }
 
+    pub fn restore_repository(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        match self.store.location() {
+            Ok(Some(location)) => self.open_recent_repository(location.root, window, cx),
+            Ok(None) => self.show_repository_start(window, cx),
+            Err(error) => {
+                eprintln!("{error:#}");
+                self.show_repository_start(window, cx);
+            }
+        }
+    }
+
+    fn open_recent_repository(
+        &mut self,
+        root: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.repository_ui.close_path_completions();
+        self.open_repository_inner(
+            Location { root, file: None },
+            None,
+            RepositoryOpen::Remembered,
+            window,
+            cx,
+        );
+    }
+
     pub fn open_repository(
         &mut self,
         location: Location,
@@ -1027,6 +1065,17 @@ impl Workspace {
         &mut self,
         location: Location,
         ssh: Option<crate::remote::SshSession>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_repository_inner(location, ssh, RepositoryOpen::Direct, window, cx);
+    }
+
+    fn open_repository_inner(
+        &mut self,
+        mut location: Location,
+        ssh: Option<crate::remote::SshSession>,
+        open: RepositoryOpen,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -1049,55 +1098,35 @@ impl Workspace {
         let cached_docs: BTreeSet<_> = self
             .recent_docs
             .iter()
-            .map(|cached| cached.key.clone())
+            .map(|cached| (cached.root.clone(), cached.key.clone()))
             .collect();
         let startup_view = self.startup_view;
         let view = self.view;
         let lsp = self.startup_lsp.clone();
+        let opening_store = store.clone();
+        let opening_current = current.clone();
+        let file = location.file.take();
+        let has_file = file.is_some();
         let task = cx.background_spawn(async move {
-            let prepare_lsp = |repo: &Repository, session: &WorktreeSession| {
-                if lsp.enabled
-                    && session.worktree_lsp_trusted
-                    && let Ok(config) = language_service::read_worktree_lsp(repo, &lsp)
-                {
-                    *repo.worktree_lsp.write().unwrap() = Arc::new(config);
-                }
-            };
-            let prepare_docs =
-                |repo: &Repository, session: &WorktreeSession, file: Option<&Path>| {
-                    let target_view = startup_view.unwrap_or_else(|| {
-                        if file.is_some() {
-                            WorkspaceView::Editor
-                        } else if current
-                            .as_ref()
-                            .is_some_and(|current| current.common_dir == repo.common_dir)
-                        {
-                            view
-                        } else {
-                            session.view.unwrap_or_default()
-                        }
-                    });
-                    (target_view == WorkspaceView::Docs
-                        && !cached_docs.contains(repo.storage_key())
-                        && repo.supports_document_batches())
-                    .then(|| {
-                        repo.fast_document_paths()
-                            .ok()
-                            .map(DocumentTree::from_paths)
-                    })
-                    .flatten()
-                };
+            let mut resolved = false;
+            if open == RepositoryOpen::Remembered
+                && crate::remote::SshTarget::parse(&location.root)?.is_none()
+                && let Some(root) = opening_store.resolve_saved_worktree(&location.root)?
+            {
+                resolved = root != location.root;
+                location.root = root;
+            }
+            let restore_view = resolved || open == RepositoryOpen::Recovery;
             if let Some(repo) =
                 cached.filter(|repo| repo.ssh.as_ref().is_some_and(|ssh| ssh.failure().is_none()))
             {
-                let session = store.session(&repo)?;
+                let session = opening_store.session(&repo)?;
                 if repo.ssh.as_ref().is_some_and(|ssh| ssh.failure().is_none()) {
-                    let docs = prepare_docs(&repo, &session, location.file.as_deref());
-                    prepare_lsp(&repo, &session);
-                    return Ok(Some(((*repo).clone(), session, location.file, docs, true)));
+                    return Ok(Some(((*repo).clone(), Some(session), None, restore_view)));
                 }
             }
-            let repo = if let Some(target) = crate::remote::SshTarget::parse(&location.root)? {
+
+            let mut repo = if let Some(target) = crate::remote::SshTarget::parse(&location.root)? {
                 match ssh {
                     Some(ssh)
                         if ssh.target().authority() == target.authority()
@@ -1108,30 +1137,131 @@ impl Workspace {
                     _ => Repository::open(&location.root)?,
                 }
             } else {
-                let root = crate::repository::repository_root(&location.root)?;
-                if current
-                    .as_ref()
-                    .is_some_and(|current| current.ssh.is_none() && current.root == root)
-                    && location.file.is_none()
-                {
-                    return Ok::<_, anyhow::Error>(None);
-                }
-                Repository::open_root(root)?
+                Repository::open(&location.root)?
             };
-            repo.language_resources();
-            let session = store.session(&repo)?;
-            let docs = prepare_docs(&repo, &session, location.file.as_deref());
-            prepare_lsp(&repo, &session);
-            Ok(Some((repo, session, location.file, docs, false)))
+            let archived = if repo.ssh.is_none() {
+                match opening_store.bind_worktree(&mut repo) {
+                    Ok(archived) => archived,
+                    Err(error) => {
+                        eprintln!("Could not identify worktree: {error:#}");
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+            if open == RepositoryOpen::Recovery
+                && opening_current.as_ref().is_none_or(|current| {
+                    current.common_dir != repo.common_dir
+                        || (repo.worktree_state.is_some() && !current.same_worktree(&repo))
+                })
+            {
+                anyhow::bail!(t!(
+                    "repository.directory_not_found",
+                    path = crate::paths::display(&repo.root)
+                ));
+            }
+            if open != RepositoryOpen::Recovery
+                && !has_file
+                && repo.ssh.is_none()
+                && opening_current.as_ref().is_some_and(|current| {
+                    current.root == repo.root && current.same_worktree(&repo)
+                })
+            {
+                return Ok::<_, anyhow::Error>(None);
+            }
+            Ok(Some((repo, None, archived, restore_view)))
         });
         self.repository_ui.open_task = cx.spawn_in(window, async move |this, cx| {
-            let result = task.await;
+            let result = async {
+                let Some((mut repo, cached_session, archived, mut restore_view)) = task.await?
+                else {
+                    return Ok::<_, anyhow::Error>(None);
+                };
+                let mut inherited = false;
+                if let Some(archived) = archived {
+                    let prompt = this.update_in(cx, |_, window, cx| {
+                        window.prompt(
+                            PromptLevel::Info,
+                            &t!("repository.restore_worktree_title"),
+                            Some(&t!(
+                                "repository.restore_worktree_detail",
+                                path = crate::paths::display(&archived.root)
+                            )),
+                            &[
+                                PromptButton::new(t!("repository.open_fresh_worktree")),
+                                PromptButton::new(t!("repository.restore_worktree")),
+                            ],
+                            cx,
+                        )
+                    })?;
+                    if prompt.await.ok() == Some(1) {
+                        repo.worktree_state.as_mut().unwrap().inherit(archived);
+                        inherited = true;
+                        restore_view = true;
+                    }
+                }
+                let reused = cached_session.is_some();
+                cx.background_spawn(async move {
+                    repo.language_resources();
+                    let mut session = match cached_session {
+                        Some(session) => session,
+                        None => store.session(&repo)?,
+                    };
+                    if inherited {
+                        // A recreated checkout may contain different language server commands.
+                        session.worktree_lsp_trusted = false;
+                    }
+                    if lsp.enabled
+                        && session.worktree_lsp_trusted
+                        && let Ok(config) = language_service::read_worktree_lsp(&repo, &lsp)
+                    {
+                        *repo.worktree_lsp.write().unwrap() = Arc::new(config);
+                    }
+                    let target_view = startup_view.unwrap_or_else(|| {
+                        if file.is_some() {
+                            WorkspaceView::Editor
+                        } else if !restore_view
+                            && current
+                                .as_ref()
+                                .is_some_and(|current| current.common_dir == repo.common_dir)
+                        {
+                            view
+                        } else {
+                            session.view.unwrap_or_default()
+                        }
+                    });
+                    let docs = (target_view == WorkspaceView::Docs
+                        && (inherited
+                            || !cached_docs
+                                .contains(&(repo.root.clone(), repo.checkout_key().to_vec())))
+                        && repo.supports_document_batches())
+                    .then(|| {
+                        repo.fast_document_paths()
+                            .ok()
+                            .map(DocumentTree::from_paths)
+                    })
+                    .flatten();
+                    Ok(Some((repo, session, file, docs, reused, restore_view)))
+                })
+                .await
+            }
+            .await;
             _ = this.update_in(cx, move |this, window, cx| {
                 this.repository_ui.opening = None;
                 let result = result.and_then(|target| {
-                    if let Some((repo, session, file, docs, reused)) = target {
+                    if let Some((repo, mut session, file, docs, reused, restore_view)) = target {
                         this.flush_drafts(cx)?;
                         this.flush_session(cx)?;
+                        if let Some(state) = &repo.worktree_state {
+                            this.store.write_worktree_state(state)?;
+                        }
+                        if this.repository.as_ref().is_some_and(|current| {
+                            current.root != repo.root && current.same_worktree(&repo)
+                        }) {
+                            session = this.session.clone();
+                            this.store.restore_session_tabs(&repo, &mut session)?;
+                        }
                         if this.repository.as_ref().is_some_and(|current| {
                             current.ssh.is_some()
                                 && current.root == repo.root
@@ -1146,6 +1276,9 @@ impl Workspace {
                                 }
                             }
                         } else {
+                            if restore_view && this.startup_view.is_none() && file.is_none() {
+                                this.startup_view = Some(session.view.unwrap_or_default());
+                            }
                             this.apply_repository(repo, session, file, docs, window, cx);
                             if reused && this.view != WorkspaceView::Docs {
                                 this.rescan_workspace(window, cx);
@@ -1185,6 +1318,56 @@ impl Workspace {
         cx.notify();
     }
 
+    fn watch_local_worktree(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.worktree_watch = Task::ready(());
+        if let Some(repo) = self.repository.clone()
+            && let Some(mut state) = repo.worktree_state.clone()
+        {
+            let store = self.store.clone();
+            self.worktree_watch = cx.spawn_in(window, async move |this, cx| {
+                loop {
+                    cx.background_executor().timer(Duration::from_secs(1)).await;
+                    let store = store.clone();
+                    let (updated, replacement) = cx
+                        .background_spawn(async move {
+                            let replacement = if state.still_at_root() {
+                                if let Err(error) = store.update_worktree_branch(&mut state) {
+                                    eprintln!("Could not remember worktree branch: {error:#}");
+                                }
+                                None
+                            } else {
+                                state.replacement().ok().flatten()
+                            };
+                            (state, replacement)
+                        })
+                        .await;
+                    state = updated;
+                    let Some(root) = replacement else { continue };
+                    if this
+                        .update_in(cx, |this, window, cx| {
+                            if this
+                                .repository
+                                .as_ref()
+                                .is_some_and(|current| Arc::ptr_eq(current, &repo))
+                            {
+                                this.open_repository_inner(
+                                    Location { root, file: None },
+                                    None,
+                                    RepositoryOpen::Recovery,
+                                    window,
+                                    cx,
+                                );
+                            }
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            });
+        }
+    }
+
     fn watch_connection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.worktree_language = WorktreeLanguageState::default();
         self.refresh_worktree_language(window, cx);
@@ -1197,6 +1380,7 @@ impl Workspace {
             self.repository_watch_pending = false;
             self.watch_repository(window, cx);
         }
+        self.watch_local_worktree(window, cx);
         let ssh = self.repository.as_ref().and_then(|repo| repo.ssh.clone());
         if ssh.is_none() && self.recent_ssh_repositories.is_empty() {
             return;
@@ -1412,7 +1596,7 @@ impl Workspace {
         let cached_docs = self
             .recent_docs
             .iter()
-            .position(|cached| cached.key == repo.storage_key())
+            .position(|cached| cached.root == repo.root && cached.key == repo.checkout_key())
             .and_then(|index| self.recent_docs.remove(index));
         self.tree_status_task = Task::ready(());
         self.recent_ssh_repositories
@@ -1452,7 +1636,7 @@ impl Workspace {
         if self
             .repository
             .as_ref()
-            .is_some_and(|current| current.storage_key() == repo.storage_key())
+            .is_some_and(|current| current.same_worktree(&repo))
         {
             // The target session was read before flushing the current UI state.
             session.commit_draft = self.session.commit_draft.take();

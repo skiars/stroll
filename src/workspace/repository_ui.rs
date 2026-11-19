@@ -239,7 +239,7 @@ impl RepositoryUi {
         }
     }
 
-    fn close_path_completions(&mut self) {
+    pub(super) fn close_path_completions(&mut self) {
         self.completion_task = Task::ready(());
         self.completions.clear();
     }
@@ -1108,6 +1108,7 @@ impl Workspace {
             .iter()
             .map(|repo| repo.root.clone())
             .collect();
+        let store = self.store.clone();
         let check = cx.background_spawn(async move {
             paths
                 .into_iter()
@@ -1117,6 +1118,7 @@ impl Workspace {
                         .flatten()
                         .is_none()
                         && !path.is_dir()
+                        && store.resolve_saved_worktree(path).ok().flatten().is_none()
                 })
                 .collect()
         });
@@ -2135,7 +2137,7 @@ impl Workspace {
             )
         })
         .on_click(cx.listener(move |this, _, window, cx| {
-            this.open_directory_path(root.clone(), window, cx)
+            this.open_recent_repository(root.clone(), window, cx)
         }))
     }
 

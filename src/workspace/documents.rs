@@ -22,6 +22,7 @@ use super::{
 
 pub(super) struct CachedDocs {
     pub key: Vec<u8>,
+    pub root: PathBuf,
     pub tree: std::rc::Rc<crate::docs::DocumentTree>,
     pub complete: bool,
     pub expanded: std::collections::BTreeSet<PathBuf>,
@@ -40,10 +41,11 @@ impl Workspace {
         if let Some(reader) = &self.doc {
             reader.update(cx, |reader, cx| reader.release_online_images(cx));
         }
-        let key = repo.storage_key().to_vec();
+        let key = repo.checkout_key().to_vec();
         self.recent_docs.retain(|cached| cached.key != key);
         self.recent_docs.push_front(CachedDocs {
             key,
+            root: repo.root.clone(),
             tree: self.docs_tree.clone(),
             complete: self.docs_tree_complete,
             expanded: self.docs_expanded.clone(),

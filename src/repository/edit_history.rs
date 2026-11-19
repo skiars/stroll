@@ -22,8 +22,8 @@ impl Store {
             return hex::encode(digest(path.as_os_str().as_encoded_bytes()));
         }
         let repo = repo.unwrap();
-        if repo.ssh.is_none() {
-            return hex::encode(digest(repo.root.join(path).as_os_str().as_encoded_bytes()));
+        if let Some(root) = repo.legacy_local_draft_root() {
+            return hex::encode(digest(root.join(path).as_os_str().as_encoded_bytes()));
         }
         let remote = crate::remote::RepoPath::from_local(path).ok();
         let path = remote.as_ref().map_or(path, |path| path.as_path());

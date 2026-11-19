@@ -58,23 +58,6 @@ fn launch() -> Result<()> {
             location.file.is_none() && view != Some(WorkspaceView::Git) && location.root.is_file()
         })
         .map(|location| location.root.clone());
-    let location = standalone
-        .is_none()
-        .then(|| {
-            requested.or_else(|| match store.location() {
-                Ok(location) => location.map(|mut location| {
-                    // The per-repository session (or the legacy location) supplies editor tabs.
-                    location.file = None;
-                    location
-                }),
-                Err(error) => {
-                    eprintln!("{error:#}");
-                    None
-                }
-            })
-        })
-        .flatten();
-
     gpui_platform::application()
         .with_assets(gpui_kit_assets::AllAssets)
         .run(move |cx| {
@@ -190,10 +173,10 @@ fn launch() -> Result<()> {
                         .unwrap_or(true)
                     });
                     view.update(cx, |workspace, cx| {
-                        if let Some(location) = location {
+                        if let Some(location) = requested {
                             workspace.open_repository(location, window, cx);
                         } else {
-                            workspace.show_repository_start(window, cx);
+                            workspace.restore_repository(window, cx);
                         }
                     });
                     cx.new(|cx| Root::new(view, window, cx))
