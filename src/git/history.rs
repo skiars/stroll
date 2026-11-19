@@ -24,6 +24,14 @@ pub(crate) struct Commit {
     pub body: String,
 }
 
+#[cfg(feature = "desktop")]
+#[derive(Clone)]
+pub(crate) struct CommitRange {
+    pub base: Option<String>,
+    pub target: String,
+    pub oldest: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct Branch {
     pub reference: String,

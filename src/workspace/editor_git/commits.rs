@@ -1,25 +1,16 @@
 use super::*;
-use crate::workspace::line_alignment::LineAlignment;
+use crate::{git::CommitRange, workspace::line_alignment::LineAlignment};
 use gpui_component::input::RopeExt as _;
 
 const COMMIT_ACTION_START: usize = usize::MAX / 2 + 1;
 
-#[derive(Clone)]
-pub(in crate::workspace) struct CommitRange {
-    pub base: Option<String>,
-    pub target: String,
-    pub oldest: String,
-}
-
-impl CommitRange {
-    fn tooltip(&self) -> SharedString {
-        let mut commits = git::short(&self.oldest).to_owned();
-        if self.target != self.oldest {
-            commits.push('…');
-            commits.push_str(git::short(&self.target));
-        }
-        t!("git.editor_commit_marker", commits = commits).into()
+fn commit_tooltip(range: &CommitRange) -> SharedString {
+    let mut commits = git::short(&range.oldest).to_owned();
+    if range.target != range.oldest {
+        commits.push('…');
+        commits.push_str(git::short(&range.target));
     }
+    t!("git.editor_commit_marker", commits = commits).into()
 }
 
 #[derive(Default)]
@@ -104,7 +95,7 @@ impl CommitMarks {
             detail,
             files,
             head,
-            tooltip: range.tooltip(),
+            tooltip: commit_tooltip(range),
         })))
     }
 }

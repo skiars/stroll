@@ -6,10 +6,9 @@ use gpui_component::{
 
 use super::*;
 use crate::git::{
-    HistoryAction, HistoryEdit, HistoryPlan, HistoryProgress, HistoryResolution, HistoryTip,
-    PublishedHistory, ResetMode, ResetPlan, RewriteKind, RewriteRecord, SavedChanges,
+    CommitRange, HistoryAction, HistoryEdit, HistoryPlan, HistoryProgress, HistoryResolution,
+    HistoryTip, PublishedHistory, ResetMode, ResetPlan, RewriteKind, RewriteRecord, SavedChanges,
 };
-use crate::workspace::editor_git::commits::CommitRange;
 
 #[derive(Default)]
 pub(super) struct HistoryPick {
@@ -80,19 +79,22 @@ impl GitPanel {
         oid: &SharedString,
         rows: Option<&BTreeSet<SharedString>>,
     ) -> Option<CommitRange> {
-        let Some(rows) = rows.filter(|rows| rows.len() > 1) else {
-            let row = self.commits.iter().find(|row| &row.oid == oid)?;
-            let selected_parent = match &self.selection {
-                Some(Selection::Commit(target, parent)) if target == oid.as_str() => parent.clone(),
-                _ => None,
-            };
-            return Some(CommitRange {
-                target: oid.to_string(),
-                oldest: oid.to_string(),
-                base: selected_parent
-                    .or_else(|| row.first_parent.as_ref().map(ToString::to_string)),
-            });
+        if let Some(rows) = rows.filter(|rows| rows.len() > 1) {
+            return self.consecutive_commit_range(rows);
+        }
+        let row = self.commits.iter().find(|row| &row.oid == oid)?;
+        let selected_parent = match &self.selection {
+            Some(Selection::Commit(target, parent)) if target == oid.as_str() => parent.clone(),
+            _ => None,
         };
+        Some(CommitRange {
+            target: oid.to_string(),
+            oldest: oid.to_string(),
+            base: selected_parent.or_else(|| row.first_parent.as_ref().map(ToString::to_string)),
+        })
+    }
+
+    fn consecutive_commit_range(&self, rows: &BTreeSet<SharedString>) -> Option<CommitRange> {
         let selected = self
             .commits
             .iter()
@@ -135,7 +137,7 @@ impl GitPanel {
         let previous = self
             .selection
             .as_ref()
-            .and_then(Selection::target_commit)
+            .and_then(Selection::focused_commit)
             .map(SharedString::from);
         let pick = &mut self.history_pick;
         let mut rows = pick
@@ -184,17 +186,32 @@ impl GitPanel {
             oid
         };
         let target = target.to_string();
-        pick.rows = Some(Rc::new(rows));
+        let rows = Rc::new(rows);
+        pick.rows = Some(rows.clone());
         if let Some(index) = self.commits.iter().position(|row| &row.oid == oid) {
             self.history_scroll
                 .scroll_to_reveal_item(index + usize::from(self.history.is_some()));
         }
-        let selection = self
-            .selection
-            .as_ref()
-            .filter(|selection| selection.target_commit() == Some(&target))
-            .cloned()
-            .unwrap_or(Selection::Commit(target, None));
+        let selection = if rows.len() > 1
+            && let Some(range) = self.consecutive_commit_range(&rows)
+        {
+            Selection::CommitRange {
+                base: range.base,
+                newest: range.target,
+                focused: target,
+                count: rows.len(),
+            }
+        } else {
+            self.selection
+                .as_ref()
+                .filter(|selection| {
+                    let reusable = matches!(selection, Selection::Commit(..))
+                        || rows.len() <= 1 && matches!(selection, Selection::Compare { .. });
+                    reusable && selection.target_commit() == Some(&target)
+                })
+                .cloned()
+                .unwrap_or(Selection::Commit(target, None))
+        };
         self.load_review(selection, false, window, cx);
         cx.notify();
     }
@@ -215,7 +232,7 @@ impl GitPanel {
                     .history_pick
                     .cursor
                     .as_deref()
-                    .or_else(|| self.selection.as_ref().and_then(Selection::target_commit));
+                    .or_else(|| self.selection.as_ref().and_then(Selection::focused_commit));
                 let index = self
                     .commits
                     .iter()

@@ -179,6 +179,7 @@
   "git.history_edit_resolve_first": "请解决并暂存所有冲突文件后再继续。",
   "git.history_edit_save_first": "请先保存编辑器中打开的更改。",
   "git.history_edit_selected": "已选择 %{count} 个提交",
+  "git.commit_range_changes": "净差异 · %{count} 个提交",
   "git.editor_mark_commit": "在编辑器中标记此提交",
   "git.editor_mark_commits": "在编辑器中标记这 %{count} 个提交",
   "git.editor_mark_consecutive_commits": "在编辑器中标记（请选择连续提交）",

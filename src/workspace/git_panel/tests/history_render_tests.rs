@@ -1939,6 +1939,155 @@ fn partial_stage_keeps_surviving_line_in_place_offscreen() -> Result<()> {
 }
 
 #[::core::prelude::v1::test]
+fn consecutive_commit_selection_shows_net_diff_and_tree() -> Result<()> {
+    let fixture = tempfile::tempdir()?;
+    let root = fixture.path().join("repo");
+    fs::create_dir(&root)?;
+    git(&root, &["init", "-qb", "main"]);
+    git(&root, &["config", "user.name", "Reviewer"]);
+    git(&root, &["config", "user.email", "reviewer@example.invalid"]);
+    git(&root, &["config", "commit.gpgsign", "false"]);
+    let commit = |message| -> Result<String> {
+        git(&root, &["add", "-A"]);
+        git(&root, &["commit", "-qm", message]);
+        Ok(git::head(&root)?.unwrap())
+    };
+    fs::write(root.join("base.txt"), "base\n")?;
+    let base = commit("Base")?;
+    fs::write(root.join("first.txt"), "first\n")?;
+    fs::write(root.join("cancelled.txt"), "temporary\n")?;
+    let first = commit("First")?;
+    fs::remove_file(root.join("cancelled.txt"))?;
+    fs::write(root.join("second.txt"), "second\n")?;
+    let second = commit("Second")?;
+    fs::write(root.join("transient.txt"), "temporary\n")?;
+    commit("Add transient file")?;
+    fs::remove_file(root.join("transient.txt"))?;
+    let latest = commit("Remove transient file")?;
+
+    let mut app = TestAppContext::build_with_text_system(
+        TestDispatcher::new(0),
+        None,
+        gpui_platform::current_platform(true).text_system(),
+    );
+    app.update(gpui_component::init);
+    let store = Arc::new(Store::new(fixture.path().join("state"))?);
+    let config = crate::config::ConfigFile::load(Some(fixture.path().join("config.toml")));
+    let (workspace, visual) = app.add_window_view(|window, cx| {
+        Workspace::with_config(store, config, WorkspaceView::Git, window, cx)
+    });
+    let draw = |visual: &mut VisualTestContext| {
+        for _ in 0..6 {
+            visual.run_until_parked();
+            visual.update(|window, cx| {
+                window.simulate_next_frame(cx);
+                window.draw(cx).clear(cx);
+            });
+        }
+    };
+    visual.simulate_resize(size(px(1280.), px(760.)));
+    visual.update(|window, cx| {
+        cx.set_reduce_motion(true);
+        workspace.update(cx, |workspace, cx| {
+            workspace.open_repository(Location { root, file: None }, window, cx)
+        });
+    });
+    draw(visual);
+    let panel = visual.update(|_, cx| workspace.read(cx).git.clone().unwrap());
+    visual.update(|_, cx| panel.update(cx, |panel, cx| panel.set_tree_visible(true, cx)));
+    draw(visual);
+    let row = |visual: &mut VisualTestContext, index| {
+        visual.update(|_, cx| {
+            panel
+                .read(cx)
+                .history_scroll
+                .bounds_for_item(index)
+                .unwrap()
+                .center()
+        })
+    };
+    let latest_row = row(visual, 1);
+    let previous_row = row(visual, 2);
+    let second_row = row(visual, 3);
+    let first_row = row(visual, 4);
+    let range = Modifiers {
+        shift: true,
+        ..Default::default()
+    };
+    let additive = Modifiers {
+        control: true,
+        ..Default::default()
+    };
+
+    visual.simulate_click(second_row, Modifiers::default());
+    visual.simulate_click(first_row, range);
+    draw(visual);
+    assert!(visual.debug_bounds("git-commit-range-comparison").is_some());
+    assert!(visual.debug_bounds("git-tree-row:file:first.txt").is_some());
+    assert!(
+        visual
+            .debug_bounds("git-tree-row:file:second.txt")
+            .is_some()
+    );
+    assert!(
+        visual
+            .debug_bounds("git-tree-row:file:cancelled.txt")
+            .is_none()
+    );
+    visual.update(|_, cx| {
+        let panel = panel.read(cx);
+        let review = panel.review.as_ref().unwrap();
+        assert!(matches!(&review.detail.comparison,
+            Comparison::Versions { base: Some(from), target: Some(to) } if from == &base && to == &second));
+        assert_eq!(panel.diff.read(cx).files().iter().map(|file| file.path().as_str()).collect::<Vec<_>>(), ["first.txt", "second.txt"]);
+        assert!(review.documents.iter().any(|file| file.hunk_locations().next().is_some()));
+        assert_eq!(panel.session(cx).unwrap().selection, Some(Selection::Commit(first.clone(), None)));
+    });
+
+    visual.simulate_click(second_row, Modifiers::default());
+    draw(visual);
+    assert!(visual.debug_bounds("git-commit-range-comparison").is_none());
+    assert!(
+        visual
+            .debug_bounds("git-tree-row:file:cancelled.txt")
+            .is_some()
+    );
+
+    visual.simulate_click(latest_row, Modifiers::default());
+    visual.simulate_click(previous_row, range);
+    draw(visual);
+    assert!(visual.debug_bounds("git-commit-range-comparison").is_some());
+    assert!(
+        visual
+            .debug_bounds("git-tree-row:file:transient.txt")
+            .is_none()
+    );
+    visual.update(|_, cx| {
+        let panel = panel.read(cx);
+        assert!(panel.review.as_ref().unwrap().detail.files.is_empty());
+        assert!(panel.diff.read(cx).files().is_empty());
+    });
+
+    visual.simulate_click(second_row, Modifiers::default());
+    visual.simulate_click(latest_row, additive);
+    draw(visual);
+    assert!(visual.debug_bounds("git-history-selected-count").is_some());
+    assert!(visual.debug_bounds("git-commit-range-comparison").is_none());
+    assert!(
+        visual
+            .debug_bounds("git-tree-row:file:transient.txt")
+            .is_some()
+    );
+    visual.update(|_, cx| {
+        assert_eq!(
+            panel.read(cx).selection,
+            Some(Selection::Commit(latest.clone(), None))
+        )
+    });
+    Ok(())
+}
+
+#[::core::prelude::v1::test]
 fn commit_markers_share_the_editor_gutter_and_keep_local_priority() -> Result<()> {
     let fixture = tempfile::tempdir()?;
     let root = fixture.path().join("repo");
@@ -2277,7 +2426,7 @@ fn commit_list_squashes_rewords_and_resets_with_local_changes() -> Result<()> {
         assert!(selection.contains(&SharedString::from(commits[3].clone())));
         assert!(selection.contains(&SharedString::from(commits[2].clone())));
         assert_eq!(
-            panel.selection.as_ref().and_then(Selection::target_commit),
+            panel.selection.as_ref().and_then(Selection::focused_commit),
             Some(commits[2].as_str())
         );
     });

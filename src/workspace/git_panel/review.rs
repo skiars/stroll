@@ -599,6 +599,7 @@ impl GitPanel {
             session.selection = None;
             session.diff = None;
         }
+        self.history_pick.clear();
         let selection = Selection::Commit(commit.oid.clone(), None);
         let position = DiffPosition {
             path: commit.path.clone(),
@@ -711,6 +712,13 @@ impl GitPanel {
                     Comparison::Commit {
                         commit: Box::new(commit),
                         parent,
+                    }
+                }
+                Selection::CommitRange { base, newest, .. } => {
+                    backend.check_revision_comparison()?;
+                    Comparison::Versions {
+                        base,
+                        target: Some(newest),
                     }
                 }
                 Selection::Worktree(mode) => Comparison::Worktree {
@@ -2662,7 +2670,15 @@ impl GitPanel {
     fn summary(&self, review: &Review, cx: &Context<Self>, colors: Palette) -> impl IntoElement {
         let counts = review.totals;
         let (title, subtitle) = match &review.detail.comparison {
-            Comparison::Versions { .. } => (t!("git.compare_versions").into(), String::new()),
+            Comparison::Versions { .. } => {
+                let title = match self.selection.as_ref() {
+                    Some(Selection::CommitRange { count, .. }) => {
+                        t!("git.commit_range_changes", count = count)
+                    }
+                    _ => t!("git.compare_versions"),
+                };
+                (title.into(), String::new())
+            }
             Comparison::Commit { commit, .. } => (
                 subject(commit),
                 format!(

@@ -787,10 +787,10 @@ impl GitPanel {
                         }
                         this.history_progress = progress;
                         this.history_rewrite = rewrite;
-                        if this.history.as_ref().is_some_and(|old| {
+                        let checkout_changed = this.history.as_ref().is_some_and(|old| {
                             old.head != history.head || old.checkout != history.checkout
-                        }) {
-                            this.history_pick.clear();
+                        });
+                        if checkout_changed {
                             this.clear_commit_amend(window, cx);
                         }
                         this.history_error = None;
@@ -864,6 +864,11 @@ impl GitPanel {
                         });
                         this.update_history_ref_heights(&history);
                         this.history = Some(history);
+                        if checkout_changed
+                            || !first_load && previous_oid.as_deref() != this.branch_oid()
+                        {
+                            this.clear_history_selection(window, cx);
+                        }
                         if let Some(state) = restore
                             && let Some(selection) = state.selection
                         {
@@ -1063,12 +1068,25 @@ impl GitPanel {
             return;
         }
         self.query = query;
-        self.history_pick.clear();
+        self.clear_history_selection(window, cx);
         self.restore_history = None;
         self.history_scroll.reset(0);
         self.commits = Rc::default();
         self.graph = Rc::default();
         self.load_commits(false, window, cx);
+    }
+
+    fn clear_history_selection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.history_pick.clear();
+        match self.selection.clone() {
+            Some(selection @ Selection::CommitRange { .. }) => {
+                self.load_review(selection.without_commit_range(), false, window, cx);
+            }
+            Some(selection @ Selection::Compare { .. }) => {
+                self.selection = Some(selection.without_commit_range());
+            }
+            _ => {}
+        }
     }
 
     fn load_commits(&mut self, more: bool, window: &mut Window, cx: &mut Context<Self>) {
@@ -1198,6 +1216,7 @@ impl GitPanel {
                 inset: top.offset_in_item.into(),
             })
         });
+        let selection = self.selection.clone();
         let diff = self
             .loading_session_diff
             .clone()
@@ -1212,9 +1231,9 @@ impl GitPanel {
         Some(GitSession {
             reference: self.branch.clone(),
             query: self.query.clone(),
-            selection: self.selection.clone(),
+            diff: diff.filter(|_| !matches!(selection, Some(Selection::CommitRange { .. }))),
+            selection: selection.map(Selection::without_commit_range),
             history,
-            diff,
             worktree_directories: self.worktree_directories.clone(),
         })
     }
@@ -1712,12 +1731,12 @@ impl GitPanel {
         cx: &mut Context<Self>,
     ) {
         self.history_pick.clear();
-        let current = self
-            .selection
-            .as_ref()
-            .filter(|selection| selection.target_commit() == target);
+        let current = self.selection.as_ref().filter(|selection| {
+            !matches!(selection, Selection::CommitRange { .. })
+                && selection.target_commit() == target
+        });
         let selection = match current {
-            Some(selection) => selection.clone(),
+            Some(selection) => selection.clone().without_commit_range(),
             None => target.map_or(Selection::Worktree(Mode::All), |oid| {
                 Selection::Commit(oid.to_owned(), None)
             }),

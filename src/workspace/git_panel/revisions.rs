@@ -291,17 +291,30 @@ impl GitPanel {
 
     pub(super) fn comparison_control(&self, cx: &Context<Self>) -> Option<AnyElement> {
         let weak = cx.weak_entity();
-        if let Some(Selection::Compare {
-            base,
-            target,
-            previous,
-        }) = &self.selection
-        {
-            let previous = previous.as_ref().clone();
-            let label = comparison_label(base.as_deref(), target.as_deref());
+        let versions = match self.selection.as_ref()? {
+            Selection::Compare {
+                base,
+                target,
+                previous,
+            } => Some((
+                "git-custom-comparison",
+                base.as_deref(),
+                target.as_deref(),
+                Some(previous.as_ref().clone()),
+            )),
+            Selection::CommitRange { base, newest, .. } => Some((
+                "git-commit-range-comparison",
+                base.as_deref(),
+                Some(newest.as_str()),
+                None,
+            )),
+            _ => None,
+        };
+        if let Some((id, base, target, previous)) = versions {
+            let label = comparison_label(base, target);
             return Some(
-                action_button("git-custom-comparison")
-                    .debug_selector(|| "git-custom-comparison".into())
+                action_button(id)
+                    .debug_selector(move || id.into())
                     .secondary()
                     .min_w_0()
                     .label(label.clone())
@@ -309,15 +322,23 @@ impl GitPanel {
                     .dropdown_caret(true)
                     .dropdown_menu(move |menu, _, _| {
                         let view = weak.clone();
-                        let previous = previous.clone();
                         menu.item(custom_item(t!("git.custom_comparison"), weak.clone()))
-                            .item(PopupMenuItem::new(t!("git.return_to_comparison")).on_click(
-                                move |_, window, cx| {
-                                    _ = view.update(cx, |this, cx| {
-                                        this.load_review(previous.clone(), false, window, cx)
-                                    });
-                                },
-                            ))
+                            .when_some(previous.clone(), |menu, previous| {
+                                menu.item(
+                                    PopupMenuItem::new(t!("git.return_to_comparison")).on_click(
+                                        move |_, window, cx| {
+                                            _ = view.update(cx, |this, cx| {
+                                                this.load_review(
+                                                    previous.clone(),
+                                                    false,
+                                                    window,
+                                                    cx,
+                                                )
+                                            });
+                                        },
+                                    ),
+                                )
+                            })
                     })
                     .into_any_element(),
             );
@@ -429,6 +450,9 @@ impl GitPanel {
                 target,
                 previous,
             } => (base.clone(), target.clone(), previous.as_ref().clone()),
+            Selection::CommitRange { base, newest, .. } => {
+                (base.clone(), Some(newest.clone()), selection.clone())
+            }
             _ => {
                 let Some(review) = &self.review else { return };
                 let (base, target) = match &review.detail.comparison {

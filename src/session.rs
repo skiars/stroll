@@ -180,6 +180,14 @@ pub(crate) struct GitSession {
 #[serde(rename_all = "snake_case")]
 pub(crate) enum GitSelection {
     Commit(String, Option<String>),
+    #[cfg(feature = "desktop")]
+    #[serde(skip)]
+    CommitRange {
+        base: Option<String>,
+        newest: String,
+        focused: String,
+        count: usize,
+    },
     Worktree(Mode),
     Compare {
         base: Option<String>,
@@ -193,8 +201,32 @@ impl GitSelection {
     pub(crate) fn target_commit(&self) -> Option<&str> {
         match self {
             Self::Commit(oid, _) => Some(oid),
+            Self::CommitRange { newest, .. } => Some(newest),
             Self::Compare { target, .. } => target.as_deref(),
             Self::Worktree(_) => None,
+        }
+    }
+
+    pub(crate) fn focused_commit(&self) -> Option<&str> {
+        match self {
+            Self::CommitRange { focused, .. } => Some(focused),
+            _ => self.target_commit(),
+        }
+    }
+
+    pub(crate) fn without_commit_range(self) -> Self {
+        match self {
+            Self::CommitRange { focused, .. } => Self::Commit(focused, None),
+            Self::Compare {
+                base,
+                target,
+                previous,
+            } => Self::Compare {
+                base,
+                target,
+                previous: Box::new(previous.without_commit_range()),
+            },
+            selection => selection,
         }
     }
 

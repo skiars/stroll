@@ -179,6 +179,7 @@
   "git.history_edit_resolve_first": "Resolve and stage all conflicted files before continuing.",
   "git.history_edit_save_first": "Save open editor changes before continuing.",
   "git.history_edit_selected": "%{count} commits selected",
+  "git.commit_range_changes": "Net Changes · %{count} Commits",
   "git.editor_mark_commit": "Mark Commit in Editor",
   "git.editor_mark_commits": "Mark %{count} Commits in Editor",
   "git.editor_mark_consecutive_commits": "Mark in Editor (Select Consecutive Commits)",
