@@ -126,6 +126,7 @@ fn interactive_editor_gutter_animates_paint_with_fixed_full_width_targets() {
     cx.update(gpui_component::init);
     let outlined = rgb(0xe07746).into();
     let filled = rgb(0x249965).into();
+    let fallback = rgb(0x7654a8).into();
     let (view, visual) = cx.add_window_view(|window, cx| {
         OverviewProbe(cx.new(|cx| {
             let mut editor = EditorState::new(window, cx).default_value("one\ntwo\nthree\n");
@@ -139,6 +140,10 @@ fn interactive_editor_gutter_animates_paint_with_fixed_full_width_targets() {
                     GutterDecoration::new(8..13)
                         .with_color(filled)
                         .with_action(2),
+                    GutterDecoration::new(0..3)
+                        .with_color(fallback)
+                        .with_action(3)
+                        .fallback(true),
                 ],
                 cx,
             );
@@ -161,6 +166,11 @@ fn interactive_editor_gutter_animates_paint_with_fixed_full_width_targets() {
         visual.update(|window, _| {
             let scale = window.scale_factor();
             let quads = window.painted_quads();
+            assert!(
+                quads
+                    .iter()
+                    .all(|quad| quad.background.as_solid() != Some(fallback))
+            );
             let outline = quads
                 .iter()
                 .find(|quad| quad.border_color == outlined)
@@ -268,7 +278,14 @@ fn editor_overview_uses_the_full_track_and_distinguishes_click_from_drag(cx: &mu
                 let offset = line * "let a = 0;\n".len();
                 GutterDecoration::new(offset..offset + 1).with_color(git_color.into())
             };
-            editor.create_gutter_decorations_collection(vec![git(52), git(121)], cx);
+            editor.create_gutter_decorations_collection(
+                vec![
+                    git(52).with_action(1).with_tooltip("First marker"),
+                    git(121).fallback(true),
+                    git(149).without_overview_marker(),
+                ],
+                cx,
+            );
             editor
                 .diagnostics_mut()
                 .unwrap()

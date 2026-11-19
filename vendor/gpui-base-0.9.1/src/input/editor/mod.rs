@@ -332,7 +332,11 @@ impl crate::input::InputExtras for super::EditorExtras {
     }
 
     fn overview_ruler_gutter(&self) -> Vec<&super::GutterDecoration> {
-        self.gutter_decorations.iter().flatten().collect()
+        self.gutter_decorations
+            .iter()
+            .flatten()
+            .filter(|mark| mark.shows_in_overview())
+            .collect()
     }
 
     fn semantic_token_styles(

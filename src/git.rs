@@ -346,6 +346,43 @@ impl Backend {
         })
     }
 
+    pub(crate) fn checked_out_head(&self) -> Result<Option<String>> {
+        match &self.ssh {
+            Some(_) => self.history().map(|history| history.head),
+            None => head(&self.root),
+        }
+    }
+
+    pub(crate) fn contains_commit(&self, tip: &str, oid: &str) -> Result<bool> {
+        if tip == oid {
+            return Ok(true);
+        }
+        if self.ssh.is_none() {
+            anyhow::ensure!(
+                object_id(tip) && object_id(oid),
+                t!("git.invalid_commit_id")
+            );
+            let output = command(&self.root, ["merge-base", "--is-ancestor", oid, tip]).output()?;
+            return match output.status.code() {
+                Some(0) => Ok(true),
+                Some(1) => Ok(false),
+                _ => anyhow::bail!("{}", text(&output.stderr).trim_end()),
+            };
+        }
+        // Exact object ID searches use the history helper's ancestry check.
+        let mut offset = 0;
+        loop {
+            let page = self.commits(tip, oid, offset)?;
+            if page.commits.iter().any(|commit| commit.oid == oid) {
+                return Ok(true);
+            }
+            if !page.more {
+                return Ok(false);
+            }
+            offset += page.commits.len();
+        }
+    }
+
     pub fn check_revision_comparison(&self) -> Result<()> {
         if let Some(ssh) = &self.ssh {
             anyhow::ensure!(

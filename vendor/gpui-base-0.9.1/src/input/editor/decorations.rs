@@ -82,6 +82,9 @@ pub struct GutterDecoration {
     folded_color: Option<Hsla>,
     action: Option<usize>,
     outlined: bool,
+    fallback: bool,
+    tooltip: Option<gpui::SharedString>,
+    hide_from_overview: bool,
 }
 
 /// The hanging action label attaches to the first displayed row of a diff block.
@@ -103,6 +106,8 @@ pub struct GutterHunk {
     pub(crate) sections: Vec<GutterHunkSection>,
     pub(crate) marker_color: Hsla,
     pub(crate) outlined: bool,
+    pub(crate) fallback: bool,
+    pub(crate) tooltip: Option<gpui::SharedString>,
     pub(crate) render: std::rc::Rc<dyn Fn(&mut gpui::Window, &mut App) -> gpui::AnyElement>,
 }
 
@@ -126,6 +131,9 @@ impl GutterDecoration {
             folded_color: None,
             action: None,
             outlined: false,
+            fallback: false,
+            tooltip: None,
+            hide_from_overview: false,
         }
     }
 
@@ -165,6 +173,36 @@ impl GutterDecoration {
 
     pub(crate) fn action(&self) -> Option<usize> {
         self.action
+    }
+
+    /// Limit the marker and its hit target to space left by ordinary gutter marks.
+    pub fn fallback(mut self, fallback: bool) -> Self {
+        self.fallback = fallback;
+        self
+    }
+
+    /// Show a label when hovering an actionable marker.
+    pub fn with_tooltip(mut self, label: impl Into<gpui::SharedString>) -> Self {
+        self.tooltip = Some(label.into());
+        self
+    }
+
+    /// Keep this decoration in the gutter when the editor mirrors marks in its overview ruler.
+    pub fn without_overview_marker(mut self) -> Self {
+        self.hide_from_overview = true;
+        self
+    }
+
+    pub(crate) fn is_fallback(&self) -> bool {
+        self.fallback
+    }
+
+    pub(crate) fn tooltip(&self) -> Option<&gpui::SharedString> {
+        self.tooltip.as_ref()
+    }
+
+    pub(crate) fn shows_in_overview(&self) -> bool {
+        !self.hide_from_overview
     }
 
     /// Draw this mark as an outline, using the same color as a solid mark.
@@ -1093,11 +1131,19 @@ impl InputBaseState<EditorMode> {
         render: impl Fn(&mut gpui::Window, &mut App) -> gpui::AnyElement + 'static,
         cx: &mut Context<Self>,
     ) {
+        let marker = self
+            .extras
+            .gutter_decorations
+            .iter()
+            .flatten()
+            .find(|mark| mark.action() == Some(action));
         self.extras.gutter_hunk = Some(GutterHunk {
             action,
             sections,
             marker_color,
             outlined,
+            fallback: marker.is_some_and(GutterDecoration::is_fallback),
+            tooltip: marker.and_then(|mark| mark.tooltip().cloned()),
             render: std::rc::Rc::new(render),
         });
         cx.notify();

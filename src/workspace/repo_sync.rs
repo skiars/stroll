@@ -13,7 +13,8 @@ use crate::{
 static NEXT_DOCUMENT_SCAN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 impl Workspace {
-    pub(super) fn reset_workspace_tree(&mut self) {
+    pub(super) fn reset_workspace_tree(&mut self, cx: &mut Context<Self>) {
+        self.clear_editor_commit_markers(cx);
         self.tree_status_task = Task::ready(());
         self.doc_sync = Task::ready(());
         self.repository_snapshot = None;
@@ -724,6 +725,9 @@ impl Workspace {
         if changes.rescan || changes.refs || changes.structure {
             self.docs_tree_dirty = true;
             self.load_docs_tree(window, cx);
+        }
+        if changes.refs || git_rescan {
+            self.load_commit_markers(false, window, cx);
         }
         self.queue_workspace_refresh(changes.clone(), window, cx);
         if self.view == WorkspaceView::Docs

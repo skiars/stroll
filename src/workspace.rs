@@ -101,6 +101,7 @@ actions!(
         NextTab,
         PreviousTab,
         ToggleTerminal,
+        ClearCommitMarkers,
         ToggleSettings,
         CloseSettings
     ]
@@ -787,6 +788,7 @@ pub struct Workspace {
     git: Option<Entity<GitPanel>>,
     git_edit: HashSet<PathBuf>,
     git_history: git_history::GitHistory,
+    commit_markers: editor_git::commits::CommitMarkers,
     git_watch: Task<()>,
     docs_tree: Rc<DocumentTree>,
     docs_expanded: BTreeSet<PathBuf>,
@@ -986,6 +988,7 @@ impl Workspace {
             git: None,
             git_edit: HashSet::new(),
             git_history: Default::default(),
+            commit_markers: Default::default(),
             git_watch: Task::ready(()),
             docs_tree: Rc::default(),
             docs_expanded: BTreeSet::new(),
@@ -1469,7 +1472,7 @@ impl Workspace {
         self.doc_loading = None;
         self.doc_error = None;
         self.open_documents_list = false;
-        self.reset_workspace_tree();
+        self.reset_workspace_tree(cx);
         if !self.session.worktree_lsp_trusted {
             *repo.worktree_lsp.write().unwrap() = Arc::default();
         }
@@ -1711,7 +1714,7 @@ impl Workspace {
             format!("{} · Stroll", repo.name)
         };
         window.set_window_title(&title);
-        self.reset_workspace_tree();
+        self.reset_workspace_tree(cx);
         if let Some(cached) = cached_docs {
             self.docs_tree = cached.tree;
             self.docs_tree_seeded = true;
@@ -3173,6 +3176,7 @@ impl Workspace {
         }
         if active && self.view == WorkspaceView::Editor {
             self.refresh_editor_git_marks(&path, window, cx);
+            self.refresh_editor_commit_markers(&path, window, cx);
         }
         self.schedule_draft_write(window, cx);
         cx.notify();
@@ -3499,6 +3503,7 @@ impl Workspace {
                     server.document.changed(Rope::from(text.as_str()));
                     server.document.saved(Rope::from(text.as_str()));
                 }
+                this.refresh_editor_commit_markers(&target, window, cx);
                 if let Some(panel) = &this.git {
                     panel.update(cx, |panel, cx| panel.repository_source_changed(target, cx));
                 }
@@ -4347,6 +4352,9 @@ impl Workspace {
                         .on_mouse_up(MouseButton::Left, cx.listener(Self::end_source_click))
                         .on_mouse_up_out(MouseButton::Left, cx.listener(Self::end_source_click))
                         .on_action(cx.listener(Self::close_editor_git_hunk))
+                        .on_action(cx.listener(|this, _: &ClearCommitMarkers, _, cx| {
+                            this.clear_editor_commit_markers(cx);
+                        }))
                         .on_action(cx.listener(Self::show_signature_help))
                         .capture_key_down(cx.listener(Self::dismiss_signature_help))
                         .capture_action(cx.listener(|this, action: &Enter, window, cx| {
@@ -4372,16 +4380,31 @@ impl Workspace {
                                 .readonly(locked)
                                 .size_full()
                                 .aria_label(name)
-                                .when_some(language_server, |editor, document| {
-                                    editor.extend_context_menu(move |menu, _, _| {
-                                        if document
-                                            .upgrade()
+                                .map(|editor| {
+                                    let workspace = cx.weak_entity();
+                                    editor.extend_context_menu(move |menu, _, app| {
+                                        let menu = if language_server
+                                            .as_ref()
+                                            .and_then(|document| document.upgrade())
                                             .is_some_and(|document| document.supports_references())
                                         {
                                             menu.menu_with_icon(
                                                 t!("lsp.find_references"),
                                                 IconName::Search,
                                                 Box::new(FindReferences),
+                                            )
+                                        } else {
+                                            menu
+                                        };
+                                        if workspace
+                                            .read_with(app, |workspace, _| {
+                                                workspace.commit_markers.active()
+                                            })
+                                            .unwrap_or(false)
+                                        {
+                                            menu.menu(
+                                                t!("git.editor_clear_commit_markers"),
+                                                Box::new(ClearCommitMarkers),
                                             )
                                         } else {
                                             menu

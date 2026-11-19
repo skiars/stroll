@@ -1,4 +1,5 @@
 pub(super) mod blame;
+pub(super) mod commits;
 
 use super::*;
 use crate::git::{self, FileAction, FileChanges, FileDiffOptions, FileEdit, Layer, Mode};
@@ -20,6 +21,7 @@ pub(super) struct EditorGit {
     draft_marks: Task<()>,
     stale: bool,
     blame: blame::Blame,
+    commits: commits::FileCommitMarkers,
 }
 
 pub(super) struct GitEditOutcome {
@@ -63,12 +65,14 @@ impl EditorGit {
             draft_marks: Task::ready(()),
             stale: false,
             blame: blame::Blame::default(),
+            commits: commits::FileCommitMarkers::new(editor, cx),
         }
     }
 
     pub(super) fn clear_hunk(&mut self, editor: &Entity<EditorState>, cx: &mut App) {
         self.pending_hunk = None;
-        if self.selected.take().is_none() {
+        let commit = self.commits.selected.take();
+        if self.selected.take().is_none() && commit.is_none() {
             return;
         }
         editor.update(cx, |editor, cx| editor.clear_gutter_hunk(cx));
@@ -401,6 +405,7 @@ impl Workspace {
 
     pub(super) fn watch_editor_git(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.git_watch = Task::ready(());
+        self.refresh_active_commit_markers(window, cx);
         let (Some(repo), Some(file)) = (self.repository.as_ref(), self.active_file()) else {
             return;
         };
@@ -480,6 +485,7 @@ impl Workspace {
                             file.git.draft_base = None;
                             file.git.changes = Some(changes);
                             workspace.refresh_editor_git_marks(&path, window, cx);
+                            workspace.refresh_editor_commit_markers(&path, window, cx);
                             if let Some(action) = next {
                                 workspace.expand_editor_git(&path, action, cx);
                             }
@@ -747,6 +753,9 @@ impl Workspace {
     }
 
     pub(super) fn toggle_editor_git(&mut self, path: &Path, action: usize, cx: &mut Context<Self>) {
+        if self.toggle_commit_hunk(path, action, cx) {
+            return;
+        }
         let Some(file) = self.files.get_mut(path) else {
             return;
         };
@@ -775,7 +784,10 @@ impl Workspace {
             cx.propagate();
             return;
         };
-        if file.git.selected.is_none() && file.git.pending_hunk.is_none() {
+        if file.git.selected.is_none()
+            && file.git.pending_hunk.is_none()
+            && file.git.commits.selected.is_none()
+        {
             cx.propagate();
             return;
         }
@@ -816,6 +828,7 @@ impl Workspace {
     }
 
     pub(super) fn refresh_expanded_editor_hunks(&mut self, cx: &mut Context<Self>) {
+        self.repaint_commit_hunks(cx);
         let expanded = self
             .files
             .iter()
@@ -857,6 +870,7 @@ impl Workspace {
         };
         let marker = marker_color(first, cx);
         let outlined = patch.layer == Layer::Staged;
+        file.git.commits.selected = None;
         file.git.selected = Some(action);
         let weak = cx.weak_entity();
         let path = path.to_owned();

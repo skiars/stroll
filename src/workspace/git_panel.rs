@@ -114,6 +114,7 @@ struct CommitRow {
     committed_at: SharedString,
     body_preview: SharedString,
     merge: bool,
+    first_parent: Option<SharedString>,
 }
 
 impl From<Commit> for CommitRow {
@@ -127,6 +128,7 @@ impl From<Commit> for CommitRow {
             committed_at: commit.committed_at.into(),
             body_preview: history_preview::preview_body(commit.body),
             merge: commit.parents.len() > 1,
+            first_parent: commit.parents.into_iter().next().map(Into::into),
         }
     }
 }
@@ -1469,6 +1471,11 @@ impl GitPanel {
                             for item in items {
                                 menu = menu.item(item);
                             }
+                        }
+                        if let Ok(item) =
+                            menu_view.read_with(cx, |panel, _| panel.mark_commits_item(&base))
+                        {
+                            menu = menu.separator().item(item);
                         }
                         menu
                     })

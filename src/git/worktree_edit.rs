@@ -109,15 +109,7 @@ impl LayerPatch {
         let hunk = hunks
             .into_iter()
             .find(|hunk| <[u8; 32]>::from(Sha256::digest(hunk)) == block.digest)?;
-        Some(
-            std::str::from_utf8(hunk)
-                .ok()?
-                .split_terminator('\n')
-                .skip(1)
-                .filter_map(|line| line.strip_prefix('-'))
-                .map(|line| line.strip_suffix('\r').unwrap_or(line).to_owned().into())
-                .collect(),
-        )
+        deleted_hunk_lines(hunk)
     }
 }
 
@@ -862,6 +854,32 @@ pub(crate) fn buffer_diff_blocks(index: &str, text: &str) -> Vec<Block> {
         .flat_map(|(_, sections)| sections)
         .filter_map(|section| parse_block(section, false))
         .collect()
+}
+
+#[cfg(feature = "desktop")]
+impl RawPatch {
+    pub(crate) fn read_only_hunks(
+        &self,
+    ) -> impl Iterator<Item = (Block, Vec<gpui::SharedString>)> + '_ {
+        split_patch(self.text.as_bytes())
+            .filter(|_| !self.truncated)
+            .into_iter()
+            .flat_map(|(_, hunks)| hunks)
+            .filter_map(|hunk| Some((parse_block(hunk, false)?, deleted_hunk_lines(hunk)?)))
+    }
+}
+
+#[cfg(feature = "desktop")]
+fn deleted_hunk_lines(hunk: &[u8]) -> Option<Vec<gpui::SharedString>> {
+    Some(
+        std::str::from_utf8(hunk)
+            .ok()?
+            .split_terminator('\n')
+            .skip(1)
+            .filter_map(|line| line.strip_prefix('-'))
+            .map(|line| line.strip_suffix('\r').unwrap_or(line).to_owned().into())
+            .collect(),
+    )
 }
 
 /// Read a verified unstaged hunk as worktree line ranges and index replacements.

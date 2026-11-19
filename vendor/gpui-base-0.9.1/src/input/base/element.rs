@@ -91,6 +91,7 @@ const FOLD_ICON_HITBOX_WIDTH: Pixels = px(18.);
 /// Space between the gutter decoration strip and the line numbers.
 const GUTTER_DECORATION_GAP: Pixels = px(4.);
 const GUTTER_ACTION_MARK_WIDTH: Pixels = px(5.);
+const GUTTER_MIN_HIT_HEIGHT: Pixels = px(10.);
 const GUTTER_HOVER_DURATION: Duration = Duration::from_millis(150);
 /// Height of the pill an empty gutter decoration paints on a line boundary.
 const GUTTER_BOUNDARY_MARK_HEIGHT: Pixels = px(8.);
@@ -952,6 +953,84 @@ struct GutterMark {
     quad: PaintQuad,
     action: Option<usize>,
     hitbox: Option<Hitbox>,
+    fallback: bool,
+    tooltip: Option<SharedString>,
+    tooltip_trigger: Option<AnyElement>,
+}
+
+fn prioritize_gutter_marks(marks: Vec<GutterMark>) -> Vec<GutterMark> {
+    if marks.iter().all(|mark| !mark.fallback) {
+        return marks;
+    }
+    let (fallback, foreground): (Vec<_>, Vec<_>) = marks
+        .into_iter()
+        .partition(|mark| mark.fallback);
+    let mut occupied = foreground
+        .iter()
+        .map(|mark| {
+            let bounds = mark.quad.bounds;
+            let padding = if mark.action.is_some() {
+                (GUTTER_MIN_HIT_HEIGHT - bounds.size.height).max(px(0.)).half()
+            } else {
+                px(0.)
+            };
+            bounds.top() - padding..bounds.bottom() + padding
+        })
+        .collect::<Vec<_>>();
+    occupied.sort_unstable_by_key(|range| range.start);
+    let mut marks = Vec::new();
+    for mark in fallback {
+        let mut top = mark.quad.bounds.top();
+        let bottom = mark.quad.bounds.bottom();
+        let mut push = |from, to| {
+            let mut quad = mark.quad.clone();
+            quad.bounds.origin.y = from;
+            quad.bounds.size.height = to - from;
+            marks.push(GutterMark {
+                quad,
+                action: mark.action,
+                hitbox: None,
+                fallback: true,
+                tooltip: mark.tooltip.clone(),
+                tooltip_trigger: None,
+            });
+        };
+        for range in occupied.iter().take_while(|range| range.start < bottom) {
+            if range.end <= top {
+                continue;
+            }
+            if range.start > top {
+                push(top, range.start);
+            }
+            top = range.end;
+            if top >= bottom {
+                break;
+            }
+        }
+        if top < bottom {
+            push(top, bottom);
+        }
+    }
+    marks.extend(foreground);
+    marks
+}
+
+struct GutterTooltip(SharedString);
+
+impl gpui::Render for GutterTooltip {
+    fn render(&mut self, _: &mut Window, cx: &mut gpui::Context<Self>) -> impl IntoElement {
+        let colors = cx.theme().tokens.colors;
+        crate::Tooltip::new("editor-gutter-tooltip")
+            .rounded(px(4.))
+            .px(px(7.))
+            .py(px(4.))
+            .bg(colors.surface)
+            .text_color(colors.surface_foreground)
+            .border_1()
+            .border_color(colors.border)
+            .text_size(px(12.))
+            .child(self.0.clone())
+    }
 }
 
 #[derive(Default)]
@@ -1895,7 +1974,7 @@ impl<M: InputModeKind> TextElement<M> {
         window: &mut Window,
         cx: &mut App,
     ) -> (HunkLayout, Vec<GutterMark>) {
-        let (sections, render, gutter_width, action, outline, color, tab_size) = {
+        let (sections, render, gutter_width, action, outline, color, fallback, tooltip, tab_size) = {
             let state = self.state.read(cx);
             let Some(hunk) = state.extras.gutter_hunk() else {
                 return (HunkLayout::default(), Vec::new());
@@ -1923,6 +2002,8 @@ impl<M: InputModeKind> TextElement<M> {
                 hunk.action,
                 hunk.outlined,
                 hunk.marker_color,
+                hunk.fallback,
+                hunk.tooltip.clone(),
                 state.mode.tab_size().tab_size,
             )
         };
@@ -2008,6 +2089,9 @@ impl<M: InputModeKind> TextElement<M> {
                         quad,
                         action: Some(action),
                         hitbox: None,
+                        fallback,
+                        tooltip: tooltip.clone(),
+                        tooltip_trigger: None,
                     });
                 }
                 for (ix, line) in deleted_lines.iter().enumerate() {
@@ -2394,6 +2478,9 @@ impl<M: InputModeKind> TextElement<M> {
                         quad,
                         action: decoration.action(),
                         hitbox: None,
+                        fallback: decoration.is_fallback(),
+                        tooltip: decoration.tooltip().cloned(),
+                        tooltip_trigger: None,
                     }
                 })
             })
@@ -2463,6 +2550,8 @@ impl<M: InputModeKind> TextElement<M> {
             mut quad,
             action,
             hitbox,
+            mut tooltip_trigger,
+            ..
         } in marks
         {
             if let (Some(width), Some(action)) = (interactive_width, action) {
@@ -2494,6 +2583,11 @@ impl<M: InputModeKind> TextElement<M> {
             }
             window.paint_quad(quad);
             if let (Some(action), Some(hitbox)) = (action, hitbox) {
+                if let Some(trigger) = tooltip_trigger.as_mut() {
+                    window.with_element_namespace(("gutter-tooltip-action", action), |window| {
+                        trigger.paint(window, cx);
+                    });
+                }
                 window.set_cursor_style(gpui::CursorStyle::PointingHand, &hitbox);
                 let state = self.state.clone();
                 window.on_mouse_event(move |event: &gpui::MouseDownEvent, phase, window, cx| {
@@ -4712,6 +4806,7 @@ impl<M: InputModeKind> Element for TextElement<M> {
         let mut gutter_decorations =
             self.layout_gutter_decorations(&bounds, &input_bounds, &last_layout, ghost_rows, cx);
         gutter_decorations.extend(extra_marks);
+        let mut gutter_decorations = prioritize_gutter_marks(gutter_decorations);
         // Marks now start in the editor's left padding, outside the text
         // element's bounds, so their click targets must include that padding.
         let state = self.state.read(cx);
@@ -4732,8 +4827,8 @@ impl<M: InputModeKind> Element for TextElement<M> {
                     + interactive_gutter_width.map_or(px(0.), |_| editor_paddings.bottom),
             ),
         );
-        for mark in &mut gutter_decorations {
-            if mark.action.is_some() {
+        for (index, mark) in gutter_decorations.iter_mut().enumerate() {
+            if let Some(action) = mark.action {
                 let mut bounds = mark.quad.bounds;
                 if let Some(width) = interactive_gutter_width {
                     bounds.origin.x = mark_hitbox_bounds.left();
@@ -4741,14 +4836,26 @@ impl<M: InputModeKind> Element for TextElement<M> {
                 } else if mark.quad.border_widths == Edges::all(px(0.)) {
                     bounds.size.width += GUTTER_DECORATION_GAP;
                 }
-                if bounds.size.height < px(10.) {
-                    bounds.origin.y -= (px(10.) - bounds.size.height) / 2.;
-                    bounds.size.height = px(10.);
+                if !mark.fallback && bounds.size.height < GUTTER_MIN_HIT_HEIGHT {
+                    bounds.origin.y -= (GUTTER_MIN_HIT_HEIGHT - bounds.size.height).half();
+                    bounds.size.height = GUTTER_MIN_HIT_HEIGHT;
                 }
-                mark.hitbox = Some(window.insert_hitbox(
-                    bounds.intersect(&mark_hitbox_bounds),
-                    HitboxBehavior::Normal,
-                ));
+                let bounds = bounds.intersect(&mark_hitbox_bounds);
+                mark.hitbox = Some(window.insert_hitbox(bounds, HitboxBehavior::Normal));
+                if let Some(label) = mark.tooltip.clone() {
+                    use gpui::{AppContext as _, StatefulInteractiveElement as _};
+                    let mut trigger = gpui::div()
+                        .id(("gutter-tooltip", index))
+                        .w(bounds.size.width)
+                        .h(bounds.size.height)
+                        .tooltip(move |_, cx| cx.new(|_| GutterTooltip(label.clone())).into())
+                        .into_any_element();
+                    window.with_element_namespace(("gutter-tooltip-action", action), |window| {
+                        trigger.layout_as_root(bounds.size.into(), window, cx);
+                        trigger.prepaint_at(bounds.origin, window, cx);
+                    });
+                    mark.tooltip_trigger = Some(trigger);
+                }
             }
         }
         let state = self.state.read(cx);

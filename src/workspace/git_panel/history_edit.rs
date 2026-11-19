@@ -9,6 +9,7 @@ use crate::git::{
     HistoryAction, HistoryEdit, HistoryPlan, HistoryProgress, HistoryResolution, HistoryTip,
     PublishedHistory, ResetMode, ResetPlan, RewriteKind, RewriteRecord, SavedChanges,
 };
+use crate::workspace::editor_git::commits::CommitRange;
 
 #[derive(Default)]
 pub(super) struct HistoryPick {
@@ -49,6 +50,71 @@ impl HistoryCommand {
 }
 
 impl GitPanel {
+    pub(super) fn mark_commits_item(&self, oid: &SharedString) -> PopupMenuItem {
+        let rows = self
+            .history_pick
+            .rows
+            .as_deref()
+            .filter(|rows| rows.contains(oid));
+        let count = rows.map_or(1, BTreeSet::len);
+        let Some(range) = self.commit_marker_range(oid, rows) else {
+            return PopupMenuItem::new(t!("git.editor_mark_consecutive_commits")).disabled(true);
+        };
+        let label = if count == 1 {
+            t!("git.editor_mark_commit")
+        } else {
+            t!("git.editor_mark_commits", count = count)
+        };
+        let workspace = self.workspace.clone();
+        PopupMenuItem::new(label)
+            .icon(IconName::GitCommitHorizontal)
+            .on_click(move |_, window, cx| {
+                _ = workspace.update(cx, |workspace, cx| {
+                    workspace.mark_editor_commits(range.clone(), window, cx);
+                });
+            })
+    }
+
+    fn commit_marker_range(
+        &self,
+        oid: &SharedString,
+        rows: Option<&BTreeSet<SharedString>>,
+    ) -> Option<CommitRange> {
+        let Some(rows) = rows.filter(|rows| rows.len() > 1) else {
+            let row = self.commits.iter().find(|row| &row.oid == oid)?;
+            let selected_parent = match &self.selection {
+                Some(Selection::Commit(target, parent)) if target == oid.as_str() => parent.clone(),
+                _ => None,
+            };
+            return Some(CommitRange {
+                target: oid.to_string(),
+                oldest: oid.to_string(),
+                base: selected_parent
+                    .or_else(|| row.first_parent.as_ref().map(ToString::to_string)),
+            });
+        };
+        let selected = self
+            .commits
+            .iter()
+            .filter(|row| rows.contains(&row.oid))
+            .map(|row| (&row.oid, row))
+            .collect::<HashMap<_, _>>();
+        let parents = selected
+            .values()
+            .filter_map(|row| row.first_parent.as_ref())
+            .collect::<HashSet<_>>();
+        let target = selected.values().find(|row| !parents.contains(&row.oid))?;
+        let mut oldest = *target;
+        for _ in 1..rows.len() {
+            oldest = selected.get(oldest.first_parent.as_ref()?)?;
+        }
+        Some(CommitRange {
+            target: target.oid.to_string(),
+            oldest: oldest.oid.to_string(),
+            base: oldest.first_parent.as_ref().map(ToString::to_string),
+        })
+    }
+
     pub(super) fn pick_commit(
         &mut self,
         oid: &SharedString,

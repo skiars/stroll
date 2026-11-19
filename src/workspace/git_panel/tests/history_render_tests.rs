@@ -1939,6 +1939,259 @@ fn partial_stage_keeps_surviving_line_in_place_offscreen() -> Result<()> {
 }
 
 #[::core::prelude::v1::test]
+fn commit_markers_share_the_editor_gutter_and_keep_local_priority() -> Result<()> {
+    let fixture = tempfile::tempdir()?;
+    let root = fixture.path().join("repo");
+    fs::create_dir(&root)?;
+    git(&root, &["init", "-qb", "main"]);
+    git(&root, &["config", "user.name", "Reviewer"]);
+    git(&root, &["config", "user.email", "reviewer@example.invalid"]);
+    git(&root, &["config", "commit.gpgsign", "false"]);
+    let path = PathBuf::from("review.txt");
+    let write = |first, staged, unstaged, last| {
+        fs::write(
+            root.join(&path),
+            format!(
+                "start\n{first}\n{staged}\nseparator\n{unstaged}\nsecond separator\n{last}\nend\n"
+            ),
+        )
+    };
+    let commit = |subject| {
+        git(&root, &["add", "--", "review.txt"]);
+        git(&root, &["commit", "-qm", subject]);
+    };
+    write("old first", "old staged", "old unstaged", "old last")?;
+    commit("Base");
+    write("new first", "new staged", "old unstaged", "old last")?;
+    commit("First selected commit");
+    write("new first", "new staged", "new unstaged", "new last")?;
+    commit("Second selected commit");
+    write("new first", "old staged", "old unstaged", "new last")?;
+    commit("Update two lines after the selected commits");
+    write("new first", "new staged", "old unstaged", "new last")?;
+    git(&root, &["add", "--", "review.txt"]);
+    write("new first", "new staged", "new unstaged", "new last")?;
+
+    let mut app = TestAppContext::build_with_text_system(
+        TestDispatcher::new(0),
+        None,
+        gpui_platform::current_platform(true).text_system(),
+    );
+    app.update(gpui_component::init);
+    let store = Arc::new(Store::new(fixture.path().join("state"))?);
+    let config = crate::config::ConfigFile::load(Some(fixture.path().join("config.toml")));
+    let mut workspace = None;
+    let (_, visual) = app.add_window_view(|window, cx| {
+        let view =
+            cx.new(|cx| Workspace::with_config(store, config, WorkspaceView::Editor, window, cx));
+        workspace = Some(view.clone());
+        Root::new(view, window, cx)
+    });
+    let workspace = workspace.unwrap();
+    let draw = |visual: &mut VisualTestContext| {
+        for _ in 0..6 {
+            visual.run_until_parked();
+            visual.update(|window, cx| {
+                window.simulate_next_frame(cx);
+                window.draw(cx).clear(cx);
+            });
+        }
+    };
+    visual.simulate_resize(size(px(1280.), px(760.)));
+    visual.update(|window, cx| {
+        cx.set_reduce_motion(true);
+        workspace.update(cx, |workspace, cx| {
+            workspace.open_repository(
+                Location {
+                    root: root.clone(),
+                    file: Some(path.clone()),
+                },
+                window,
+                cx,
+            )
+        });
+    });
+    draw(visual);
+    let original = visual.update(|_, cx| {
+        workspace.read(cx).files[&path]
+            .editor
+            .read(cx)
+            .input_bounds()
+    });
+    let switch = |visual: &mut VisualTestContext, view| {
+        visual.update(|window, cx| {
+            workspace.update(cx, |workspace, cx| workspace.switch_view(view, window, cx))
+        });
+        draw(visual);
+    };
+    switch(visual, WorkspaceView::Git);
+    let row = |visual: &mut VisualTestContext, index| {
+        visual.update(|_, cx| {
+            workspace
+                .read(cx)
+                .git
+                .as_ref()
+                .unwrap()
+                .read(cx)
+                .history_scroll
+                .bounds_for_item(index)
+                .unwrap()
+                .center()
+        })
+    };
+    let newer = row(visual, 2);
+    let older = row(visual, 3);
+    let base = row(visual, 4);
+    let right_click = |visual: &mut VisualTestContext, point| {
+        visual.simulate_mouse_down(point, MouseButton::Right, Modifiers::default());
+        visual.simulate_mouse_up(point, MouseButton::Right, Modifiers::default());
+        draw(visual);
+        assert!(visual.debug_bounds("popup-menu-surface").is_some());
+    };
+
+    let history_color = |cx: &App| {
+        let color = if cx.theme().mode == ThemeMode::Dark {
+            rgb(0xb493eb)
+        } else {
+            rgb(0x7956b4)
+        };
+        Background::from(Hsla::from(color))
+    };
+    right_click(visual, newer);
+    visual.simulate_keystrokes("up enter");
+    draw(visual);
+    switch(visual, WorkspaceView::Editor);
+    visual.update(|window, cx| {
+        assert_eq!(
+            window
+                .painted_quads()
+                .iter()
+                .filter(|quad| quad.background == history_color(cx))
+                .count(),
+            1
+        );
+    });
+    switch(visual, WorkspaceView::Git);
+
+    visual.simulate_click(newer, Modifiers::default());
+    visual.simulate_click(
+        base,
+        Modifiers {
+            control: true,
+            ..Default::default()
+        },
+    );
+    draw(visual);
+    visual.update(|_, cx| {
+        let panel = workspace.read(cx).git.as_ref().unwrap().read(cx);
+        assert!(matches!(
+            panel.mark_commits_item(&panel.commits[1].oid),
+            PopupMenuItem::Item { disabled: true, .. }
+        ));
+    });
+
+    visual.simulate_click(newer, Modifiers::default());
+    visual.simulate_click(
+        older,
+        Modifiers {
+            shift: true,
+            ..Default::default()
+        },
+    );
+    draw(visual);
+    right_click(visual, newer);
+    visual.simulate_keystrokes("up enter");
+    draw(visual);
+    assert!(visual.update(|_, cx| workspace.read(cx).commit_markers.active()));
+    switch(visual, WorkspaceView::Editor);
+
+    let markers = visual.update(|window, cx| {
+        let editor = workspace.read(cx).files[&path].editor.read(cx);
+        assert_eq!(editor.input_bounds(), original);
+        let quads = window.painted_quads();
+        let scale = window.scale_factor();
+        let history = history_color(cx);
+        let purple = quads
+            .iter()
+            .filter(|quad| quad.background == history)
+            .collect::<Vec<_>>();
+        let x = px(purple
+            .first()
+            .expect("selected commits paint historical marks")
+            .bounds
+            .left()
+            .0
+            / scale);
+        let at_line = |line| {
+            point(
+                x + px(14.),
+                editor.projected_line_bounds(line).unwrap().center().y,
+            )
+        };
+        for line in [1, 6] {
+            assert!(
+                purple
+                    .iter()
+                    .any(|quad| px(quad.bounds.top().0 / scale) <= at_line(line).y
+                        && px(quad.bounds.bottom().0 / scale) >= at_line(line).y)
+            );
+        }
+        for line in [2, 4] {
+            let y = at_line(line).y;
+            assert!(
+                !purple
+                    .iter()
+                    .any(|quad| px(quad.bounds.top().0 / scale) <= y
+                        && px(quad.bounds.bottom().0 / scale) >= y)
+            );
+        }
+        (
+            at_line(1),
+            at_line(2),
+            at_line(4),
+            point(original.left() + px(80.), at_line(0).y),
+        )
+    });
+
+    visual.simulate_click(markers.0, Modifiers::default());
+    draw(visual);
+    visual.update(|window, cx| {
+        let hunk = super::super::super::code_theme::HunkPalette::for_mode(cx.theme().mode);
+        let quads = window.painted_quads();
+        for color in [hunk.removed_row, hunk.added_row] {
+            assert!(
+                quads
+                    .iter()
+                    .any(|quad| quad.background == Background::from(color))
+            );
+        }
+    });
+    assert!(visual.debug_bounds("git-hunk-action:0").is_none());
+    visual.simulate_keystrokes("escape");
+    draw(visual);
+    for (mark, action) in [
+        (markers.1, "git-hunk-action:1"),
+        (markers.2, "git-hunk-action:0"),
+    ] {
+        visual.simulate_mouse_move(mark, None, Modifiers::default());
+        visual.simulate_click(mark, Modifiers::default());
+        draw(visual);
+        assert!(
+            visual.debug_bounds(action).is_some(),
+            "local action {action} has priority"
+        );
+        visual.simulate_keystrokes("escape");
+        draw(visual);
+    }
+
+    right_click(visual, markers.3);
+    visual.simulate_keystrokes("up enter");
+    draw(visual);
+    visual.update(|_, cx| assert!(!workspace.read(cx).commit_markers.active()));
+    Ok(())
+}
+
+#[::core::prelude::v1::test]
 fn commit_list_squashes_rewords_and_resets_with_local_changes() -> Result<()> {
     let fixture = tempfile::tempdir()?;
     let root = fixture.path().join("repo");
