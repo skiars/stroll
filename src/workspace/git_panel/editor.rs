@@ -89,6 +89,32 @@ struct Projection {
     lines: Vec<Option<Line>>,
     text: Rope,
     snapshots: Rc<SnapshotEditors>,
+    edited: bool,
+    row_mapping: Option<Rc<RowMapping>>,
+}
+
+// The diff model still addresses the last published patch while the editor
+// already lays out the edited text. Track the surviving rows in both spaces.
+#[derive(Clone)]
+struct RowMapping(Vec<(usize, usize)>);
+
+impl RowMapping {
+    fn projected(&self, row: usize) -> Option<usize> {
+        let index = self.0.binary_search_by_key(&row, |&(row, _)| row).ok()?;
+        Some(self.0[index].1)
+    }
+
+    fn patch_start(&self, projected: usize) -> usize {
+        self.0
+            .partition_point(|&(_, row)| row <= projected)
+            .checked_sub(1)
+            .map_or(0, |index| self.0[index].0)
+    }
+
+    fn patch_end(&self, projected: usize, len: usize) -> usize {
+        let index = self.0.partition_point(|&(_, row)| row < projected);
+        self.0.get(index).map_or(len, |&(row, _)| row)
+    }
 }
 
 fn projected_inlay_hints(
@@ -667,6 +693,8 @@ impl Column {
             projection.text.replace(range.clone(), &text);
         }
         projection.snapshots = snapshots;
+        projection.edited = false;
+        projection.row_mapping = None;
 
         let mut rows = self.presentation.borrow_mut();
         // Local edits shift the projection before the diff refreshes its presentation.
@@ -729,6 +757,10 @@ pub(super) struct ReviewEditor {
 }
 
 impl ReviewEditor {
+    pub(super) fn has_pending_projection(&self, panel: &GitPanel) -> bool {
+        self.modified.projection.borrow().edited && !panel.live_tasks.is_empty()
+    }
+
     pub(super) fn new(window: &mut Window, cx: &mut Context<GitPanel>) -> Self {
         Self {
             original: Column::new(window, cx),
@@ -1091,10 +1123,11 @@ impl ReviewEditor {
         // scroll notifications never replace the editor document.
         let theme = cx.theme().mode;
         let hunk = HunkPalette::for_mode(theme);
-        let changed = panel.editor.row_revision != Some(revision)
+        let changed = (panel.editor.row_revision != Some(revision)
             || panel.editor.theme != Some(theme)
             || panel.editor.split != split
-            || !panel.editor.dirty_sources.is_empty();
+            || !panel.editor.dirty_sources.is_empty())
+            && !panel.editor.has_pending_projection(panel);
         if changed {
             if panel.editor.modified.editor.read(cx).is_composing() {
                 return;
@@ -1136,6 +1169,13 @@ impl ReviewEditor {
             let reuse = panel.editor.row_revision.is_some()
                 && panel.editor.theme == Some(theme)
                 && panel.editor.split == split
+                && panel
+                    .editor
+                    .modified
+                    .projection
+                    .borrow()
+                    .row_mapping
+                    .is_none()
                 && panel.editor.modified.projection.borrow().lines.len() == old.len()
                 && (!split || panel.editor.original.projection.borrow().lines.len() == old.len());
             let (prefix, suffix) = if reuse {
@@ -1309,7 +1349,14 @@ impl ReviewEditor {
                     .is_some_and(|review| review.patch_display[ix].truncated.is_none())
             }),
         );
-        if changed || panel.editor.block_layout != Some(block_layout) {
+        let row_mapping = panel
+            .editor
+            .modified
+            .projection
+            .borrow()
+            .row_mapping
+            .clone();
+        if changed || panel.editor.block_layout != Some(block_layout) || row_mapping.is_some() {
             let mut heights = Vec::new();
             let mut notices = HashMap::new();
             for (row, entry) in panel.editor.rows.iter().enumerate() {
@@ -1336,9 +1383,25 @@ impl ReviewEditor {
                 heights.push((row, height));
             }
             let heights = Rc::new(heights);
-            for column in [&panel.editor.original, &panel.editor.modified] {
+            for (column, mapping) in [
+                (&panel.editor.original, None),
+                (&panel.editor.modified, row_mapping.as_deref()),
+            ] {
+                let heights = mapping.map_or_else(
+                    || heights.clone(),
+                    |mapping| {
+                        Rc::new(
+                            heights
+                                .iter()
+                                .filter_map(|&(row, height)| {
+                                    Some((mapping.projected(row)?, height))
+                                })
+                                .collect(),
+                        )
+                    },
+                );
                 column.editor.update(cx, |editor, cx| {
-                    editor.set_projected_block_heights(heights.clone(), cx)
+                    editor.set_projected_block_heights(heights, cx)
                 });
             }
             panel.editor.notices = Rc::new(notices);
@@ -1397,9 +1460,10 @@ impl ReviewEditor {
                 matches!(&panel.editor.rows[row], DiffEditorRow::File(header) if header.as_str() == path)
             })
         });
-        if file_row.is_some()
-            || panel.editor.restore_viewport
-            || panel.editor.navigation_row != target
+        if row_mapping.is_none()
+            && (file_row.is_some()
+                || panel.editor.restore_viewport
+                || panel.editor.navigation_row != target)
         {
             let preserve_offset = std::mem::take(&mut panel.editor.restore_viewport);
             let target = file_row.unwrap_or(target);
@@ -1463,6 +1527,7 @@ impl ReviewEditor {
         let right = self.modified.editor.clone();
         let left = self.original.editor.clone();
         let rows = self.rows.clone();
+        let row_mapping = self.modified.projection.borrow().row_mapping.clone();
         let hunk_neighbors = self.hunk_neighbors.clone();
         let revision = self.row_revision.unwrap_or_default();
         let navigation = panel.diff.read(cx).editor_viewport_position();
@@ -1571,18 +1636,32 @@ impl ReviewEditor {
                 last_scroll.set((a, b));
                 let right_state = right.read(cx);
                 let visible = right_state.visible_row_range().unwrap_or(0..2);
-                let start = right_state.projected_top_line().min(rows.len());
-                let end = visible.end.max(start.saturating_add(1)).min(rows.len());
-                let measured_offset = right_state
-                    .projected_line_bounds(start)
+                let top = right_state.projected_top_line();
+                let start = row_mapping.as_ref().map_or(top, |map| map.patch_start(top)).min(rows.len());
+                let end = row_mapping.as_ref().map_or(visible.end, |map| map.patch_end(visible.end, rows.len()))
+                    .max(start.saturating_add(1)).min(rows.len());
+                let bounds_at = |row, cx: &App| {
+                    let projected = row_mapping.as_ref().map_or(Some(row), |map| map.projected(row))?;
+                    right.read(cx).projected_line_bounds(projected)
+                };
+                // The left column still shows the published patch. Keep
+                // displaced controls over the edited column until it catches up.
+                let controls_left = |row| {
+                    if split && row_mapping.as_ref().is_some_and(|map| map.projected(row) != Some(row)) {
+                        bounds.center().x
+                    } else {
+                        bounds.left()
+                    }
+                };
+                let measured_offset = bounds_at(start, cx)
                     .map(|line| right_state.input_bounds().top() - line.top());
                 let offset = measured_offset.unwrap_or_default().max(px(0.));
                 // Keep the editor's normal clearance when it already reaches the
                 // final header. For a short tail, add only what header alignment needs.
                 let extra_rows = headers.last().and_then(|&row| {
                     let line_height = right_state.line_height().filter(|h| *h > px(0.))?;
-                    let header = right_state.projected_line_bounds(row)?;
-                    let end = right_state.projected_line_bounds(rows.len())?;
+                    let header = bounds_at(row, cx)?;
+                    let end = bounds_at(rows.len(), cx)?;
                     let height = right_state.input_bounds().size.height;
                     let needed = height - (end.bottom() - header.top());
                     (needed > height.half()).then(|| (needed / line_height).ceil() as usize)
@@ -1670,15 +1749,12 @@ impl ReviewEditor {
                                 file_header = Some((row, path));
                                 header_stuck = row < start;
                             } else if next_header_top.is_none() {
-                                next_header_top = right
-                                    .read(cx)
-                                    .projected_line_bounds(row)
-                                    .map(|line| line.top());
+                                next_header_top = bounds_at(row, cx).map(|line| line.top());
                             }
                         }
                         _ => {}
                     }
-                    let Some(line) = right.read(cx).projected_line_bounds(row) else {
+                    let Some(line) = bounds_at(row, cx) else {
                         continue;
                     };
                     if matches!(entry, DiffEditorRow::File(_)) && row <= start {
@@ -1709,7 +1785,7 @@ impl ReviewEditor {
                                     })
                                 })
                                 .into_any_element();
-                            elements.push((marker, line.top(), line.size.height));
+                            elements.push((marker, controls_left(row), line.top(), line.size.height));
                         }
                     }
                     let chrome = match entry {
@@ -1746,7 +1822,7 @@ impl ReviewEditor {
                                             .min_w(px(24.))
                                             .h_full()
                                             .flex_shrink_0()
-                                            .disabled(target.is_none())
+                                            .disabled(target.is_none() || row_mapping.is_some())
                                             .on_click(move |_, _, cx| {
                                                 if let Some(target) = target {
                                                     _ = view.update(cx, |panel, cx| {
@@ -1792,10 +1868,10 @@ impl ReviewEditor {
                         _ => None,
                     };
                     if let Some(chrome) = chrome {
-                        elements.push((chrome, line.top(), line.size.height));
+                        elements.push((chrome, controls_left(row), line.top(), line.size.height));
                     }
                 }
-                if let Some((_, path)) = file_header
+                if let Some((row, path)) = file_header
                     && header_stuck
                 {
                     let top = next_header_top.map_or(bounds.top(), |next| {
@@ -1803,13 +1879,14 @@ impl ReviewEditor {
                     });
                     elements.push((
                         render_header(path, &header, colors, hover.clone(), cx),
+                        controls_left(row),
                         top,
                         FILE_HEADER_HEIGHT,
                     ));
                 }
-                if hunk_actions
+                if hunk_actions && row_mapping.is_none()
                     && let Some((path, hunk, row, bottom)) = active_hunk
-                    && let Some(line) = right.read(cx).projected_line_bounds(row)
+                    && let Some(line) = bounds_at(row, cx)
                 {
                     let clip_top = if header_stuck {
                         next_header_top.map_or(bounds.top() + FILE_HEADER_HEIGHT, |next| {
@@ -1830,21 +1907,22 @@ impl ReviewEditor {
                             .ok()
                             .flatten()
                     {
-                        elements.push((hunk_toolbar_row(Some(toolbar)), top, HUNK_TOOLBAR_HEIGHT));
+                        elements.push((hunk_toolbar_row(Some(toolbar)), bounds.left(), top, HUNK_TOOLBAR_HEIGHT));
                     }
                 }
                 elements
                     .into_iter()
-                    .map(|(child, y, height)| {
+                    .map(|(child, x, y, height)| {
+                        let width = bounds.right() - x;
                         let mut element = div()
-                            .w(bounds.size.width)
+                            .w(width)
                             .h(height)
                             .child(child)
                             .into_any_element();
                         window.with_content_mask(Some(ContentMask { bounds }), |window| {
                             element.prepaint_as_root(
-                                point(bounds.left(), y),
-                                size(bounds.size.width.into(), height.into()),
+                                point(x, y),
+                                size(width.into(), height.into()),
                                 window,
                                 cx,
                             );
@@ -2033,6 +2111,22 @@ impl Projection {
                 Some(result)
             })
             .collect::<Vec<_>>();
+        self.edited = true;
+        if line_delta != 0 || start != end {
+            let mapping = self.row_mapping.get_or_insert_with(|| {
+                Rc::new(RowMapping(
+                    (0..=self.lines.len()).map(|row| (row, row)).collect(),
+                ))
+            });
+            Rc::make_mut(mapping).0.retain_mut(|(_, row)| {
+                if *row > end {
+                    *row = row.saturating_add_signed(line_delta);
+                } else if *row > start {
+                    return false;
+                }
+                true
+            });
+        }
         self.lines.splice(start..=end, replacement);
         for line in self
             .lines

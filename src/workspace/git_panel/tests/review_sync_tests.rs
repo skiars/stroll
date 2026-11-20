@@ -619,6 +619,124 @@ fn inserting_a_blank_line_in_a_staged_new_file_refreshes_the_diff() {
 }
 
 #[::core::prelude::v1::test]
+fn local_diff_edits_stay_visible_and_editable_across_layout_and_filter_changes() {
+    for split in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("repo");
+        fs::create_dir(&root).unwrap();
+        setup(&root);
+        command(&root, &["commit", "--allow-empty", "-qm", "Initial"]);
+        let name = "a.sh";
+        let path = Path::new(name);
+        let shebang = "#!/usr/bin/env bash";
+        let last = "echo done";
+        fs::write(root.join(name), format!("{shebang}\n{last}\n")).unwrap();
+        fs::write(root.join("b.sh"), "echo next file\n").unwrap();
+        command(&root, &["add", "."]);
+
+        let mut cx = test_context();
+        let (panel, visual) = open(&mut cx, temp.path(), &root);
+        let set_split = |visual: &mut VisualTestContext, split| {
+            visual.update(|_, cx| {
+                panel.update(cx, |panel, cx| {
+                    panel.split = split;
+                    cx.notify();
+                });
+            });
+        };
+        set_split(visual, split);
+        let editor =
+            visual.update(|window, cx| panel.read(cx).editor.focused_column(window, cx).clone());
+        let focus_line_end = |visual: &mut VisualTestContext, line: &str| {
+            visual.update(|window, cx| {
+                let Some(start) = editor.read(cx).text().to_string().find(line) else {
+                    return false;
+                };
+                let caret = start + line.len();
+                editor.update(cx, |editor, cx| {
+                    editor.set_selected_range(caret..caret, cx);
+                    editor.focus(window, cx);
+                });
+                panel.read(cx).editing_path(window, cx).as_deref() == Some(path)
+            })
+        };
+        let is_split = |visual: &mut VisualTestContext| {
+            visual.update(|_, cx| panel.read(cx).diff.read(cx).mode() == DiffMode::Split)
+        };
+        let header = "git-editor-file-header:b.sh";
+        wait_for_review(visual, "both staged files", |visual| {
+            visual.debug_bounds(header).is_some()
+                && is_split(visual) == split
+                && focus_line_end(visual, shebang)
+        });
+        let revision = visual.update(|_, cx| panel.read(cx).diff.read(cx).editor_row_revision());
+        visual.simulate_keystrokes("enter enter");
+        settle(visual);
+
+        // Inspect the frame before the debounced patch has been published.
+        let position = DiffLinePosition::new(name, DiffSide::Modified, 4);
+        let last_line = visual.update(|_, cx| {
+            let panel = panel.read(cx);
+            assert_eq!(panel.diff.read(cx).editor_row_revision(), revision);
+            panel.review_source_bounds(&position, cx).unwrap()
+        });
+        assert_eq!(
+            visual.debug_bounds(header).unwrap().top(),
+            last_line.bottom()
+        );
+
+        set_split(visual, !split);
+        settle(visual);
+        visual.simulate_input("echo draft");
+        let expected = format!("{shebang}\n\necho draft\n{last}\n");
+        visual.update(|_, cx| {
+            assert!(editor.read(cx).text().to_string().contains(&expected));
+        });
+        wait_for_review(visual, "the requested layout and live patch", |visual| {
+            is_split(visual) != split
+                && visual.update(|_, cx| {
+                    let review = panel.read(cx).review.as_ref().unwrap();
+                    review.live.contains_key(&review.by_path[name])
+                })
+        });
+
+        for mode in [Mode::Staged, Mode::All] {
+            visual.update(|window, cx| {
+                panel.update(cx, |panel, cx| {
+                    panel.load_review(Selection::Worktree(mode), false, window, cx);
+                });
+            });
+            wait_for_review(visual, "the selected worktree filter", |visual| {
+                visual.update(|_, cx| {
+                    let panel = panel.read(cx);
+                    panel.review.as_ref().is_some_and(|review| {
+                        review.detail.comparison.worktree_mode() == Some(mode)
+                            && matches!(review.patches[review.by_path[name]], PatchState::Ready)
+                    })
+                })
+            });
+        }
+        wait_for_review(
+            visual,
+            "the editable draft after switching filters",
+            |visual| focus_line_end(visual, "echo draft"),
+        );
+        visual.simulate_input(" kept");
+        visual.update(|_, cx| {
+            let workspace = panel.read(cx).workspace.upgrade().unwrap();
+            assert_eq!(
+                workspace.read(cx).files[path].committed.to_string(),
+                expected.replace("echo draft", "echo draft kept")
+            );
+        });
+        assert_eq!(
+            fs::read_to_string(root.join(name)).unwrap(),
+            format!("{shebang}\n{last}\n")
+        );
+    }
+}
+
+#[::core::prelude::v1::test]
 fn custom_workspace_diff_edits_undoes_and_saves_against_the_selected_base() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("repo");

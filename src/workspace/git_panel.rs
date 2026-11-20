@@ -1787,7 +1787,8 @@ impl Render for GitPanel {
         } else {
             DiffMode::Unified
         };
-        if self.diff.read(cx).mode() != mode {
+        // A layout change must use the patch that includes pending local edits.
+        if self.diff.read(cx).mode() != mode && !self.editor.has_pending_projection(self) {
             self.diff.update(cx, |diff, cx| diff.set_mode(mode, cx));
         }
         h_flex()

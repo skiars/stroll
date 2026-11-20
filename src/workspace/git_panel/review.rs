@@ -1555,7 +1555,8 @@ impl GitPanel {
             self.editor.restore_viewport();
         }
         let draft = self.review.as_ref().and_then(|review| {
-            if !is_custom_worktree(&review.detail.comparison)
+            if !has_live_target(&review.detail.comparison)
+                || review.live.contains_key(&ix)
                 || !matches!(review.patches[ix], PatchState::Ready)
             {
                 return None;
@@ -2940,6 +2941,7 @@ impl GitPanel {
             return;
         }
         if saved {
+            self.live_tasks.remove(path);
             self.repository_changed(
                 git::watch::RepoChanges {
                     paths: [name.to_owned()].into(),
@@ -3005,6 +3007,8 @@ impl GitPanel {
                 })
                 .await;
             _ = this.update_in(cx, |this, window, cx| {
+                this.live_tasks.remove(&edit_path);
+                cx.notify();
                 let Some(review) = this.review.as_mut().filter(|review| {
                     Arc::ptr_eq(&review.detail, &detail)
                         && review.versions.get(&ix) == Some(&patch_version)
@@ -3055,7 +3059,6 @@ impl GitPanel {
                 review.patch_display[ix].content = None;
                 this.diff.update(cx, |diff, cx| diff.replace_file(doc, cx));
                 App::notify(cx, this.review_pane.entity_id());
-                cx.notify();
             });
         });
         self.live_tasks.insert(path, task);
