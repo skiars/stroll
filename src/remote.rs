@@ -4,8 +4,6 @@ mod client;
 mod server;
 
 #[cfg(feature = "desktop")]
-pub(crate) use client::GitHelper;
-#[cfg(feature = "desktop")]
 pub(crate) use client::PendingCall;
 pub(crate) use client::SshSession;
 #[cfg(feature = "desktop")]
@@ -210,8 +208,6 @@ pub(crate) enum Request {
     },
     Open(PathBuf),
     OpenWorkspace(PathBuf),
-    /// Bind only the worktree root for the local Git helper, without constructing a `Repository` file tree.
-    Bind(PathBuf),
     Worktrees,
     Exists(RepoPath),
     Openable(Vec<Option<String>>),

@@ -56,8 +56,7 @@ impl Drop for PendingCall {
 pub(crate) struct SshSession(Arc<Connection>);
 
 struct Connection {
-    /// `None` identifies a local Git helper.
-    target: Option<SshTarget>,
+    target: SshTarget,
     child: Mutex<Child>,
     writer: mpsc::SyncSender<Call>,
     pending: Pending,
@@ -136,14 +135,11 @@ pub(crate) fn helper_command(target: &SshTarget, arguments: &str) -> Command {
 
 impl SshSession {
     pub fn connect(target: SshTarget) -> Result<Self> {
-        Ok(Self(Connection::open(
-            helper_command(&target, ""),
-            Some(target),
-        )?))
+        Ok(Self(Connection::open(target)?))
     }
 
     pub fn target(&self) -> &SshTarget {
-        self.0.target.as_ref().expect("Expected an SSH session")
+        &self.0.target
     }
 
     #[cfg(feature = "desktop")]
@@ -270,79 +266,9 @@ impl SshSession {
     }
 }
 
-/// The local Git helper is a persistent child process that runs the same `Backend` over the SSH framing protocol.
-///
-/// Local and remote calls share the same path, and Git operations run outside the main process and its worker pool.
-/// If the helper crashes, `Backend` falls back to running in-process.
-#[cfg(feature = "desktop")]
-#[derive(Clone)]
-pub(crate) struct GitHelper(Arc<Connection>);
-
-#[cfg(feature = "desktop")]
-impl GitHelper {
-    /// Start the helper and bind it to the worktree root.
-    pub fn connect(root: &std::path::Path) -> Result<Self> {
-        let command = helper_process()?;
-        let connection = Connection::open(command, None)?;
-        let bound: std::path::PathBuf = connection.call(Request::Bind(root.to_owned()))?;
-        ensure!(
-            bound == root || crate::paths::simplified(&bound) == crate::paths::simplified(root),
-            t!("git.helper_bind_mismatch")
-        );
-        Ok(Self(connection))
-    }
-
-    pub fn failure(&self) -> Option<String> {
-        self.0.failure.lock().unwrap().clone()
-    }
-
-    pub fn supports_review_files(&self) -> bool {
-        self.0.review.load(Ordering::Relaxed)
-    }
-
-    pub fn supports_blame(&self) -> bool {
-        self.0.blame.load(Ordering::Relaxed)
-    }
-
-    pub fn supports_image_diff(&self) -> bool {
-        self.0.supports_image_diff()
-    }
-
-    #[cfg(feature = "desktop")]
-    pub fn supports_revision_comparison(&self) -> bool {
-        self.0.supports_revision_comparison()
-    }
-
-    pub fn call<T: DeserializeOwned>(&self, request: Request) -> Result<T> {
-        self.0.call(request)
-    }
-}
-
-/// Prefer the smaller sibling `stroll-remote` for faster startup, then fall back to the current executable with a hidden argument.
-///
-/// `STROLL_GIT_HELPER_PATH` lets installers or read-only deployments specify another helper location.
-#[cfg(feature = "desktop")]
-fn helper_process() -> Result<Command> {
-    if let Some(path) = std::env::var_os("STROLL_GIT_HELPER_PATH") {
-        return Ok(crate::process::background(path));
-    }
-    let executable = std::env::current_exe().context(t!("git.helper_start_failed"))?;
-    let sibling = executable.with_file_name(if cfg!(windows) {
-        "stroll-remote.exe"
-    } else {
-        "stroll-remote"
-    });
-    if sibling.is_file() {
-        return Ok(crate::process::background(sibling));
-    }
-    let mut command = crate::process::background(executable);
-    command.arg("--git-helper");
-    Ok(command)
-}
-
 impl Connection {
-    fn open(mut command: Command, target: Option<SshTarget>) -> Result<Arc<Self>> {
-        let mut child = command
+    fn open(target: SshTarget) -> Result<Arc<Self>> {
+        let mut child = helper_command(&target, "")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -488,49 +414,47 @@ impl Connection {
                 .call::<u32>(Request::Hello(version))
                 .is_ok_and(|reply| reply == version);
             connection.blame.store(supported, Ordering::Relaxed);
-            if connection.target.is_some() {
-                let version = super::AI_CONTEXT_VERSION;
-                let supports_ai_context = connection
-                    .call::<u32>(Request::Hello(version))
-                    .is_ok_and(|reply| reply == version);
-                connection
-                    .ai_context
-                    .store(supports_ai_context, Ordering::Relaxed);
+            let version = super::AI_CONTEXT_VERSION;
+            let supports_ai_context = connection
+                .call::<u32>(Request::Hello(version))
+                .is_ok_and(|reply| reply == version);
+            connection
+                .ai_context
+                .store(supports_ai_context, Ordering::Relaxed);
 
-                let version = super::GIT_OPERATIONS_VERSION;
-                let supported = connection
+            let version = super::GIT_OPERATIONS_VERSION;
+            let supported = connection
+                .call::<u32>(Request::Hello(version))
+                .is_ok_and(|reply| reply == version);
+            connection
+                .git_operations
+                .store(supported, Ordering::Relaxed);
+            let version = super::GIT_HISTORY_VERSION;
+            let supported = supported
+                && connection
                     .call::<u32>(Request::Hello(version))
                     .is_ok_and(|reply| reply == version);
-                connection
-                    .git_operations
-                    .store(supported, Ordering::Relaxed);
-                let version = super::GIT_HISTORY_VERSION;
-                let supported = supported
-                    && connection
-                        .call::<u32>(Request::Hello(version))
-                        .is_ok_and(|reply| reply == version);
-                connection.git_history.store(supported, Ordering::Relaxed);
-                let version = super::WORKSPACE_FILES_VERSION;
-                let supported = connection
+            connection.git_history.store(supported, Ordering::Relaxed);
+            let version = super::WORKSPACE_FILES_VERSION;
+            let supported = connection
+                .call::<u32>(Request::Hello(version))
+                .is_ok_and(|reply| reply == version);
+            connection
+                .workspace_files
+                .store(supported, Ordering::Relaxed);
+            let version = super::WORKSPACE_TRANSFER_VERSION;
+            let supported = supported
+                && connection
                     .call::<u32>(Request::Hello(version))
                     .is_ok_and(|reply| reply == version);
-                connection
-                    .workspace_files
-                    .store(supported, Ordering::Relaxed);
-                let version = super::WORKSPACE_TRANSFER_VERSION;
-                let supported = supported
-                    && connection
-                        .call::<u32>(Request::Hello(version))
-                        .is_ok_and(|reply| reply == version);
-                connection
-                    .workspace_transfer
-                    .store(supported, Ordering::Relaxed);
-                let version = super::LSP_EDITS_VERSION;
-                let supported = connection
-                    .call::<u32>(Request::Hello(version))
-                    .is_ok_and(|reply| reply == version);
-                connection.lsp_edits.store(supported, Ordering::Relaxed);
-            }
+            connection
+                .workspace_transfer
+                .store(supported, Ordering::Relaxed);
+            let version = super::LSP_EDITS_VERSION;
+            let supported = connection
+                .call::<u32>(Request::Hello(version))
+                .is_ok_and(|reply| reply == version);
+            connection.lsp_edits.store(supported, Ordering::Relaxed);
             let version = super::LOCATOR_VERSION;
             let supported = connection
                 .call::<u32>(Request::Hello(version))

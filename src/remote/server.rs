@@ -25,8 +25,6 @@ use crate::{
 #[derive(Default)]
 struct Server {
     repository: RwLock<Option<Arc<Repository>>>,
-    /// The worktree root set by `Bind` for the local Git-only helper.
-    root: RwLock<Option<std::path::PathBuf>>,
     mutations: Mutex<()>,
     documents: Mutex<Option<(u64, crate::repository::files::DocumentScan)>>,
     watch: Mutex<Option<git::watch::RepoWatcher>>,
@@ -186,8 +184,12 @@ impl Server {
                 )?);
             }
             Request::WatchRepository => {
-                let repo = self.repository.read().unwrap().clone();
-                let repo = repository(&repo)?;
+                let repo = self
+                    .repository
+                    .read()
+                    .unwrap()
+                    .clone()
+                    .context("Open a repository first")?;
                 let mut watcher = self.watch.lock().unwrap();
                 if watcher.is_none() {
                     let replies = self
@@ -228,10 +230,6 @@ impl Server {
                     current.is_none(),
                     "This SSH connection is already bound to a workspace"
                 );
-                ensure!(
-                    self.root.read().unwrap().is_none(),
-                    "This connection is already bound to a workspace"
-                );
                 let mut repo = Repository::open_root(crate::repository::repository_root(path)?)?;
                 if matches!(request, Request::Open(_)) {
                     // Older clients need a complete tree in the open response.
@@ -241,51 +239,30 @@ impl Server {
                 *current = Some(Arc::new(repo));
                 return value(info);
             }
-            Request::Bind(path) => {
-                let mut root = self.root.write().unwrap();
-                ensure!(
-                    root.is_none(),
-                    "This connection is already bound to a workspace"
-                );
-                ensure!(
-                    self.repository.read().unwrap().is_none(),
-                    "This connection is already bound to a workspace"
-                );
-                let root_path = crate::repository::repository_root(&path)?;
-                *root = Some(root_path.clone());
-                return value(root_path);
-            }
             _ => {}
         }
-        let repo = self.repository.read().unwrap().clone();
-        let root = match &repo {
-            Some(repo) => repo.root.clone(),
-            None => self
-                .root
-                .read()
-                .unwrap()
-                .clone()
-                .context("Open a repository first")?,
-        };
-        let root = &root;
+        let repo = self
+            .repository
+            .read()
+            .unwrap()
+            .clone()
+            .context("Open a repository first")?;
+        let root = &repo.root;
         let session = git::session_for(root);
         match request {
             Request::Hello(_)
             | Request::WatchRepository
             | Request::Open(_)
             | Request::OpenWorkspace(_)
-            | Request::Bind(_)
             | Request::Browse { .. }
             | Request::Complete { .. } => unreachable!(),
-            Request::TreeDirectories(paths) => value(crate::repository::files::scan_directories(
-                &repository(&repo)?.root,
-                paths,
-            )?),
-            Request::FastDocumentPaths => value(crate::repository::files::fast_document_paths(
-                &repository(&repo)?.root,
-            )?),
+            Request::TreeDirectories(paths) => {
+                value(crate::repository::files::scan_directories(root, paths)?)
+            }
+            Request::FastDocumentPaths => {
+                value(crate::repository::files::fast_document_paths(root)?)
+            }
             Request::DocumentBatch(generation) => {
-                let root = &repository(&repo)?.root;
                 let mut scan = self.documents.lock().unwrap();
                 if scan
                     .as_ref()
@@ -297,12 +274,10 @@ impl Server {
                 ensure!(*active == generation, "The document scan was superseded");
                 value(cursor.next(root)?)
             }
-            Request::DocumentPaths => value(crate::repository::files::scan_document_paths(
-                &repository(&repo)?.root,
-            )?),
+            Request::DocumentPaths => value(crate::repository::files::scan_document_paths(root)?),
             Request::TreeBranch => value(crate::repository::files::branch(root)),
             Request::TreeSnapshot => value((
-                crate::repository::files::scan_tree(&repository(&repo)?.root)?,
+                crate::repository::files::scan_tree(root)?,
                 crate::repository::files::branch(root),
             )),
             Request::WorktreeStatus => value(session.call(|state| Ok(state.status()?.clone()))?),
@@ -310,33 +285,25 @@ impl Server {
             Request::LspEditTarget(path, before) => value(
                 crate::repository::files::lsp_edit_target(root, path.as_path(), before)?,
             ),
-            Request::EntryVersion(path) => value(repository(&repo)?.entry_version(path.as_path())?),
+            Request::EntryVersion(path) => value(repo.entry_version(path.as_path())?),
             Request::FileOperation(path, operation) => {
                 let _guard = self.mutations.lock().unwrap();
-                repository(&repo)?.operate(path.as_path(), operation)?;
+                repo.operate(path.as_path(), operation)?;
                 session.invalidate();
                 value(())
             }
-            Request::ReadCopyChunk(path, version, offset) => value(Bytes(
-                repository(&repo)?.read_copy_chunk(path.as_path(), &version, offset)?,
-            )),
-            Request::Worktrees => value(repository(&repo)?.worktrees()?),
-            Request::Exists(path) => value(repository(&repo)?.exists(path.as_path())),
+            Request::ReadCopyChunk(path, version, offset) => value(Bytes(repo.read_copy_chunk(
+                path.as_path(),
+                &version,
+                offset,
+            )?)),
+            Request::Worktrees => value(repo.worktrees()?),
+            Request::Exists(path) => value(repo.exists(path.as_path())),
             Request::Openable(paths) => value(git::openable(root, &paths)),
             Request::LocatorPaths => value(crate::repository::worktree_paths(root)?),
-            Request::Locator(query) => value(crate::locator::search_text(
-                repository(&repo)?,
-                &query,
-                || false,
-            )?),
-            Request::ReadForSync(path) => value(
-                repository(&repo)?
-                    .bytes_if_present(path.as_path())?
-                    .map(Bytes),
-            ),
-            Request::Read(path, asset) => {
-                value(Bytes(repository(&repo)?.bytes(path.as_path(), asset)?))
-            }
+            Request::Locator(query) => value(crate::locator::search_text(&repo, &query, || false)?),
+            Request::ReadForSync(path) => value(repo.bytes_if_present(path.as_path())?.map(Bytes)),
+            Request::Read(path, asset) => value(Bytes(repo.bytes(path.as_path(), asset)?)),
             Request::Save {
                 path,
                 baseline,
@@ -600,11 +567,6 @@ impl Server {
 
 fn value(value: impl Serialize) -> Result<Value> {
     Ok(to_value(value)?)
-}
-
-/// Requests that need a full repository fail when only the worktree root is bound.
-fn repository(repository: &Option<Arc<Repository>>) -> Result<&Repository> {
-    Ok(repository.as_deref().context("Open a repository first")?)
 }
 
 fn browse_path(path: &str, base: Option<&str>) -> Result<std::path::PathBuf> {

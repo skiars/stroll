@@ -1,6 +1,5 @@
-//! End-to-end protocol tests for `stroll-remote --serve`.
+//! End-to-end stdio protocol tests for `stroll-remote`.
 //!
-//! The local Git helper uses this stdio protocol for `Bind` and batched patches.
 //! Send frames to a real helper to cover Windows paths, grouped diffs, and invalidation after staging.
 
 use std::{
@@ -111,15 +110,15 @@ fn comparison() -> Value {
 }
 
 #[test]
-fn helper_binds_a_worktree_and_returns_batched_patches() {
+fn helper_opens_a_workspace_and_returns_batched_patches() {
     let repo = fixture();
     let mut helper = Helper::start();
     helper.ok(json!({ "Hello": 1 }));
-    // The local helper binds with `root.to_string_lossy()`, which uses backslashes on Windows.
-    let bound = helper.ok(json!({ "Bind": repo.path().to_string_lossy() }));
+    // The workspace path contains backslashes on Windows.
+    let opened = helper.ok(json!({ "OpenWorkspace": repo.path().to_string_lossy() }));
     assert!(
-        bound.as_str().is_some(),
-        "Bind should return the canonical root: {bound}"
+        opened["root"].as_str().is_some(),
+        "OpenWorkspace should return the canonical root: {opened}"
     );
 
     let changes = helper.ok(json!({ "Changes": comparison() }));
@@ -160,7 +159,7 @@ fn helper_stage_invalidates_cached_state() {
     let repo = fixture();
     let mut helper = Helper::start();
     helper.ok(json!({ "Hello": 1 }));
-    helper.ok(json!({ "Bind": repo.path().to_string_lossy() }));
+    helper.ok(json!({ "OpenWorkspace": repo.path().to_string_lossy() }));
 
     let changes = helper.ok(json!({ "Changes": comparison() }));
     let mut expected = serde_json::Map::new();
@@ -194,12 +193,12 @@ fn helper_stage_invalidates_cached_state() {
 }
 
 #[test]
-fn helper_rejects_a_second_bind() {
+fn helper_rejects_opening_a_second_workspace() {
     let repo = fixture();
     let mut helper = Helper::start();
     helper.ok(json!({ "Hello": 1 }));
-    helper.ok(json!({ "Bind": repo.path().to_string_lossy() }));
-    let second = helper.call(json!({ "Bind": repo.path().to_string_lossy() }));
+    helper.ok(json!({ "OpenWorkspace": repo.path().to_string_lossy() }));
+    let second = helper.call(json!({ "OpenWorkspace": repo.path().to_string_lossy() }));
     assert!(second.get("Err").is_some(), "{second}");
 }
 
@@ -561,7 +560,7 @@ fn helper_commit_and_undo_keep_the_index_and_worktree_separate() {
     let connect = || {
         let mut helper = Helper::start();
         assert_eq!(helper.ok(json!({ "Hello": 11 })), 11);
-        helper.ok(json!({ "Bind": root.to_string_lossy() }));
+        helper.ok(json!({ "OpenWorkspace": root.to_string_lossy() }));
         helper
     };
     let mut helper = connect();
@@ -664,7 +663,7 @@ fn helper_stage_undo_preserves_intent_to_add_even_if_the_file_disappeared() {
     std::fs::write(root.join(file), "").unwrap();
     git(root, &["add", "-N", "--", file]);
     let mut helper = Helper::start();
-    helper.ok(json!({ "Bind": root.to_string_lossy() }));
+    helper.ok(json!({ "OpenWorkspace": root.to_string_lossy() }));
     let expected = helper.ok(json!("WorktreeStatus"));
     helper.ok(json!({"StageOperation": [expected, [file], true]}));
     assert_eq!(helper.ok(json!("WorktreeStatus"))[file]["staged"], true);
@@ -680,7 +679,7 @@ fn helper_blame_reads_the_committed_file_instead_of_the_worktree() {
     let repo = fixture();
     let mut helper = Helper::start();
     assert_eq!(helper.ok(json!({ "Hello": 12 })), json!(12));
-    helper.ok(json!({ "Bind": repo.path().to_string_lossy() }));
+    helper.ok(json!({ "OpenWorkspace": repo.path().to_string_lossy() }));
     let version = helper.ok(json!({ "FileVersion": "b with space.txt" }));
     let head = version["head"].as_str().unwrap();
     assert_eq!(

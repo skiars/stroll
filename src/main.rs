@@ -222,16 +222,6 @@ fn launch() -> Result<()> {
 }
 
 fn main() -> ExitCode {
-    // The local Git helper runs Git over stdio without initializing the UI or user state.
-    if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("--git-helper")) {
-        return match stroll::remote::serve() {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(error) => {
-                eprintln!("{error:#}");
-                ExitCode::FAILURE
-            }
-        };
-    }
     if let Err(error) = launch() {
         eprintln!("{error:#}");
         return ExitCode::FAILURE;

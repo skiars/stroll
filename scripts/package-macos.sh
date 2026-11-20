@@ -33,14 +33,14 @@ bins="$target_dir/$target/release"
 output="$target_dir/macos"
 archive="Stroll-$version-$arch.zip"
 
-cargo build --release --locked --target "$target" --bin stroll --bin stroll-remote
+cargo build --release --locked --target "$target" --bin stroll
 
 mkdir -p "$output"
 stage=$(mktemp -d "$output/.package.XXXXXXXX")
 trap 'rm -rf "$stage"' EXIT
 app="$stage/Stroll.app"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
-install -m 755 "$bins/stroll" "$bins/stroll-remote" "$app/Contents/MacOS/"
+install -m 755 "$bins/stroll" "$app/Contents/MacOS/"
 install -m 644 packaging/macos/Stroll.icns "$app/Contents/Resources/"
 install -m 644 packaging/macos/Info.plist "$app/Contents/"
 plist="$app/Contents/Info.plist"
@@ -49,7 +49,6 @@ plutil -insert CFBundleShortVersionString -string "$bundle_version" "$plist"
 plutil -insert CFBundleVersion -string "$bundle_version" "$plist"
 plutil -lint "$plist"
 
-codesign --force --sign - "$app/Contents/MacOS/stroll-remote"
 codesign --force --sign - "$app"
 codesign --verify --deep --strict "$app"
 ditto -c -k --keepParent "$app" "$stage/$archive"

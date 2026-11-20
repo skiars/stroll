@@ -60,7 +60,7 @@ From the repository root, run:
 .\scripts\package-windows.ps1
 ```
 
-The script builds the release binaries and writes `Stroll-Setup-<version>-x64.exe`
+The script builds the release binary and writes `Stroll-Setup-<version>-x64.exe`
 to `target\windows` by default. For a custom Inno Setup installation, pass
 `-InnoSetupCompiler 'C:\path\to\ISCC.exe'`.
 
@@ -82,9 +82,8 @@ scripts/package-macos.sh
 The script builds for the active macOS Rust toolchain's architecture
 (Apple Silicon or Intel) and writes `Stroll-<version>-<arch>.zip` to
 `target/macos` by default. Unzip it and move `Stroll.app` to Applications.
-The bundle includes the local Git helper and uses ad hoc signing for local
-installation. Public distribution requires Developer ID signing and Apple
-notarization.
+The bundle uses ad hoc signing for local installation. Public distribution
+requires Developer ID signing and Apple notarization.
 
 ## SSH helper (optional)
 

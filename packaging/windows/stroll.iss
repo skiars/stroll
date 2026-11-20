@@ -14,7 +14,6 @@ WizardStyle=modern
 
 [Files]
 Source: "{#BinDir}\stroll.exe"; DestDir: "{app}"; Flags: ignoreversion
-Source: "{#BinDir}\stroll-remote.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#VCRuntime}"; DestDir: "{app}"
 
 [Icons]

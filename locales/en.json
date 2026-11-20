@@ -368,8 +368,6 @@
   "git.view_before": "View snapshot before changes",
   "git.whitespace_ignored": "Whitespace changes are hidden",
   "git.worktree_changed": "The worktree changed. Review the refreshed changes.",
-  "git.helper_bind_mismatch": "The git helper bound a different worktree",
-  "git.helper_start_failed": "Could not locate the git helper executable",
   "git.worktree_count": "%{total}  ·  %{staged} staged  ·  %{unstaged} unstaged  ·  %{untracked} untracked",
   "git.worktree_diff": "Changes between %{branch} and the worktree",
   "git.wrap_diff": "Word wrap",

@@ -146,60 +146,6 @@ fn text(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).into_owned()
 }
 
-/// Process-wide registry with one persistent local Git helper per worktree root.
-///
-/// Start helpers on demand from background tasks, where all `Backend` methods run.
-/// If startup fails or the helper exits, that repository falls back to in-process Git without retries.
-#[cfg(feature = "desktop")]
-mod helper {
-    use std::{
-        collections::HashMap,
-        path::{Path, PathBuf},
-        sync::{Arc, Mutex, OnceLock},
-    };
-
-    use crate::remote::GitHelper;
-
-    static HELPERS: OnceLock<Mutex<HashMap<PathBuf, Arc<GitHelper>>>> = OnceLock::new();
-
-    fn enabled() -> bool {
-        !matches!(
-            std::env::var("STROLL_GIT_HELPER").as_deref(),
-            Ok("0") | Ok("off") | Ok("false")
-        )
-    }
-
-    pub(super) fn session(root: &Path) -> Option<Arc<GitHelper>> {
-        if !enabled() {
-            return None;
-        }
-        // Hold the lock while connecting so concurrent first requests share one helper process.
-        let mut helpers = HELPERS.get_or_init(Default::default).lock().unwrap();
-        if let Some(helper) = helpers.get(root) {
-            return Some(helper.clone());
-        }
-        let helper = GitHelper::connect(root)
-            .map_err(|error| {
-                if std::env::var_os("STROLL_GIT_HELPER_LOG").is_some() {
-                    eprintln!(
-                        "Local Git helper unavailable. Falling back to in-process Git: {error:#}"
-                    );
-                }
-            })
-            .ok()
-            .map(Arc::new);
-        helpers.insert(root.to_owned(), helper.clone()?);
-        helper
-    }
-
-    /// Remove a failed helper from the registry and run subsequent requests in-process.
-    pub(super) fn retire(root: &Path) {
-        if let Some(helpers) = HELPERS.get() {
-            helpers.lock().unwrap().remove(root);
-        }
-    }
-}
-
 fn object_id(value: &str) -> bool {
     matches!(value.len(), 40 | 64) && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
@@ -429,11 +375,11 @@ impl Backend {
 
     /// Returns whether the comparison's statistics still need to be loaded.
     pub fn review_files(&self, comparison: Comparison) -> Result<(Changes, bool)> {
-        let split = match &self.ssh {
-            Some(ssh) => ssh.supports_review_files(),
-            None => helper::session(&self.root).is_none_or(|helper| helper.supports_review_files()),
-        };
-        if !split {
+        if self
+            .ssh
+            .as_ref()
+            .is_some_and(|ssh| !ssh.supports_review_files())
+        {
             return self.changes(comparison).map(|detail| (detail, false));
         }
         self.call(
@@ -669,37 +615,22 @@ impl Backend {
         local: impl FnOnce(&RepoState) -> Result<T>,
     ) -> Result<T> {
         use crate::remote::Request;
-        let needs_comparison = matches!(
-            request,
-            Request::SearchRevisions(_)
-                | Request::Changes(Comparison::Versions { .. })
-                | Request::ReviewFiles(Comparison::Versions { .. })
-                | Request::ReviewStats(Comparison::Versions { .. }, _)
-                | Request::Patch(Comparison::Versions { .. }, ..)
-                | Request::Snapshot(Comparison::Versions { .. }, ..)
-        );
-        let needs_image_diff = matches!(request, Request::ImageDiffSide(..));
         if let Some(ssh) = &self.ssh {
-            if needs_image_diff {
+            if matches!(request, Request::ImageDiffSide(..)) {
                 anyhow::ensure!(ssh.supports_image_diff(), t!("image.open_failed"));
             }
-            if needs_comparison {
+            if matches!(
+                request,
+                Request::SearchRevisions(_)
+                    | Request::Changes(Comparison::Versions { .. })
+                    | Request::ReviewFiles(Comparison::Versions { .. })
+                    | Request::ReviewStats(Comparison::Versions { .. }, _)
+                    | Request::Patch(Comparison::Versions { .. }, ..)
+                    | Request::Snapshot(Comparison::Versions { .. }, ..)
+            ) {
                 self.check_revision_comparison()?;
             }
             return ssh.call(request);
-        }
-        let needs_blame = matches!(request, Request::BlameBaseline(..) | Request::Blame(..));
-        if let Some(helper) = helper::session(&self.root)
-            && (!needs_blame || helper.supports_blame())
-            && (!needs_image_diff || helper.supports_image_diff())
-            && (!needs_comparison || helper.supports_revision_comparison())
-        {
-            match helper.call(request) {
-                Ok(value) => return Ok(value),
-                // Fall back to in-process Git if the helper exits or is killed.
-                Err(_) if helper.failure().is_some() => helper::retire(&self.root),
-                Err(error) => return Err(error),
-            }
         }
         match &self.session {
             Some(session) => session.call(local),

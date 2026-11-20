@@ -50,7 +50,7 @@ try {
     $metadata = $metadataJson | ConvertFrom-Json
     $package = $metadata.packages | Where-Object { $_.name -eq 'stroll' }
 
-    & cargo build --release --locked --target $target --bin stroll --bin stroll-remote
+    & cargo build --release --locked --target $target --bin stroll
     if ($LASTEXITCODE -ne 0) {
         throw "cargo build failed with exit code $LASTEXITCODE."
     }

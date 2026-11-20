@@ -368,8 +368,6 @@
   "git.view_before": "查看改动前快照",
   "git.whitespace_ignored": "已忽略空白变化",
   "git.worktree_changed": "工作区状态已变化，请检查刷新后的改动",
-  "git.helper_bind_mismatch": "git 助手绑定了不同的工作树",
-  "git.helper_start_failed": "无法定位 git 助手可执行文件",
   "git.worktree_count": "%{total}  ·  %{staged} 已暂存  ·  %{unstaged} 未暂存  ·  %{untracked} 未跟踪",
   "git.worktree_diff": "%{branch} 与工作区的差异",
   "git.wrap_diff": "自动折行",
