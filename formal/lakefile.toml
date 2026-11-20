@@ -1,0 +1,10 @@
+name = "editor-model"
+defaultTargets = ["EditorModel"]
+moreLeanArgs = ["-DwarningAsError=true"]
+
+[[lean_lib]]
+name = "EditorModel"
+
+[[lean_exe]]
+name = "editor_trace"
+root = "EditorTrace"

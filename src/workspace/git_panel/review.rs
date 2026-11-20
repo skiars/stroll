@@ -671,6 +671,7 @@ impl GitPanel {
         self.selection = Some(selection.clone());
         if !keep {
             self.editor.invalidate();
+            self.editor.clear_hidden_selections();
         }
         self.detail_loading = true;
         self.live_tasks.clear();

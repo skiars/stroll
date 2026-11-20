@@ -16,7 +16,7 @@ use gpui_component::{
         InputEditsEvent, Rope, RopeExt, TextDecoration, TextDecorationCollection, hovered_hunk_top,
     },
 };
-use similar::TextDiff;
+use similar::{DiffTag, TextDiff};
 use std::{
     cell::{Cell, RefCell},
     collections::BTreeMap,
@@ -304,6 +304,30 @@ impl Projection {
             (first.bytes.start + start.column).min(first.bytes.end)
                 ..(previous.bytes.start + end.column).min(previous.bytes.end),
         ))
+    }
+
+    fn source_offset(&self, path: &Path, byte: usize) -> Option<usize> {
+        self.lines.iter().enumerate().find_map(|(row, line)| {
+            let line = line.as_ref()?;
+            (line.source.as_deref() == Some(path)
+                && (line.bytes.start..=line.bytes.end).contains(&byte))
+            .then(|| self.text.line_start_offset(row) + byte - line.bytes.start)
+        })
+    }
+
+    fn decoration_offset(&self, near: usize) -> usize {
+        let row = self.text.offset_to_point(near.min(self.text.len())).row;
+        // The trailing projected row is also a decoration.
+        let row = (0..=self.lines.len())
+            .filter(|&row| {
+                self.lines
+                    .get(row)
+                    .and_then(Option::as_ref)
+                    .is_none_or(|line| line.source.is_none())
+            })
+            .min_by_key(|&candidate| row.abs_diff(candidate))
+            .unwrap_or(self.lines.len());
+        self.text.line_start_offset(row)
     }
 
     fn source_rows_match(&self, range: &Range<usize>, source: &Rope) -> bool {
@@ -636,6 +660,29 @@ struct Column {
     highlights: TextDecorationCollection,
     presentation: RefCell<Rc<Vec<(Option<usize>, Option<Hsla>)>>>,
     inlay_hints: InlayHints,
+    hidden_selections: RefCell<Option<HiddenSelections>>,
+}
+
+#[derive(Clone)]
+struct SelectionEndpoint {
+    offset: usize,
+    source: Option<(PathBuf, usize)>,
+    position: Option<(DiffLinePosition, usize)>,
+}
+
+type ColumnSelections = Vec<[SelectionEndpoint; 2]>;
+
+struct HiddenSelections {
+    projected: Vec<(usize, usize)>,
+    logical: ColumnSelections,
+}
+
+impl HiddenSelections {
+    fn matches(&self, editor: &EditorState) -> bool {
+        editor
+            .selection_endpoints()
+            .eq(self.projected.iter().copied())
+    }
 }
 
 impl Column {
@@ -673,7 +720,126 @@ impl Column {
             presentation: RefCell::default(),
             projection: Rc::default(),
             inlay_hints,
+            hidden_selections: RefCell::default(),
         }
+    }
+
+    fn capture_selections(
+        &self,
+        projection: &Projection,
+        editor: &EditorState,
+    ) -> ColumnSelections {
+        let mut hidden = self.hidden_selections.borrow_mut();
+        if let Some(saved) = hidden.as_ref() {
+            if saved.matches(editor) {
+                return saved.logical.clone();
+            }
+            *hidden = None;
+        }
+        let endpoint = |offset| SelectionEndpoint {
+            offset,
+            source: projection
+                .source_range(&(offset..offset))
+                .map(|(path, bytes)| (path, bytes.start)),
+            position: projection.position(offset),
+        };
+        editor
+            .selection_endpoints()
+            .map(|(anchor, head)| [endpoint(anchor), endpoint(head)])
+            .collect()
+    }
+
+    fn restore_selections(
+        &self,
+        selections: ColumnSelections,
+        editor: &mut EditorState,
+        cx: &mut Context<EditorState>,
+    ) {
+        let projection = self.projection.borrow();
+        let mut hidden = false;
+        let mut map = |endpoint: &SelectionEndpoint| {
+            if let Some((path, byte)) = &endpoint.source {
+                return projection.source_offset(path, *byte).unwrap_or_else(|| {
+                    hidden = true;
+                    // A hidden source anchor must not become an editable
+                    // position in an unrelated row.
+                    projection.decoration_offset(endpoint.offset)
+                });
+            }
+            endpoint
+                .position
+                .as_ref()
+                .and_then(|(position, col)| projection.offset(position, *col))
+                .unwrap_or(endpoint.offset.min(projection.text.len()))
+        };
+        let projected = selections
+            .iter()
+            .map(|[anchor, head]| (map(anchor), map(head)))
+            .collect::<Vec<_>>();
+        if !editor.selection_endpoints().eq(projected.iter().copied()) {
+            editor.restore_projected_selections(&projected, cx);
+        }
+        *self.hidden_selections.borrow_mut() = hidden.then(|| HiddenSelections {
+            projected: editor.selection_endpoints().collect(),
+            logical: selections,
+        });
+    }
+
+    fn history_target(&self, editor: &EditorState) -> Option<PathBuf> {
+        let hidden = self.hidden_selections.borrow();
+        if let Some(saved) = hidden.as_ref().filter(|saved| saved.matches(editor)) {
+            return saved.logical[0][1]
+                .source
+                .as_ref()
+                .map(|(path, _)| path.clone());
+        }
+        let offset = editor.cursor();
+        self.projection
+            .borrow()
+            .source_range(&(offset..offset))
+            .map(|(path, _)| path)
+    }
+
+    fn replay_source_edit(
+        &self,
+        path: &Path,
+        edit: &InputEdit,
+        before: &Rope,
+        source: &Rope,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let mut projection = self.projection.borrow_mut();
+        let mut selections = self.capture_selections(&projection, self.editor.read(cx));
+        let mut endpoints = selections
+            .iter_mut()
+            .flatten()
+            .filter_map(|endpoint| {
+                let (file, byte) = endpoint.source.as_mut()?;
+                (file == path).then_some(byte)
+            })
+            .collect::<Vec<_>>();
+        let affected = edit.start_byte..edit.old_end_byte;
+        let refine = endpoints.iter().any(|byte| affected.contains(&**byte));
+        let changes = replay_changes(edit, before, source, refine);
+        let mut selected_rows = HashSet::new();
+        for byte in &mut endpoints {
+            **byte = translate_source_offset(**byte, &changes);
+            selected_rows.insert(source.offset_to_point(**byte).row);
+        }
+        let replacements = projection.replay_source_edit(path, edit, before, source, selected_rows);
+        drop(projection);
+        self.editor.update(cx, |editor, cx| {
+            let scroll = editor.scroll_offset();
+            let changed = !replacements.is_empty();
+            for (range, text) in replacements {
+                editor.replace_projected_text(range, text, window, cx);
+            }
+            self.restore_selections(selections, editor, cx);
+            if changed {
+                editor.set_scroll_offset(scroll, cx);
+            }
+        });
     }
 
     fn install(
@@ -691,11 +857,8 @@ impl Column {
         let range = projection.text.line_start_offset(old_rows.start)
             ..projection.text.line_start_offset(old_rows.end);
         let editor = self.editor.read(cx);
-        let selection = editor.selected_range();
-        let reversed = editor.is_selection_reversed();
+        let selections = self.capture_selections(&projection, editor);
         let scroll = editor.scroll_offset();
-        let start = projection.position(selection.start);
-        let end = projection.position(selection.end);
         let changed = !projection
             .text
             .slice(range.clone())
@@ -739,22 +902,13 @@ impl Column {
             Rc::make_mut(&mut rows).splice(old_rows, presentation);
         }
         let rows = rows.clone();
-        let map = |offset, anchor: Option<(DiffLinePosition, usize)>| {
-            anchor
-                .and_then(|(pos, col)| projection.offset(&pos, col))
-                .unwrap_or(offset)
-        };
-        let start = map(selection.start, start);
-        let end = map(selection.end, end);
         drop(projection);
         self.editor.update(cx, |editor, cx| {
             if changed {
                 editor.replace_projected_text(range, text, window, cx);
-                editor.set_selected_range_with_direction(
-                    start.min(end)..start.max(end),
-                    reversed,
-                    cx,
-                );
+            }
+            self.restore_selections(selections, editor, cx);
+            if changed {
                 editor.set_scroll_offset(scroll, cx);
             }
             editor.set_projected_rows(rows, cx);
@@ -993,6 +1147,10 @@ impl ReviewEditor {
     pub(super) fn invalidate(&mut self) {
         self.row_revision = None;
         self.reset_viewport();
+    }
+
+    pub(super) fn clear_hidden_selections(&self) {
+        self.modified.hidden_selections.borrow_mut().take();
     }
 
     pub(super) fn invalidate_live_source(&mut self, path: PathBuf) {
@@ -2248,6 +2406,62 @@ fn deletion_target(document: &DiffFile, line: usize) -> Option<usize> {
     Some(new_start + (line - old_start).min(new_count.min(old_count) - 1))
 }
 
+// A source transaction can arrive as an enclosing replacement. Preserve
+// equal lines inside it so their anchors survive changes on either side.
+fn replay_changes(
+    edit: &InputEdit,
+    before: &Rope,
+    source: &Rope,
+    refine: bool,
+) -> Vec<(Range<usize>, usize)> {
+    let range = edit.start_byte..edit.old_end_byte;
+    let inserted = edit.start_byte..edit.new_end_byte;
+    if !refine
+        || range.is_empty()
+        || inserted.is_empty()
+        || (edit.start_position.row == edit.old_end_position.row
+            && edit.start_position.row == edit.new_end_position.row)
+    {
+        return vec![(range, inserted.len())];
+    }
+
+    let old = before.slice(range.clone()).to_string();
+    let new = source.slice(inserted).to_string();
+    let diff = TextDiff::configure()
+        .deadline(Instant::now() + Duration::from_millis(20))
+        .diff_lines(&old, &new);
+    let mut offset = range.start;
+    let mut changes = Vec::new();
+    for op in diff.ops() {
+        let old = &diff.old_slices()[op.old_range()];
+        let len = old.iter().map(|line| line.len()).sum::<usize>();
+        if op.tag() != DiffTag::Equal {
+            let new = &diff.new_slices()[op.new_range()];
+            let (span, replacement) = restore_text_edit(&old.concat(), &new.concat());
+            changes.push((offset + span.start..offset + span.end, replacement.len()));
+        }
+        offset += len;
+    }
+    changes
+}
+
+fn translate_source_offset(byte: usize, changes: &[(Range<usize>, usize)]) -> usize {
+    let mut old_end = 0;
+    let mut new_end = 0;
+    for (range, inserted) in changes {
+        if byte < range.start {
+            break;
+        }
+        new_end += range.start - old_end + inserted;
+        old_end = range.end;
+        // Source selections have right affinity.
+        if byte < old_end {
+            return new_end;
+        }
+    }
+    new_end + (byte - old_end)
+}
+
 impl Projection {
     fn remap_rows(&mut self, rows: Range<usize>, new_count: usize, keep: usize) {
         if keep == rows.len() && new_count == rows.len() {
@@ -2335,18 +2549,11 @@ impl Projection {
         edit: &InputEdit,
         before: &Rope,
         source: &Rope,
+        selected_rows: HashSet<usize>,
     ) -> Vec<(Range<usize>, String)> {
-        let offset = |row, byte| {
-            self.lines.iter().enumerate().find_map(|(view_row, line)| {
-                let line = line.as_ref()?;
-                (line.source.as_deref() == Some(path)
-                    && line.position.line() == row + 1
-                    && (line.bytes.start..=line.bytes.end).contains(&byte))
-                .then(|| self.text.line_start_offset(view_row) + byte - line.bytes.start)
-            })
-        };
-        let range = offset(edit.start_position.row, edit.start_byte)
-            .zip(offset(edit.old_end_position.row, edit.old_end_byte))
+        let range = self
+            .source_offset(path, edit.start_byte)
+            .zip(self.source_offset(path, edit.old_end_byte))
             .map(|(start, end)| start..end)
             .filter(|range| {
                 self.source_range(range)
@@ -2371,7 +2578,7 @@ impl Projection {
             return vec![(range, replacement)];
         }
 
-        self.replay_across_gaps(path, edit, before, source)
+        self.replay_across_gaps(path, edit, before, source, selected_rows)
     }
 
     fn replay_across_gaps(
@@ -2380,6 +2587,7 @@ impl Projection {
         edit: &InputEdit,
         before: &Rope,
         source: &Rope,
+        mut selected_rows: HashSet<usize>,
     ) -> Vec<(Range<usize>, String)> {
         let start = edit.start_position.row;
         let old_end = edit.old_end_position.row + 1;
@@ -2395,6 +2603,7 @@ impl Projection {
             };
             let old_row = line.position.line() - 1;
             if old_row < start {
+                selected_rows.remove(&old_row);
                 continue;
             }
             if old_row >= before.lines_len()
@@ -2404,6 +2613,7 @@ impl Projection {
                 line.source = None;
             } else if old_row >= old_end {
                 let row = old_row.saturating_add_signed(row_delta);
+                selected_rows.remove(&row);
                 line.bytes = source.line_start_offset(row)..source.line_end_offset(row);
                 line.position = DiffLinePosition::new(
                     line.position.path().clone(),
@@ -2445,6 +2655,10 @@ impl Projection {
         }
         *boundaries.last_mut().unwrap() = new_end;
 
+        for (_, old) in &runs {
+            let new = boundaries[old.start - start]..boundaries[old.end - start];
+            selected_rows.retain(|row| !new.contains(row));
+        }
         let mut edits = Vec::new();
         for (view, old) in runs.into_iter().rev() {
             let path_key = self.lines[view.start]
@@ -2453,7 +2667,13 @@ impl Projection {
                 .position
                 .path()
                 .clone();
-            let new = boundaries[old.start - start]..boundaries[old.end - start];
+            let mut new = boundaries[old.start - start]..boundaries[old.end - start];
+            // Keep the source boundary under a selection when its entire
+            // visible run disappears. This also gives redo a row to expand.
+            if new.is_empty() && new.start < source.lines_len() && selected_rows.remove(&new.start)
+            {
+                new.end += 1;
+            }
             let mut text = String::new();
             let mut lines = Vec::with_capacity(new.len());
             for row in new {
@@ -2991,6 +3211,35 @@ impl GitPanel {
     }
 
     #[cfg(test)]
+    pub(super) fn review_test_source_offset(&self, offset: usize) -> Option<(PathBuf, usize)> {
+        self.editor
+            .modified
+            .projection
+            .borrow()
+            .source_range(&(offset..offset))
+            .map(|(path, range)| (path, range.start))
+    }
+
+    #[cfg(test)]
+    pub(super) fn review_test_hidden_selections(
+        &self,
+        cx: &App,
+    ) -> Option<Vec<[Option<(PathBuf, usize)>; 2]>> {
+        let column = &self.editor.modified;
+        let hidden = column.hidden_selections.borrow();
+        let saved = hidden
+            .as_ref()
+            .filter(|saved| saved.matches(column.editor.read(cx)))?;
+        Some(
+            saved
+                .logical
+                .iter()
+                .map(|[anchor, head]| [anchor.source.clone(), head.source.clone()])
+                .collect(),
+        )
+    }
+
+    #[cfg(test)]
     pub(super) fn review_source_bounds(
         &self,
         position: &DiffLinePosition,
@@ -3113,17 +3362,18 @@ impl GitPanel {
     }
 
     pub(in crate::workspace) fn editing_path(&self, window: &Window, cx: &App) -> Option<PathBuf> {
-        let editor = self.editor.modified.editor.read(cx);
-        if self.snapshot.is_some() || !editor.focus_handle(cx).contains_focused(window, cx) {
+        let column = &self.editor.modified;
+        let editor = column.editor.read(cx);
+        if self.snapshot.is_some()
+            || !editor.focus_handle(cx).contains_focused(window, cx)
+            || !self
+                .review
+                .as_ref()
+                .is_some_and(|review| super::review::has_live_target(&review.detail.comparison))
+        {
             return None;
         }
-        let offset = editor.cursor();
-        self.editor
-            .modified
-            .projection
-            .borrow()
-            .source_range(&(offset..offset))
-            .map(|(path, _)| path)
+        column.history_target(editor)
     }
 
     fn replay_review_history(&mut self, undo: bool, window: &mut Window, cx: &mut Context<Self>) {
@@ -3149,23 +3399,12 @@ impl GitPanel {
                 &source,
                 window,
                 move |panel, _, event: &InputEditsEvent, window, cx| {
-                    let column = &panel.editor.modified;
                     for (edit, source) in event.edits() {
-                        let replacements = column
-                            .projection
-                            .borrow_mut()
-                            .replay_source_edit(&path, edit, &before, source);
+                        panel
+                            .editor
+                            .modified
+                            .replay_source_edit(&path, edit, &before, source, window, cx);
                         before = source.clone();
-                        if replacements.is_empty() {
-                            continue;
-                        }
-                        column.editor.update(cx, |editor, cx| {
-                            let scroll = editor.scroll_offset();
-                            for (range, text) in replacements {
-                                editor.replace_projected_text(range, text, window, cx);
-                            }
-                            editor.set_scroll_offset(scroll, cx);
-                        });
                     }
                     App::notify(cx, panel.review_pane.entity_id());
                 },

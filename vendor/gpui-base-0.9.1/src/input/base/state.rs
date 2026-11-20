@@ -4329,6 +4329,43 @@ impl<M: InputModeKind> InputBaseState<M> {
         !selection.is_empty() && selection.reversed
     }
 
+    /// All selections as (anchor, head) UTF-8 byte offsets, active first.
+    pub fn selection_endpoints(&self) -> impl Iterator<Item = (usize, usize)> + '_ {
+        self.selections.iter().map(|selection| {
+            if selection.reversed {
+                (selection.end, selection.start)
+            } else {
+                (selection.start, selection.end)
+            }
+        })
+    }
+
+    /// Restore all oriented selections after replacing a document projection.
+    pub fn restore_projected_selections(
+        &mut self,
+        endpoints: &[(usize, usize)],
+        cx: &mut Context<Self>,
+    ) {
+        let mut current = self.selections.iter().copied().collect::<Vec<_>>().into_iter();
+        let selections = endpoints
+            .iter()
+            .map(|&(anchor, head)| {
+                let mut selection = current.next().unwrap_or_else(|| {
+                    CursorSelection::new(self.selections.generate_id(), 0, 0)
+                });
+                selection.start = self.cursor_boundary(anchor.min(head), Bias::Left);
+                selection.end = self.cursor_boundary(anchor.max(head), Bias::Left);
+                selection.reversed = head < anchor && selection.start != selection.end;
+                selection.column_anchor = None;
+                selection
+            })
+            .collect();
+        self.selections.replace_all(selections);
+        self.selections.merge_overlapping();
+        self.update_preferred_column();
+        cx.notify();
+    }
+
     pub fn select_all(&mut self, _: &mut Window, cx: &mut Context<Self>) {
         self.undo_manager.break_transaction_coalescing();
         self.selections.remove_all_but_active();

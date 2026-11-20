@@ -7,6 +7,9 @@ use gpui::{
 };
 use std::{fs, path::Path, process::Command, time::Instant};
 
+#[path = "edit_model_tests.rs"]
+mod edit_model_tests;
+
 fn command(root: &Path, args: &[&str]) {
     let output = Command::new("git")
         .arg("-C")
