@@ -1035,11 +1035,10 @@ mod tests {
         )?;
         let config = ConfigFile::load(Some(config_path));
         let store = std::sync::Arc::new(Store::new(fixture.path().join("state"))?);
-        let platform = gpui_platform::current_platform(true);
         let mut app = TestAppContext::build_with_text_system(
             TestDispatcher::new(0),
             None,
-            platform.text_system(),
+            crate::test_support::text_system(true),
         );
         app.update(gpui_component::init);
         let mut workspace = None;
@@ -1166,11 +1165,10 @@ mod tests {
             }
         }
 
-        let platform = gpui_platform::current_platform(cfg!(target_os = "linux"));
         let mut cx = TestAppContext::build_with_text_system(
             TestDispatcher::new(0),
             None,
-            platform.text_system(),
+            crate::test_support::text_system(cfg!(target_os = "linux")),
         );
         cx.update(gpui_component::init);
         let (_, visual) = cx.add_window_view(|_, _| ErrorCard);

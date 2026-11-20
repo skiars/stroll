@@ -226,7 +226,7 @@ impl Workspace {
     }
 }
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 mod tests {
     use super::*;
     use crate::{config::ConfigFile, repository::Store, workspace::SaveFile};
@@ -268,11 +268,10 @@ mod tests {
         fs::write(&binary, [0, 255])?;
         let store = Arc::new(Store::new(fixture.path().join("state"))?);
         let config = ConfigFile::load(Some(fixture.path().join("config.toml")));
-        let platform = gpui_platform::current_platform(true);
         let mut app = TestAppContext::build_with_text_system(
             TestDispatcher::new(0),
             None,
-            platform.text_system(),
+            crate::test_support::text_system(true),
         );
         app.update(gpui_component::init);
         let mut workspace = None;
@@ -365,11 +364,10 @@ mod tests {
         }
         let store = Arc::new(Store::new(root.join("state"))?);
         let config = ConfigFile::load(Some(root.join("config.toml")));
-        let platform = gpui_platform::current_platform(true);
         let mut app = TestAppContext::build_with_text_system(
             TestDispatcher::new(0),
             None,
-            platform.text_system(),
+            crate::test_support::text_system(true),
         );
         app.update(|cx| {
             gpui_component::init(cx);

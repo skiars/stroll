@@ -627,7 +627,7 @@ fn tab_close_button(
         )
 }
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 mod tests {
     use std::{fs, path::PathBuf, process::Command, sync::Arc, time::Duration};
 
@@ -726,7 +726,7 @@ mod tests {
         let mut app = TestAppContext::build_with_text_system(
             TestDispatcher::new(0),
             None,
-            gpui_platform::current_platform(true).text_system(),
+            crate::test_support::text_system(true),
         );
         app.update(gpui_component::init);
         let mut workspace = None;
@@ -783,11 +783,10 @@ mod tests {
     #[::core::prelude::v1::test]
     fn overflow_indicator_below_tabs_is_read_only_but_keeps_wheel_scrolling() -> anyhow::Result<()>
     {
-        let platform = gpui_platform::current_platform(cfg!(target_os = "linux"));
         let mut cx = TestAppContext::build_with_text_system(
             TestDispatcher::new(0),
             None,
-            platform.text_system(),
+            crate::test_support::text_system(cfg!(target_os = "linux")),
         );
         cx.update(gpui_component::init);
         let scroll = ScrollHandle::new();
@@ -877,11 +876,10 @@ mod tests {
         let repo = Repository::open(&root)?;
         let store = Arc::new(Store::new(fixture.path().join("state"))?);
         let config = ConfigFile::load(Some(fixture.path().join("config.toml")));
-        let platform = gpui_platform::current_platform(cfg!(target_os = "linux"));
         let mut cx = TestAppContext::build_with_text_system(
             TestDispatcher::new(0),
             None,
-            platform.text_system(),
+            crate::test_support::text_system(cfg!(target_os = "linux")),
         );
         cx.update(gpui_component::init);
         let mut workspace = None;
@@ -976,11 +974,10 @@ mod tests {
         let repo = Repository::open(&root)?;
         let store = Arc::new(Store::new(fixture.path().join("state"))?);
         let config = ConfigFile::load(Some(fixture.path().join("config.toml")));
-        let platform = gpui_platform::current_platform(cfg!(target_os = "linux"));
         let mut cx = TestAppContext::build_with_text_system(
             TestDispatcher::new(0),
             None,
-            platform.text_system(),
+            crate::test_support::text_system(cfg!(target_os = "linux")),
         );
         cx.update(gpui_component::init);
         let mut workspace = None;
@@ -1085,11 +1082,10 @@ mod tests {
         let repo = Repository::open(&root)?;
         let store = Arc::new(Store::new(fixture.path().join("state"))?);
         let config = ConfigFile::load(Some(fixture.path().join("config.toml")));
-        let platform = gpui_platform::current_platform(cfg!(target_os = "linux"));
         let mut cx = TestAppContext::build_with_text_system(
             TestDispatcher::new(0),
             None,
-            platform.text_system(),
+            crate::test_support::text_system(cfg!(target_os = "linux")),
         );
         cx.update(|cx| {
             gpui_component::init(cx);

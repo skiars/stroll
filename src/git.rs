@@ -704,7 +704,7 @@ mod tests {
     }
 
     fn fixture(format: &str) -> Result<tempfile::TempDir> {
-        let repo = tempfile::tempdir()?;
+        let repo = tempfile::tempdir_in(std::env::temp_dir().canonicalize()?)?;
         git(
             repo.path(),
             &[

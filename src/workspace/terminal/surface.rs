@@ -1443,7 +1443,7 @@ mod tests {
         let mut app = TestAppContext::build_with_text_system(
             TestDispatcher::new(0),
             None,
-            gpui_platform::current_platform(true).text_system(),
+            crate::test_support::text_system(true),
         );
         app.update(|cx| {
             gpui_component::init(cx);

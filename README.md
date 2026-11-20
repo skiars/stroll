@@ -4,7 +4,9 @@ A Rust and GPUI desktop app for exploring Git repositories, reviewing changes, a
 
 ## Prerequisites
 
-Install Rust, Git, and a C toolchain. The project was tested with Rust 1.99.1.
+Install stable Rust 1.98 or later, Git, and a C toolchain. On macOS, the
+GPUI backend uses `Option::map_or_default`, which stabilized in Rust 1.98.
+If you use rustup, run `rustup update stable` to update your stable toolchain.
 
 - Linux needs `pkg-config`, Wayland, libxkbcommon with X11 support, libxcb, and Fontconfig. The desktop app also needs a Vulkan loader and driver.
 - For WSL2 with WSLg, see [WSL development](docs/wsl-development.md).
@@ -68,6 +70,21 @@ Its optional Explorer integrations add
 **Open with** for `.md` files. On Windows 11, find the folder action under
 **Show more options**. To make Stroll the default Markdown app, use the
 Windows **Open with** dialog.
+
+## Install on macOS
+
+From the repository root, run:
+
+```sh
+scripts/package-macos.sh
+```
+
+The script builds for the active macOS Rust toolchain's architecture
+(Apple Silicon or Intel) and writes `Stroll-<version>-<arch>.zip` to
+`target/macos` by default. Unzip it and move `Stroll.app` to Applications.
+The bundle includes the local Git helper and uses ad hoc signing for local
+installation. Public distribution requires Developer ID signing and Apple
+notarization.
 
 ## SSH helper (optional)
 

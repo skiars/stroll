@@ -1,3 +1,6 @@
+#[path = "../src/test_support.rs"]
+mod test_support;
+
 use std::time::Duration;
 
 use gpui::{
@@ -90,11 +93,10 @@ fn open(cx: &mut TestAppContext) -> VisualTestContext {
 
 #[test]
 fn restarting_tooltips_wait_on_every_entry() {
-    let platform = gpui_platform::current_platform(cfg!(target_os = "linux"));
     let mut app = TestAppContext::build_with_text_system(
         gpui::TestDispatcher::new(0),
         None,
-        platform.text_system(),
+        test_support::text_system(cfg!(target_os = "linux")),
     );
     let mut cx = open(&mut app);
 

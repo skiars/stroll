@@ -735,11 +735,10 @@ mod tests {
 
         let store = Arc::new(Store::new(fixture.path().join("state")).unwrap());
         let config = ConfigFile::load(Some(fixture.path().join("config.toml")));
-        let platform = gpui_platform::current_platform(true);
         let mut cx = TestAppContext::build_with_text_system(
             TestDispatcher::new(0),
             None,
-            platform.text_system(),
+            crate::test_support::text_system(true),
         );
         cx.update(|cx| {
             gpui_component::init(cx);

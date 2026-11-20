@@ -318,7 +318,7 @@ impl Workspace {
     }
 }
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 #[::core::prelude::v1::test]
 fn standalone_markdown_keeps_the_editor_buffer_and_reads_saved_text() -> Result<()> {
     use gpui::{TestAppContext, TestDispatcher, VisualTestContext};
@@ -329,11 +329,10 @@ fn standalone_markdown_keeps_the_editor_buffer_and_reads_saved_text() -> Result<
     fs::write(&path, "# Original\n")?;
     let store = Arc::new(Store::new(fixture.path().join("state"))?);
     let config = ConfigFile::load(Some(fixture.path().join("config.toml")));
-    let platform = gpui_platform::current_platform(true);
     let mut app = TestAppContext::build_with_text_system(
         TestDispatcher::new(0),
         None,
-        platform.text_system(),
+        crate::test_support::text_system(true),
     );
     app.update(gpui_component::init);
     app.update(|cx| {
@@ -443,7 +442,7 @@ fn standalone_markdown_keeps_the_editor_buffer_and_reads_saved_text() -> Result<
     Ok(())
 }
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 #[::core::prelude::v1::test]
 fn standalone_text_opens_and_saves_without_a_repository() -> Result<()> {
     use gpui::{TestAppContext, TestDispatcher};
@@ -457,7 +456,7 @@ fn standalone_text_opens_and_saves_without_a_repository() -> Result<()> {
     let mut app = TestAppContext::build_with_text_system(
         TestDispatcher::new(0),
         None,
-        gpui_platform::current_platform(true).text_system(),
+        crate::test_support::text_system(true),
     );
     app.update(gpui_component::init);
     app.update(|cx| {
@@ -510,7 +509,7 @@ fn standalone_text_opens_and_saves_without_a_repository() -> Result<()> {
     Ok(())
 }
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 #[::core::prelude::v1::test]
 fn standalone_embedded_images_open_the_original_in_the_preview() -> Result<()> {
     use base64::{Engine as _, engine::general_purpose::STANDARD};
@@ -529,7 +528,7 @@ fn standalone_embedded_images_open_the_original_in_the_preview() -> Result<()> {
     let mut app = TestAppContext::build_with_text_system(
         TestDispatcher::new(0),
         None,
-        gpui_platform::current_platform(true).text_system(),
+        crate::test_support::text_system(true),
     );
     app.update(gpui_component::init);
     let store = Arc::new(Store::new(fixture.path().join("state"))?);
@@ -585,7 +584,7 @@ fn standalone_embedded_images_open_the_original_in_the_preview() -> Result<()> {
     Ok(())
 }
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 #[::core::prelude::v1::test]
 fn standalone_editor_syncs_external_replacements_and_retains_draft_conflicts() -> Result<()> {
     use std::time::{Duration, Instant};
@@ -601,7 +600,7 @@ fn standalone_editor_syncs_external_replacements_and_retains_draft_conflicts() -
     let mut app = TestAppContext::build_with_text_system(
         TestDispatcher::new(0),
         None,
-        gpui_platform::current_platform(true).text_system(),
+        crate::test_support::text_system(true),
     );
     app.update(gpui_component::init);
     let open = |app: &mut TestAppContext| -> Result<_> {

@@ -1074,7 +1074,7 @@ impl TreeStatus {
     }
 }
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 mod tests {
     use super::*;
 
@@ -1126,11 +1126,10 @@ mod tests {
         let path = Path::new("guide.md");
         fs::write(root.join(path), "# Project guide\n")?;
 
-        let platform = gpui_platform::current_platform(true);
         let mut cx = TestAppContext::build_with_text_system(
             TestDispatcher::new(0),
             None,
-            platform.text_system(),
+            crate::test_support::text_system(true),
         );
         cx.update(gpui_component::init);
         let store = Arc::new(Store::new(fixture.path().join("state"))?);
@@ -1194,11 +1193,10 @@ mod tests {
         image.save(root.join("picture.png"))?;
         fs::copy(root.join("picture.png"), root.join("second.png"))?;
 
-        let platform = gpui_platform::current_platform(true);
         let mut cx = TestAppContext::build_with_text_system(
             TestDispatcher::new(0),
             None,
-            platform.text_system(),
+            crate::test_support::text_system(true),
         );
         cx.update(gpui_component::init);
         let store = Arc::new(Store::new(fixture.path().join("state"))?);
@@ -1602,11 +1600,10 @@ mod tests {
         let local_file = fixture.path().join("clipboard source.txt");
         fs::write(&local_file, "from desktop")?;
 
-        let platform = gpui_platform::current_platform(true);
         let mut cx = TestAppContext::build_with_text_system(
             TestDispatcher::new(0),
             None,
-            platform.text_system(),
+            crate::test_support::text_system(true),
         );
         cx.update(gpui_component::init);
         let store = Arc::new(Store::new(fixture.path().join("state"))?);
@@ -1750,6 +1747,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(target_os = "linux")]
     #[::core::prelude::v1::test]
     fn workspace_file_tree_watcher_and_inline_edit() -> Result<()> {
         let fixture = tempfile::tempdir()?;

@@ -541,12 +541,11 @@ mod tests {
             },
         )?;
         let config = ConfigFile::load(Some(fixture.path().join("settings.toml")));
-        let platform = gpui_platform::current_platform(true);
         let dispatcher = TestDispatcher::new(0);
         let mut cx = TestAppContext::build_with_text_system(
             dispatcher.clone(),
             None,
-            platform.text_system(),
+            crate::test_support::text_system(true),
         );
         cx.update(gpui_component::init);
         let mut workspace = None;
@@ -743,11 +742,10 @@ mod tests {
         let other_repo = Repository::open(&other)?;
         let store = Arc::new(Store::new(fixture.path().join("state"))?);
         let config = ConfigFile::load(Some(fixture.path().join("config.toml")));
-        let platform = gpui_platform::current_platform(true);
         let mut cx = TestAppContext::build_with_text_system(
             TestDispatcher::new(0),
             None,
-            platform.text_system(),
+            crate::test_support::text_system(true),
         );
         cx.update(gpui_component::init);
         let mut workspace = None;

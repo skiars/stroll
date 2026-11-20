@@ -59,11 +59,10 @@ fn workflow(authority: Option<String>) -> Result<()> {
     )?;
     let config = ConfigFile::load(Some(config_path));
     let store = Arc::new(Store::new(fixture.path().join("state"))?);
-    let platform = gpui_platform::current_platform(cfg!(target_os = "linux"));
     let mut app = TestAppContext::build_with_text_system(
         TestDispatcher::new(0),
         None,
-        platform.text_system(),
+        crate::test_support::text_system(cfg!(target_os = "linux")),
     );
     app.update(|cx| {
         gpui_component::init(cx);

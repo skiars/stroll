@@ -244,11 +244,10 @@ mod tests {
     }
 
     fn test_app() -> TestAppContext {
-        let platform = gpui_platform::current_platform(true);
         let app = TestAppContext::build_with_text_system(
             TestDispatcher::new(0),
             None,
-            platform.text_system(),
+            crate::test_support::text_system(true),
         );
         app.update(gpui_component::init);
         app

@@ -86,7 +86,7 @@ pub(super) fn with_workspace_editor(
     let mut app = TestAppContext::build_with_text_system(
         TestDispatcher::new(0),
         None,
-        gpui_platform::current_platform(true).text_system(),
+        crate::test_support::text_system(true),
     );
     app.update(|cx| {
         gpui_component::init(cx);
@@ -918,7 +918,7 @@ fn local_cpp_diagnostics_and_highlights_stay_visible_during_edits() -> Result<()
     let mut app = TestAppContext::build_with_text_system(
         TestDispatcher::new(0),
         None,
-        gpui_platform::current_platform(true).text_system(),
+        crate::test_support::text_system(true),
     );
     app.update(gpui_component::init);
     app.update(|cx| Workspace::open_standalone(store, config, local_file.clone(), None, cx))?;
@@ -1263,7 +1263,11 @@ fn workspace_caret_hints_use_the_latest_symbol_and_signature() -> Result<()> {
             visual.simulate_keystrokes("escape");
             frame(visual);
             assert!(visual.debug_bounds("editor-signature-help").is_none());
-            visual.simulate_keystrokes("ctrl-shift-space");
+            visual.simulate_keystrokes(if cfg!(target_os = "macos") {
+                "cmd-shift-space"
+            } else {
+                "ctrl-shift-space"
+            });
             wait(visual, "explicit signature request", |visual| {
                 files.join("invoked").exists()
                     && visual.debug_bounds("editor-signature-help").is_some()

@@ -29,7 +29,7 @@ fn push(notification: Notification, window: &mut Window, cx: &mut App) {
     window.push_notification(notification.placement(PLACEMENT), cx);
 }
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 mod tests {
     use super::*;
     use gpui::{
@@ -48,11 +48,10 @@ mod tests {
 
     /// Show one notification in a window of its own, then inspect the toast.
     fn with_toast(notification: Notification, check: impl FnOnce(&mut VisualTestContext)) {
-        let platform = gpui_platform::current_platform(true);
         let mut cx = TestAppContext::build_with_text_system(
             TestDispatcher::new(0),
             None,
-            platform.text_system(),
+            crate::test_support::text_system(true),
         );
         cx.update(gpui_component::init);
         let (_, visual) = cx.add_window_view(|window, cx| {

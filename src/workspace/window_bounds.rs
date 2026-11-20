@@ -388,7 +388,7 @@ mod tests {
     }
 }
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 mod window_tests {
     use super::*;
     use crate::config::ConfigFile;
@@ -401,11 +401,10 @@ mod window_tests {
         let fixture = tempfile::tempdir()?;
         let store = Arc::new(Store::new(fixture.path().join("state"))?);
         let config = ConfigFile::load(Some(fixture.path().join("config.toml")));
-        let platform = gpui_platform::current_platform(true);
         let mut app = TestAppContext::build_with_text_system(
             TestDispatcher::new(0),
             None,
-            platform.text_system(),
+            crate::test_support::text_system(true),
         );
         app.update(gpui_component::init);
         let mut workspace = None;

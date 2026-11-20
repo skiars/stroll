@@ -30,5 +30,7 @@ mod symbols;
 pub mod tabs;
 #[cfg(feature = "desktop")]
 mod terminal;
+#[cfg(all(test, feature = "desktop"))]
+mod test_support;
 #[cfg(feature = "desktop")]
 pub mod workspace;

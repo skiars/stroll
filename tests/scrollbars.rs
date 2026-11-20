@@ -1,3 +1,6 @@
+#[path = "../src/test_support.rs"]
+mod test_support;
+
 use std::{cell::RefCell, rc::Rc, time::Duration};
 
 use gpui::{
@@ -119,11 +122,10 @@ impl Render for OverviewProbe {
 
 #[test]
 fn interactive_editor_gutter_animates_paint_with_fixed_full_width_targets() {
-    let platform = gpui_platform::current_platform(cfg!(target_os = "linux"));
     let mut cx = TestAppContext::build_with_text_system(
         TestDispatcher::new(0),
         None,
-        platform.text_system(),
+        test_support::text_system(cfg!(target_os = "linux")),
     );
     cx.update(gpui_component::init);
     let outlined = rgb(0xe07746).into();

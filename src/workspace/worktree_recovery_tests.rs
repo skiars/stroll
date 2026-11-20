@@ -103,7 +103,7 @@ fn moved_and_deleted_worktrees_restore_the_expected_workspace() -> Result<()> {
         let cx = TestAppContext::build_with_text_system(
             TestDispatcher::new(0),
             None,
-            gpui_platform::current_platform(true).text_system(),
+            crate::test_support::text_system(true),
         );
         cx.update(gpui_component::init);
         cx

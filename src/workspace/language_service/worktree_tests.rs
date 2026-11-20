@@ -49,7 +49,7 @@ fn test_app() -> TestAppContext {
     TestAppContext::build_with_text_system(
         TestDispatcher::new(0),
         None,
-        gpui_platform::current_platform(true).text_system(),
+        crate::test_support::text_system(true),
     )
 }
 

@@ -1421,7 +1421,7 @@ fn git_path(repo: &Repository, path: &Path) -> Option<String> {
     }
 }
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 #[::core::prelude::v1::test]
 fn editing_below_an_inline_hunk_preserves_the_source_viewport() -> Result<()> {
     use gpui::{TestAppContext, TestDispatcher, size};
@@ -1470,7 +1470,7 @@ fn editing_below_an_inline_hunk_preserves_the_source_viewport() -> Result<()> {
     let mut app = TestAppContext::build_with_text_system(
         TestDispatcher::new(0),
         None,
-        gpui_platform::current_platform(true).text_system(),
+        crate::test_support::text_system(true),
     );
     app.update(gpui_component::init);
     let mut workspace = None;
@@ -1523,7 +1523,7 @@ fn editing_below_an_inline_hunk_preserves_the_source_viewport() -> Result<()> {
     Ok(())
 }
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 mod tests {
     use super::*;
     use std::process::Command;
@@ -1556,7 +1556,7 @@ mod tests {
         let mut app = TestAppContext::build_with_text_system(
             TestDispatcher::new(0),
             None,
-            gpui_platform::current_platform(true).text_system(),
+            crate::test_support::text_system(true),
         );
         app.update(gpui_component::init);
         let (_, visual) = app.add_window_view(|_, _| Probe);
@@ -1633,11 +1633,10 @@ mod tests {
 
         let store = Arc::new(Store::new(fixture.path().join("state")).unwrap());
         let config = ConfigFile::load(Some(fixture.path().join("config.toml")));
-        let platform = gpui_platform::current_platform(true);
         let mut cx = TestAppContext::build_with_text_system(
             TestDispatcher::new(0),
             None,
-            platform.text_system(),
+            crate::test_support::text_system(true),
         );
         cx.update(gpui_component::init);
         let (workspace, visual) = cx.add_window_view(|window, cx| {
@@ -1791,11 +1790,10 @@ mod tests {
 
         let store = Arc::new(Store::new(fixture.path().join("state")).unwrap());
         let config = ConfigFile::load(Some(fixture.path().join("config.toml")));
-        let platform = gpui_platform::current_platform(true);
         let mut cx = TestAppContext::build_with_text_system(
             TestDispatcher::new(0),
             None,
-            platform.text_system(),
+            crate::test_support::text_system(true),
         );
         cx.update(gpui_component::init);
         let (workspace, visual) = cx.add_window_view(|window, cx| {

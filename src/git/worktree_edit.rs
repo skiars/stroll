@@ -1050,7 +1050,7 @@ mod tests {
     use std::fs;
 
     fn fixture() -> Result<tempfile::TempDir> {
-        let dir = tempfile::tempdir()?;
+        let dir = tempfile::tempdir_in(std::env::temp_dir().canonicalize()?)?;
         read(dir.path(), ["init", "-q"])?;
         read(dir.path(), ["config", "user.name", "Test"])?;
         read(dir.path(), ["config", "user.email", "test@example.invalid"])?;

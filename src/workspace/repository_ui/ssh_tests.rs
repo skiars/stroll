@@ -80,11 +80,10 @@ fn ssh_switch_reuses_connection_refreshes_view_and_reconnects() -> anyhow::Resul
     let ssh_root = PathBuf::from(format!("ssh://{authority}{}", remote.display()));
     let store = Arc::new(Store::new(fixture.path().join("state"))?);
     let config = ConfigFile::load(Some(fixture.path().join("config.toml")));
-    let platform = gpui_platform::current_platform(true);
     let mut cx = TestAppContext::build_with_text_system(
         TestDispatcher::new(0),
         None,
-        platform.text_system(),
+        crate::test_support::text_system(true),
     );
     cx.update(gpui_component::init);
     let (workspace, visual) = cx.add_window_view(|window, cx| {

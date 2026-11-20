@@ -1602,11 +1602,10 @@ mod tests {
         let config_path = fixture.path().join("config.toml");
         let config = ConfigFile::load(Some(config_path.clone()));
         let store = Arc::new(Store::new(fixture.path().join("state"))?);
-        let platform = gpui_platform::current_platform(cfg!(target_os = "linux"));
         let mut app = TestAppContext::build_with_text_system(
             TestDispatcher::new(0),
             None,
-            platform.text_system(),
+            crate::test_support::text_system(cfg!(target_os = "linux")),
         );
         app.update(gpui_component::init);
         let (owner, owner_window) = app.add_window_view(|window, cx| {
@@ -1736,11 +1735,10 @@ mod tests {
         let fixture = tempfile::tempdir()?;
         let store = Arc::new(Store::new(fixture.path().join("state"))?);
         let config = ConfigFile::load(Some(fixture.path().join("config.toml")));
-        let platform = gpui_platform::current_platform(cfg!(target_os = "linux"));
         let mut app = TestAppContext::build_with_text_system(
             TestDispatcher::new(0),
             None,
-            platform.text_system(),
+            crate::test_support::text_system(cfg!(target_os = "linux")),
         );
         app.update(gpui_component::init);
         let (owner, owner_window) = app.add_window_view(|window, cx| {
