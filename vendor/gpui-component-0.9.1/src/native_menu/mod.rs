@@ -178,6 +178,12 @@ impl NativeMenu {
         self
     }
 
+    /// Append all items from another menu in their original order.
+    pub fn append(mut self, menu: NativeMenu) -> Self {
+        self.items.extend(menu.items);
+        self
+    }
+
     /// Append a submenu built from another [`NativeMenu`].
     pub fn submenu(mut self, label: impl Into<SharedString>, submenu: NativeMenu) -> Self {
         self.items.push(NativeMenuItem::Submenu {

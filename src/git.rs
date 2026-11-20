@@ -498,6 +498,29 @@ impl Backend {
         )
     }
 
+    pub fn supports_image_diff(&self) -> bool {
+        self.ssh
+            .as_ref()
+            .is_none_or(|ssh| ssh.supports_image_diff())
+    }
+
+    pub fn image_diff_side(
+        &self,
+        detail: &Changes,
+        file: &ChangedFile,
+        side: Side,
+    ) -> Result<Option<crate::remote::Bytes>> {
+        self.call(
+            crate::remote::Request::ImageDiffSide(
+                detail.comparison.clone(),
+                detail.base.clone(),
+                file.path.clone(),
+                side,
+            ),
+            |state| image_diff_side(state, detail, file, side),
+        )
+    }
+
     pub fn stage(&self, expected: &WorktreeStatus, paths: &[String], staged: bool) -> Result<()> {
         let selected = paths
             .iter()
@@ -655,7 +678,11 @@ impl Backend {
                 | Request::Patch(Comparison::Versions { .. }, ..)
                 | Request::Snapshot(Comparison::Versions { .. }, ..)
         );
+        let needs_image_diff = matches!(request, Request::ImageDiffSide(..));
         if let Some(ssh) = &self.ssh {
+            if needs_image_diff {
+                anyhow::ensure!(ssh.supports_image_diff(), t!("image.open_failed"));
+            }
             if needs_comparison {
                 self.check_revision_comparison()?;
             }
@@ -664,6 +691,7 @@ impl Backend {
         let needs_blame = matches!(request, Request::BlameBaseline(..) | Request::Blame(..));
         if let Some(helper) = helper::session(&self.root)
             && (!needs_blame || helper.supports_blame())
+            && (!needs_image_diff || helper.supports_image_diff())
             && (!needs_comparison || helper.supports_revision_comparison())
         {
             match helper.call(request) {

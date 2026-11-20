@@ -6,6 +6,7 @@ use crate::workspace::{
     DiffSource, OpenFile, WorkspaceView,
     code_theme::HunkPalette,
     editor_git::{HunkDirection, hunk_label, hunk_toolbar_row, restore_text_edit},
+    image_preview::ImageHoverDismiss,
     inlay_hints::InlayHints,
     line_alignment::LineAlignment,
 };
@@ -15,6 +16,7 @@ use gpui_component::{
         DefinitionProvider, Editor, HUNK_TOOLBAR_HEIGHT, HoverProvider, InlayHint, InputEdit,
         InputEditsEvent, Rope, RopeExt, TextDecoration, TextDecorationCollection, hovered_hunk_top,
     },
+    native_menu::NativeMenu,
 };
 use similar::{DiffTag, TextDiff};
 use std::{
@@ -940,6 +942,7 @@ pub(super) struct ReviewEditor {
     navigation_row: usize,
     navigation_source: Option<DiffLinePosition>,
     pub(super) navigating_file: Option<String>,
+    pub(super) image_hover: ImageHoverDismiss,
     restore_viewport: bool,
     tail_rows: Rc<Cell<Option<usize>>>,
     wrap_rows: Rc<RefCell<Rc<Vec<usize>>>>,
@@ -1009,6 +1012,7 @@ impl ReviewEditor {
             navigation_row: 0,
             navigation_source: None,
             navigating_file: None,
+            image_hover: ImageHoverDismiss::default(),
             restore_viewport: false,
             tail_rows: Rc::default(),
             wrap_rows: Rc::default(),
@@ -1619,9 +1623,20 @@ impl ReviewEditor {
             for (row, entry) in panel.editor.rows.iter().enumerate() {
                 let height = match entry {
                     DiffEditorRow::Preamble => summary_height,
-                    DiffEditorRow::File(_) => FILE_HEADER_HEIGHT,
+                    DiffEditorRow::File(path) => {
+                        FILE_HEADER_HEIGHT
+                            + if panel.has_image_diff(path) {
+                                super::review::IMAGE_DIFF_HEIGHT
+                            } else {
+                                px(0.)
+                            }
+                    }
                     DiffEditorRow::Notice(path) => {
                         let Some(label) = panel.review_notice(path, cx) else {
+                            if panel.has_image_diff(path) {
+                                // The thumbnail block already represents this file's notice.
+                                heights.push((row, px(0.)));
+                            }
                             continue;
                         };
                         let height =
@@ -1866,6 +1881,7 @@ impl ReviewEditor {
         let notices = self.notices.clone();
         let hover = weak.clone();
         let wheel_view = weak.clone();
+        let image_hover = self.image_hover.clone();
         let hunk_font = font.clone();
         let context_click = self.context_click.clone();
         let menu_panel = weak.clone();
@@ -1891,12 +1907,15 @@ impl ReviewEditor {
                             panel.openable_review_file(position.path()).is_some()
                         })
                         .unwrap_or(false);
-                    menu.separator().menu_with_icon_disabled(
-                        t!("git.open_in_editor"),
-                        IconName::FileInput,
-                        !can_open,
-                        Box::new(OpenDiffRowInEditor(position)),
-                    )
+                    NativeMenu::new()
+                        .menu_with_icon_disabled(
+                            t!("git.open_in_editor"),
+                            IconName::FileInput,
+                            !can_open,
+                            Box::new(OpenDiffRowInEditor(position)),
+                        )
+                        .separator()
+                        .append(menu)
                 })
         };
         let controls = canvas(
@@ -2137,8 +2156,11 @@ impl ReviewEditor {
                                     ),
                                     controls_left(row),
                                     line.top(),
-                                    line.size.height,
+                                    FILE_HEADER_HEIGHT,
                                 ));
+                            }
+                            if let Ok(Some(images)) = hover.read_with(cx, |panel, _| panel.image_diff_row(path, colors)) {
+                                elements.push((images, controls_left(row), line.top() + FILE_HEADER_HEIGHT, super::review::IMAGE_DIFF_HEIGHT));
                             }
                             None
                         }
@@ -2306,11 +2328,15 @@ impl ReviewEditor {
                     .collect::<Vec<_>>()
             },
             |bounds, elements, window, cx| {
-                window.on_mouse_event(move |event: &ScrollEvent, phase, _, cx| {
-                    if phase.capture()
-                        && bounds.contains(&event.position)
-                        && event.delta.pixel_delta(px(1.)).y != px(0.)
-                    {
+                window.on_mouse_event(move |event: &ScrollEvent, phase, window, cx| {
+                    if !phase.capture() || !bounds.contains(&event.position) {
+                        return;
+                    }
+                    let delta = event.delta.pixel_delta(px(1.));
+                    if delta != Point::default() {
+                        image_hover.dismiss(window, cx);
+                    }
+                    if delta.y != px(0.) {
                         _ = wheel_view.update(cx, |panel, cx| {
                             panel.pending_hunk_navigation = None;
                             panel.editor.revealed_hunk.set(None);

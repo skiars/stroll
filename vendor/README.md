@@ -132,6 +132,10 @@ dialogs in a Wayland window after changes to paint order or focus handling.
 - The code editor can append items to its built-in context menu. The workspace uses this hook
   for Find References. Run `cargo test --release --locked --lib find_references` to check that
   the built-in items and the appended action share the same menu and editor focus.
+- Native menus can append another menu's items in order. The Git diff uses this to place
+  Open in Editor before the built-in items. Popup menu separators have a debug selector
+  used by the Git navigation tests to check the staging and restore group.
+  Run `cargo test --release --locked --lib navigation_render_tests` for coverage.
 - The workspace editor opts into a navigable overview ruler that mirrors gutter decorations
   and diagnostics in 3 px lanes. The vertical track resolves clicks by height and uses the
   painted lanes to disambiguate overlapping markers, falling back to the track halves

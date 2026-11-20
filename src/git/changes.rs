@@ -679,6 +679,22 @@ fn read_side(
     state.blob(&spec, limit)
 }
 
+pub(crate) fn image_diff_side(
+    state: &RepoState,
+    detail: &Changes,
+    file: &ChangedFile,
+    side: Side,
+) -> Result<Option<crate::remote::Bytes>> {
+    if file.submodule() || file.conflict() {
+        return Ok(None);
+    }
+    let Some((bytes, truncated)) = read_side(state, detail, file, side, 16 * 1024 * 1024)? else {
+        return Ok(None);
+    };
+    ensure!(!truncated, t!("storage.image_limit"));
+    Ok(Some(crate::remote::Bytes(bytes)))
+}
+
 pub(crate) fn snapshot(
     state: &RepoState,
     detail: &Changes,

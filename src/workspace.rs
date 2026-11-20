@@ -835,6 +835,7 @@ pub struct Workspace {
     file_task: Task<()>,
     image_preview: Option<Preview>,
     image_preview_focus: FocusHandle,
+    image_viewer_focus: FocusHandle,
     image_preview_return_focus: Option<FocusHandle>,
     images: HashMap<PathBuf, image_tab::ImageTab>,
     audio_preview: audio_preview::AudioPreview,
@@ -1034,6 +1035,7 @@ impl Workspace {
             file_task: Task::ready(()),
             image_preview: None,
             image_preview_focus: cx.focus_handle(),
+            image_viewer_focus: cx.focus_handle(),
             image_preview_return_focus: None,
             images: HashMap::new(),
             audio_preview: audio_preview::AudioPreview::default(),
@@ -3731,6 +3733,8 @@ impl Workspace {
                     file.editor
                         .update(cx, |editor, cx| editor.focus(window, cx));
                 }
+            } else if !keep_focus && active.is_some_and(|path| self.images.contains_key(path)) {
+                self.image_viewer_focus.focus(window, cx);
             } else if !keep_focus {
                 self.focus.focus(window, cx);
             }
@@ -4308,12 +4312,27 @@ impl Workspace {
                     );
                 // Native tooltips lay out at min-content and collapse this row's
                 // clamped content into a vertical strip; use the window-managed tooltip.
-                let element = element.when_some(decoration, |row, (_, label)| {
-                    use gpui_component::tooltip::{ManagedTooltipExt as _, Tooltip};
-                    row.managed_tooltip(move |window, cx| {
-                        Tooltip::new(label.clone()).build(window, cx)
+                let element = if in_workspace
+                    && !directory
+                    && !entry.symlink
+                    && crate::image_viewer::is_image(&entry.path)
+                    && let Some(repo) = repository.clone()
+                {
+                    let path = entry.path.clone();
+                    image_preview::hover_image(
+                        element,
+                        None,
+                        move || repo.bytes(&path, true),
+                        entry.path.clone(),
+                    )
+                } else {
+                    element.when_some(decoration, |row, (_, label)| {
+                        use gpui_component::tooltip::{ManagedTooltipExt as _, Tooltip};
+                        row.managed_tooltip(move |window, cx| {
+                            Tooltip::new(label.clone()).build(window, cx)
+                        })
                     })
-                });
+                };
                 Some(if in_workspace {
                     let element =
                         tree_transfer::tree_drag_source(element, &entry, drag_repo.as_ref());

@@ -475,6 +475,7 @@ impl GitPanel {
                                             ));
                                         }),
                                 );
+                                let mut worktree_items = Vec::new();
                                 for (staged, label) in [
                                     (true, t!("git.stage_directory")),
                                     (false, t!("git.unstage_directory")),
@@ -483,7 +484,7 @@ impl GitPanel {
                                         stage_paths(&menu_detail, &files, staged, stage_allowed);
                                     if !paths.is_empty() {
                                         let view = context_view.clone();
-                                        menu = menu.item(
+                                        worktree_items.push(
                                             PopupMenuItem::new(label)
                                                 .icon(if staged {
                                                     IconName::Plus
@@ -504,15 +505,19 @@ impl GitPanel {
                                         );
                                     }
                                 }
-                                for item in worktree_restore_items(
+                                worktree_items.extend(worktree_restore_items(
                                     &context_view,
                                     &menu_detail,
                                     &files,
                                     &directory,
                                     true,
                                     cx,
-                                ) {
-                                    menu = menu.item(item);
+                                ));
+                                if !worktree_items.is_empty() {
+                                    menu = menu.separator();
+                                    for item in worktree_items {
+                                        menu = menu.item(item);
+                                    }
                                 }
                                 menu
                             })
@@ -619,6 +624,7 @@ impl GitPanel {
                                             ));
                                         }),
                                 );
+                                let mut worktree_items = Vec::new();
                                 for (paths, staged, label) in [
                                     (&stage, true, t!("git.stage_file")),
                                     (&unstage, false, t!("git.unstage")),
@@ -626,7 +632,7 @@ impl GitPanel {
                                     if !paths.is_empty() {
                                         let view = menu_view.clone();
                                         let paths = paths.clone();
-                                        menu = menu.item(
+                                        worktree_items.push(
                                             PopupMenuItem::new(label)
                                                 .icon(if staged {
                                                     IconName::Plus
@@ -647,15 +653,19 @@ impl GitPanel {
                                         );
                                     }
                                 }
-                                for item in worktree_restore_items(
+                                worktree_items.extend(worktree_restore_items(
                                     &menu_view,
                                     &menu_detail,
                                     &[ix],
                                     &path,
                                     false,
                                     cx,
-                                ) {
-                                    menu = menu.item(item);
+                                ));
+                                if !worktree_items.is_empty() {
+                                    menu = menu.separator();
+                                    for item in worktree_items {
+                                        menu = menu.item(item);
+                                    }
                                 }
                                 menu
                             })

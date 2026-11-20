@@ -191,6 +191,7 @@ fn git_menus_confirm_restore_and_discard_for_files_and_filtered_directories() {
         visual.simulate_mouse_down(pos, MouseButton::Right, Modifiers::default());
         visual.simulate_mouse_up(pos, MouseButton::Right, Modifiers::default());
         settle(visual);
+        assert!(visual.debug_bounds("popup-menu-separator").is_some());
         visual.simulate_keystrokes(keys);
         settle(visual);
         assert!(visual.debug_bounds("git-confirm-file-restore").is_some());
@@ -749,7 +750,7 @@ fn diff_file_and_row_menus_reveal_worktree_lines() {
             assert!(column_bounds.contains(&target));
             target
         });
-        menu_click(visual, target, "up enter");
+        menu_click(visual, target, "down enter");
         assert_editor(visual, path, expected);
     }
 

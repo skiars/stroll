@@ -158,6 +158,7 @@ impl Server {
                             | super::REVISION_COMPARISON_VERSION
                             | super::WORKSPACE_TRANSFER_VERSION
                             | super::WORKTREE_LSP_VERSION
+                            | super::IMAGE_DIFF_VERSION
                     ),
                     "SSH workspace protocol version mismatch. Update the remote helper."
                 );
@@ -382,6 +383,21 @@ impl Server {
                     .context("Changes are out of date. Refresh the workspace.")?;
                 git::snapshot(state, &detail, file, side)
             })?),
+            Request::ImageDiffSide(comparison, base, path, side) => {
+                value(session.call(|state| {
+                    let detail = self.patch_files(state, comparison)?;
+                    ensure!(
+                        detail.base == base,
+                        "Changes are out of date. Refresh the workspace."
+                    );
+                    let file = detail
+                        .files
+                        .iter()
+                        .find(|file| file.path == path)
+                        .context("Changes are out of date. Refresh the workspace.")?;
+                    git::image_diff_side(state, &detail, file, side)
+                })?)
+            }
             Request::Stage(expected, paths, staged) => {
                 let _guard = self.mutations.lock().unwrap();
                 git::stage(root, &expected, &paths, staged)?;

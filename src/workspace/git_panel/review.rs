@@ -1,3 +1,4 @@
+use anyhow::Context as _;
 use std::path::Path;
 
 use rust_i18n::t;
@@ -31,6 +32,85 @@ pub(super) struct CommitSummaryLayout {
 pub(super) struct LivePatch {
     base: Option<Arc<str>>,
     version: git::FileVersion,
+}
+
+pub(super) const IMAGE_DIFF_HEIGHT: Pixels = px(128.);
+const IMAGE_DIFF_CACHE_SIZE: usize = 64;
+
+#[derive(Clone)]
+pub(super) enum DiffImage {
+    Ready(Arc<RenderImage>),
+    Missing,
+    Unsupported,
+    UnsupportedHelper,
+    Failed,
+}
+
+fn image_diff_format(file: &git::ChangedFile, side: Side) -> bool {
+    let (path, mode) = match side {
+        Side::Old => (
+            file.old_path.as_deref().unwrap_or(&file.path),
+            file.old_mode.as_str(),
+        ),
+        Side::New => (file.path.as_str(), file.new_mode.as_str()),
+    };
+    mode != "120000" && crate::image_viewer::is_image(Path::new(path))
+}
+
+fn image_diff_candidate(file: &git::ChangedFile) -> bool {
+    !file.conflict()
+        && !file.submodule()
+        && [Side::Old, Side::New]
+            .into_iter()
+            .any(|side| image_diff_format(file, side))
+}
+
+fn diff_images(
+    backend: &git::Backend,
+    detail: &Changes,
+    file: &git::ChangedFile,
+    renderer: SvgRenderer,
+    scale: f32,
+) -> [DiffImage; 2] {
+    if !backend.supports_image_diff() {
+        return [DiffImage::UnsupportedHelper, DiffImage::UnsupportedHelper];
+    }
+    [Side::Old, Side::New].map(|side| {
+        // Refuse symlinks on either side, including type changes.
+        if !image_diff_format(file, side) {
+            return DiffImage::Unsupported;
+        }
+        let path = snapshot_path(
+            file,
+            if side == Side::Old {
+                DiffSide::Original
+            } else {
+                DiffSide::Modified
+            },
+        );
+        match backend.image_diff_side(detail, file, side) {
+            Ok(Some(bytes)) => match super::super::image_preview::decode_preview(
+                path,
+                &bytes.0,
+                renderer.clone(),
+                (160. * scale).ceil() as u32,
+                (112. * scale).ceil() as u32,
+            ) {
+                Ok(image) => DiffImage::Ready(image),
+                Err(_) => DiffImage::Failed,
+            },
+            Ok(None) => DiffImage::Missing,
+            Err(_) => DiffImage::Failed,
+        }
+    })
+}
+
+fn release_diff_images(images: [DiffImage; 2], window: &mut Window) {
+    for image in images {
+        if let DiffImage::Ready(image) = image {
+            _ = window.drop_image(image);
+        }
+    }
 }
 
 fn translated_placeholder(file: &git::ChangedFile) -> Result<DiffFile> {
@@ -226,6 +306,9 @@ impl Review {
             {
                 continue;
             }
+            if let Some(images) = previous.images.remove(&old) {
+                self.images.insert(ix, images);
+            }
             if matches!(previous.patches[old], PatchState::Failed) {
                 self.patches[ix] = PatchState::Failed;
             }
@@ -241,6 +324,11 @@ impl Review {
             }
         }
         self.update_totals();
+        self.image_order
+            .extend(previous.image_order.iter().filter_map(|&old| {
+                let &ix = self.by_path.get(&previous.detail.files[old].path)?;
+                self.images.contains_key(&ix).then_some(ix)
+            }));
     }
 }
 
@@ -738,6 +826,8 @@ impl GitPanel {
         }
         self.patch_tasks = std::array::from_fn(|_| Task::ready(()));
         self.patch_loading = [false; 2];
+        self.image_queue.clear();
+        self.image_task = None;
         self.viewport_reads.clear();
         self.assets_task = Task::ready(());
         self.assets_loading = false;
@@ -756,7 +846,11 @@ impl GitPanel {
         }
         self.pending_position = None;
         if !keep {
-            self.review = None;
+            if let Some(review) = self.review.take() {
+                for (_, images) in review.images {
+                    release_diff_images(images, window);
+                }
+            }
             self.diff.update(cx, |diff, cx| diff.set_files([], cx));
             self.tree_scroll = UniformListScrollHandle::new();
             self.tree_followed_file = None;
@@ -864,6 +958,9 @@ impl GitPanel {
                             };
                         this.review = Some(Review {
                             patch_display: vec![PatchDisplay::default(); detail.files.len()],
+                            image_files: detail.files.iter().map(image_diff_candidate).collect(),
+                            images: HashMap::new(),
+                            image_order: VecDeque::new(),
                             openable: vec![false; detail.files.len()],
                             detail: Arc::new(detail),
                             patches,
@@ -936,6 +1033,11 @@ impl GitPanel {
                                 if let Some(history) = this.history.as_mut() {
                                     history.changes.clone_from(status);
                                 }
+                            }
+                        }
+                        if let Some(previous) = previous {
+                            for (_, images) in previous.images {
+                                release_diff_images(images, window);
                             }
                         }
                         if blame_navigation
@@ -1494,7 +1596,10 @@ impl GitPanel {
     pub(super) fn prefetch_patches(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.preload_working_buffers(window, cx);
         self.viewport_queue.clear();
-        let Some(review) = &self.review else { return };
+        self.image_queue.clear();
+        let Some(review) = &mut self.review else {
+            return;
+        };
         if self.detail_loading || self.snapshot.is_some() {
             return;
         }
@@ -1521,16 +1626,86 @@ impl GitPanel {
             } else {
                 (above.collect(), below.collect())
             };
-            self.viewport_queue
-                .extend((first..=last).chain(leading).chain(trailing).filter(|&ix| {
-                    matches!(review.patches[ix], PatchState::Pending)
-                        && !review.collapsed.contains(&review.detail.files[ix].path)
-                        && (!self.only_matching
-                            || super::tree::matches(&review.detail.files[ix], &self.filter))
-                }));
+            for ix in (first..=last).chain(leading).chain(trailing) {
+                let file = &review.detail.files[ix];
+                if review.collapsed.contains(&file.path)
+                    || (self.only_matching && !super::tree::matches(file, &self.filter))
+                {
+                    continue;
+                }
+                if matches!(review.patches[ix], PatchState::Pending) {
+                    self.viewport_queue.push_back(ix);
+                }
+                if review.image_files[ix] {
+                    if review.images.contains_key(&ix) {
+                        if ix <= last && ix >= first {
+                            review.image_order.retain(|&cached| cached != ix);
+                            review.image_order.push_back(ix);
+                        }
+                    } else if !self
+                        .image_task
+                        .as_ref()
+                        .is_some_and(|(loading, _)| *loading == ix)
+                    {
+                        self.image_queue.push_back(ix);
+                    }
+                }
+            }
         }
         self.start_next_patch(window, cx);
+        self.start_next_image(window, cx);
         self.start_patch_assets(window, cx);
+    }
+
+    fn start_next_image(&mut self, window: &Window, cx: &mut Context<Self>) {
+        if self.image_task.is_some() || self.snapshot.is_some() {
+            return;
+        }
+        let (Some(review), Some(ix)) = (&self.review, self.image_queue.pop_front()) else {
+            return;
+        };
+        let detail = review.detail.clone();
+        let source = detail.clone();
+        let backend = self.backend.clone();
+        let renderer = cx.svg_renderer();
+        let scale = window.scale_factor();
+        // Thumbnail I/O and decoding must not hold up publication of text patches.
+        let load = cx
+            .background_executor()
+            .spawn_with_priority(Priority::Low, async move {
+                diff_images(&backend, &source, &source.files[ix], renderer, scale)
+            });
+        let task = cx.spawn_in(window, async move |this, cx| {
+            let images = load.await;
+            _ = this.update_in(cx, |this, window, cx| {
+                let Some(review) = this
+                    .review
+                    .as_mut()
+                    .filter(|review| Arc::ptr_eq(&review.detail, &detail))
+                else {
+                    return;
+                };
+                this.image_task = None;
+                if review.image_order.len() >= IMAGE_DIFF_CACHE_SIZE
+                    && let Some(old) = review.image_order.pop_front()
+                    && let Some(images) = review.images.remove(&old)
+                {
+                    release_diff_images(images, window);
+                }
+                review.images.insert(ix, images);
+                review.image_order.push_back(ix);
+                if this
+                    .diff
+                    .read(cx)
+                    .visible_paths()
+                    .any(|path| path.as_str() == detail.files[ix].path)
+                {
+                    App::notify(cx, this.review_pane.entity_id());
+                }
+                this.start_next_image(window, cx);
+            });
+        });
+        self.image_task = Some((ix, task));
     }
 
     pub(super) fn request_patch(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
@@ -2402,6 +2577,7 @@ impl GitPanel {
         let Some(review) = &self.review else { return };
         self.confirm_restore = None;
         self.viewport_queue.clear();
+        self.image_queue.clear();
         self.pending_file_reveal = None;
         self.pending_hunk_navigation = None;
         self.pending_editor_open = None;
@@ -3285,6 +3461,104 @@ impl GitPanel {
         self.live_tasks.insert(path, task);
     }
 
+    pub(super) fn has_image_diff(&self, path: &str) -> bool {
+        let Some(review) = &self.review else {
+            return false;
+        };
+        !review.collapsed.contains(path)
+            && review
+                .by_path
+                .get(path)
+                .is_some_and(|&ix| review.image_files[ix])
+    }
+
+    pub(super) fn image_diff_row(&self, path: &str, colors: Palette) -> Option<AnyElement> {
+        let review = self.review.as_ref()?;
+        let &ix = review.by_path.get(path)?;
+        if !review.image_files[ix] || review.collapsed.contains(path) {
+            return None;
+        }
+        let detail = &review.detail;
+        let file = &detail.files[ix];
+        let images = review.images.get(&ix);
+        let [before, after] = [Side::Old, Side::New].map(|side| {
+            let (index, name, label) = if side == Side::Old {
+                (0, "before", t!("git.before"))
+            } else {
+                (1, "after", t!("git.after"))
+            };
+            let preview = div()
+                .id(("git-image-thumbnail", index))
+                .debug_selector(|| format!("git-image-thumbnail:{name}:{path}"))
+                .aria_label(label)
+                .flex()
+                .items_center()
+                .justify_center()
+                .flex_1()
+                .min_w_0()
+                .max_w(px(160.))
+                .h(px(112.));
+            let status = match images.map(|sides| &sides[index]) {
+                Some(DiffImage::Ready(image)) => {
+                    let backend = self.backend.clone();
+                    let detail = detail.clone();
+                    let path = snapshot_path(
+                        file,
+                        if side == Side::Old {
+                            DiffSide::Original
+                        } else {
+                            DiffSide::Modified
+                        },
+                    )
+                    .to_owned();
+                    return super::super::image_preview::hover_image(
+                        preview.child(
+                            img(image.clone())
+                                .size_full()
+                                .object_fit(ObjectFit::Contain),
+                        ),
+                        Some(self.editor.image_hover.clone()),
+                        move || {
+                            backend
+                                .image_diff_side(&detail, &detail.files[ix], side)?
+                                .map(|bytes| bytes.0)
+                                .context(t!("git.missing_snapshot"))
+                        },
+                        path,
+                    );
+                }
+                Some(DiffImage::Missing) => t!("git.missing_snapshot"),
+                Some(DiffImage::Unsupported) => t!("image.unsupported"),
+                Some(DiffImage::Failed) => t!("image.open_failed"),
+                Some(DiffImage::UnsupportedHelper) => t!("git.binary_diff"),
+                None => t!("image.loading"),
+            };
+            preview.child(div().px_2().text_xs().child(status))
+        });
+        Some(
+            h_flex()
+                .id((
+                    ElementId::from("git-image-diff"),
+                    SharedString::from(path.to_owned()),
+                ))
+                .debug_selector(|| format!("git-image-diff:{path}"))
+                .h(IMAGE_DIFF_HEIGHT)
+                .w_full()
+                .px_4()
+                .gap_3()
+                .text_color(colors.muted)
+                .child(before)
+                .child(
+                    div()
+                        .flex_shrink_0()
+                        .debug_selector(|| format!("git-image-arrow:{path}"))
+                        .child(icon(IconName::ArrowRight, colors.muted, 16.)),
+                )
+                .child(after)
+                .into_any_element(),
+        )
+    }
+
     pub(super) fn review_notice(&self, path: &str, cx: &App) -> Option<SharedString> {
         let review = self.review.as_ref()?;
         let &ix = review.by_path.get(path)?;
@@ -3296,11 +3570,14 @@ impl GitPanel {
         } else if file.submodule() {
             t!("git.submodule_changed")
         } else if change_stat(&review.stats, file).binary || document.is_binary() {
+            if review.image_files[ix] {
+                return None;
+            }
             t!("git.binary_diff")
         } else {
             match display.truncated {
                 None if display.error.is_some() => return display.error.clone().map(Into::into),
-                None if self.active_file(cx) == Some(ix) => {
+                None if !review.image_files[ix] && self.active_file(cx) == Some(ix) => {
                     t!("git.loading_changes")
                 }
                 None => return None,

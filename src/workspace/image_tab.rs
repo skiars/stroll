@@ -91,6 +91,11 @@ impl ImageTab {
     }
 
     #[cfg(test)]
+    pub(super) fn offset(&self) -> Point<Pixels> {
+        self.offset
+    }
+
+    #[cfg(test)]
     pub(super) fn zoom(&self) -> Option<f32> {
         self.zoom
     }
@@ -130,19 +135,21 @@ impl ImageTab {
         true
     }
 
-    fn pan_to(&mut self, position: Point<Pixels>, window: &Window) {
-        let (Some(previous), Some(zoom), Some(Ok(data))) = (self.drag, self.zoom, &self.loaded)
-        else {
-            return;
+    fn pan_by(&mut self, delta: Point<Pixels>, window: &Window) -> bool {
+        let (Some(zoom), Some(Ok(data))) = (self.zoom, &self.loaded) else {
+            return false;
         };
         let viewport = self.viewport.get().size;
         let image = display_size(&data.image, window).map(|side| side * zoom);
-        self.offset = clamp_offset(
-            clamp_offset(self.offset, viewport, image) + position - previous,
-            viewport,
-            image,
-        );
-        self.drag = Some(position);
+        let offset = clamp_offset(self.offset, viewport, image);
+        self.offset = clamp_offset(offset + delta, viewport, image);
+        self.offset != offset
+    }
+
+    fn pan_to(&mut self, position: Point<Pixels>, window: &Window) {
+        if let Some(previous) = self.drag.replace(position) {
+            self.pan_by(position - previous, window);
+        }
     }
 }
 
@@ -224,6 +231,23 @@ impl Workspace {
         colors: Palette,
     ) -> AnyElement {
         let pane = v_flex()
+            .id("workspace-image-pane")
+            .track_focus(&self.image_viewer_focus)
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                let stroke = &event.keystroke;
+                if !this.image_viewer_focus.is_focused(window)
+                    || stroke.modifiers != Modifiers::default()
+                {
+                    return;
+                }
+                let forward = match stroke.key.as_str() {
+                    "left" | "up" => false,
+                    "right" | "down" => true,
+                    _ => return,
+                };
+                this.cycle_directory_image(forward, window, cx);
+                cx.stop_propagation();
+            }))
             .relative()
             .flex_1()
             .min_h_0()
@@ -382,12 +406,21 @@ impl Workspace {
                             cx.stop_propagation();
                         } else {
                             tab.zoom_scroll = ZoomScroll::default();
+                            let mut delta = event.delta.pixel_delta(SCROLL_STEP);
+                            if event.modifiers.shift && delta.x == px(0.) {
+                                delta = point(delta.y, px(0.));
+                            }
+                            if tab.pan_by(delta, window) {
+                                cx.notify();
+                                cx.stop_propagation();
+                            }
                         }
                     }
                 }))
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                        this.image_viewer_focus.focus(window, cx);
                         this.update_image_view(cx, |tab| {
                             if let Some(zoom) = tab.zoom
                                 && let Some(Ok(data)) = &tab.loaded
@@ -476,6 +509,63 @@ impl Workspace {
             )
     }
 
+    fn cycle_directory_image(
+        &mut self,
+        forward: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((current, _)) = self.active_image_tab() else {
+            return;
+        };
+        let Some(parent) = current.parent() else {
+            return;
+        };
+        let Some(repo) = self
+            .repository_snapshot
+            .as_ref()
+            .or(self.repository.as_ref())
+        else {
+            return;
+        };
+        if let Some(entries) = repo.children.get(parent) {
+            if let Some(next) = adjacent_image(entries, current, forward) {
+                self.open_file(next, true, window, cx);
+            }
+            return;
+        }
+        // An image opened through the locator can belong to a directory the tree hasn't loaded.
+        let Some(repo) = self.repository.clone() else {
+            return;
+        };
+        let current = current.to_owned();
+        let parent = parent.to_owned();
+        let source = repo.clone();
+        let lookup = cx.background_spawn(async move {
+            let snapshot = source
+                .refresh_directories([parent.clone()].into(), Default::default(), false)
+                .ok()?;
+            adjacent_image(snapshot.children.get(&parent)?, &current, forward)
+                .map(|next| (current, next))
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            if let Some((current, next)) = lookup.await {
+                _ = this.update_in(cx, |this, window, cx| {
+                    if this.image_viewer_focus.is_focused(window)
+                        && this.tabs.active() == Some(&current)
+                        && this
+                            .repository
+                            .as_ref()
+                            .is_some_and(|active| Arc::ptr_eq(active, &repo))
+                    {
+                        this.open_file(next, true, window, cx);
+                    }
+                });
+            }
+        })
+        .detach();
+    }
+
     fn update_image_view(&mut self, cx: &mut Context<Self>, update: impl FnOnce(&mut ImageTab)) {
         if let Some(tab) = self
             .tabs
@@ -486,6 +576,20 @@ impl Workspace {
             cx.notify();
         }
     }
+}
+
+fn adjacent_image(entries: &[Entry], current: &Path, forward: bool) -> Option<PathBuf> {
+    let images = entries
+        .iter()
+        .filter(|entry| !entry.directory && !entry.symlink && image_viewer::is_image(&entry.path))
+        .map(|entry| &entry.path)
+        .collect::<Vec<_>>();
+    let count = images.len();
+    if count < 2 {
+        return None;
+    }
+    let index = images.iter().position(|path| path.as_path() == current)?;
+    Some(images[(index + if forward { 1 } else { count - 1 }) % count].clone())
 }
 
 fn sampling_label(sampling: ImageSampling) -> Cow<'static, str> {

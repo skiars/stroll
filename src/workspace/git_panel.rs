@@ -178,6 +178,9 @@ struct Review {
     detail: Arc<Changes>,
     patches: Vec<PatchState>,
     patch_display: Vec<PatchDisplay>,
+    image_files: Vec<bool>,
+    images: HashMap<usize, [review::DiffImage; 2]>,
+    image_order: VecDeque<usize>,
     documents: Vec<DiffFile>,
     operations: HashMap<usize, review::FileOperations>,
     pending_assets: HashMap<usize, review::PatchAssets>,
@@ -311,6 +314,7 @@ pub(super) struct GitPanel {
     loading_session_diff: Option<DiffPosition>,
     patch_requests: VecDeque<usize>,
     viewport_queue: VecDeque<usize>,
+    image_queue: VecDeque<usize>,
     prefetch_first: Option<usize>,
     prefetch_forward: bool,
     history_error: Option<String>,
@@ -340,6 +344,7 @@ pub(super) struct GitPanel {
     commits_task: Task<()>,
     detail_task: Task<()>,
     patch_tasks: [Task<()>; 2],
+    image_task: Option<(usize, Task<()>)>,
     assets_task: Task<()>,
     assets_loading: bool,
     metadata_tasks: [Task<()>; 2],
@@ -488,6 +493,7 @@ impl GitPanel {
                     }
                     if expanded {
                         this.request_patch(ix, window, cx);
+                        this.prefetch_patches(window, cx);
                     }
                     cx.notify();
                 }
@@ -575,6 +581,7 @@ impl GitPanel {
             loading_session_diff: None,
             patch_requests: VecDeque::new(),
             viewport_queue: VecDeque::new(),
+            image_queue: VecDeque::new(),
             prefetch_first: None,
             prefetch_forward: true,
             history_error: None,
@@ -604,6 +611,7 @@ impl GitPanel {
             commits_task: Task::ready(()),
             detail_task: Task::ready(()),
             patch_tasks: std::array::from_fn(|_| Task::ready(())),
+            image_task: None,
             assets_task: Task::ready(()),
             assets_loading: false,
             metadata_tasks: std::array::from_fn(|_| Task::ready(())),
@@ -3500,6 +3508,183 @@ mod tests {
             header_index < thumb_index,
             "the scrollbar must paint above the pinned file header"
         );
+    }
+
+    #[::core::prelude::v1::test]
+    fn review_image_hover_preserves_diff_layout() {
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path().join("repo");
+        fs::create_dir(&root).unwrap();
+        git(&root, &["init", "-qb", "main"]);
+        let picture = root.join("image.png");
+        let text = root.join("source.txt");
+        image::RgbImage::from_pixel(96, 96, image::Rgb([32, 160, 144]))
+            .save(&picture)
+            .unwrap();
+        fs::write(&text, "before\n").unwrap();
+        git(&root, &["add", "."]);
+        git(
+            &root,
+            &[
+                "-c",
+                "user.name=Reviewer",
+                "-c",
+                "user.email=reviewer@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-qm",
+                "Initial",
+            ],
+        );
+        image::RgbImage::from_pixel(1920, 1080, image::Rgb([224, 120, 62]))
+            .save(&picture)
+            .unwrap();
+        fs::write(&text, "after\n").unwrap();
+
+        let store = Arc::new(Store::new(fixture.path().join("state")).unwrap());
+        let config = crate::config::ConfigFile::load(Some(fixture.path().join("config.toml")));
+        let mut cx = TestAppContext::build_with_text_system(
+            TestDispatcher::new(0),
+            None,
+            crate::test_support::text_system(true),
+        );
+        cx.update(gpui_component::init);
+        let mut workspace = None;
+        let (_, visual) = cx.add_window_view(|window, cx| {
+            let view =
+                cx.new(|cx| Workspace::with_config(store, config, WorkspaceView::Git, window, cx));
+            workspace = Some(view.clone());
+            gpui_component::Root::new(view, window, cx)
+        });
+        let workspace = workspace.unwrap();
+        visual.simulate_resize(size(px(1180.), px(780.)));
+        visual.update(|window, cx| {
+            window.activate_window();
+            workspace.update(cx, |this, cx| {
+                this.open_repository(Location { root, file: None }, window, cx)
+            });
+        });
+        visual.run_until_parked();
+        let panel = visual.update(|window, cx| {
+            let panel = workspace.read(cx).git.clone().unwrap();
+            panel.update(cx, |panel, cx| {
+                panel.split = true;
+                panel.show_history = false;
+                panel.show_tree = false;
+                panel.select_worktree(window, cx);
+                cx.notify();
+            });
+            panel
+        });
+        let frame = |visual: &mut VisualTestContext| {
+            for _ in 0..8 {
+                visual.run_until_parked();
+                visual.update(|window, cx| {
+                    window.simulate_next_frame(cx);
+                    window.draw(cx).clear(cx);
+                });
+            }
+        };
+        frame(visual);
+        visual.update(|window, cx| {
+            let panel = panel.read(cx);
+            let review = panel.review.as_ref().unwrap();
+            let sides = &review.images[&review.by_path["image.png"]];
+            let [
+                review::DiffImage::Ready(before),
+                review::DiffImage::Ready(after),
+            ] = sides
+            else {
+                panic!("both images should decode");
+            };
+            assert_eq!(before.size(0).width, before.size(0).height);
+            let thumbnail = after.size(0);
+            let scale = window.scale_factor();
+            assert!(thumbnail.width > thumbnail.height);
+            assert!(thumbnail.width.0 <= (160. * scale).ceil() as i32);
+            assert!(thumbnail.height.0 <= (112. * scale).ceil() as i32);
+        });
+        let layout = |visual: &mut VisualTestContext| {
+            [
+                visual
+                    .debug_bounds("git-image-thumbnail:before:image.png")
+                    .unwrap(),
+                visual
+                    .debug_bounds("git-image-thumbnail:after:image.png")
+                    .unwrap(),
+                visual
+                    .debug_bounds("git-editor-file-header:source.txt")
+                    .unwrap(),
+            ]
+        };
+        let viewport = |visual: &mut VisualTestContext| {
+            visual.update(|_, cx| panel.read(cx).diff.read(cx).editor_viewport_position())
+        };
+        let initial_viewport = viewport(visual);
+        let before = layout(visual);
+        let image_row = visual.debug_bounds("git-image-diff:image.png").unwrap();
+        assert!((image_row.bottom() - before[2].top()).abs() < px(0.01));
+        let arrow = visual.debug_bounds("git-image-arrow:image.png").unwrap();
+        assert!(before[0].right() < arrow.left() && arrow.right() < before[1].left());
+        let delay = visual
+            .update(|_, cx| gpui_component::tooltip::TooltipDefaults::global(cx).show_delay());
+        visual.simulate_mouse_move(before[1].center(), None, Modifiers::default());
+        visual
+            .executor()
+            .advance_clock(delay + Duration::from_millis(32));
+        frame(visual);
+        let popup = visual
+            .debug_bounds("image-hover-preview")
+            .expect("image diff hover");
+        assert_eq!(popup.size, size(px(320.), px(240.)));
+        visual.update(|window, cx| {
+            let scale = window.scale_factor();
+            let expected = cx.theme().popover.alpha(0.5);
+            assert!(window.painted_quads().iter().any(|quad| {
+                quad.bounds.size == popup.size.scale(scale)
+                    && (quad.bounds.left() - popup.left().scale(scale))
+                        .as_f32()
+                        .abs()
+                        <= scale
+                    && (quad.bounds.top() - popup.top().scale(scale))
+                        .as_f32()
+                        .abs()
+                        <= scale
+                    && quad.background.as_solid().is_some_and(|color| {
+                        color.a > 0. && color.a <= 0.5 && color.alpha(0.5) == expected
+                    })
+            }));
+        });
+        assert!(visual.debug_bounds("image-hover-loaded").is_some());
+        frame(visual);
+        assert!(visual.debug_bounds("image-hover-loaded").is_some());
+        assert_eq!(layout(visual), before);
+        assert_eq!(viewport(visual), initial_viewport);
+        visual.simulate_mouse_move(point(px(2.), px(2.)), None, Modifiers::default());
+        std::thread::sleep(
+            gpui_base::PopupMotionKind::Hover.duration(false) + Duration::from_millis(16),
+        );
+        frame(visual);
+        assert!(visual.debug_bounds("image-hover-preview").is_none());
+        assert_eq!(layout(visual), before);
+        assert_eq!(viewport(visual), initial_viewport);
+
+        visual.simulate_mouse_move(before[0].center(), None, Modifiers::default());
+        visual
+            .executor()
+            .advance_clock(delay + Duration::from_millis(32));
+        frame(visual);
+        assert!(visual.debug_bounds("image-hover-loaded").is_some());
+        visual.simulate_event(ScrollEvent {
+            position: before[0].center(),
+            delta: ScrollDelta::Lines(point(0., -2.)),
+            source: ScrollSource::Pointer,
+            touch_phase: TouchPhase::Moved,
+            modifiers: Modifiers::default(),
+        });
+        frame(visual);
+        assert!(visual.debug_bounds("image-hover-preview").is_none());
     }
 
     #[cfg(debug_assertions)]

@@ -1027,19 +1027,32 @@ impl Workspace {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum DirectoryStatus {
+    Added,
+    Changed,
+    Conflict,
+}
+
 #[derive(Default, PartialEq)]
 pub(super) struct TreeStatus {
     files: Arc<crate::git::WorktreeStatus>,
-    directories: HashMap<PathBuf, bool>,
+    directories: HashMap<PathBuf, DirectoryStatus>,
 }
 
 impl TreeStatus {
     pub(super) fn new(files: Arc<crate::git::WorktreeStatus>) -> Self {
-        let mut directories = HashMap::new();
+        let mut directories = HashMap::<_, DirectoryStatus>::new();
         for (path, status) in files.iter() {
+            let change = match status.code {
+                _ if status.conflict => DirectoryStatus::Conflict,
+                'A' | '?' => DirectoryStatus::Added,
+                _ => DirectoryStatus::Changed,
+            };
             for path in std::iter::once(path).chain(status.old_path.iter()) {
                 for directory in Path::new(path).ancestors().skip(1) {
-                    *directories.entry(directory.to_owned()).or_default() |= status.conflict;
+                    let entry = directories.entry(directory.to_owned()).or_insert(change);
+                    *entry = (*entry).max(change);
                 }
             }
         }
@@ -1052,14 +1065,11 @@ impl TreeStatus {
         colors: Palette,
         cx: &App,
     ) -> Option<(Hsla, SharedString)> {
-        let (color, label) = if entry.directory {
-            if *self.directories.get(&entry.path)? {
-                (
-                    cx.theme().danger,
-                    t!("workspace.tree_status_directory_conflict"),
-                )
-            } else {
-                (colors.warning, t!("workspace.tree_status_directory"))
+        let (code, label) = if entry.directory {
+            match self.directories.get(&entry.path)? {
+                DirectoryStatus::Added => ('A', t!("workspace.tree_status_directory")),
+                DirectoryStatus::Changed => ('M', t!("workspace.tree_status_directory")),
+                DirectoryStatus::Conflict => ('U', t!("workspace.tree_status_directory_conflict")),
             }
         } else {
             let key = entry.path.to_str()?.replace(std::path::MAIN_SEPARATOR, "/");
@@ -1074,12 +1084,12 @@ impl TreeStatus {
                 'C' => t!("workspace.tree_status_copied"),
                 _ => t!("workspace.tree_status_modified"),
             };
-            let mut color = super::git_panel::status_color(code, colors, cx);
-            if matches!(code, 'A' | '?') {
-                color.s *= 0.55;
-            }
-            (color, label)
+            (code, label)
         };
+        let mut color = super::git_panel::status_color(code, colors, cx);
+        if matches!(code, 'A' | '?') {
+            color.s *= 0.55;
+        }
         Some((color, label.into()))
     }
 }
@@ -1087,6 +1097,67 @@ impl TreeStatus {
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 mod tests {
     use super::*;
+
+    #[::core::prelude::v1::test]
+    fn tree_directories_use_added_color_when_all_changes_are_additions() {
+        use crate::git::WorktreeFile;
+
+        let files = [
+            ("new/staged.txt", 'A', None, false),
+            ("new/nested/untracked.txt", '?', None, false),
+            ("mixed/added.txt", 'A', None, false),
+            ("mixed/modified.txt", 'M', None, false),
+            ("conflicted/added.txt", 'A', None, false),
+            ("conflicted/nested/conflict.txt", 'U', None, true),
+            (
+                "moved-to/renamed.txt",
+                'R',
+                Some("moved-from/renamed.txt"),
+                false,
+            ),
+            ("moved-from/added.txt", '?', None, false),
+        ]
+        .into_iter()
+        .map(|(path, code, old_path, conflict)| {
+            let mut status = WorktreeFile::default();
+            status.code = code;
+            status.old_path = old_path.map(str::to_owned);
+            status.conflict = conflict;
+            (path.to_owned(), status)
+        })
+        .collect();
+        let status = TreeStatus::new(Arc::new(files));
+
+        TestAppContext::single().update(|cx| {
+            gpui_component::init(cx);
+            let colors = Palette::for_mode(cx.theme().mode);
+            let mut added = cx.theme().success;
+            added.s *= 0.55;
+            for (path, color) in [
+                ("new", Some(added)),
+                ("new/nested", Some(added)),
+                ("mixed", Some(colors.warning)),
+                ("conflicted", Some(cx.theme().danger)),
+                ("moved-from", Some(colors.warning)),
+                ("moved-to", Some(colors.warning)),
+                ("clean", None),
+            ] {
+                let directory = Entry {
+                    path: path.into(),
+                    directory: true,
+                    symlink: false,
+                    ignored: false,
+                };
+                assert_eq!(
+                    status
+                        .decoration(&directory, colors, cx)
+                        .map(|(color, _)| color),
+                    color,
+                    "{path}",
+                );
+            }
+        });
+    }
 
     fn test_repository_location(root: PathBuf) -> PathBuf {
         match env::var("STROLL_TEST_WORKSPACE_SSH_AUTHORITY") {
@@ -1447,6 +1518,8 @@ mod tests {
         let image = image::RgbaImage::from_pixel(1600, 960, image::Rgba([93, 146, 223, 160]));
         image.save(root.join("picture.png"))?;
         fs::copy(root.join("picture.png"), root.join("second.png"))?;
+        fs::create_dir(root.join("nested"))?;
+        fs::copy(root.join("picture.png"), root.join("nested/third.png"))?;
 
         let mut cx = TestAppContext::build_with_text_system(
             TestDispatcher::new(0),
@@ -1518,6 +1591,24 @@ mod tests {
             .debug_bounds("workspace-tree-row:picture.png")
             .unwrap()
             .center();
+        let hover_delay = visual
+            .update(|_, cx| gpui_component::tooltip::TooltipDefaults::global(cx).show_delay());
+        visual.simulate_mouse_move(image_row, None, Modifiers::default());
+        visual
+            .executor()
+            .advance_clock(hover_delay + Duration::from_millis(32));
+        settle(visual, &workspace, |this| this.active_file().is_some());
+        let hover = visual
+            .debug_bounds("image-hover-preview")
+            .expect("tree image hover");
+        assert!(hover.left() > image_row.x);
+        assert_eq!(hover.size, size(px(320.), px(240.)));
+        assert!(visual.debug_bounds("image-hover-loaded").is_some());
+
+        // A redraw while the pointer stays put must keep the decoded image visible.
+        settle(visual, &workspace, |this| this.active_file().is_some());
+        assert!(visual.debug_bounds("image-hover-loaded").is_some());
+
         visual.simulate_click(image_row, Modifiers::default());
         settle(visual, &workspace, |this| {
             this.tabs.active() == Some(picture)
@@ -1569,6 +1660,43 @@ mod tests {
         scroll.source = ScrollSource::Pointer;
         visual.simulate_event(scroll);
         assert_eq!(zoom(visual), Some(1.25));
+
+        let offset = |visual: &mut VisualTestContext| {
+            visual.update(|_, cx| workspace.read(cx).active_image_tab().unwrap().1.offset())
+        };
+        let before = offset(visual);
+        visual.simulate_event(ScrollEvent {
+            position: viewport.center(),
+            delta: ScrollDelta::Pixels(point(px(21.), px(-19.))),
+            modifiers: Modifiers::default(),
+            source: ScrollSource::Touchpad,
+            touch_phase: TouchPhase::Started,
+        });
+        for _ in 0..5 {
+            tick(visual);
+        }
+        assert_eq!(offset(visual) - before, point(px(21.), px(-19.)));
+        let before = offset(visual);
+        visual.simulate_mouse_down(viewport.center(), MouseButton::Left, Modifiers::default());
+        visual.simulate_mouse_move(
+            viewport.center() + point(px(-7.), px(12.)),
+            MouseButton::Left,
+            Modifiers::default(),
+        );
+        visual.simulate_mouse_up(viewport.center(), MouseButton::Left, Modifiers::default());
+        assert_eq!(offset(visual) - before, point(px(-7.), px(12.)));
+        visual.simulate_keystrokes("right");
+        settle(visual, &workspace, |this| {
+            this.tabs.active() == Some(Path::new("second.png"))
+        });
+        visual.simulate_keystrokes("down");
+        settle(visual, &workspace, |this| {
+            this.tabs.active() == Some(broken)
+        });
+        visual.simulate_keystrokes("up left");
+        settle(visual, &workspace, |this| {
+            this.tabs.active() == Some(picture)
+        });
 
         let broken_row = visual
             .debug_bounds("workspace-tree-row:broken.webp")

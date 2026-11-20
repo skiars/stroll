@@ -47,6 +47,7 @@ pub(crate) const DOCUMENT_BATCH_VERSION: u32 = 18;
 pub(crate) const REVISION_COMPARISON_VERSION: u32 = 19;
 pub(crate) const WORKSPACE_TRANSFER_VERSION: u32 = 20;
 pub(crate) const WORKTREE_LSP_VERSION: u32 = 21;
+pub(crate) const IMAGE_DIFF_VERSION: u32 = 22;
 const MAX_FRAME: usize = 40 * 1024 * 1024;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -243,6 +244,7 @@ pub(crate) enum Request {
     ReviewStats(git::Comparison, String),
     Patch(git::Comparison, String, usize, bool),
     Snapshot(git::Comparison, String, git::Side),
+    ImageDiffSide(git::Comparison, String, String, git::Side),
     Stage(git::WorktreeStatus, Vec<String>, bool),
     FileChanges(String, git::FileDiffOptions),
     FileChangesBatch(Vec<(String, git::FileDiffOptions)>),
