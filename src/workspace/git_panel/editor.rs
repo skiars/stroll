@@ -19,10 +19,17 @@ use std::{
     collections::BTreeMap,
     ops::Range,
     path::Path,
+    sync::OnceLock,
     time::Instant,
 };
 
-const FILE_HEADER_HEIGHT: Pixels = px(28.);
+const FILE_HEADER_HEIGHT: Pixels = px(32.);
+
+struct FileHeaderPosition {
+    top: Pixels,
+    viewport_top: Pixels,
+    next_top: Option<Pixels>,
+}
 
 #[derive(Clone, PartialEq, Action)]
 #[action(namespace = git, no_json, no_register)]
@@ -1519,7 +1526,7 @@ impl ReviewEditor {
         font: Option<SharedString>,
         colors: Palette,
         hunk_actions: bool,
-        header: impl Fn(&str, &mut App) -> AnyElement + 'static,
+        header: impl Fn(&str, f32, &mut App) -> AnyElement + 'static,
         summary: impl Fn(&mut GitPanel, &mut Context<GitPanel>) -> Option<AnyElement> + 'static,
         window: &mut Window,
         cx: &mut Context<GitPanel>,
@@ -1735,6 +1742,7 @@ impl ReviewEditor {
                 }
                 let mouse = window.mouse_position();
                 let mut elements = Vec::new();
+                let mut file_headers = Vec::new();
                 let mut active_hunk = None;
                 let previous = |indices: &[usize]| {
                     indices
@@ -1807,8 +1815,28 @@ impl ReviewEditor {
                             .update(cx, |panel, cx| summary(panel, cx))
                             .ok()
                             .flatten(),
-                        DiffEditorRow::File(path) => (!(row <= start && header_stuck))
-                            .then(|| render_header(path, &header, colors, hover.clone(), cx)),
+                        DiffEditorRow::File(path) => {
+                            if !(row <= start && header_stuck) {
+                                file_headers.push((
+                                    render_header(
+                                        path,
+                                        &header,
+                                        colors,
+                                        hover.clone(),
+                                        FileHeaderPosition {
+                                            top: line.top(),
+                                            viewport_top: bounds.top(),
+                                            next_top: None,
+                                        },
+                                        cx,
+                                    ),
+                                    controls_left(row),
+                                    line.top(),
+                                    line.size.height,
+                                ));
+                            }
+                            None
+                        }
                         DiffEditorRow::Notice(path) => notices
                             .get(&row)
                             .map(|label| render_notice(path, label.clone(), colors, cx)),
@@ -1885,6 +1913,8 @@ impl ReviewEditor {
                         elements.push((chrome, controls_left(row), line.top(), line.size.height));
                     }
                 }
+                // Paint the header shadows above the hunk and notice rows they border.
+                elements.append(&mut file_headers);
                 if let Some((row, path)) = file_header
                     && header_stuck
                 {
@@ -1892,7 +1922,18 @@ impl ReviewEditor {
                         bounds.top().min(next - FILE_HEADER_HEIGHT)
                     });
                     elements.push((
-                        render_header(path, &header, colors, hover.clone(), cx),
+                        render_header(
+                            path,
+                            &header,
+                            colors,
+                            hover.clone(),
+                            FileHeaderPosition {
+                                top,
+                                viewport_top: bounds.top(),
+                                next_top: next_header_top,
+                            },
+                            cx,
+                        ),
                         controls_left(row),
                         top,
                         FILE_HEADER_HEIGHT,
@@ -2338,19 +2379,30 @@ fn render_notice(path: &str, label: SharedString, colors: Palette, cx: &App) -> 
 
 fn render_header(
     path: &SharedString,
-    render: &impl Fn(&str, &mut App) -> AnyElement,
+    render: &impl Fn(&str, f32, &mut App) -> AnyElement,
     colors: Palette,
     panel: WeakEntity<GitPanel>,
+    position: FileHeaderPosition,
     cx: &mut App,
 ) -> AnyElement {
     let name = path.clone();
+    let dark = cx.theme().mode.is_dark();
+    // Use the visible header's position so the text reaches full strength at
+    // the viewport edge and fades again when the next header pushes it off.
+    let distance = (position.top - position.viewport_top).abs();
+    let text_progress = (1. - distance / FILE_HEADER_HEIGHT).max(0.);
     h_flex()
         .id((ElementId::from("git-editor-file"), path.clone()))
         .debug_selector(|| format!("git-editor-file-header:{path}"))
         .w_full()
         .h_full()
         .px_2()
-        .bg(colors.elevated)
+        .bg(if dark {
+            rgb(0x26272c).into()
+        } else {
+            colors.elevated
+        })
+        .child(file_header_lighting(dark, position.next_top))
         .child(
             compact_icon_button(
                 "git-editor-disclosure",
@@ -2368,8 +2420,258 @@ fn render_header(
                 });
             }),
         )
-        .child(render(path.as_str(), cx))
+        .child(render(path.as_str(), text_progress, cx))
         .into_any_element()
+}
+
+pub(super) fn file_header_name(
+    title: String,
+    colors: Palette,
+    progress: f32,
+    dark: bool,
+) -> impl IntoElement {
+    let ink = colors.ink;
+    let name = div()
+        .flex_1()
+        .min_w_0()
+        .truncate()
+        .font_medium()
+        .text_color(ink);
+    if progress == 0. {
+        return name.child(title);
+    }
+
+    let (warm_ink, glow) = if dark {
+        (rgb(0xe0d7ca), rgb(0xffb45a))
+    } else {
+        (rgb(0x66451e), rgb(0xeea548))
+    };
+    let glow = Hsla::from(glow).opacity(0.26 * progress);
+    let title = StyledText::new(title);
+    let layout = title.layout().clone();
+    name.relative()
+        .text_color(ink.blend(Hsla::from(warm_ink).opacity(progress)))
+        .child(
+            canvas(
+                |_, _, _| (),
+                move |bounds, (), window, _| {
+                    paint_file_name_glow(&layout, glow, bounds, window);
+                },
+            )
+            .absolute()
+            .inset_0(),
+        )
+        .child(title)
+}
+
+fn paint_file_name_glow(
+    layout: &TextLayout,
+    color: Hsla,
+    bounds: Bounds<Pixels>,
+    window: &mut Window,
+) {
+    const RADIUS: Pixels = px(3.);
+    // Sample the glow around the same glyphs used for the foreground, including
+    // the ellipsis when the name was truncated. This reuses GPUI's glyph atlas.
+    const SAMPLES: [(f32, f32, f32); 12] = [
+        (-0.4, 0., 0.14),
+        (0.4, 0., 0.14),
+        (0., -0.4, 0.14),
+        (0., 0.4, 0.14),
+        (-0.58, -0.58, 0.09),
+        (-0.58, 0.58, 0.09),
+        (0.58, -0.58, 0.09),
+        (0.58, 0.58, 0.09),
+        (-1., 0., 0.02),
+        (1., 0., 0.02),
+        (0., -1., 0.02),
+        (0., 1., 0.02),
+    ];
+    let samples =
+        SAMPLES.map(|(x, y, weight)| (point(RADIUS * x, RADIUS * y), color.opacity(weight)));
+    let line_height = layout.line_height();
+    let mut origin = layout.bounds().origin;
+    window.paint_layer(bounds, |window| {
+        for line in layout.line_layouts() {
+            let baseline =
+                origin + point(px(0.), (line_height + line.ascent() - line.descent()) / 2.);
+            for run in line.runs() {
+                for glyph in run.glyphs.iter().filter(|glyph| !glyph.is_emoji) {
+                    for (offset, color) in samples {
+                        _ = window.paint_glyph(
+                            baseline + glyph.position + offset,
+                            run.font_id,
+                            glyph.id,
+                            line.font_size(),
+                            color,
+                        );
+                    }
+                }
+            }
+            origin.y += line_height;
+        }
+    });
+}
+
+fn file_header_lighting(dark: bool, next_top: Option<Pixels>) -> impl IntoElement {
+    canvas(
+        |_, _, _| (),
+        move |bounds, (), window, _| {
+            let black = Hsla::black();
+            let paint_shade = |window: &mut Window, bounds, angle, from, to| {
+                window.paint_quad(fill(
+                    bounds,
+                    linear_gradient(
+                        angle,
+                        linear_color_stop(black.opacity(from), 0.),
+                        linear_color_stop(black.opacity(to), 1.),
+                    ),
+                ));
+            };
+            // The viewport clips the contact shadow when the header reaches the top.
+            let contact = Bounds::new(
+                point(bounds.left(), bounds.top() - px(3.)),
+                size(bounds.size.width, px(3.)),
+            );
+            paint_shade(window, contact, 180., 0., if dark { 0.26 } else { 0.055 });
+            let (reflection, center_x, radius) = if dark {
+                (FileHeaderLight::DarkReflection, px(72.), 0.60)
+            } else {
+                (FileHeaderLight::LightReflection, px(92.), 0.76)
+            };
+            let radius = bounds.size.width * radius;
+            let image_bounds = Bounds::new(
+                point(bounds.left() + center_x - radius, bounds.top()),
+                size(radius * 2., bounds.size.height),
+            );
+            _ = window.paint_image(
+                bounds,
+                image_bounds,
+                Corners::default(),
+                reflection.image(),
+                0,
+                false,
+            );
+
+            let origin = bounds.bottom_left();
+            let shadow_height = px(if dark { 9. } else { 8. });
+            let (near, soft, fade_at) = if dark {
+                (0.53, 0.19, shadow_height * 0.39)
+            } else {
+                (0.08, 0.08 * 0.32, shadow_height * 0.4)
+            };
+            let effect_height = if dark { shadow_height } else { px(14.) };
+            let bottom = next_top
+                .unwrap_or(origin.y + effect_height)
+                .min(origin.y + effect_height);
+            if bottom <= origin.y {
+                return;
+            }
+            // When the next title pushes the pinned one up, its surface stays clear.
+            let mask = ContentMask {
+                bounds: Bounds::new(origin, size(bounds.size.width, bottom - origin.y)),
+            };
+            window.with_content_mask(Some(mask), |window| {
+                paint_shade(
+                    window,
+                    Bounds::new(origin, size(bounds.size.width, fade_at)),
+                    180.,
+                    near,
+                    soft,
+                );
+                paint_shade(
+                    window,
+                    Bounds::new(
+                        point(origin.x, origin.y + fade_at),
+                        size(bounds.size.width, shadow_height - fade_at),
+                    ),
+                    180.,
+                    soft,
+                    0.,
+                );
+                if !dark {
+                    let image_bounds = Bounds::new(origin, size(bounds.size.width, effect_height));
+                    _ = window.paint_image(
+                        mask.bounds,
+                        image_bounds,
+                        Corners::default(),
+                        FileHeaderLight::LightEdge.image(),
+                        0,
+                        false,
+                    );
+                }
+            });
+        },
+    )
+    .absolute()
+    .inset_0()
+}
+
+enum FileHeaderLight {
+    DarkReflection,
+    LightReflection,
+    LightEdge,
+}
+
+impl FileHeaderLight {
+    fn image(self) -> Arc<RenderImage> {
+        static DARK_REFLECTION: OnceLock<Arc<RenderImage>> = OnceLock::new();
+        static LIGHT_REFLECTION: OnceLock<Arc<RenderImage>> = OnceLock::new();
+        static LIGHT_EDGE: OnceLock<Arc<RenderImage>> = OnceLock::new();
+        // Horizontal coordinates are fractions of the cached sprite width.
+        // RenderImage expects BGRA channels.
+        let header_height = FILE_HEADER_HEIGHT.as_f32() as u32;
+        let (cache, center, radii, height, middle_stop, core, middle) = match self {
+            Self::DarkReflection => (
+                &DARK_REFLECTION,
+                point(0.50, 13.),
+                size(0.50, 33.),
+                header_height,
+                0.58,
+                [154., 210., 255., 255. * 0.21],
+                [187., 222., 255., 255. * 0.08],
+            ),
+            Self::LightReflection => (
+                &LIGHT_REFLECTION,
+                point(0.50, 11.),
+                size(0.50, 30.),
+                header_height,
+                0.58,
+                [111., 182., 248., 255. * 0.09],
+                [153., 207., 255., 255. * 0.09 * 0.45],
+            ),
+            Self::LightEdge => (
+                &LIGHT_EDGE,
+                point(0.13, 1.),
+                size(0.50, 12.),
+                14,
+                0.47,
+                [195., 232., 255., 255. * 0.24],
+                [185., 227., 255., 255. * 0.24 / 3.],
+            ),
+        };
+        cache
+            .get_or_init(|| {
+                let width = 512;
+                let mut edge = middle;
+                edge[3] = 0.;
+                let pixels = image::RgbaImage::from_fn(width, height, |x, y| {
+                    let x = ((x as f32 + 0.5) / width as f32 - center.x) / radii.width;
+                    let y = (y as f32 + 0.5 - center.y) / radii.height;
+                    let distance = x.hypot(y).min(1.);
+                    let (from, to, fraction) = if distance <= middle_stop {
+                        (core, middle, distance / middle_stop)
+                    } else {
+                        (middle, edge, (distance - middle_stop) / (1. - middle_stop))
+                    };
+                    image::Rgba(std::array::from_fn(|channel| {
+                        (from[channel] + (to[channel] - from[channel]) * fraction).round() as u8
+                    }))
+                });
+                Arc::new(RenderImage::new([image::Frame::new(pixels)]))
+            })
+            .clone()
+    }
 }
 
 impl GitPanel {

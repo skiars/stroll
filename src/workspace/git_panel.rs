@@ -3253,7 +3253,7 @@ mod tests {
                     .debug_bounds("git-editor-file-header:second.txt")
                     .expect("the sticky file header stays visible while its row scrolls out");
                 assert_eq!(header.top(), editor_top);
-                assert_eq!(header.size.height, px(28.));
+                assert_eq!(header.size.height, px(32.));
             }
         }
         visual.simulate_event(scroll(diff, 12.));
@@ -3544,12 +3544,13 @@ mod tests {
             }
         };
         settle(visual);
-        visual.update(|_, cx| {
+        visual.update(|window, cx| {
             panel.update(cx, |panel, cx| {
                 let review = panel.review.as_mut().unwrap();
                 let sub = &review.detail.files[review.by_path["b-submodule"]];
                 assert!(sub.submodule(), "{sub:?}");
                 let ix = review.by_path["bb-empty"];
+                let code = review.by_path["code.txt"];
                 // The same notice renderer also handles backend diagnostics.
                 review.patches[ix] = PatchState::Failed;
                 review.patch_display[ix] = PatchDisplay {
@@ -3558,6 +3559,7 @@ mod tests {
                     error: Some("Unable to read the requested revision. ".repeat(14)),
                 };
                 panel.editor.invalidate();
+                panel.request_patch(code, window, cx);
                 App::notify(cx, panel.review_pane.entity_id());
             });
         });
@@ -3585,7 +3587,7 @@ mod tests {
             ] {
                 let header = bounds(header);
                 let notice = bounds(notice);
-                assert_eq!(header.size.height, px(28.));
+                assert_eq!(header.size.height, px(32.));
                 assert!((notice.top() - header.bottom()).abs() < px(0.01));
             }
             let binary = bounds("git-editor-notice:binary.bin");

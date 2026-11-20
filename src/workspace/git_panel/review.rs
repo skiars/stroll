@@ -2419,7 +2419,6 @@ impl GitPanel {
             .update(cx, |diff, cx| diff.show_editor_preamble(cx));
         super::editor::ReviewEditor::prepare(self, summary_height, width, window, cx);
         let review = self.review.as_ref();
-        let active = self.active_file(cx);
         v_flex()
             .id("git-review")
             .w_full()
@@ -2469,7 +2468,7 @@ impl GitPanel {
             .when(self.snapshot.is_none(), |panel| {
                 if let Some(review) = review {
                     if matches!(review.detail.comparison, Comparison::Commit { .. }) {
-                        panel.child(self.diff_view(review, active, colors, window, cx))
+                        panel.child(self.diff_view(review, colors, window, cx))
                     } else if self.diff.read(cx).files().is_empty() {
                         let (label, icon) = if review.detail.files.is_empty() {
                             (t!("git.no_changes"), IconName::FileDiff)
@@ -2486,7 +2485,7 @@ impl GitPanel {
                                 .child(center_empty(label, icon, colors)),
                         )
                     } else {
-                        panel.child(self.diff_view(review, active, colors, window, cx))
+                        panel.child(self.diff_view(review, colors, window, cx))
                     }
                 } else {
                     panel.child(center_empty(
@@ -3100,7 +3099,6 @@ impl GitPanel {
     fn diff_view(
         &self,
         review: &Review,
-        active: Option<usize>,
         colors: Palette,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -3128,7 +3126,7 @@ impl GitPanel {
                     None,
                 )
             });
-        let header = move |path: &str, cx: &mut App| {
+        let header = move |path: &str, text_progress: f32, cx: &mut App| {
             let Some(&ix) = by_path.get(path) else {
                 return div().into_any_element();
             };
@@ -3185,19 +3183,12 @@ impl GitPanel {
                 .gap_2()
                 .text_size(px(file_name_size))
                 .child(status_badge(file, colors, file_name_size, cx))
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .truncate()
-                        .font_medium()
-                        .text_color(if active == Some(ix) {
-                            colors.accent
-                        } else {
-                            colors.ink
-                        })
-                        .child(title),
-                )
+                .child(super::editor::file_header_name(
+                    title,
+                    colors,
+                    text_progress,
+                    cx.theme().mode.is_dark(),
+                ))
                 .when_some(notice, |row, label| {
                     row.child(div().text_color(colors.warning).child(label))
                 })

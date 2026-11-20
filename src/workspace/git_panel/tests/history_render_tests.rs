@@ -244,6 +244,223 @@ fn open_history_at_size(
 }
 
 #[::core::prelude::v1::test]
+fn diff_file_headers_render_theme_lighting_before_and_after_pinning() -> Result<()> {
+    let fixture = tempfile::tempdir()?;
+    let root = fixture.path();
+    git(root, &["init", "-qb", "main"]);
+    git(root, &["config", "user.name", "Reviewer"]);
+    git(root, &["config", "user.email", "reviewer@example.invalid"]);
+    git(root, &["config", "commit.gpgsign", "false"]);
+    fs::write(root.join("a.txt"), "before\ncontext\n")?;
+    fs::write(root.join("b.txt"), "before\n".repeat(80))?;
+    git(root, &["add", "."]);
+    git(root, &["commit", "-qm", "Initial"]);
+    fs::write(root.join("a.txt"), "after\ncontext\n")?;
+    fs::write(root.join("b.txt"), "after\n".repeat(80))?;
+
+    let state = tempfile::tempdir()?;
+    let (mut cx, handle, _, panel) = open_history(root, state.path(), None, None)?;
+    let window = handle.into();
+    let settle = |cx: &mut HeadlessAppContext| -> Result<()> {
+        for _ in 0..4 {
+            cx.run_until_parked();
+            cx.update_window(window, |_, window, cx| window.draw(cx).clear(cx))?;
+        }
+        Ok(())
+    };
+    let headers = |cx: &mut HeadlessAppContext, mode: ThemeMode| {
+        let background = if mode.is_dark() {
+            rgb(0x26272c).into()
+        } else {
+            Palette::for_mode(mode).elevated
+        };
+        cx.update_window(window, |_, window, _| {
+            window
+                .painted_quads()
+                .into_iter()
+                .filter(|quad| {
+                    quad.bounds.size.width.0 > 600.
+                        && quad.bounds.size.height.0 == 32.
+                        && quad.background.as_solid() == Some(background)
+                })
+                .map(|quad| quad.bounds)
+                .collect::<Vec<_>>()
+        })
+    };
+    let reveal = |cx: &mut HeadlessAppContext, path| -> Result<()> {
+        cx.update_window(window, |_, _, cx| {
+            panel
+                .read(cx)
+                .diff
+                .clone()
+                .update(cx, |diff, cx| diff.scroll_to_file(path, cx));
+        })?;
+        settle(cx)
+    };
+    let viewport = |cx: &HeadlessAppContext| {
+        cx.read_entity(&panel, |panel, cx| {
+            panel.diff.read(cx).editor_viewport_position()
+        })
+    };
+    let assert_lighting = |image: &RgbaImage, header: Bounds<ScaledPixels>, mode| {
+        let x = |fraction| (header.left().0 + header.size.width.0 * fraction) as u32;
+        let y = header.top().0 as u32;
+        let face = image.get_pixel(x(0.20), y + 4).0;
+        let other_end = image.get_pixel(x(0.97), y + 4).0;
+        let shadow = image.get_pixel(x(0.83), y + 33).0;
+        let below = image.get_pixel(x(0.83), y + 46).0;
+        assert!(shadow[0] < below[0], "{mode:?}: {shadow:?} vs {below:?}");
+        if mode == ThemeMode::Light {
+            let warmth = |pixel: [u8; 4]| i16::from(pixel[0]) - i16::from(pixel[2]);
+            assert_eq!(other_end, [255; 4]);
+            let warmest = image.get_pixel(x(0.) + 92, y + 4).0;
+            let toward_right = image.get_pixel(x(0.55), y + 4).0;
+            assert!(
+                warmest[0] >= 251
+                    && warmth(warmest) > warmth(face)
+                    && warmth(face) > warmth(toward_right)
+                    && warmth(toward_right) > warmth(other_end),
+                "light highlight should fade into white: {warmest:?}, {face:?}, {toward_right:?}"
+            );
+            let halo = image.get_pixel(x(0.50), y + 33).0;
+            assert!(
+                warmth(halo) > warmth(shadow),
+                "light halo should reach the middle of the header: {halo:?} vs {shadow:?}"
+            );
+        } else {
+            assert_eq!(other_end, [38, 39, 44, 255]);
+            let warmest = image.get_pixel(x(0.) + 72, y + 4).0;
+            let toward_right = image.get_pixel(x(0.56), y + 4).0;
+            assert_eq!(image.get_pixel(x(0.72), y + 4).0, other_end);
+            assert!(
+                warmest[0] > warmest[2]
+                    && warmest[0] > face[0]
+                    && face[0] > toward_right[0]
+                    && toward_right[0] > other_end[0],
+                "dark highlight should fade from the left: {warmest:?}, {face:?}, {toward_right:?}, {other_end:?}"
+            );
+        }
+    };
+
+    for (split, mode) in [(false, ThemeMode::Light), (true, ThemeMode::Dark)] {
+        cx.update_window(window, |_, window, cx| {
+            crate::workspace::apply_theme(mode, cx);
+            window.set_scale_factor(1.);
+            panel.update(cx, |panel, cx| {
+                panel.show_history = false;
+                panel.show_tree = false;
+                panel.split = split;
+                panel.select_worktree(window, cx);
+                cx.notify();
+            });
+        })?;
+        settle(&mut cx)?;
+        reveal(&mut cx, "a.txt")?;
+        let mut visible = headers(&mut cx, mode)?;
+        visible.sort_by(|a, b| a.top().0.total_cmp(&b.top().0));
+        assert_eq!(visible.len(), 2, "{mode:?}: {visible:?}");
+        let in_flow = cx.capture_screenshot(window)?;
+        assert_lighting(&in_flow, visible[1], mode);
+        if mode.is_dark() {
+            // Sample over the neutral hunk header before scrolling it out of view.
+            let x = (visible[1].left().0 + visible[1].size.width.0 * 0.20) as u32;
+            let y = visible[1].top().0 as u32 + 33;
+            let shadow = in_flow.get_pixel(x, y).0;
+            assert!(shadow[0] <= shadow[2], "dark shadow: {shadow:?}");
+        }
+
+        reveal(&mut cx, "b.txt")?;
+        let aligned = headers(&mut cx, mode)?.pop().unwrap();
+        let aligned_image = cx.capture_screenshot(window)?;
+        let before_scroll = viewport(&cx);
+        let scroll = |cx: &mut HeadlessAppContext, dy| -> Result<()> {
+            cx.update_window(window, |_, window, cx| {
+                window.dispatch_event(
+                    ScrollEvent {
+                        position: point(px(aligned.left().0 + 100.), px(aligned.bottom().0 + 40.)),
+                        delta: ScrollDelta::Pixels(point(px(0.), px(dy))),
+                        touch_phase: TouchPhase::Moved,
+                        source: ScrollSource::Pointer,
+                        ..Default::default()
+                    }
+                    .to_platform_input(),
+                    cx,
+                );
+            })?;
+            settle(cx)
+        };
+        scroll(&mut cx, 16.)?;
+        assert!(viewport(&cx) < before_scroll);
+        let mut moving_headers = headers(&mut cx, mode)?;
+        moving_headers.sort_by(|a, b| a.top().0.total_cmp(&b.top().0));
+        assert_eq!(moving_headers.len(), 2, "{mode:?}: {moving_headers:?}");
+        let [outgoing, approaching] = [moving_headers[0], moving_headers[1]];
+        assert_eq!(outgoing.top().0, aligned.top().0 - 16.);
+        assert_eq!(approaching.top().0, aligned.top().0 + 16.);
+        let halfway = cx.capture_screenshot(window)?;
+        scroll(&mut cx, -40.)?;
+        let pinned = headers(&mut cx, mode)?.pop().unwrap();
+        assert_eq!(pinned, aligned);
+        let pinned_image = cx.capture_screenshot(window)?;
+        assert_lighting(&pinned_image, pinned, mode);
+        let x = pinned.left().0 as u32;
+        let y = pinned.top().0 as u32;
+        for dy in [4, 16, 28] {
+            assert_eq!(
+                aligned_image.get_pixel(x + 200, y + dy),
+                pinned_image.get_pixel(x + 200, y + dy),
+                "{mode:?}: pinning should leave the title lighting unchanged"
+            );
+        }
+        let (regular_ink, halfway_ink, pinned_ink) = if mode.is_dark() {
+            ([220, 221, 226], [222, 218, 214], [224, 215, 202])
+        } else {
+            ([48, 53, 64], [75, 61, 47], [102, 69, 30])
+        };
+        let has_ink = |image: &RgbaImage, header: Bounds<ScaledPixels>, expected: [u8; 3]| {
+            let header_y = header.top().0 as u32;
+            ((header_y + 8).max(y)..header_y + 26).any(|row| {
+                (x + 48..x + 84).any(|column| {
+                    image
+                        .get_pixel(column, row)
+                        .0
+                        .into_iter()
+                        .zip(expected)
+                        .all(|(channel, expected)| channel.abs_diff(expected) <= 1)
+                })
+            })
+        };
+        assert!(
+            has_ink(&in_flow, visible[1], regular_ink),
+            "{mode:?}: in-flow filename"
+        );
+        assert!(
+            has_ink(&halfway, approaching, halfway_ink),
+            "{mode:?}: approaching filename"
+        );
+        assert!(
+            has_ink(&halfway, outgoing, halfway_ink),
+            "{mode:?}: outgoing filename"
+        );
+        assert!(
+            has_ink(&aligned_image, aligned, pinned_ink),
+            "{mode:?}: filename at the viewport edge"
+        );
+        assert!(
+            has_ink(&pinned_image, pinned, pinned_ink),
+            "{mode:?}: pinned filename"
+        );
+        if let Some(output) = std::env::var_os("STROLL_GIT_SCREENSHOTS") {
+            let output = PathBuf::from(output);
+            fs::create_dir_all(&output)?;
+            in_flow.save(output.join(format!("diff-headers-{mode:?}.png")))?;
+            pinned_image.save(output.join(format!("diff-header-pinned-{mode:?}.png")))?;
+        }
+    }
+    Ok(())
+}
+
+#[::core::prelude::v1::test]
 fn compares_outside_the_selected_branch_from_both_toolbar_entries() -> Result<()> {
     let fixture = tempfile::tempdir()?;
     let root = fixture.path();
