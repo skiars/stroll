@@ -1,20 +1,25 @@
 use super::{review::ActionBlocks, *};
 use crate::workspace::{
-    DiffSource, OpenFile, WorkspaceView, code_theme::HunkPalette, editor_git::hunk_toolbar_row,
-    inlay_hints::InlayHints, line_alignment::LineAlignment,
+    DiffSource, OpenFile, WorkspaceView,
+    code_theme::HunkPalette,
+    editor_git::{hunk_toolbar_row, restore_text_edit},
+    inlay_hints::InlayHints,
+    line_alignment::LineAlignment,
 };
 use gpui_component::{
     diff::{DiffEditorRow, DiffSide},
     input::{
-        DefinitionProvider, Editor, HUNK_TOOLBAR_HEIGHT, HoverProvider, InlayHint, InputEditsEvent,
-        Rope, RopeExt, TextDecoration, TextDecorationCollection, hovered_hunk_top,
+        DefinitionProvider, Editor, HUNK_TOOLBAR_HEIGHT, HoverProvider, InlayHint, InputEdit,
+        InputEditsEvent, Rope, RopeExt, TextDecoration, TextDecorationCollection, hovered_hunk_top,
     },
 };
+use similar::TextDiff;
 use std::{
     cell::{Cell, RefCell},
     collections::BTreeMap,
     ops::Range,
     path::Path,
+    time::Instant,
 };
 
 const FILE_HEADER_HEIGHT: Pixels = px(28.);
@@ -282,6 +287,19 @@ impl Projection {
             (first.bytes.start + start.column).min(first.bytes.end)
                 ..(previous.bytes.start + end.column).min(previous.bytes.end),
         ))
+    }
+
+    fn source_rows_match(&self, range: &Range<usize>, source: &Rope) -> bool {
+        let start = self.text.offset_to_point(range.start).row;
+        let end = self.text.offset_to_point(range.end).row;
+        (start..=end).all(|row| {
+            self.lines[row].as_ref().is_some_and(|line| {
+                let source_row = line.position.line() - 1;
+                source_row < source.lines_len()
+                    && line.bytes.start == source.line_start_offset(source_row)
+                    && self.text.slice_line(row) == source.slice_line(source_row)
+            })
+        })
     }
 
     fn position(&self, offset: usize) -> Option<(DiffLinePosition, usize)> {
@@ -866,11 +884,7 @@ impl ReviewEditor {
                                 && source.end <= file.committed.len()
                                 && file.committed.is_char_boundary(source.start)
                                 && file.committed.is_char_boundary(source.end)
-                                && file
-                                    .committed
-                                    .slice(source)
-                                    .chars()
-                                    .eq(projection.text.slice(range.clone()).chars())
+                                && projection.source_rows_match(range, &file.committed)
                         })
                     })
                 })
@@ -2074,7 +2088,27 @@ fn deletion_target(document: &DiffFile, line: usize) -> Option<usize> {
 }
 
 impl Projection {
-    fn apply_edit(&mut self, edit: &gpui_component::input::InputEdit, text: &Rope) {
+    fn remap_rows(&mut self, rows: Range<usize>, new_count: usize, keep: usize) {
+        if keep == rows.len() && new_count == rows.len() {
+            return;
+        }
+        let delta = new_count as isize - rows.len() as isize;
+        let mapping = self.row_mapping.get_or_insert_with(|| {
+            Rc::new(RowMapping(
+                (0..=self.lines.len()).map(|row| (row, row)).collect(),
+            ))
+        });
+        Rc::make_mut(mapping).0.retain_mut(|(_, row)| {
+            if *row >= rows.end {
+                *row = row.saturating_add_signed(delta);
+            } else if *row >= rows.start + keep {
+                return false;
+            }
+            true
+        });
+    }
+
+    fn apply_edit(&mut self, edit: &InputEdit, text: &Rope) {
         let range = edit.start_byte..edit.old_end_byte;
         let Some((path, bytes)) = self.source_range(&range) else {
             return;
@@ -2112,21 +2146,7 @@ impl Projection {
             })
             .collect::<Vec<_>>();
         self.edited = true;
-        if line_delta != 0 || start != end {
-            let mapping = self.row_mapping.get_or_insert_with(|| {
-                Rc::new(RowMapping(
-                    (0..=self.lines.len()).map(|row| (row, row)).collect(),
-                ))
-            });
-            Rc::make_mut(mapping).0.retain_mut(|(_, row)| {
-                if *row > end {
-                    *row = row.saturating_add_signed(line_delta);
-                } else if *row > start {
-                    return false;
-                }
-                true
-            });
-        }
+        self.remap_rows(start..end + 1, replacement.len(), 1);
         self.lines.splice(start..=end, replacement);
         for line in self
             .lines
@@ -2146,6 +2166,157 @@ impl Projection {
             );
         }
         self.text = text.clone();
+    }
+
+    fn replay_source_edit(
+        &mut self,
+        path: &Path,
+        edit: &InputEdit,
+        before: &Rope,
+        source: &Rope,
+    ) -> Vec<(Range<usize>, String)> {
+        let offset = |row, byte| {
+            self.lines.iter().enumerate().find_map(|(view_row, line)| {
+                let line = line.as_ref()?;
+                (line.source.as_deref() == Some(path)
+                    && line.position.line() == row + 1
+                    && (line.bytes.start..=line.bytes.end).contains(&byte))
+                .then(|| self.text.line_start_offset(view_row) + byte - line.bytes.start)
+            })
+        };
+        let range = offset(edit.start_position.row, edit.start_byte)
+            .zip(offset(edit.old_end_position.row, edit.old_end_byte))
+            .map(|(start, end)| start..end)
+            .filter(|range| {
+                self.source_range(range)
+                    .is_some_and(|(mapped_path, bytes)| {
+                        mapped_path == path && bytes == (edit.start_byte..edit.old_end_byte)
+                    })
+                    && self.source_rows_match(range, before)
+            });
+        if let Some(range) = range {
+            let replacement = source.slice(edit.start_byte..edit.new_end_byte).to_string();
+            let mut text = self.text.clone();
+            text.replace(range.clone(), &replacement);
+            let edit = InputEdit {
+                start_byte: range.start,
+                old_end_byte: range.end,
+                new_end_byte: range.start + replacement.len(),
+                start_position: self.text.offset_to_point(range.start),
+                old_end_position: self.text.offset_to_point(range.end),
+                new_end_position: text.offset_to_point(range.start + replacement.len()),
+            };
+            self.apply_edit(&edit, &text);
+            return vec![(range, replacement)];
+        }
+
+        self.replay_across_gaps(path, edit, before, source)
+    }
+
+    fn replay_across_gaps(
+        &mut self,
+        path: &Path,
+        edit: &InputEdit,
+        before: &Rope,
+        source: &Rope,
+    ) -> Vec<(Range<usize>, String)> {
+        let start = edit.start_position.row;
+        let old_end = edit.old_end_position.row + 1;
+        let new_end = edit.new_end_position.row + 1;
+        let row_delta = new_end as isize - old_end as isize;
+        let mut runs: Vec<(Range<usize>, Range<usize>)> = Vec::new();
+        for (view_row, line) in self.lines.iter_mut().enumerate() {
+            let Some(line) = line
+                .as_mut()
+                .filter(|line| line.source.as_deref() == Some(path))
+            else {
+                continue;
+            };
+            let old_row = line.position.line() - 1;
+            if old_row < start {
+                continue;
+            }
+            if old_row >= before.lines_len()
+                || line.bytes.start != before.line_start_offset(old_row)
+                || self.text.slice_line(view_row) != before.slice_line(old_row)
+            {
+                line.source = None;
+            } else if old_row >= old_end {
+                let row = old_row.saturating_add_signed(row_delta);
+                line.bytes = source.line_start_offset(row)..source.line_end_offset(row);
+                line.position = DiffLinePosition::new(
+                    line.position.path().clone(),
+                    DiffSide::Modified,
+                    row + 1,
+                );
+            } else if let Some((view, old)) = runs
+                .last_mut()
+                .filter(|(view, old)| view.end == view_row && old.end == old_row)
+            {
+                view.end += 1;
+                old.end += 1;
+            } else {
+                runs.push((view_row..view_row + 1, old_row..old_row + 1));
+            }
+        }
+        self.edited = true;
+        if runs.is_empty() {
+            return Vec::new();
+        }
+
+        // Line boundaries split the source replacement into the visible runs.
+        // Equal lines keep the intervening collapsed context in its own run.
+        let old = before.slice_lines(start..old_end).to_string();
+        let new = source.slice_lines(start..new_end).to_string();
+        let old = old.split('\n').collect::<Vec<_>>();
+        let new = new.split('\n').collect::<Vec<_>>();
+        let diff = TextDiff::configure()
+            .deadline(Instant::now() + Duration::from_millis(20))
+            .diff_slices(&old, &new);
+        let mut boundaries = vec![start];
+        for op in diff.ops() {
+            let old_count = op.old_range().len();
+            let new = op.new_range();
+            boundaries.extend((1..old_count).map(|row| start + new.start + row.min(new.len())));
+            if old_count != 0 {
+                boundaries.push(start + new.end);
+            }
+        }
+        *boundaries.last_mut().unwrap() = new_end;
+
+        let mut edits = Vec::new();
+        for (view, old) in runs.into_iter().rev() {
+            let path_key = self.lines[view.start]
+                .as_ref()
+                .unwrap()
+                .position
+                .path()
+                .clone();
+            let new = boundaries[old.start - start]..boundaries[old.end - start];
+            let mut text = String::new();
+            let mut lines = Vec::with_capacity(new.len());
+            for row in new {
+                text.push_str(&source.slice_line(row).to_string());
+                text.push('\n');
+                lines.push(Some(Line {
+                    position: DiffLinePosition::new(path_key.clone(), DiffSide::Modified, row + 1),
+                    source: Some(path.to_owned()),
+                    bytes: source.line_start_offset(row)..source.line_end_offset(row),
+                }));
+            }
+            let offset = self.text.line_start_offset(view.start);
+            let end = self.text.line_start_offset(view.end);
+            let old = self.text.slice(offset..end).to_string();
+            if old != text {
+                let (range, replacement) = restore_text_edit(&old, &text);
+                let range = offset + range.start..offset + range.end;
+                self.text.replace(range.clone(), &replacement);
+                edits.push((range, replacement));
+            }
+            self.remap_rows(view.clone(), lines.len(), view.len().min(lines.len()));
+            self.lines.splice(view, lines);
+        }
+        edits
     }
 }
 
@@ -2490,16 +2661,52 @@ impl GitPanel {
     fn replay_review_history(&mut self, undo: bool, window: &mut Window, cx: &mut Context<Self>) {
         let path = self.editing_path(window, cx);
         if let Some(path) = path {
-            _ = self.workspace.update(cx, |workspace, cx| {
-                if workspace.git_edit.contains(&path) {
-                    return;
-                }
-                if let Some(file) = workspace.files.get(&path) {
-                    file.editor.update(cx, |editor, cx| {
-                        editor.replay_text_history(undo, window, cx)
-                    });
-                }
+            let Some(source) = self
+                .workspace
+                .read_with(cx, |workspace, _| {
+                    if workspace.git_edit.contains(&path) {
+                        return None;
+                    }
+                    workspace.files.get(&path).map(|file| file.editor.clone())
+                })
+                .ok()
+                .flatten()
+            else {
+                return;
+            };
+            // The source owns undo history. Mirror the emitted replacements
+            // before accepting more input in the projected editor.
+            let mut before = source.read(cx).text().clone();
+            let replay = cx.subscribe_in(
+                &source,
+                window,
+                move |panel, _, event: &InputEditsEvent, window, cx| {
+                    let column = &panel.editor.modified;
+                    for (edit, source) in event.edits() {
+                        let replacements = column
+                            .projection
+                            .borrow_mut()
+                            .replay_source_edit(&path, edit, &before, source);
+                        before = source.clone();
+                        if replacements.is_empty() {
+                            continue;
+                        }
+                        column.editor.update(cx, |editor, cx| {
+                            let scroll = editor.scroll_offset();
+                            for (range, text) in replacements {
+                                editor.replace_projected_text(range, text, window, cx);
+                            }
+                            editor.set_scroll_offset(scroll, cx);
+                        });
+                    }
+                    App::notify(cx, panel.review_pane.entity_id());
+                },
+            );
+            source.update(cx, |editor, cx| {
+                editor.replay_text_history(undo, window, cx);
             });
+            // A grouped replay can enqueue its edits from a deferred callback.
+            cx.defer(move |cx| cx.defer(move |_| drop(replay)));
         } else {
             self.replay_worktree_history(undo, window, cx);
         }

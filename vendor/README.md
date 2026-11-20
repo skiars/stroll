@@ -145,6 +145,9 @@ dialogs in a Wayland window after changes to paint order or focus handling.
   passes them to the shared diff parser. Run
   `cargo test --release --locked --lib custom_workspace_diff_edits` to verify
   drafts, undo, and save against a selected comparison base.
+- Silent text replacements in projected editors with a history handler remap
+  every selection. Run `cargo test --release --locked --lib pending_diff_`
+  to verify continued typing after undo and redo before the Git patch refreshes.
 - To verify presentation feedback in a native Wayland session, set
   `STROLL_FRAME_TIMINGS=1` and check `wayland_submit`,
   `wayland_present_return`, `wayland_callback`, and the compositor's

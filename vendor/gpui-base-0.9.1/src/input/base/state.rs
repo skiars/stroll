@@ -3950,6 +3950,7 @@ impl<M: InputModeKind> InputBaseState<M> {
     }
 
     /// Update a projection without sending an edit back to its source document.
+    /// Editors with a history handler keep all selections mapped through the replacement.
     pub fn replace_projected_text(
         &mut self,
         range: Range<usize>,
@@ -3960,9 +3961,38 @@ impl<M: InputModeKind> InputBaseState<M> {
         let emit_events = self.emit_events;
         self.emit_events = false;
         self.undo_manager.set_ignoring(true);
-        self.with_edits_allowed(|this| this.replace_text_in_ranges(&[(range, text)], window, cx));
-        self.undo_manager
-            .set_ignoring(self.history_handler.is_some());
+        let mapped = self.history_handler.is_some();
+        if mapped {
+            let new_end = range.start + text.len();
+            let map = |offset: usize| {
+                if offset >= range.end {
+                    new_end + (offset - range.end)
+                } else {
+                    offset.min(new_end)
+                }
+            };
+            self.edit_ranges_mapping_selection_ranges(
+                &[(range.clone(), text)],
+                None,
+                |after, selection| {
+                    let start = map(selection.start);
+                    let end = map(selection.end);
+                    let end_bias = if start == end {
+                        Bias::Left
+                    } else {
+                        Bias::Right
+                    };
+                    after.clip_offset(start, Bias::Left)..after.clip_offset(end, end_bias)
+                },
+                window,
+                cx,
+            );
+        } else {
+            self.with_edits_allowed(|this| {
+                this.replace_text_in_ranges(&[(range, text)], window, cx)
+            });
+        }
+        self.undo_manager.set_ignoring(mapped);
         self.emit_events = emit_events;
     }
 

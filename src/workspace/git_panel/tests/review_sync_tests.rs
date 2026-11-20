@@ -737,6 +737,319 @@ fn local_diff_edits_stay_visible_and_editable_across_layout_and_filter_changes()
 }
 
 #[::core::prelude::v1::test]
+fn typing_after_pending_diff_undo_or_redo_uses_the_visible_caret() {
+    for (split, redo) in [(false, false), (false, true), (true, false), (true, true)] {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("repo");
+        fs::create_dir(&root).unwrap();
+        setup(&root);
+        command(&root, &["commit", "--allow-empty", "-qm", "Initial"]);
+        let name = "a.txt";
+        let path = Path::new(name);
+        let source = "first\nsecond line with words\n";
+        fs::write(root.join(name), source).unwrap();
+        command(&root, &["add", name]);
+        let mut cx = test_context();
+        let (panel, visual) = open(&mut cx, temp.path(), &root);
+        visual.update(|_, cx| {
+            panel.update(cx, |panel, cx| {
+                panel.split = split;
+                cx.notify();
+            })
+        });
+        let editor =
+            visual.update(|window, cx| panel.read(cx).editor.focused_column(window, cx).clone());
+        let focus_line = |visual: &mut VisualTestContext, prefix: &str| {
+            visual.update(|window, cx| {
+                let Some(start) = editor.read(cx).text().to_string().find(prefix) else {
+                    return false;
+                };
+                let caret = start + prefix.len();
+                editor.update(cx, |editor, cx| {
+                    editor.focus(window, cx);
+                    editor.set_selected_range(caret..caret, cx);
+                });
+                panel.read(cx).editing_path(window, cx).as_deref() == Some(path)
+            })
+        };
+        let assert_projection = |visual: &mut VisualTestContext, text: &str, prefix: &str| {
+            visual.update(|_, cx| {
+                let editor = editor.read(cx);
+                let projected = editor.text().to_string();
+                assert!(
+                    projected.contains(text),
+                    "split={split}, redo={redo}: {projected:?}"
+                );
+                assert!(
+                    projected[..editor.cursor()].ends_with(prefix),
+                    "split={split}, redo={redo}"
+                );
+            });
+        };
+
+        wait_for_review(visual, "editable diff", |visual| {
+            focus_line(visual, "first")
+        });
+        visual.simulate_input(" draft");
+        wait_for_review(visual, "published initial draft", |visual| {
+            visual.update(|_, cx| {
+                let panel = panel.read(cx);
+                let review = panel.review.as_ref().unwrap();
+                review.live.contains_key(&review.by_path[name])
+            })
+        });
+        let revision = visual.update(|_, cx| panel.read(cx).diff.read(cx).editor_row_revision());
+
+        assert!(focus_line(visual, "first draft"));
+        visual.simulate_keystrokes("enter");
+        assert!(focus_line(visual, "second line"));
+        visual
+            .update(|window, cx| window.dispatch_action(Box::new(gpui_component::input::Undo), cx));
+        assert_projection(
+            visual,
+            "first draft\nsecond line with words\n",
+            "second line",
+        );
+        if redo {
+            visual.update(|window, cx| {
+                window.dispatch_action(Box::new(gpui_component::input::Redo), cx)
+            });
+            assert_projection(
+                visual,
+                "first draft\n\nsecond line with words\n",
+                "second line",
+            );
+        }
+
+        visual.simulate_input("MARK");
+        let gap = if redo { "\n\n" } else { "\n" };
+        let expected = format!("first draft{gap}second lineMARK with words\n");
+        assert_projection(visual, &expected, "second lineMARK");
+        visual.update(|_, cx| {
+            let panel = panel.read(cx);
+            assert_eq!(panel.diff.read(cx).editor_row_revision(), revision);
+            let workspace = panel.workspace.upgrade().unwrap();
+            assert_eq!(
+                workspace.read(cx).files[path].committed.to_string(),
+                expected
+            );
+        });
+        wait_for_review(visual, "rebuilt patch with the new input", |visual| {
+            visual.update(|_, cx| panel.read(cx).diff.read(cx).editor_row_revision() != revision)
+        });
+        assert_projection(visual, &expected, "second lineMARK");
+        assert_eq!(fs::read_to_string(root.join(name)).unwrap(), source);
+    }
+}
+
+#[::core::prelude::v1::test]
+fn pending_diff_replays_history_across_collapsed_context() {
+    for split in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("repo");
+        fs::create_dir(&root).unwrap();
+        setup(&root);
+        let name = "text.txt";
+        let path = Path::new(name);
+        let context = (0..24)
+            .map(|i| format!("context {i:02}\n"))
+            .collect::<String>();
+        fs::write(root.join(path), format!("old first\n{context}old last\n")).unwrap();
+        command(&root, &["add", name]);
+        command(&root, &["commit", "-qm", "Initial"]);
+        let disk = format!("new first with words\n{context}new last with words\n");
+        fs::write(root.join(path), &disk).unwrap();
+        let mut cx = test_context();
+        let (panel, visual) = open(&mut cx, temp.path(), &root);
+        let editor = visual.update(|window, cx| {
+            panel.update(cx, |panel, cx| {
+                panel.split = split;
+                cx.notify();
+            });
+            panel.read(cx).editor.focused_column(window, cx).clone()
+        });
+        let focus = |visual: &mut VisualTestContext, marker: &str| {
+            focus_review_line(visual, &panel, &editor, path, marker, None)
+        };
+        wait_for_review(visual, "editable hunks", |visual| {
+            focus(visual, "new first")
+        });
+        // One source-editor transaction changes both hunks and preserves the
+        // omitted context between them. The first hunk also changes height.
+        let draft = format!("draft first with words\nextra line\n{context}draft last with words\n");
+        visual.update(|window, cx| {
+            let workspace = panel.read(cx).workspace.upgrade().unwrap();
+            let source = workspace.read(cx).files[path].editor.clone();
+            source.update(cx, |source, cx| {
+                source.edit_ranges(&[(0..disk.len(), draft.clone())], window, cx);
+            });
+        });
+        wait_for_review(visual, "visible draft hunks", |visual| {
+            focus(visual, "draft last")
+        });
+        let revision = visual.update(|_, cx| panel.read(cx).diff.read(cx).editor_row_revision());
+        let check = |visual: &mut VisualTestContext, text: &str, caret: &str, pending: bool| {
+            visual.update(|window, cx| {
+                assert_review_history(window, cx, &panel, &editor, path, text, caret);
+                let projected = editor.read(cx).text().to_string();
+                let (first, last) = (text.lines().next().unwrap(), text.lines().last().unwrap());
+                assert!(
+                    projected.contains(first) && projected.contains(last),
+                    "{projected:?}"
+                );
+                assert_eq!(
+                    projected.contains("extra line"),
+                    text.contains("extra line")
+                );
+                assert!(!projected.contains("context 12"));
+                assert_eq!(
+                    panel.read(cx).diff.read(cx).editor_row_revision() == revision,
+                    pending,
+                    "split={split}, caret after {caret:?}"
+                );
+            });
+        };
+
+        check(visual, &draft, "draft last", true);
+        visual
+            .update(|window, cx| window.dispatch_action(Box::new(gpui_component::input::Undo), cx));
+        check(visual, &disk, "new last", true);
+        visual
+            .update(|window, cx| window.dispatch_action(Box::new(gpui_component::input::Redo), cx));
+        check(visual, &draft, "draft last", true);
+        visual.update(|window, cx| {
+            window.dispatch_keystroke(gpui::Keystroke::parse("?").unwrap(), cx);
+        });
+        let expected = draft.replace("last with", "last? with");
+        check(visual, &expected, "draft last?", true);
+        wait_for_review(visual, "rebuilt draft patch", |visual| {
+            visual.update(|_, cx| panel.read(cx).diff.read(cx).editor_row_revision() != revision)
+        });
+        check(visual, &expected, "draft last?", false);
+        assert_eq!(fs::read_to_string(root.join(path)).unwrap(), disk);
+    }
+}
+
+#[::core::prelude::v1::test]
+fn pending_diff_undo_preserves_multiple_carets_for_typing() {
+    for split in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("repo");
+        fs::create_dir(&root).unwrap();
+        setup(&root);
+        command(&root, &["commit", "--allow-empty", "-qm", "Initial"]);
+        let name = "text.txt";
+        let path = Path::new(name);
+        let disk = "first with words\nsecond with words\nthird with words\n";
+        fs::write(root.join(path), disk).unwrap();
+        command(&root, &["add", name]);
+        let mut cx = test_context();
+        let (panel, visual) = open(&mut cx, temp.path(), &root);
+        let editor = visual.update(|window, cx| {
+            panel.update(cx, |panel, cx| {
+                panel.split = split;
+                cx.notify();
+            });
+            panel.read(cx).editor.focused_column(window, cx).clone()
+        });
+        wait_for_review(visual, "editable diff", |visual| {
+            focus_review_line(visual, &panel, &editor, path, "third", None)
+        });
+        visual.simulate_input(" draft");
+        wait_for_review(visual, "initial draft", |visual| {
+            visual.update(|_, cx| {
+                let review = panel.read(cx).review.as_ref().unwrap();
+                review.live.contains_key(&review.by_path[name])
+            })
+        });
+        let revision = visual.update(|_, cx| panel.read(cx).diff.read(cx).editor_row_revision());
+        assert!(focus_review_line(
+            visual,
+            &panel,
+            &editor,
+            path,
+            "third draft",
+            None
+        ));
+        visual.simulate_keystrokes("enter");
+        assert!(focus_review_line(
+            visual,
+            &panel,
+            &editor,
+            path,
+            "first",
+            Some("second")
+        ));
+        visual
+            .update(|window, cx| window.dispatch_action(Box::new(gpui_component::input::Undo), cx));
+        visual.simulate_input("?");
+
+        let expected = "first? with words\nsecond? with words\nthird draft with words\n";
+        let check = |visual: &mut VisualTestContext| {
+            visual.update(|window, cx| {
+                assert_review_history(window, cx, &panel, &editor, path, expected, "first?");
+                assert!(editor.read(cx).text().to_string().contains(expected));
+                panel.read(cx).diff.read(cx).editor_row_revision()
+            })
+        };
+        assert_eq!(check(visual), revision);
+        wait_for_review(visual, "rebuilt draft patch", |visual| {
+            check(visual) != revision
+        });
+        assert_eq!(fs::read_to_string(root.join(path)).unwrap(), disk);
+    }
+}
+
+fn focus_review_line(
+    visual: &mut VisualTestContext,
+    panel: &Entity<GitPanel>,
+    editor: &Entity<EditorState>,
+    path: &Path,
+    marker: &str,
+    second: Option<&str>,
+) -> bool {
+    visual.update(|window, cx| {
+        let projected = editor.read(cx).text().to_string();
+        let Some(caret) = projected.find(marker).map(|pos| pos + marker.len()) else {
+            return false;
+        };
+        editor.update(cx, |editor, cx| {
+            editor.focus(window, cx);
+            editor.set_selected_range(caret..caret, cx);
+            if let Some(marker) = second {
+                let caret = projected.find(marker).unwrap() + marker.len();
+                editor.add_selection(caret..caret, cx);
+            }
+        });
+        panel.read(cx).editing_path(window, cx).as_deref() == Some(path)
+    })
+}
+
+fn assert_review_history(
+    window: &Window,
+    cx: &App,
+    panel: &Entity<GitPanel>,
+    editor: &Entity<EditorState>,
+    path: &Path,
+    expected: &str,
+    caret: &str,
+) {
+    let editor = editor.read(cx);
+    let panel = panel.read(cx);
+    let workspace = panel.workspace.upgrade().unwrap();
+    assert_eq!(
+        workspace.read(cx).files[path].committed.to_string(),
+        expected
+    );
+    let projected = editor.text().to_string();
+    assert!(
+        projected[..editor.cursor()].ends_with(caret),
+        "{projected:?}"
+    );
+    assert_eq!(panel.editing_path(window, cx).as_deref(), Some(path));
+}
+
+#[::core::prelude::v1::test]
 fn custom_workspace_diff_edits_undoes_and_saves_against_the_selected_base() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("repo");
