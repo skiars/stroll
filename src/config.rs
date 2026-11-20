@@ -1,13 +1,15 @@
 use rust_i18n::t;
 
 use std::{
+    collections::BTreeMap,
     env,
     fs::{self, File, OpenOptions},
-    io::ErrorKind,
+    io::{ErrorKind, Write as _},
     path::{Path, PathBuf},
 };
 
 use anyhow::{Context as _, Result, ensure};
+use globset::{GlobBuilder, GlobMatcher};
 use gpui::TextRenderingPreference;
 use serde::{Deserialize, Serialize};
 use toml_edit::{DocumentMut, Item, Table, TableLike};
@@ -29,10 +31,66 @@ pub(crate) struct Config {
     pub appearance: Appearance,
     pub docs: Docs,
     pub editor: Editor,
+    pub files: Files,
     pub git: Git,
     pub terminal: Terminal,
     pub lsp: Lsp,
     pub ai: crate::ai::Settings,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+#[serde(default)]
+pub(crate) struct Files {
+    pub associations: BTreeMap<String, String>,
+}
+
+#[derive(Clone, Default)]
+pub(crate) struct FileAssociations {
+    globs: Vec<(GlobMatcher, String)>,
+    invalid: Vec<String>,
+}
+
+impl FileAssociations {
+    fn compile(files: &Files) -> Self {
+        let mut associations = Self::default();
+        for (pattern, language) in &files.associations {
+            if pattern.is_empty() || pattern.contains(['/', '\\', '\0']) {
+                associations.invalid.push(pattern.clone());
+            } else if let Ok(glob) = GlobBuilder::new(pattern).build() {
+                associations
+                    .globs
+                    .push((glob.compile_matcher(), language.clone()));
+            } else {
+                associations.invalid.push(pattern.clone());
+            }
+        }
+        associations
+            .globs
+            .sort_by_key(|(glob, _)| std::cmp::Reverse(glob.glob().glob().len()));
+        associations
+    }
+
+    pub(crate) fn language_for(&self, path: &Path) -> Option<&str> {
+        let filename = Path::new(path.file_name()?);
+        self.globs
+            .iter()
+            .find(|(glob, _)| {
+                let pattern = glob.glob().glob();
+                !pattern.contains(['*', '?', '[', '{']) && filename.as_os_str() == pattern
+            })
+            .or_else(|| self.globs.iter().find(|(glob, _)| glob.is_match(filename)))
+            .map(|(_, language)| language.as_str())
+    }
+
+    pub(crate) fn invalid_patterns(&self) -> impl Iterator<Item = &str> {
+        self.invalid.iter().map(String::as_str)
+    }
+
+    pub(crate) fn rules(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.globs
+            .iter()
+            .map(|(glob, language)| (glob.glob().glob(), language.as_str()))
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -366,6 +424,7 @@ impl Config {
 pub struct ConfigFile {
     path: Option<PathBuf>,
     config: Config,
+    pub(crate) file_associations: FileAssociations,
     baseline: Option<Vec<u8>>,
     pub(crate) load_error: Option<String>,
 }
@@ -391,6 +450,7 @@ impl ConfigFile {
         let mut file = Self {
             path,
             config: Config::default(),
+            file_associations: FileAssociations::default(),
             baseline: None,
             load_error: None,
         };
@@ -406,11 +466,43 @@ impl ConfigFile {
         &self.config
     }
 
+    pub(crate) fn same_disk_state(&self, other: &Self) -> bool {
+        self.baseline == other.baseline && self.load_error == other.load_error
+    }
+
+    pub(crate) fn path_for_editing(&mut self) -> Result<PathBuf> {
+        let path = self.path()?.to_owned();
+        if path.try_exists()? {
+            return Ok(path);
+        }
+        let _lock = lock_config(&path)?;
+        let bytes = new_document().to_string().into_bytes();
+        let parent = path.parent().context(t!("config.missing_directory"))?;
+        let mut file = tempfile::NamedTempFile::new_in(parent)?;
+        file.write_all(&bytes)?;
+        match file.persist_noclobber(&path) {
+            Ok(_) => {}
+            Err(error) if error.error.kind() == ErrorKind::AlreadyExists => return Ok(path),
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    t!("config.write_failed", path = path.display()).into_owned()
+                });
+            }
+        }
+        if self.baseline.is_none() && self.load_error.is_none() {
+            self.baseline = Some(bytes);
+        }
+        Ok(path)
+    }
+
     pub(crate) fn reload(&mut self) -> Result<()> {
         let result = self.read();
         self.load_error = result.as_ref().err().map(|error| format!("{error:#}"));
         let (bytes, config) = result?;
         self.baseline = bytes;
+        if self.config.files != config.files {
+            self.file_associations = FileAssociations::compile(&config.files);
+        }
         self.config = config;
         Ok(())
     }
@@ -418,6 +510,9 @@ impl ConfigFile {
     fn read(&self) -> Result<(Option<Vec<u8>>, Config)> {
         let path = self.path()?;
         let bytes = read_file(path)?;
+        if self.load_error.is_none() && bytes == self.baseline {
+            return Ok((bytes, self.config.clone()));
+        }
         let config = match &bytes {
             Some(bytes) => decode(bytes)
                 .with_context(|| t!("common.read_failed", path = path.display()).into_owned())?,
@@ -447,6 +542,9 @@ impl ConfigFile {
         atomic_write(path, &bytes)
             .with_context(|| t!("config.write_failed", path = path.display()).into_owned())?;
         self.baseline = Some(bytes);
+        if self.config.files != config.files {
+            self.file_associations = FileAssociations::compile(&config.files);
+        }
         self.config = config;
         Ok(())
     }
@@ -553,9 +651,17 @@ fn lock_config(path: &Path) -> Result<ConfigLock> {
 }
 
 fn patch_table(target: &mut dyn TableLike, old: &dyn TableLike, new: &dyn TableLike) {
+    for (key, _) in old.iter() {
+        if !new.contains_key(key) {
+            target.remove(key);
+        }
+    }
     for (key, value) in new.iter() {
-        let old_value = old.get(key).expect("both tables use the same schema");
-        if let (Some(old), Some(new)) = (old_value.as_table_like(), value.as_table_like()) {
+        let old_value = old.get(key);
+        if let (Some(old), Some(new)) = (
+            old_value.and_then(Item::as_table_like),
+            value.as_table_like(),
+        ) {
             let mut empty = Table::new();
             empty.set_implicit(true);
             if let Some(table) = target.get_mut(key).and_then(Item::as_table_like_mut) {
@@ -566,7 +672,7 @@ fn patch_table(target: &mut dyn TableLike, old: &dyn TableLike, new: &dyn TableL
                     target.insert(key, Item::Table(empty));
                 }
             }
-        } else if value.to_string() != old_value.to_string() {
+        } else if old_value.is_none_or(|old| value.to_string() != old.to_string()) {
             let Some(mut replacement) = value.as_value().cloned() else {
                 unreachable!("settings are scalar values or tables");
             };
@@ -585,6 +691,47 @@ fn patch_table(target: &mut dyn TableLike, old: &dyn TableLike, new: &dyn TableL
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn file_association_rules_round_trip_and_match_basenames() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("config.toml");
+        fs::write(
+            &path,
+            r#"[files.associations]
+    "*.ux" = "html" # Keep the comment
+    "*.test.ux" = "javascript"
+    "a.test.ux" = "text"
+    "nested/*.ux" = "css"
+    "[bad" = "css"
+    "#,
+        )?;
+        let mut config = ConfigFile::load(Some(path.clone()));
+        assert!(config.load_error.is_none());
+        let language = |name: &str| config.file_associations.language_for(Path::new(name));
+        assert_eq!(language("nested/a.ux"), Some("html"));
+        assert_eq!(language("nested/b.test.ux"), Some("javascript"));
+        assert_eq!(language("nested/a.test.ux"), Some("text"));
+        assert_eq!(language("nested/a.UX"), None);
+        assert_eq!(
+            config
+                .file_associations
+                .invalid_patterns()
+                .collect::<Vec<_>>(),
+            ["[bad", "nested/*.ux"]
+        );
+
+        let mut draft = config.current().clone();
+        draft.files.associations.remove("*.test.ux");
+        draft
+            .files
+            .associations
+            .insert("*.foo".into(), "toml".into());
+        config.save(draft.clone())?;
+        assert!(fs::read_to_string(&path)?.contains("\"*.ux\" = \"html\" # Keep the comment"));
+        assert_eq!(ConfigFile::load(Some(path)).current(), &draft);
+        Ok(())
+    }
 
     #[test]
     fn migrates_legacy_hinting_when_loading_and_saving() -> Result<()> {

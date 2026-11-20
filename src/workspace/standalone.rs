@@ -288,6 +288,7 @@ impl Workspace {
                         bar.when_some(path, |bar, path| {
                             bar.child(file_type_icon(
                                 self.repository.as_deref(),
+                                &self.config.file_associations,
                                 path,
                                 colors,
                                 15.,

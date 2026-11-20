@@ -7,6 +7,27 @@ fence names `bash` and `sh` use the same grammar.
 CMake highlighting is built in for `CMakeLists.txt`, `*.cmake` files, and
 Markdown fences labeled `cmake`.
 
+## File associations
+
+Use **Edit in config.toml** at the bottom of the Settings sidebar to open the
+active user configuration. Add a table such as:
+
+```toml
+[files.associations]
+"*.ext" = "html"
+```
+
+Save the file to apply associations in open Stroll windows. Associations set
+syntax highlighting in the source editor and Git diffs, and select the
+corresponding file icons. Targets can be built-in language IDs such as
+`html` or IDs contributed by installed TextMate packs. Language servers use
+their own configuration.
+
+Patterns match basenames case-sensitively. An exact filename wins over a glob.
+Among matching globs, longer patterns win, with ties resolved alphabetically.
+Explicit associations take precedence over language pack and built-in file
+detection. Settings reports invalid patterns and unavailable languages.
+
 ## TextMate extensions
 
 Add a `.stroll.json` file to the worktree:

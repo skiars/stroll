@@ -223,6 +223,7 @@ impl Workspace {
             .label_size(px(13.5))
             .icon(file_type_icon(
                 self.repository.as_deref(),
+                &self.config.file_associations,
                 path,
                 colors,
                 15.,

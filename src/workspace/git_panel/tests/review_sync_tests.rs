@@ -108,6 +108,150 @@ fn open<'a>(
     (panel, visual)
 }
 
+#[::core::prelude::v1::test]
+fn file_association_highlights_ux_in_source_and_git_snapshots() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("repo");
+    fs::create_dir(&root).unwrap();
+    setup(&root);
+    let path = "main.ux";
+    fs::write(
+        root.join(path),
+        "<template>\n  <text>old</text>\n</template>\n",
+    )
+    .unwrap();
+    command(&root, &["add", path]);
+    command(&root, &["commit", "-qm", "Initial"]);
+    fs::write(
+        root.join(path),
+        "<template>\n  <text>new</text>\n</template>\n",
+    )
+    .unwrap();
+    fs::write(
+        temp.path().join("config.toml"),
+        "[files.associations]\n\"*.ux\" = \"html\"\n\"*.rs\" = \"missing-language\"\n",
+    )
+    .unwrap();
+
+    let mut app = test_context();
+    let (panel, visual) = open(&mut app, temp.path(), &root);
+    let owner = visual.update(|_, cx| panel.read(cx).workspace.upgrade().unwrap());
+    visual.update(|window, cx| {
+        panel.update(cx, |panel, cx| {
+            panel.load_review(Selection::Worktree(Mode::All), false, window, cx);
+        });
+    });
+    wait_for_review(visual, "the UX patch", |visual| {
+        visual.update(|_, cx| {
+            panel.read(cx).review.as_ref().is_some_and(|review| {
+                review.by_path.get(path).is_some_and(|&ix| {
+                    matches!(review.patches[ix], PatchState::Ready)
+                        && review.sources.get(&ix).is_some_and(|sources| {
+                            sources.contains_key(&(path.into(), DiffSide::Original))
+                        })
+                })
+            })
+        })
+    });
+    let diff_source = visual.update(|_, cx| {
+        let review = panel.read(cx).review.as_ref().unwrap();
+        let editor = review.sources[&review.by_path[path]][&(path.into(), DiffSide::Original)]
+            .editor()
+            .clone();
+        assert_eq!(editor.read(cx).language_name().as_str(), "html");
+        editor
+    });
+    visual.update(|window, cx| {
+        panel.update(cx, |panel, cx| {
+            let ix = panel.review.as_ref().unwrap().by_path[path];
+            panel.open_layer_snapshot(ix, None, Side::Old, 1, window, cx);
+        });
+    });
+    wait_for_review(visual, "the original UX snapshot", |visual| {
+        visual.update(|_, cx| {
+            panel
+                .read(cx)
+                .snapshot
+                .as_ref()
+                .and_then(|snapshot| snapshot.editor.as_ref())
+                .is_some_and(|editor| {
+                    assert_eq!(editor.read(cx).language_name().as_str(), "html");
+                    true
+                })
+        })
+    });
+    visual.update(|window, cx| {
+        owner.update(cx, |owner, cx| {
+            assert!(
+                owner
+                    .associated_highlight(Path::new("example.rs"))
+                    .is_none()
+            );
+            assert_eq!(
+                owner
+                    .source_language(Path::new("example.rs"), &gpui_component::input::Rope::new())
+                    .as_str(),
+                "rust",
+            );
+            owner.switch_view(WorkspaceView::Editor, window, cx);
+            owner.open_file(path.into(), false, window, cx);
+        });
+    });
+    wait_for_review(visual, "the UX source editor", |visual| {
+        visual.update(|_, cx| {
+            owner
+                .read(cx)
+                .files
+                .get(Path::new(path))
+                .is_some_and(|file| {
+                    let editor = file.editor.read(cx);
+                    assert_eq!(editor.language_name().as_str(), "text");
+                    editor.display_map().is_fold_candidate(0)
+                })
+        })
+    });
+    let (editor, snapshot) = visual.update(|window, cx| {
+        let editor = owner.read(cx).files[Path::new(path)].editor.clone();
+        let snapshot = panel
+            .read(cx)
+            .snapshot
+            .as_ref()
+            .unwrap()
+            .editor
+            .clone()
+            .unwrap();
+        editor.update(cx, |editor, cx| {
+            editor.edit_ranges(&[(19..22, "draft".into())], window, cx);
+            editor.set_selected_range(19..24, cx);
+        });
+        (editor, snapshot)
+    });
+    let draft = visual.update(|_, cx| editor.read(cx).text().clone());
+    crate::repository::atomic_write(&temp.path().join("config.toml"), b"[files.associations]\n")
+        .unwrap();
+    wait_for_review(
+        visual,
+        "the removed file association to refresh both editors",
+        |visual| {
+            visual.update(|_, cx| {
+                let editor = editor.read(cx);
+                snapshot.read(cx).language_name().as_str() == "text"
+                    && diff_source.read(cx).language_name().as_str() == "text"
+                    && !editor.display_map().is_fold_candidate(0)
+            })
+        },
+    );
+    visual.update(|_, cx| {
+        assert_eq!(owner.read(cx).files[Path::new(path)].editor, editor);
+        assert_eq!(editor.read(cx).text(), &draft);
+        assert_eq!(editor.read(cx).selected_range(), 19..24);
+        assert_eq!(
+            panel.read(cx).snapshot.as_ref().unwrap().editor.as_ref(),
+            Some(&snapshot)
+        );
+    });
+}
+
 fn report(
     panel: &Entity<GitPanel>,
     visual: &mut VisualTestContext,

@@ -20,6 +20,9 @@ other supported WGPU adapter. A software Vulkan adapter also runs the
 pixel regression. Check editor and tab menus, hover, the overflow list and
 dialogs in a Wayland window after changes to paint order or focus handling.
 
+- The shared Settings view accepts an optional footer below its scrollable
+  sidebar navigation. The Stroll settings test checks the position and opens
+  the active configuration from the footer.
 - The application uses the UI font size as its window rem size and as the shared
   control font size for inputs, searchable select rows, dropdown buttons, and
   popup menu options. The Git comparison integration test covers live changes.

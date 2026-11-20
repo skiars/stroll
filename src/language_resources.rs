@@ -322,6 +322,14 @@ impl LanguageResources {
         self.matched_grammar(path).map(|(_, name)| name.clone())
     }
 
+    pub(crate) fn syntax_for_id(&self, id: &str) -> Option<SharedString> {
+        self.names.get(id).cloned().or_else(|| {
+            LanguageRegistry::singleton()
+                .language(id)
+                .map(|grammar| grammar.name)
+        })
+    }
+
     pub(crate) fn display_name_for_path(&self, path: &Path) -> Option<SharedString> {
         let (language, _) = self.matched_grammar(path)?;
         let display_name = language

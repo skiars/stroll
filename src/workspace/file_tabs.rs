@@ -205,6 +205,7 @@ impl Workspace {
                     }))
                     .child(div().flex_shrink_0().mr_1().child(file_type_icon(
                         self.repository.as_deref(),
+                        &self.config.file_associations,
                         path,
                         colors,
                         12.,
@@ -347,6 +348,7 @@ impl Workspace {
                             .gap(px(3.))
                             .child(file_type_icon(
                                 self.repository.as_deref(),
+                                &self.config.file_associations,
                                 path,
                                 colors,
                                 14.,

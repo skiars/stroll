@@ -800,10 +800,20 @@ impl Workspace {
                 pending.result = None;
                 file.path = target.clone();
                 repo.language_resources().configure_editor(&target, cx);
+                let old_syntax = self.associated_highlight(&path).map(|(_, syntax)| syntax);
+                let new_syntax = self.associated_highlight(&target).map(|(_, syntax)| syntax);
+                let syntax_changed = old_syntax != new_syntax;
                 file.editor.update(cx, |editor, cx| {
                     let language = self.source_language(&target, editor.text());
-                    if editor.language_name() != language {
+                    let language_changed = editor.language_name() != language;
+                    if language_changed {
                         editor.set_highlighter(language, cx);
+                    }
+                    if syntax_changed {
+                        editor.set_highlighter_factory(source_highlighter_factory(new_syntax), cx);
+                        editor.apply_highlighter_fold_candidates(Vec::new(), cx);
+                    }
+                    if syntax_changed || language_changed {
                         editor.prepare_language(window, cx);
                     }
                 });

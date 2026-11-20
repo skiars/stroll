@@ -43,6 +43,7 @@ pub struct Settings {
     sidebar_width: Pixels,
     sidebar_size_range: Range<Pixels>,
     sidebar_style: StyleRefinement,
+    sidebar_footer: Option<gpui::AnyElement>,
     default_selected_index: SelectIndex,
     header_style: StyleRefinement,
 }
@@ -59,6 +60,7 @@ impl Settings {
             sidebar_width: px(250.0),
             sidebar_size_range: px(160.0)..px(360.0),
             sidebar_style: StyleRefinement::default(),
+            sidebar_footer: None,
             default_selected_index: SelectIndex::default(),
             header_style: StyleRefinement::default(),
         }
@@ -105,6 +107,12 @@ impl Settings {
     /// Set the style refinement for the sidebar.
     pub fn sidebar_style(mut self, style: &StyleRefinement) -> Self {
         self.sidebar_style = style.clone();
+        self
+    }
+
+    /// Places an element below the scrollable page navigation.
+    pub fn sidebar_footer(mut self, footer: impl IntoElement) -> Self {
+        self.sidebar_footer = Some(footer.into_any_element());
         self
     }
 
@@ -165,7 +173,7 @@ impl Settings {
         &self,
         state: &Entity<SettingsState>,
         filter: &SettingsFilter,
-        _: &mut Window,
+        footer: Option<gpui::AnyElement>,
         cx: &mut App,
     ) -> impl IntoElement {
         let selected_index = state.read(cx).selected_index;
@@ -180,6 +188,7 @@ impl Settings {
             .refine_style(&self.sidebar_style)
             .collapsible(false)
             .collapsed(false)
+            .when_some(footer, |sidebar, footer| sidebar.footer(footer))
             .header(
                 div()
                     .w_full()
@@ -447,7 +456,7 @@ pub struct SelectIndex {
 }
 
 impl RenderOnce for Settings {
-    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
+    fn render(mut self, window: &mut Window, cx: &mut App) -> impl IntoElement {
         let state = window.use_keyed_state(self.id.clone(), cx, |window, cx| {
             let search_input = cx.new(|cx| {
                 InputState::new(window, cx)
@@ -490,8 +499,9 @@ impl RenderOnce for Settings {
         .with_size(self.size)
         .with_group_variant(self.group_variant);
         let sidebar_size_range = self.sidebar_size_range.clone();
+        let sidebar_footer = self.sidebar_footer.take();
         let sidebar = self
-            .render_sidebar(&state, &filter, window, cx)
+            .render_sidebar(&state, &filter, sidebar_footer, cx)
             .into_any_element();
 
         h_resizable(self.id.clone())

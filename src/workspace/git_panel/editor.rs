@@ -95,6 +95,10 @@ impl SnapshotEditor {
             .lines
             .clone()
     }
+
+    pub(super) fn editor(&self) -> &Entity<EditorState> {
+        &self.editor
+    }
 }
 
 pub(super) type SnapshotEditors = HashMap<(SharedString, DiffSide), SnapshotEditor>;
@@ -639,12 +643,13 @@ impl DefinitionProvider for ProjectedLanguageFeatures {
 pub(super) fn snapshot_editor(
     text: Rope,
     language: &'static str,
+    syntax_override: Option<SharedString>,
     window: &mut Window,
     cx: &mut App,
 ) -> Entity<EditorState> {
     cx.new(|cx| {
         let mut editor = EditorState::new(window, cx)
-            .language(language)
+            .language(syntax_override.unwrap_or_else(|| language.into()))
             .folding(false)
             .default_file_text(text);
         editor.lsp_mut().hover_provider = Some(Rc::new(crate::symbols::LocalSymbols(language)));

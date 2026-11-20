@@ -20,11 +20,14 @@ use gpui_component::{
     v_flex, window_corner_radii,
 };
 
-use super::{CloseSettings, ToggleSettings, Workspace, action_button, apply_theme_with_fonts};
+use super::{
+    CloseSettings, ToggleSettings, Workspace, WorkspaceView, action_button, apply_theme_with_fonts,
+    associated_highlight, config_watch, source_highlighter_factory,
+};
 use crate::{
     config::{
-        CodeContrast, CodeTheme, Config, DiffLayout, EDITOR_LINE_HEIGHT_RANGE, FONT_SIZE_MAX,
-        FONT_SIZE_MIN, Theme, UI_FONT_SIZE_MAX, UI_FONT_SIZE_MIN,
+        CodeContrast, CodeTheme, Config, ConfigFile, DiffLayout, EDITOR_LINE_HEIGHT_RANGE,
+        FONT_SIZE_MAX, FONT_SIZE_MIN, Theme, UI_FONT_SIZE_MAX, UI_FONT_SIZE_MIN,
     },
     language::CommandSource,
     locale::Language,
@@ -156,13 +159,14 @@ const CODE_PREVIEW: &[&[(&str, &str)]] = &[
 
 pub(super) struct SettingsWindow {
     handle: AnyWindowHandle,
-    draft: Entity<Config>,
+    page: WeakEntity<SettingsPage>,
 }
 
 struct SettingsPage {
     owner: WeakEntity<Workspace>,
     owner_window: AnyWindowHandle,
     draft: Entity<Config>,
+    base: Config,
     focus: FocusHandle,
     title: SharedString,
     ai_base: Entity<InputState>,
@@ -302,25 +306,23 @@ impl Workspace {
                 cx,
             )));
             let owner_window = window.window_handle();
-            let result = cx.open_window(options, {
-                let owner = owner.clone();
-                let draft = draft.clone();
-                move |window, cx| {
-                    let page =
-                        cx.new(|cx| SettingsPage::new(owner, owner_window, draft, window, cx));
-                    let weak = page.downgrade();
-                    window.on_window_should_close(cx, move |_, cx| {
-                        _ = weak.update(cx, |page, cx| page.save_now(cx));
-                        true
-                    });
-                    cx.new(|cx| Root::new(page, window, cx))
-                }
+            let mut settings_page = None;
+            let result = cx.open_window(options, |window, cx| {
+                let page =
+                    cx.new(|cx| SettingsPage::new(owner.clone(), owner_window, draft, window, cx));
+                let weak = page.downgrade();
+                settings_page = Some(weak.clone());
+                window.on_window_should_close(cx, move |_, cx| {
+                    weak.update(cx, |page, cx| page.save_now(cx))
+                        .unwrap_or(true)
+                });
+                cx.new(|cx| Root::new(page, window, cx))
             });
             match result {
                 Ok(handle) => owner.update(cx, |owner, _| {
                     owner.settings = Some(SettingsWindow {
                         handle: handle.into(),
-                        draft,
+                        page: settings_page.unwrap(),
                     });
                 }),
                 Err(error) => {
@@ -358,15 +360,26 @@ impl Workspace {
         if !self.flush_before_close(window, cx) {
             return false;
         }
-        if let Some(settings) = self.settings.take()
+        if let Some(settings) = &self.settings
             && cx.windows().contains(&settings.handle)
+            && let Some(page) = settings.page.upgrade()
         {
-            let draft = settings.draft.read(cx).clone();
-            _ = self.commit_settings(draft, window, cx);
-            _ = settings
-                .handle
-                .update(cx, |_, window, _| window.remove_window());
+            let handle = settings.handle;
+            let page_state = page.read(cx);
+            let result = if page_state.conflicts_with(&self.config, cx) {
+                Err(anyhow::anyhow!(t!("settings.config_conflict")))
+            } else {
+                let base = page_state.base.clone();
+                self.commit_settings_draft(page_state.draft.read(cx).clone(), &base, window, cx)
+            };
+            if let Err(error) = result {
+                page.update(cx, |page, cx| page.show_save_error(error, cx));
+                _ = handle.update(cx, |_, window, _| window.activate_window());
+                return false;
+            }
+            _ = handle.update(cx, |_, window, _| window.remove_window());
         }
+        self.settings = None;
         self.audio_preview.stop();
         self.save_window_geometry(window);
         true
@@ -378,15 +391,21 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let mut config = self.config.current().clone();
+        let base = self.config.current().clone();
+        let mut config = base.clone();
         config.appearance.theme = config.appearance.theme.next();
         let theme = config.appearance.theme;
         match self.commit_settings(config, window, cx) {
             Ok(()) => {
                 if let Some(settings) = &self.settings {
-                    settings.draft.update(cx, |draft, cx| {
-                        draft.appearance.theme = theme;
-                        cx.notify();
+                    _ = settings.page.update(cx, |page, cx| {
+                        if page.base == base {
+                            page.base.appearance.theme = theme;
+                            page.draft.update(cx, |draft, cx| {
+                                draft.appearance.theme = theme;
+                                cx.notify();
+                            });
+                        }
                     });
                 }
             }
@@ -408,19 +427,22 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> anyhow::Result<()> {
-        let previous = self.config.current().clone();
-        if draft == previous {
+        let previous = self.config.clone();
+        if &draft == previous.current() {
             return Ok(());
         }
         for (name, old_name) in [
-            (&draft.editor.font_family, &previous.editor.font_family),
+            (
+                &draft.editor.font_family,
+                &previous.current().editor.font_family,
+            ),
             (
                 &draft.appearance.ui_font_family,
-                &previous.appearance.ui_font_family,
+                &previous.current().appearance.ui_font_family,
             ),
             (
                 &draft.appearance.fallback_font_family,
-                &previous.appearance.fallback_font_family,
+                &previous.current().appearance.fallback_font_family,
             ),
         ] {
             if name != old_name && !name.is_empty() && installed_font(name, cx).is_none() {
@@ -428,8 +450,26 @@ impl Workspace {
             }
         }
         self.config.save(draft)?;
+        config_watch::publish(&self.config, cx);
         self.apply_config(&previous, window, cx);
         Ok(())
+    }
+
+    fn commit_settings_draft(
+        &mut self,
+        draft: Config,
+        base: &Config,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> anyhow::Result<()> {
+        if &draft == base || &draft == self.config.current() {
+            return Ok(());
+        }
+        anyhow::ensure!(
+            base == self.config.current(),
+            t!("settings.config_conflict")
+        );
+        self.commit_settings(draft, window, cx)
     }
 
     pub(super) fn configured_editor_font(config: &Config, cx: &App) -> Option<SharedString> {
@@ -462,8 +502,42 @@ impl Workspace {
         cx.set_text_rendering_preference(appearance.text_rendering);
     }
 
-    fn apply_config(&mut self, previous: &Config, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn apply_config(
+        &mut self,
+        previous_file: &ConfigFile,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let config = self.config.current();
+        let previous = previous_file.current();
+        if previous.files != config.files {
+            let associations = &self.config.file_associations;
+            for (path, file) in &self.files {
+                let resources = self.source_resources(path);
+                let previous =
+                    associated_highlight(&previous_file.file_associations, resources, path)
+                        .map(|(_, syntax)| syntax);
+                let next =
+                    associated_highlight(associations, resources, path).map(|(_, syntax)| syntax);
+                if previous != next {
+                    file.editor.update(cx, |editor, cx| {
+                        editor.set_highlighter_factory(source_highlighter_factory(next), cx);
+                        editor.apply_highlighter_fold_candidates(Vec::new(), cx);
+                        editor.prepare_language(window, cx);
+                    });
+                }
+            }
+            if let Some(panel) = &self.git {
+                panel.update(cx, |panel, cx| {
+                    panel.refresh_file_associations(
+                        associations,
+                        self.repository.as_deref(),
+                        window,
+                        cx,
+                    );
+                });
+            }
+        }
         if previous.ai != config.ai {
             self.ai.configure(config.ai.clone());
             for file in self.files.values() {
@@ -579,7 +653,16 @@ impl SettingsPage {
             });
             cx.notify();
         });
-        let owner_changes = cx.observe(&owner, |_, _, cx| cx.notify());
+        let owner_changes = cx.observe_in(&owner, window, |page, owner, window, cx| {
+            let config = &owner.read(cx).config;
+            if page.conflicts_with(config, cx) {
+                page.save_task = Task::ready(());
+            } else if &page.base != config.current() {
+                page.use_current_config(config.current().clone(), false, window, cx);
+            }
+            cx.notify();
+        });
+        let base = draft.read(cx).clone();
         let ai = draft.read(cx).ai.clone();
         let key_placeholder = if ai.has_key_for(&ai.base_url) {
             SAVED_API_KEY_MASK
@@ -619,6 +702,7 @@ impl SettingsPage {
             owner: owner.downgrade(),
             owner_window,
             draft,
+            base,
             focus,
             title: t!("common.settings").into(),
             code_preview_open: false,
@@ -628,23 +712,130 @@ impl SettingsPage {
         }
     }
 
-    fn save_now(&mut self, cx: &mut Context<Self>) {
-        let draft = self.draft.read(cx).clone();
-        let result = self.owner_window.update(cx, |_, window, cx| {
-            self.owner
-                .update(cx, |owner, cx| owner.commit_settings(draft, window, cx))
-        });
-        self.error = result
-            .and_then(|result| result)
-            .and_then(|result| result)
-            .err()
-            .map(|error| t!("settings.save_failed", error = format!("{error:#}")).into_owned());
+    fn conflicts_with(&self, config: &ConfigFile, cx: &App) -> bool {
+        let current = config.current();
+        let draft = self.draft.read(cx);
+        let ai_editing = || {
+            self.ai_base.read(cx).value().as_str() != self.base.ai.base_url
+                || self.ai_model.read(cx).value().as_str() != self.base.ai.model
+                || self.ai_key.read(cx).text().len() != 0
+        };
+        if config.load_error.is_some() {
+            return draft != &self.base || ai_editing();
+        }
+        &self.base != current
+            && (draft != &self.base && draft != current
+                || self.base.ai != current.ai && ai_editing())
+    }
+
+    fn use_current_config(
+        &mut self,
+        current: Config,
+        discard_ai_draft: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let update_ai = self.base.ai != current.ai || discard_ai_draft;
+        self.base = current.clone();
+        self.error = None;
+        self.save_task = Task::ready(());
+        if self.draft.read(cx) != &current {
+            self.draft.update(cx, |draft, cx| {
+                *draft = current.clone();
+                cx.notify();
+            });
+        }
+        if update_ai {
+            self.ai_base.update(cx, |state, cx| {
+                state.set_value(current.ai.base_url, window, cx)
+            });
+            self.ai_model.update(cx, |state, cx| {
+                state.set_value(current.ai.model, window, cx)
+            });
+            self.ai_key
+                .update(cx, |state, cx| state.set_value("", window, cx));
+            self.refresh_ai_key_mask(window, cx);
+            self.clear_ai_models(cx);
+        }
         cx.notify();
     }
 
+    fn use_disk_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Ok(current) = self
+            .owner
+            .read_with(cx, |owner, _| owner.config.current().clone())
+        {
+            self.use_current_config(current, true, window, cx);
+        }
+    }
+
+    fn show_save_error(&mut self, error: anyhow::Error, cx: &mut Context<Self>) {
+        self.error = Some(t!("settings.save_failed", error = format!("{error:#}")).into_owned());
+        cx.notify();
+    }
+
+    fn save_now(&mut self, cx: &mut Context<Self>) -> bool {
+        if self
+            .owner
+            .read_with(cx, |owner, cx| self.conflicts_with(&owner.config, cx))
+            .unwrap_or(false)
+        {
+            self.show_save_error(anyhow::anyhow!(t!("settings.config_conflict")), cx);
+            return false;
+        }
+        let draft = self.draft.read(cx).clone();
+        let result = self.owner_window.update(cx, |_, window, cx| {
+            self.owner.update(cx, |owner, cx| {
+                owner.commit_settings_draft(draft, &self.base, window, cx)
+            })
+        });
+        match result.and_then(|result| result).and_then(|result| result) {
+            Ok(()) => {
+                self.error = None;
+                cx.notify();
+                true
+            }
+            Err(error) => {
+                self.show_save_error(error, cx);
+                false
+            }
+        }
+    }
+
+    fn edit_config(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.save_task = Task::ready(());
+        let saved = self.save_now(cx);
+        let result = (|| -> anyhow::Result<()> {
+            let (store, config, path) = self.owner.update(cx, |owner, cx| {
+                let path = owner.config.path_for_editing()?;
+                config_watch::publish(&owner.config, cx);
+                Ok::<_, anyhow::Error>((owner.store.clone(), owner.config.clone(), path))
+            })??;
+            Workspace::open_standalone_in_view(
+                store,
+                config,
+                path,
+                None,
+                Some(WorkspaceView::Editor),
+                cx,
+            )
+        })();
+        match result {
+            Ok(()) if saved => window.remove_window(),
+            Ok(()) => {}
+            Err(error) => {
+                self.error = Some(
+                    t!("settings.open_config_failed", error = format!("{error:#}")).into_owned(),
+                );
+                cx.notify();
+            }
+        }
+    }
+
     fn close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.save_now(cx);
-        window.remove_window();
+        if self.save_now(cx) {
+            window.remove_window();
+        }
     }
 }
 
@@ -657,10 +848,40 @@ impl Render for SettingsPage {
         }
         let owner = self.owner.upgrade();
         let workspace = owner.as_ref().map(|owner| owner.read(cx));
-        let error = self
-            .error
-            .clone()
-            .or_else(|| workspace.and_then(|owner| owner.config.load_error.clone()));
+        let conflict = workspace.is_some_and(|owner| self.conflicts_with(&owner.config, cx));
+        let mut errors = Vec::new();
+        if conflict {
+            errors.push(t!("settings.config_conflict").into_owned());
+        } else if let Some(error) = &self.error {
+            errors.push(error.clone());
+        }
+        if let Some(workspace) = workspace {
+            errors.extend(workspace.config.load_error.clone());
+            let associations = &workspace.config.file_associations;
+            errors.extend(associations.invalid_patterns().map(|pattern| {
+                t!(
+                    "settings.invalid_file_pattern",
+                    pattern = format!("{pattern:?}")
+                )
+                .into_owned()
+            }));
+            let resources = if let Some(repo) = &workspace.repository {
+                repo.language_resources()
+            } else {
+                crate::language_resources::LanguageResources::installed()
+            };
+            errors.extend(associations.rules().filter_map(|(pattern, language)| {
+                resources.syntax_for_id(language).is_none().then(|| {
+                    t!(
+                        "settings.unknown_file_language",
+                        pattern = format!("{pattern:?}"),
+                        language = format!("{language:?}")
+                    )
+                    .into_owned()
+                })
+            }));
+        }
+        let error = (!errors.is_empty()).then(|| errors.join("\n"));
         let restart =
             workspace.is_some_and(|owner| owner.startup_lsp != owner.config.current().lsp);
         let pages = self.pages(workspace, cx.weak_entity());
@@ -695,6 +916,21 @@ impl Render for SettingsPage {
                         .font_size(font_size)
                         .sidebar_width(px(152.))
                         .sidebar_size_range(px(120.)..px(220.))
+                        .sidebar_footer(
+                            div().w_full().child(
+                                action_button("edit-config")
+                                    .link()
+                                    .max_w_full()
+                                    .h(px(26.))
+                                    .debug_selector(|| "settings-edit-config".into())
+                                    .label_size(font_size)
+                                    .label(t!("settings.edit_config"))
+                                    .tooltip(t!("settings.edit_config_tooltip"))
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.edit_config(window, cx)
+                                    })),
+                            ),
+                        )
                         .when(error.is_none() && !restart, |settings| {
                             settings.sidebar_style(
                                 &StyleRefinement::default().rounded_bl(radii.bottom_left),
@@ -710,11 +946,22 @@ impl Render for SettingsPage {
                         .py_2()
                         .max_h(px(100.))
                         .id("settings-error")
+                        .debug_selector(|| "settings-error".into())
                         .overflow_y_scroll()
                         .text_size(DESCRIPTION_FONT_SIZE)
                         .line_height(DESCRIPTION_LINE_HEIGHT)
                         .text_color(cx.theme().danger)
-                        .child(error),
+                        .child(error)
+                        .when(conflict, |view| {
+                            view.child(
+                                action_button("use-disk-settings")
+                                    .link()
+                                    .label(t!("settings.discard_config_draft"))
+                                    .on_click(cx.listener(|page, _, window, cx| {
+                                        page.use_disk_settings(window, cx)
+                                    })),
+                            )
+                        }),
                 )
             })
             .when(restart, |view| {
@@ -1224,6 +1471,7 @@ impl SettingsPage {
         let key = self.ai_key.read(cx).text().to_string();
         let previous = self.draft.read(cx).ai.clone();
         let original = previous.clone();
+        let config_base = self.base.clone();
         let worker_scope = scope.clone();
         self.ai_saving = true;
         self.error = None;
@@ -1242,7 +1490,7 @@ impl SettingsPage {
                         draft.ai = ai;
                         page.owner_window.update(cx, |_, window, cx| {
                             page.owner.update(cx, |owner, cx| {
-                                owner.commit_settings(draft.clone(), window, cx)
+                                owner.commit_settings_draft(draft.clone(), &config_base, window, cx)
                             })
                         })???;
                         page.draft.update(cx, |draft_config, cx| {
@@ -1559,6 +1807,184 @@ mod tests {
     use super::*;
     use crate::{config::ConfigFile, repository::Store, workspace::WorkspaceView};
     use std::sync::Arc;
+
+    #[::core::prelude::v1::test]
+    fn reloads_config_in_open_windows_and_protects_a_conflicting_settings_draft()
+    -> anyhow::Result<()> {
+        let fixture = tempfile::tempdir()?;
+        let path = fixture.path().join("config.toml");
+        let config = ConfigFile::load(Some(path.clone()));
+        let store = Arc::new(Store::new(fixture.path().join("state"))?);
+        let mut app = TestAppContext::build_with_text_system(
+            TestDispatcher::new(0),
+            None,
+            crate::test_support::text_system(cfg!(target_os = "linux")),
+        );
+        app.update(gpui_component::init);
+        let (owner, visual) = app.add_window_view(|window, cx| {
+            Workspace::with_config(
+                store.clone(),
+                config.clone(),
+                WorkspaceView::Editor,
+                window,
+                cx,
+            )
+        });
+        let owner_window = visual.update(|window, _| window.window_handle());
+        let (second, _) = app.add_window_view(|window, cx| {
+            Workspace::with_config(store, config, WorkspaceView::Editor, window, cx)
+        });
+        let mut settings = None;
+        let (_, visual) = app.add_window_view(|window, cx| {
+            let draft = cx.new(|cx| owner.read(cx).config.current().clone());
+            let page =
+                cx.new(|cx| SettingsPage::new(owner.clone(), owner_window, draft, window, cx));
+            settings = Some(page.clone());
+            Root::new(page, window, cx)
+        });
+        let settings = settings.unwrap();
+        let wait = |visual: &mut VisualTestContext, message, ready: &dyn Fn(&App) -> bool| {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                visual.executor().advance_clock(Duration::from_millis(25));
+                visual.run_until_parked();
+                if visual.update(|_, cx| ready(cx)) {
+                    return;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "Waiting for {message}"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        };
+        let write = |contents: &str| crate::repository::atomic_write(&path, contents.as_bytes());
+        write("[editor]\nline_numbers = false\n")?;
+        wait(
+            visual,
+            "both workspaces and the clean settings form to update",
+            &|cx| {
+                [&owner, &second]
+                    .into_iter()
+                    .all(|workspace| !workspace.read(cx).config.current().editor.line_numbers)
+                    && !settings.read(cx).draft.read(cx).editor.line_numbers
+            },
+        );
+
+        write("[editor\n")?;
+        wait(visual, "the parsing error", &|cx| {
+            owner.read(cx).config.load_error.is_some()
+        });
+        visual.update(|_, cx| assert!(!owner.read(cx).config.current().editor.line_numbers));
+
+        visual.update(|_, cx| {
+            let draft = settings.read(cx).draft.clone();
+            draft.update(cx, |draft, cx| {
+                draft.editor.soft_wrap = false;
+                cx.notify();
+            });
+            assert!(settings.read(cx).conflicts_with(&owner.read(cx).config, cx));
+        });
+        let external = "[editor]\nline_numbers = true # External edit\n";
+        write(external)?;
+        wait(
+            visual,
+            "recovery from the parsing error and the draft conflict",
+            &|cx| {
+                let workspace = owner.read(cx);
+                workspace.config.load_error.is_none()
+                    && workspace.config.current().editor.line_numbers
+                    && settings.read(cx).conflicts_with(&workspace.config, cx)
+            },
+        );
+        visual.update(|window, cx| {
+            settings.update(cx, |page, cx| page.edit_config(window, cx));
+            assert!(!settings.read(cx).draft.read(cx).editor.soft_wrap);
+        });
+        assert_eq!(std::fs::read_to_string(&path)?, external);
+
+        visual.update(|window, cx| {
+            settings.update(cx, |page, cx| page.use_disk_settings(window, cx));
+            let page = settings.read(cx);
+            assert_eq!(page.draft.read(cx), owner.read(cx).config.current());
+            assert!(!page.conflicts_with(&owner.read(cx).config, cx));
+        });
+        Ok(())
+    }
+
+    #[::core::prelude::v1::test]
+    fn sidebar_footer_opens_the_active_config_and_closes_settings() -> anyhow::Result<()> {
+        for invalid in [false, true] {
+            let fixture = tempfile::tempdir()?;
+            let path = fixture.path().join("custom/config.toml");
+            let malformed = "[editor\n";
+            if invalid {
+                std::fs::create_dir_all(path.parent().unwrap())?;
+                std::fs::write(&path, malformed)?;
+            }
+            let config = ConfigFile::load(Some(path.clone()));
+            let store = Arc::new(Store::new(fixture.path().join("state"))?);
+            let mut app = TestAppContext::build_with_text_system(
+                TestDispatcher::new(0),
+                None,
+                crate::test_support::text_system(cfg!(target_os = "linux")),
+            );
+            app.update(gpui_component::init);
+            let (owner, visual) = app.add_window_view(|window, cx| {
+                Workspace::with_config(store, config, WorkspaceView::Editor, window, cx)
+            });
+            let owner_window = visual.update(|window, _| window.window_handle());
+            let (_, visual) = app.add_window_view(|window, cx| {
+                let draft = cx.new(|cx| owner.read(cx).config.current().clone());
+                let page = cx.new(|cx| SettingsPage::new(owner, owner_window, draft, window, cx));
+                Root::new(page, window, cx)
+            });
+            visual.simulate_resize(size(px(720.), px(520.)));
+            visual.update(|window, cx| window.draw(cx).clear(cx));
+            let footer = visual
+                .debug_bounds("settings-edit-config")
+                .expect("sidebar footer");
+            assert!(footer.left() < px(16.));
+            assert!(footer.right() <= px(152.));
+            let navigation_bottom = if invalid {
+                visual.debug_bounds("settings-error").unwrap().top()
+            } else {
+                visual.update(|window, _| window.viewport_size().height)
+            };
+            let bottom_gap = navigation_bottom - footer.bottom();
+            assert!(
+                (px(0.)..=px(20.)).contains(&bottom_gap),
+                "Invalid TOML: {invalid}, footer: {footer:?}, navigation bottom: {navigation_bottom:?}"
+            );
+
+            let settings_window = visual.update(|window, _| window.window_handle());
+            visual.simulate_click(footer.center(), Modifiers::default());
+            visual.run_until_parked();
+            let expected = if invalid { malformed } else { "version = 1\n" };
+            assert_eq!(std::fs::read_to_string(&path)?, expected);
+            let path = path.canonicalize()?;
+            app.update(|cx| {
+                assert!(!cx.windows().contains(&settings_window));
+                assert!(cx.windows().into_iter().any(|handle| {
+                    handle
+                        .update(cx, |root, _, cx| {
+                            root.downcast::<Root>()
+                                .ok()
+                                .and_then(|root| {
+                                    root.read(cx).view().clone().downcast::<Workspace>().ok()
+                                })
+                                .is_some_and(|workspace| {
+                                    let workspace = workspace.read(cx);
+                                    workspace.standalone.as_ref() == Some(&path)
+                                        && workspace.view == WorkspaceView::Editor
+                                })
+                        })
+                        .unwrap_or(false)
+                }));
+            });
+        }
+        Ok(())
+    }
 
     #[::core::prelude::v1::test]
     fn ai_provider_settings_mask_the_key_and_fetch_model_ids() -> anyhow::Result<()> {

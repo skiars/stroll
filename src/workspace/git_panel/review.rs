@@ -501,34 +501,32 @@ fn review_patch(
     ))
 }
 
-fn document_language(
-    repo: Option<&crate::repository::Repository>,
-    file: &git::ChangedFile,
-    side: DiffSide,
-) -> Option<SharedString> {
+fn snapshot_path(file: &git::ChangedFile, side: DiffSide) -> &Path {
     let path = if side == DiffSide::Original {
         file.old_path.as_deref().unwrap_or(&file.path)
     } else {
         &file.path
     };
-    repo?.language_resources().for_path(Path::new(path))
+    Path::new(path)
 }
 
 fn scope_diff_document(
     mut document: DiffFile,
-    repo: Option<&crate::repository::Repository>,
+    workspace: &WeakEntity<Workspace>,
+    cx: &App,
 ) -> DiffFile {
-    if let Some(repo) = repo {
-        let resources = repo.language_resources();
+    if let Some(workspace) = workspace.upgrade() {
+        let workspace = workspace.read(cx);
         for (side, path) in [
             (DiffSide::Original, document.original_path()),
             (DiffSide::Modified, document.modified_path()),
         ]
         .map(|(side, path)| (side, path.cloned()))
         {
-            if let Some(language) =
-                path.and_then(|path| resources.for_path(Path::new(path.as_ref())))
-            {
+            if let Some(language) = path.and_then(|path| {
+                let path = Path::new(path.as_ref());
+                workspace.source_resources(path).for_path(path)
+            }) {
                 document = document.with_side_language(side, language);
             }
         }
@@ -537,6 +535,61 @@ fn scope_diff_document(
 }
 
 impl GitPanel {
+    pub(in crate::workspace) fn refresh_file_associations(
+        &mut self,
+        associations: &crate::config::FileAssociations,
+        repo: Option<&crate::repository::Repository>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let refresh =
+            |editor: &Entity<EditorState>, path: &Path, window: &mut Window, cx: &mut App| {
+                let resources = crate::language_resources::LanguageResources::for_file(repo, path);
+                let language = super::super::associated_highlight(associations, resources, path)
+                    .map(|(_, syntax)| syntax)
+                    .or_else(|| resources.for_path(path))
+                    .unwrap_or_else(|| {
+                        super::super::language_for_source(path, editor.read(cx).text()).into()
+                    });
+                if editor.read(cx).language_name() != language {
+                    editor.update(cx, |editor, cx| {
+                        editor.set_highlighter(language, cx);
+                        editor.ensure_highlighter_factory(
+                            gpui_component::highlighter::input_highlighter_factory(),
+                        );
+                        editor.prepare_language(window, cx);
+                    });
+                }
+            };
+        // Projected diffs take their syntax from these snapshots and the live source editors.
+        // Refresh them without replacing the diff documents or their expanded context.
+        if let Some(review) = &self.review {
+            for (ix, sources) in &review.sources {
+                let file = &review.detail.files[*ix];
+                for ((_, side), snapshot) in sources {
+                    refresh(snapshot.editor(), snapshot_path(file, *side), window, cx);
+                }
+            }
+        }
+        if let Some(snapshot) = &self.snapshot
+            && let Some(editor) = &snapshot.editor
+        {
+            let side = if snapshot.side == Side::Old {
+                DiffSide::Original
+            } else {
+                DiffSide::Modified
+            };
+            refresh(
+                editor,
+                snapshot_path(&snapshot.detail.files[snapshot.file], side),
+                window,
+                cx,
+            );
+        }
+        App::notify(cx, self.review_pane.entity_id());
+        cx.notify();
+    }
+
     pub(super) fn refresh_placeholders(&mut self, cx: &mut Context<Self>) {
         let Some(review) = &mut self.review else {
             return;
@@ -1068,10 +1121,6 @@ impl GitPanel {
         let Some(review) = &mut self.review else {
             return;
         };
-        let repo = self
-            .workspace
-            .upgrade()
-            .and_then(|workspace| workspace.read(cx).document_repository());
         let matches_filter = |file: &git::ChangedFile| {
             !self.only_matching || super::tree::matches(file, &self.filter)
         };
@@ -1093,7 +1142,7 @@ impl GitPanel {
                 }
             })
             .map(|(_, document)| document.clone())
-            .map(|document| scope_diff_document(document, repo.as_deref()))
+            .map(|document| scope_diff_document(document, &self.workspace, cx))
             .collect::<Vec<_>>();
         let collapsed = review.collapsed.clone();
         self.diff.update(cx, |diff, cx| {
@@ -1625,10 +1674,6 @@ impl GitPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let repo = self
-            .workspace
-            .upgrade()
-            .and_then(|workspace| workspace.read(cx).document_repository());
         let Some(review) = &mut self.review else {
             return;
         };
@@ -1664,7 +1709,7 @@ impl GitPanel {
                 review.totals.1 = review.totals.1 - before.1 + after.1;
                 // Index-only changes keep the rendered projection, including expanded context.
                 if !same_content {
-                    let patch = scope_diff_document(patch.document, repo.as_deref());
+                    let patch = scope_diff_document(patch.document, &self.workspace, cx);
                     review.documents[ix] = patch.clone();
                     document = Some(patch);
                     review.sources.remove(&ix);
@@ -1812,10 +1857,7 @@ impl GitPanel {
             let sources = worker.await;
             _ = this.update_in(cx, |this, window, cx| {
                 this.assets_loading = false;
-                let repo = this
-                    .workspace
-                    .upgrade()
-                    .and_then(|workspace| workspace.read(cx).document_repository());
+                let workspace = this.workspace.upgrade();
                 let mut replacements = Vec::new();
                 if let Some(review) = this.review.as_mut().filter(|review| current(review)) {
                     review.pending_assets.remove(&ix);
@@ -1829,21 +1871,20 @@ impl GitPanel {
                             if language == "bash" && !editors.contains_key(&key) {
                                 *document = scope_diff_document(
                                     document.clone().with_side_language(key.1, language.into()),
-                                    repo.as_deref(),
+                                    &this.workspace,
+                                    cx,
                                 );
                                 replacements.push(document.clone());
                             }
-                            let selected =
-                                document_language(repo.as_deref(), &review.detail.files[ix], key.1);
+                            let selected = workspace.as_ref().and_then(|workspace| {
+                                workspace
+                                    .read(cx)
+                                    .path_highlight_override(snapshot_path(file, key.1))
+                            });
                             editors.entry(key).or_insert_with(|| {
-                                let editor =
-                                    super::editor::snapshot_editor(text, language, window, cx);
-                                if let Some(selected) = selected {
-                                    editor.update(cx, |editor, cx| {
-                                        editor.set_highlighter(selected, cx);
-                                        editor.prepare_language(window, cx);
-                                    });
-                                }
+                                let editor = super::editor::snapshot_editor(
+                                    text, language, selected, window, cx,
+                                );
                                 super::editor::SnapshotEditor::new(editor, worktree_path)
                             });
                         }
@@ -2412,11 +2453,14 @@ impl GitPanel {
                 match result {
                     Ok(git::Snapshot::Text { text, truncated }) if !text.is_empty() => {
                         let file = &snapshot.detail.files[ix];
-                        let path = if side == Side::Old {
-                            file.old_path.as_deref().unwrap_or(&file.path)
-                        } else {
-                            &file.path
-                        };
+                        let path = snapshot_path(
+                            file,
+                            if side == Side::Old {
+                                DiffSide::Original
+                            } else {
+                                DiffSide::Modified
+                            },
+                        );
                         let source = text
                             .strip_prefix('\u{feff}')
                             .unwrap_or(&text)
@@ -2428,10 +2472,15 @@ impl GitPanel {
                         let language = this
                             .workspace
                             .upgrade()
-                            .and_then(|workspace| workspace.read(cx).document_repository())
-                            .and_then(|repo| repo.language_resources().for_path(Path::new(path)))
+                            .map(|workspace| {
+                                let workspace = workspace.read(cx);
+                                workspace
+                                    .associated_highlight(path)
+                                    .map(|(_, syntax)| syntax)
+                                    .unwrap_or_else(|| workspace.source_language(path, &source))
+                            })
                             .unwrap_or_else(|| {
-                                super::super::language_for_source(Path::new(path), &source).into()
+                                super::super::language_for_source(path, &source).into()
                             });
                         let editor = cx.new(|cx| {
                             EditorState::new(window, cx)
@@ -3193,11 +3242,7 @@ impl GitPanel {
                         return;
                     }
                 };
-                let repo = this
-                    .workspace
-                    .upgrade()
-                    .and_then(|workspace| workspace.read(cx).document_repository());
-                doc = scope_diff_document(doc, repo.as_deref());
+                doc = scope_diff_document(doc, &this.workspace, cx);
                 this.editor.invalidate_live_source(edit_path.clone());
                 if let Some(base) = &live.base {
                     let sources = review.sources.entry(ix).or_default();
@@ -3214,8 +3259,16 @@ impl GitPanel {
                                 worktree_path.as_deref().unwrap_or(&edit_path),
                                 &source,
                             );
+                            let selected = this.workspace.upgrade().and_then(|workspace| {
+                                workspace.read(cx).path_highlight_override(snapshot_path(
+                                    &detail.files[ix],
+                                    DiffSide::Original,
+                                ))
+                            });
                             super::editor::SnapshotEditor::new(
-                                super::editor::snapshot_editor(source, language, window, cx),
+                                super::editor::snapshot_editor(
+                                    source, language, selected, window, cx,
+                                ),
                                 worktree_path,
                             )
                         });

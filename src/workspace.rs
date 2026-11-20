@@ -3,6 +3,7 @@ use rust_i18n::t;
 mod audio_preview;
 mod caret_hints;
 mod code_theme;
+mod config_watch;
 mod documents;
 mod edit_history;
 mod editor_git;
@@ -943,6 +944,7 @@ impl Workspace {
                 });
             })
             .detach();
+        let config = config_watch::subscribe(config, window, cx);
         let wrap = config.current().editor.soft_wrap;
         let editor_font = Self::configured_editor_font(config.current(), cx);
         let startup_lsp = config.current().lsp.clone();
@@ -2977,6 +2979,20 @@ impl Workspace {
             .unwrap_or_else(|| language_for_source(path, source).into())
     }
 
+    fn associated_highlight(&self, path: &Path) -> Option<(&str, SharedString)> {
+        associated_highlight(
+            &self.config.file_associations,
+            self.source_resources(path),
+            path,
+        )
+    }
+
+    fn path_highlight_override(&self, path: &Path) -> Option<SharedString> {
+        self.associated_highlight(path)
+            .map(|(_, syntax)| syntax)
+            .or_else(|| self.source_resources(path).for_path(path))
+    }
+
     fn install_file(
         &mut self,
         path: &Path,
@@ -2986,6 +3002,7 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         let language = self.source_language(path, &buffer.text);
+        let syntax = self.associated_highlight(path).map(|(_, syntax)| syntax);
         self.source_resources(path).configure_editor(path, cx);
         let wrap = self.wrap;
         let line_numbers = self.config.current().editor.line_numbers;
@@ -3033,9 +3050,7 @@ impl Workspace {
             if let Some(position) = restore_position {
                 session::restore_file_selection(editor, position, cx);
             }
-            editor.ensure_highlighter_factory(
-                gpui_component::highlighter::input_highlighter_factory(),
-            );
+            editor.ensure_highlighter_factory(source_highlighter_factory(syntax));
             editor.prepare_language(window, cx);
         });
         let caret_hints = editor.update(cx, |editor, cx| caret_hints::CaretHints::new(editor, cx));
@@ -4136,6 +4151,7 @@ impl Workspace {
             .tree_transfer_available()
             .then(|| self.repository.as_ref().unwrap().clone());
         let repository = self.repository.clone();
+        let associations = self.config.file_associations.clone();
         let status = self.tree_status.clone();
         let inline = self.tree_edit.as_ref().and_then(|edit| {
             let (index, depth, replace) = edit.row(&rows)?;
@@ -4236,8 +4252,14 @@ impl Workspace {
                 } else if entry.symlink {
                     icon(IconName::Link, icon_color, 15.).into_any_element()
                 } else {
-                    file_type_icon(repository.as_deref(), &entry.path, colors, 15.)
-                        .into_any_element()
+                    file_type_icon(
+                        repository.as_deref(),
+                        &associations,
+                        &entry.path,
+                        colors,
+                        15.,
+                    )
+                    .into_any_element()
                 };
                 let element = h_flex()
                     .id(SharedString::from(row_id.clone()))
@@ -4646,8 +4668,9 @@ impl Workspace {
         let position = format!("Ln {}:{}", caret.line + 1, caret.character + 1);
         let line_ending = file.document.line_ending_label();
         let language = self
-            .source_resources(path)
-            .display_name_for_path(path)
+            .associated_highlight(path)
+            .map(|(id, _)| SharedString::from(id.to_owned()))
+            .or_else(|| self.source_resources(path).display_name_for_path(path))
             .unwrap_or_else(|| language_for(path).into());
         let progress = self.language_service_progress(file, status_size, colors, cx);
         // Every text/button in this row goes through `baseline_aligned`,
@@ -5356,6 +5379,27 @@ fn file_name(path: &Path) -> &str {
     path.file_name()
         .and_then(|name| name.to_str())
         .unwrap_or_default()
+}
+
+fn associated_highlight<'a>(
+    associations: &'a crate::config::FileAssociations,
+    resources: &crate::language_resources::LanguageResources,
+    path: &Path,
+) -> Option<(&'a str, SharedString)> {
+    let id = associations.language_for(path)?;
+    Some((id, resources.syntax_for_id(id)?))
+}
+
+fn source_highlighter_factory(
+    syntax: Option<SharedString>,
+) -> gpui_base::input::InputHighlighterFactory {
+    let factory = gpui_component::highlighter::input_highlighter_factory();
+    if let Some(syntax) = syntax {
+        // Use the associated syntax while keeping the editor's editing rules.
+        Rc::new(move |_| factory(&syntax))
+    } else {
+        factory
+    }
 }
 
 fn language_for_source(path: &Path, source: &Rope) -> &'static str {
