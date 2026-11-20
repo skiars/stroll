@@ -2671,6 +2671,208 @@ fn commit_markers_share_the_editor_gutter_and_keep_local_priority() -> Result<()
 }
 
 #[::core::prelude::v1::test]
+fn foreign_commit_menu_cherry_picks_single_or_multiple_commits_and_offers_undo() -> Result<()> {
+    let fixture = tempfile::tempdir()?;
+    let root = fixture.path().join("repo");
+    fs::create_dir(&root)?;
+    git(&root, &["init", "-q", "-b", "main"]);
+    git(&root, &["config", "user.name", "Reviewer"]);
+    git(&root, &["config", "user.email", "reviewer@example.invalid"]);
+    git(&root, &["config", "commit.gpgsign", "false"]);
+    fs::write(root.join("base"), "base\n")?;
+    git(&root, &["add", "base"]);
+    git(&root, &["commit", "-qm", "Base"]);
+    git(&root, &["switch", "-qc", "source"]);
+    fs::write(root.join("picked"), "picked\n")?;
+    git(&root, &["add", "picked"]);
+    git(&root, &["commit", "-qm", "Pick this change"]);
+    fs::write(root.join("picked"), "picked again\n")?;
+    fs::write(root.join("base"), "source version\n")?;
+    git(&root, &["add", "picked", "base"]);
+    git(&root, &["commit", "-qm", "Pick this next"]);
+    let source = git::head(&root)?.unwrap();
+    git(&root, &["switch", "-q", "main"]);
+    fs::write(root.join("current"), "current\n")?;
+    git(&root, &["add", "current"]);
+    git(&root, &["commit", "-qm", "Current branch change"]);
+    let before = git::head(&root)?.unwrap();
+
+    let store = Arc::new(Store::new(fixture.path().join("state"))?);
+    let config = crate::config::ConfigFile::load(Some(fixture.path().join("config.toml")));
+    let platform = gpui_platform::current_platform(true);
+    let mut cx = TestAppContext::build_with_text_system(
+        TestDispatcher::new(0),
+        None,
+        platform.text_system(),
+    );
+    cx.update(gpui_component::init);
+    let mut workspace = None;
+    let (_, visual) = cx.add_window_view(|window, cx| {
+        let view =
+            cx.new(|cx| Workspace::with_config(store, config, WorkspaceView::Git, window, cx));
+        workspace = Some(view.clone());
+        Root::new(view, window, cx)
+    });
+    let workspace = workspace.unwrap();
+    visual.simulate_resize(size(px(1280.), px(760.)));
+    visual.update(|window, cx| {
+        cx.set_reduce_motion(true);
+        workspace.update(cx, |workspace, cx| {
+            workspace.open_repository(
+                Location {
+                    root: root.clone(),
+                    file: None,
+                },
+                window,
+                cx,
+            );
+        });
+    });
+    let draw = |visual: &mut VisualTestContext| {
+        for _ in 0..4 {
+            visual.run_until_parked();
+            visual.update(|window, cx| {
+                window.draw(cx).clear(cx);
+                window.simulate_next_frame(cx);
+            });
+        }
+    };
+    draw(visual);
+    let panel = visual.update(|window, cx| {
+        let panel = workspace.read(cx).git.clone().unwrap();
+        panel.update(cx, |panel, cx| {
+            panel.select_branch("refs/heads/source".into(), window, cx);
+        });
+        panel
+    });
+    draw(visual);
+    let row = |visual: &mut VisualTestContext, index| {
+        visual.update(|_, cx| {
+            panel
+                .read(cx)
+                .history_scroll
+                .bounds_for_item(index)
+                .unwrap()
+                .center()
+        })
+    };
+    let open_menu = |visual: &mut VisualTestContext, index| {
+        let cell = row(visual, index);
+        visual.simulate_mouse_down(cell, MouseButton::Right, Modifiers::default());
+        visual.simulate_mouse_up(cell, MouseButton::Right, Modifiers::default());
+        draw(visual);
+        visual
+            .debug_bounds("popup-menu-surface")
+            .unwrap()
+            .size
+            .height
+    };
+    let shared_menu = open_menu(visual, 3);
+    visual.simulate_keystrokes("escape");
+    draw(visual);
+    assert!(open_menu(visual, 2) > shared_menu);
+    assert!(visual.debug_bounds("git-history-rewrite-undo").is_none());
+
+    // The cherry-pick item is immediately above Mark Commit.
+    visual.simulate_keystrokes("up up enter");
+    draw(visual);
+    let picked = git::commit(&root, &git::head(&root)?.unwrap())?;
+    assert_eq!(picked.subject, "Pick this change");
+    assert_eq!(picked.parents, [before.clone()]);
+    assert_eq!(fs::read_to_string(root.join("picked"))?, "picked\n");
+    let undo = visual
+        .debug_bounds("git-history-rewrite-undo")
+        .unwrap()
+        .center();
+    visual.simulate_click(undo, Modifiers::default());
+    draw(visual);
+    assert_eq!(git::head(&root)?.as_deref(), Some(before.as_str()));
+    assert!(!root.join("picked").exists());
+
+    let newest = row(visual, 1);
+    visual.simulate_click(newest, Modifiers::default());
+    visual.simulate_keystrokes("shift-down");
+    draw(visual);
+    assert!(visual.debug_bounds("git-history-selected-count").is_some());
+    assert!(open_menu(visual, 1) > shared_menu);
+    visual.simulate_keystrokes("up up enter");
+    draw(visual);
+    let picked = git::commit(&root, &git::head(&root)?.unwrap())?;
+    assert_eq!(picked.subject, "Pick this next");
+    let first = git::commit(&root, &picked.parents[0])?;
+    assert_eq!(first.subject, "Pick this change");
+    assert_eq!(first.parents, [before.clone()]);
+    assert_eq!(fs::read_to_string(root.join("picked"))?, "picked again\n");
+    let undo = visual
+        .debug_bounds("git-history-rewrite-undo")
+        .unwrap()
+        .center();
+    visual.simulate_click(undo, Modifiers::default());
+    draw(visual);
+    assert_eq!(git::head(&root)?.as_deref(), Some(before.as_str()));
+    assert!(!root.join("picked").exists());
+
+    visual.executor().advance_clock(Duration::from_millis(500));
+    draw(visual);
+    assert!(visual.debug_bounds("git-history-rewrite-undo").is_none());
+
+    fs::write(root.join("base"), "local draft\n")?;
+    let newest = row(visual, 1);
+    visual.simulate_click(newest, Modifiers::default());
+    visual.simulate_keystrokes("shift-down");
+    draw(visual);
+    assert!(open_menu(visual, 1) > shared_menu);
+    visual.simulate_keystrokes("up up enter");
+    draw(visual);
+    let partial = git::head(&root)?.unwrap();
+    let first = git::commit(&root, &partial)?;
+    assert_eq!(first.subject, "Pick this change");
+    assert_eq!(first.parents, [before.clone()]);
+    assert!(!root.join(".git/CHERRY_PICK_HEAD").exists());
+    assert!(!root.join(".git/stroll/history-backup").exists());
+    assert!(visual.debug_bounds("git-history-rewrite-undo").is_none());
+    assert!(visual.debug_bounds("git-history-saved-changes").is_none());
+    visual.update(|_, cx| {
+        let panel = panel.read(cx);
+        assert!(panel.history_progress.as_ref().unwrap().stopped_before_pick);
+        let error = panel.stage_error.as_deref().unwrap();
+        assert!(error.contains("would be overwritten") && error.contains("base"));
+    });
+    let continue_button = visual
+        .debug_bounds("git-history-continue")
+        .unwrap()
+        .center();
+    visual.simulate_click(continue_button, Modifiers::default());
+    draw(visual);
+    assert_eq!(git::head(&root)?.as_deref(), Some(partial.as_str()));
+
+    let abort = visual.debug_bounds("git-history-abort").unwrap().center();
+    visual.simulate_click(abort, Modifiers::default());
+    draw(visual);
+    let confirm = visual
+        .debug_bounds("git-history-edit-apply")
+        .unwrap()
+        .center();
+    visual.simulate_click(confirm, Modifiers::default());
+    draw(visual);
+    assert_eq!(git::head(&root)?.as_deref(), Some(before.as_str()));
+    assert_eq!(fs::read_to_string(root.join("base"))?, "local draft\n");
+    assert!(!root.join("picked").exists());
+    assert!(!root.join(".git/sequencer").exists());
+    assert!(visual.debug_bounds("git-history-edit-progress").is_none());
+
+    let history = git::history(&root)?;
+    assert_eq!(history.checkout.as_deref(), Some("refs/heads/main"));
+    assert!(
+        history
+            .branches
+            .iter()
+            .any(|branch| branch.reference == "refs/heads/source" && branch.oid == source)
+    );
+    Ok(())
+}
+
+#[::core::prelude::v1::test]
 fn commit_list_squashes_rewords_and_resets_with_local_changes() -> Result<()> {
     let fixture = tempfile::tempdir()?;
     let root = fixture.path().join("repo");

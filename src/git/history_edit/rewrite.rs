@@ -14,6 +14,7 @@ pub(crate) enum RewriteKind {
     Squash,
     Rebase,
     Amend,
+    CherryPick,
 }
 
 impl RewriteKind {
@@ -22,6 +23,7 @@ impl RewriteKind {
             Self::Squash => "squash",
             Self::Rebase => "rebase",
             Self::Amend => "amend",
+            Self::CherryPick => "cherry-pick",
         }
     }
 }
@@ -29,7 +31,7 @@ impl RewriteKind {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct RewriteRecord {
     pub kind: RewriteKind,
-    before: String,
+    pub(super) before: String,
     after: HistoryTip,
 }
 
@@ -85,9 +87,14 @@ pub(super) fn record_for(root: &Path, branch: &str, after: &str) -> Option<Rewri
         .ok()?
         .trim_end()
         .split_once('\0')?;
-    let kind = [RewriteKind::Squash, RewriteKind::Rebase, RewriteKind::Amend]
-        .into_iter()
-        .find(|kind| message == format!("stroll: {} {branch}", kind.key()))?;
+    let kind = [
+        RewriteKind::Squash,
+        RewriteKind::Rebase,
+        RewriteKind::Amend,
+        RewriteKind::CherryPick,
+    ]
+    .into_iter()
+    .find(|kind| message == format!("stroll: {} {branch}", kind.key()))?;
     object_id(before).then(|| RewriteRecord {
         kind,
         before: before.to_owned(),
@@ -99,7 +106,7 @@ pub(super) fn record_for(root: &Path, branch: &str, after: &str) -> Option<Rewri
 }
 
 pub(super) fn undo(root: &Path, record: RewriteRecord, confirmed: bool) -> Result<()> {
-    ready(root, &record.after)?;
+    let state = ready(root, &record.after)?;
     ensure!(
         record_for(root, &record.after.branch, &record.after.oid).as_ref() == Some(&record),
         t!("git.history_edit_stale")
@@ -129,6 +136,11 @@ pub(super) fn undo(root: &Path, record: RewriteRecord, confirmed: bool) -> Resul
     if touched.is_empty() || record.kind == RewriteKind::Amend {
         // Amend's patch becomes staged again with the retained index.
         apply_reset(root, &record.after, &record.before, ResetMode::Soft)?;
+    } else if record.kind == RewriteKind::CherryPick {
+        // A keep reset preserves unrelated worktree edits but can unstage changes.
+        ensure!(!state.ready, t!("git.history_edit_cherry_pick_undo_staged"));
+        super::backup::check_ignored_paths(root, &touched)?;
+        apply_reset(root, &record.after, &record.before, ResetMode::Keep)?;
     } else {
         let owner = Owner {
             tip: record.after.clone(),

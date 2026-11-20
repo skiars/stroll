@@ -330,6 +330,31 @@ fn tracked_trees(root: &Path, snapshot: Option<&str>, head: &str) -> Result<(Str
     }
 }
 
+pub(super) fn check_ignored_paths(root: &Path, touched: &[u8]) -> Result<BTreeSet<PathBuf>> {
+    let ignored = read(
+        root,
+        [
+            "ls-files",
+            "--others",
+            "--ignored",
+            "--exclude-standard",
+            "--directory",
+            "-z",
+        ],
+    )?;
+    let ignored = git_paths(&ignored).collect::<Result<BTreeSet<_>>>()?;
+    for path in git_paths(touched) {
+        let path = path?;
+        if let Some(obstruction) = ignored.iter().find(|ignored| intersects(ignored, &path)) {
+            anyhow::bail!(t!(
+                "git.history_edit_ignored_overlap",
+                path = obstruction.display()
+            ));
+        }
+    }
+    Ok(ignored)
+}
+
 pub(super) fn save(root: &Path, owner: &Owner, touched: &[u8]) -> Result<()> {
     let initial = status(root, "--untracked-files=all")?;
     if initial.is_empty() {
@@ -349,29 +374,8 @@ pub(super) fn save(root: &Path, owner: &Owner, touched: &[u8]) -> Result<()> {
     {
         return Ok(());
     }
-    // Removing an untracked .gitignore or restoring its committed version can
-    // expose ignored build output. Keep it in place when replay cannot touch it.
-    let ignored = read(
-        root,
-        [
-            "ls-files",
-            "--others",
-            "--ignored",
-            "--exclude-standard",
-            "--directory",
-            "-z",
-        ],
-    )?;
-    let ignored = git_paths(&ignored).collect::<Result<BTreeSet<_>>>()?;
-    for path in git_paths(touched) {
-        let path = path?;
-        if let Some(obstruction) = ignored.iter().find(|ignored| intersects(ignored, &path)) {
-            anyhow::bail!(t!(
-                "git.history_backup_unsupported",
-                path = obstruction.display()
-            ));
-        }
-    }
+    // Restoring a committed .gitignore can expose ignored build output.
+    let ignored = check_ignored_paths(root, touched)?;
     let (worktree, index) = tracked_trees(root, tracked.as_deref(), &owner.tip.oid)?;
     let oid = if let Some(tree) = &untracked {
         let index = commit_tree(root, &index, &[&owner.tip.oid], "Stroll saved index")?;

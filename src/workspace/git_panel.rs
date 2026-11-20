@@ -30,7 +30,7 @@ use gpui_component::{
     },
     h_flex,
     input::{EditorState, Input, InputEvent, InputState, TextareaState},
-    menu::{ContextMenuExt as _, PopupMenuItem},
+    menu::{ContextMenuExt as _, PopupMenu, PopupMenuItem},
     resizable::HandleEdge,
     scroll::{Scrollbar, ScrollbarMode},
     select::{SearchableVec, Select, SelectEvent, SelectItem, SelectState},
@@ -1471,33 +1471,73 @@ impl GitPanel {
                 ))
                 .map(|row| {
                     let comparison_target = comparison_target.clone();
-                    row.context_menu(move |mut menu, _, cx| {
-                        if let Some(target) = comparison_target.clone() {
-                            let view = menu_view.clone();
-                            let base = base.clone();
-                            menu = menu.item(
-                                PopupMenuItem::new(t!("git.compare_with", target = target))
-                                    .icon(IconName::GitCompareArrows)
-                                    .on_click(move |_, window, cx| {
-                                        _ = view.update(cx, |this, cx| {
-                                            this.compare_with_base(&base, window, cx)
-                                        });
-                                    }),
-                            );
-                        }
-                        if let Ok(items) = menu_view.read_with(cx, |panel, cx| {
-                            panel.history_commands(&base, &subject, merge, &menu_view, cx)
-                        }) && !items.is_empty()
-                        {
-                            menu = menu.separator();
-                            for item in items {
-                                menu = menu.item(item);
+                    row.context_menu(move |menu, window, cx| {
+                        let backend = menu_view
+                            .read_with(cx, |panel, _| {
+                                let selection = panel.cherry_pick_selection(&base)?;
+                                Some((panel.backend.clone(), selection))
+                            })
+                            .ok()
+                            .flatten();
+                        let menu_view = menu_view.clone();
+                        let comparison_target = comparison_target.clone();
+                        let base = base.clone();
+                        let subject = subject.clone();
+                        let build = move |mut menu: PopupMenu,
+                                          cherry_pick: Option<&(git::HistoryTip, Vec<String>)>,
+                                          cx: &App| {
+                            if let Some(target) = comparison_target.clone() {
+                                let view = menu_view.clone();
+                                let base = base.clone();
+                                menu = menu.item(
+                                    PopupMenuItem::new(t!("git.compare_with", target = target))
+                                        .icon(IconName::GitCompareArrows)
+                                        .on_click(move |_, window, cx| {
+                                            _ = view.update(cx, |this, cx| {
+                                                this.compare_with_base(&base, window, cx)
+                                            });
+                                        }),
+                                );
                             }
-                        }
-                        if let Ok(item) =
-                            menu_view.read_with(cx, |panel, _| panel.mark_commits_item(&base))
-                        {
-                            menu = menu.separator().item(item);
+                            if let Ok(items) = menu_view.read_with(cx, |panel, cx| {
+                                let mut items =
+                                    panel.history_commands(&base, &subject, merge, &menu_view, cx);
+                                if let Some(selection) = cherry_pick {
+                                    items.extend(
+                                        panel.cherry_pick_item(&base, selection, &menu_view, cx),
+                                    );
+                                }
+                                items
+                            }) && !items.is_empty()
+                            {
+                                menu = menu.separator();
+                                for item in items {
+                                    menu = menu.item(item);
+                                }
+                            }
+                            if let Ok(item) =
+                                menu_view.read_with(cx, |panel, _| panel.mark_commits_item(&base))
+                            {
+                                menu = menu.separator().item(item);
+                            }
+                            menu
+                        };
+                        let menu = build(menu, None, cx);
+                        if let Some((backend, expected)) = backend {
+                            let (tip, targets) = expected.clone();
+                            let task = cx.background_spawn(async move {
+                                backend.can_cherry_pick(&tip, &targets).unwrap_or(false)
+                            });
+                            cx.spawn_in(window, async move |menu, cx| {
+                                if task.await {
+                                    _ = menu.update_in(cx, |menu, window, cx| {
+                                        menu.rebuild(window, cx, |menu, _, cx| {
+                                            build(menu, Some(&expected), cx)
+                                        });
+                                    });
+                                }
+                            })
+                            .detach();
                         }
                         menu
                     })

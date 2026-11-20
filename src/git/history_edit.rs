@@ -4,6 +4,7 @@ mod rewrite;
 use std::{
     collections::{HashMap, HashSet},
     fs,
+    io::{Seek as _, Write as _},
     path::{Path, PathBuf},
 };
 
@@ -75,6 +76,7 @@ pub(crate) enum HistoryEdit {
     Undo(HistoryTip),
     Reset(ResetPlan, ResetMode),
     Revert(HistoryTip, String),
+    CherryPick(HistoryTip, Vec<String>),
     Resume(HistoryProgress, HistoryResolution),
 }
 
@@ -93,7 +95,7 @@ impl HistoryEdit {
     fn recording_tip(&self) -> Option<&HistoryTip> {
         match self {
             Self::Rebase(plan) if plan.rewrite.is_some() => Some(&plan.tip),
-            Self::Amend(tip, ..) => Some(tip),
+            Self::Amend(tip, ..) | Self::CherryPick(tip, _) => Some(tip),
             Self::Resume(
                 progress,
                 HistoryResolution::Continue | HistoryResolution::RestoreSaved,
@@ -123,7 +125,15 @@ pub(crate) struct ResetPlan {
 enum Operation {
     Rebase,
     Revert(String),
+    CherryPick(String),
+    CherryPickSequence(Vec<String>),
     UndoRewrite,
+}
+
+impl Operation {
+    fn is_cherry_pick(&self) -> bool {
+        matches!(self, Self::CherryPick(_) | Self::CherryPickSequence(_))
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -139,12 +149,23 @@ pub(crate) struct HistoryProgress {
     owner: Owner,
     pub commit: Option<String>,
     pub conflicts: Vec<String>,
+    pub stopped_before_pick: bool,
     pub saved: Option<SavedChanges>,
 }
 
 impl HistoryProgress {
-    pub fn is_rebase(&self) -> bool {
-        self.owner.operation == Operation::Rebase
+    pub fn is_cherry_pick(&self) -> bool {
+        self.owner.operation.is_cherry_pick()
+    }
+
+    pub fn paused_label(&self) -> std::borrow::Cow<'static, str> {
+        match self.owner.operation {
+            Operation::Rebase => t!("git.history_edit_rebase_paused"),
+            Operation::CherryPick(_) | Operation::CherryPickSequence(_) => {
+                t!("git.history_edit_cherry_pick_paused")
+            }
+            Operation::Revert(_) | Operation::UndoRewrite => t!("git.history_edit_revert_paused"),
+        }
     }
 }
 
@@ -152,6 +173,7 @@ impl HistoryProgress {
 pub(crate) struct SavedChanges {
     pub reference: String,
     pub can_restore: bool,
+    pub completed_cherry_picks: Option<usize>,
 }
 
 #[derive(Clone)]
@@ -166,6 +188,12 @@ pub(crate) enum HistoryResolution {
 impl Backend {
     pub(crate) fn supports_history_edit(&self) -> bool {
         self.ssh.is_none()
+    }
+
+    pub(crate) fn can_cherry_pick(&self, tip: &HistoryTip, targets: &[String]) -> Result<bool> {
+        ensure!(self.supports_history_edit(), t!("git.history_edit_local"));
+        check_tip(&self.root, tip)?;
+        Ok(cherry_pick_order(&self.root, tip, targets)?.is_some())
     }
 
     pub(crate) fn history_plan(&self, tip: HistoryTip, targets: &[String]) -> Result<HistoryPlan> {
@@ -260,14 +288,75 @@ fn check_tip(root: &Path, tip: &HistoryTip) -> Result<()> {
     Ok(())
 }
 
-fn ready(root: &Path, tip: &HistoryTip) -> Result<()> {
+fn is_outside_history(root: &Path, tip: &HistoryTip, oid: &str) -> Result<bool> {
+    ensure!(object_id(oid), t!("git.invalid_commit_id"));
+    let output = command(root, ["merge-base", "--is-ancestor", oid, &tip.oid]).output()?;
+    match output.status.code() {
+        Some(0) => Ok(false),
+        Some(1) => Ok(true),
+        _ => anyhow::bail!("{}", text(&output.stderr).trim_end()),
+    }
+}
+
+fn cherry_pick_order(
+    root: &Path,
+    tip: &HistoryTip,
+    targets: &[String],
+) -> Result<Option<Vec<String>>> {
+    let selected = targets.iter().map(String::as_str).collect::<HashSet<_>>();
+    ensure!(
+        !selected.is_empty()
+            && selected.len() == targets.len()
+            && selected.iter().all(|oid| object_id(oid)),
+        t!("git.invalid_commit_id")
+    );
+    if let [oid] = targets {
+        let eligible =
+            is_outside_history(root, tip, oid)? && super::commit(root, oid)?.parents.len() <= 1;
+        return Ok(eligible.then(|| targets.to_vec()));
+    }
+
+    let excluded = format!("^{}", tip.oid);
+    let mut git = command(
+        root,
+        [
+            "rev-list",
+            "--topo-order",
+            "--reverse",
+            "--no-commit-header",
+            "--format=%H%x20%P",
+            "--stdin",
+        ],
+    );
+    git.stdin(commit_input(
+        targets
+            .iter()
+            .map(String::as_str)
+            .chain([excluded.as_str()]),
+    )?);
+    let output = capture_repository(git)?;
+    let mut ordered = Vec::with_capacity(selected.len());
+    for line in std::str::from_utf8(&output)?.lines() {
+        let mut fields = line.split_ascii_whitespace();
+        if let Some(oid) = fields.next().filter(|oid| selected.contains(oid)) {
+            if fields.take(2).count() > 1 {
+                return Ok(None);
+            }
+            ordered.push(oid.to_owned());
+        }
+    }
+    Ok((ordered.len() == selected.len()).then_some(ordered))
+}
+
+fn ready(root: &Path, tip: &HistoryTip) -> Result<super::CommitState> {
     check_tip(root, tip)?;
-    ensure!(!commit_state(root)?.blocked, t!("git.history_edit_blocked"));
+    let state = commit_state(root)?;
+    ensure!(!state.blocked, t!("git.history_edit_blocked"));
     ensure!(
         backup::load(root)?.is_none(),
         t!("git.history_backup_pending")
     );
-    Ok(())
+    Ok(state)
 }
 
 fn prepare_reset(root: &Path, tip: HistoryTip, target: &str) -> Result<ResetPlan> {
@@ -480,9 +569,38 @@ fn active_commit(root: &Path, owner: &Owner) -> Option<Option<String>> {
             )
         }
         Operation::UndoRewrite => None,
-        Operation::Revert(oid) => (matches_file("REVERT_HEAD", oid)
-            && check_tip(root, &owner.tip).is_ok())
-        .then(|| Some(oid.clone())),
+        Operation::Revert(oid) | Operation::CherryPick(oid) => {
+            let marker = if owner.operation.is_cherry_pick() {
+                "CHERRY_PICK_HEAD"
+            } else {
+                "REVERT_HEAD"
+            };
+            (matches_file(marker, oid) && check_tip(root, &owner.tip).is_ok())
+                .then(|| Some(oid.clone()))
+        }
+        Operation::CherryPickSequence(commits) => {
+            if !matches_file("sequencer/head", &owner.tip.oid)
+                || !fs::read_to_string(git.join("HEAD")).is_ok_and(|head| {
+                    head.trim_end().strip_prefix("ref: ") == Some(&owner.tip.branch)
+                })
+            {
+                return None;
+            }
+            let todo = fs::read_to_string(git.join("sequencer/todo")).ok()?;
+            let remaining = commits.get(commits.len().checked_sub(todo.lines().count())?..)?;
+            let current = remaining.first()?;
+            // Git stores short IDs in the todo file. Verify the remaining suffix of this sequence.
+            if !todo.lines().zip(remaining).all(|(line, oid)| {
+                line.strip_prefix("pick ")
+                    .and_then(|entry| entry.split_ascii_whitespace().next())
+                    .is_some_and(|short| oid.starts_with(short))
+            }) || git.join("CHERRY_PICK_HEAD").exists()
+                && !matches_file("CHERRY_PICK_HEAD", current)
+            {
+                return None;
+            }
+            Some(Some(current.clone()))
+        }
     }
 }
 
@@ -495,13 +613,36 @@ fn progress(root: &Path) -> Option<HistoryProgress> {
     let active = active_commit(root, &owner);
     let saved = if active.is_none() {
         let backup = backup?;
+        let count = match &owner.operation {
+            Operation::CherryPick(_) => Some(1),
+            Operation::CherryPickSequence(commits) => Some(commits.len()),
+            _ => None,
+        };
+        let completed_cherry_picks = count.filter(|_| {
+            head(root)
+                .ok()
+                .flatten()
+                .and_then(|oid| rewrite::record_for(root, &owner.tip.branch, &oid))
+                .is_some_and(|record| {
+                    record.kind == RewriteKind::CherryPick && record.before == owner.tip.oid
+                })
+        });
         Some(SavedChanges {
             reference: backup.reference,
             can_restore: backup.phase == BackupPhase::Ready,
+            completed_cherry_picks,
         })
     } else {
         None
     };
+    // Git can leave a todo entry without applying it. Continuing in this state skips that entry.
+    let stopped_before_pick = active.is_some()
+        && matches!(owner.operation, Operation::CherryPickSequence(_))
+        && !git_dir(root).join("CHERRY_PICK_HEAD").exists()
+        && head(root).ok().flatten().is_none_or(|head| {
+            fs::read_to_string(git_dir(root).join("sequencer/abort-safety"))
+                .map_or(true, |last| last.trim_end() == head)
+        });
     let conflicts = super::worktree_status(root)
         .ok()?
         .into_iter()
@@ -511,17 +652,21 @@ fn progress(root: &Path) -> Option<HistoryProgress> {
         owner,
         commit: active.flatten(),
         conflicts,
+        stopped_before_pick,
         saved,
     })
 }
 
-fn rewrite_paths<'a>(root: &Path, commits: impl Iterator<Item = &'a str>) -> Result<Vec<u8>> {
-    use std::io::{Seek as _, Write as _};
+fn commit_input<'a>(commits: impl Iterator<Item = &'a str>) -> Result<fs::File> {
     let mut input = tempfile::tempfile()?;
     for commit in commits {
         writeln!(input, "{commit}")?;
     }
     input.rewind()?;
+    Ok(input)
+}
+
+fn rewrite_paths<'a>(root: &Path, commits: impl Iterator<Item = &'a str>) -> Result<Vec<u8>> {
     let mut git = command(
         root,
         [
@@ -535,7 +680,7 @@ fn rewrite_paths<'a>(root: &Path, commits: impl Iterator<Item = &'a str>) -> Res
             "-z",
         ],
     );
-    git.stdin(input);
+    git.stdin(commit_input(commits)?);
     capture_repository(git)
 }
 
@@ -819,6 +964,32 @@ fn execute_history_edit(root: &Path, edit: HistoryEdit, confirmed: bool) -> Resu
                 capture_repository(command(root, ["revert", "--no-edit", &oid])).map(|_| ())
             })
         }
+        HistoryEdit::CherryPick(tip, targets) => {
+            // A batch rejected for a dirty index leaves a sequencer behind, and abort can
+            // discard the staged changes. Refuse it before asking Git to start.
+            ensure!(
+                !ready(root, &tip)?.ready,
+                t!("git.history_edit_cherry_pick_staged")
+            );
+            let ordered = cherry_pick_order(root, &tip, &targets)?
+                .context(t!("git.history_edit_cherry_pick_ineligible"))?;
+            let owner = Owner {
+                tip,
+                operation: match ordered.as_slice() {
+                    [oid] => Operation::CherryPick(oid.clone()),
+                    _ => Operation::CherryPickSequence(ordered.clone()),
+                },
+                rewrite: Some(RewriteKind::CherryPick),
+            };
+            let touched = rewrite_paths(root, ordered.iter().map(String::as_str))?;
+            // Git can overwrite ignored files even when status reports a clean worktree.
+            backup::check_ignored_paths(root, &touched)?;
+            check_tip(root, &owner.tip)?;
+            let mut git = command(root, ["cherry-pick", "--stdin"]);
+            git.stdin(commit_input(ordered.iter().map(String::as_str))?);
+            store(root, &owner)?;
+            settle(root, &owner, capture_repository(git).map(|_| ()))
+        }
         HistoryEdit::Resume(expected, action) => {
             let current = progress(root).context(t!("git.history_edit_stale"))?;
             ensure!(
@@ -853,14 +1024,25 @@ fn execute_history_edit(root: &Path, edit: HistoryEdit, confirmed: bool) -> Resu
                 ),
                 t!("git.history_edit_stale")
             );
-            let subcommand = if current.is_rebase() {
-                "rebase"
-            } else {
-                "revert"
+            let subcommand = match current.owner.operation {
+                Operation::Rebase => "rebase",
+                Operation::CherryPick(_) | Operation::CherryPickSequence(_) => "cherry-pick",
+                Operation::Revert(_) => "revert",
+                Operation::UndoRewrite => anyhow::bail!(t!("git.history_edit_stale")),
             };
             let flag = if matches!(action, HistoryResolution::Abort) {
+                if current.stopped_before_pick {
+                    ensure!(
+                        !commit_state(root)?.ready,
+                        t!("git.history_edit_cherry_pick_abort_staged")
+                    );
+                }
                 "--abort"
             } else {
+                ensure!(
+                    !current.stopped_before_pick,
+                    t!("git.history_edit_cherry_pick_retry")
+                );
                 // Include unmerged paths that cannot be represented as UI strings.
                 ensure!(
                     read(root, ["ls-files", "--unmerged", "-z"])?.is_empty(),
@@ -986,6 +1168,254 @@ mod tests {
         assert_eq!(repo.git(["rev-parse", "HEAD^"])?, before_revert.oid);
         assert_eq!(repo.git(["rev-parse", "origin/feature"])?, published);
         assert!(!repo.root.join("one").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn cherry_pick_and_undo_preserve_ignored_files_in_a_clean_worktree() -> Result<()> {
+        let repo = Fixture::new()?;
+        let base = repo.change(".gitignore", "artifact\n", "Ignore local artifact")?;
+        repo.git(["switch", "-qc", "source"])?;
+        fs::write(repo.root.join("artifact"), "source\n")?;
+        repo.git(["add", "-f", "artifact"])?;
+        repo.git(["commit", "-qm", "Track artifact"])?;
+        let source = repo.tip()?.oid;
+        repo.git(["rm", "artifact"])?;
+        repo.git(["commit", "-qm", "Remove artifact"])?;
+        let removed = repo.tip()?.oid;
+        repo.git(["switch", "-q", "main"])?;
+        fs::write(repo.root.join("artifact"), "local\n")?;
+        assert!(repo.git(["status", "--porcelain"])?.is_empty());
+
+        let backend = Backend::new(repo.root.clone(), None);
+        assert!(
+            backend
+                .edit_history(HistoryEdit::CherryPick(repo.tip()?, vec![source.clone()]))
+                .is_err()
+        );
+        assert_eq!(repo.tip()?.oid, base);
+        assert_eq!(fs::read_to_string(repo.root.join("artifact"))?, "local\n");
+        assert!(backend.history_progress().is_none());
+
+        fs::remove_file(repo.root.join("artifact"))?;
+        backend.edit_history(HistoryEdit::CherryPick(repo.tip()?, vec![source]))?;
+        let before_removal = repo.tip()?;
+        let (_, record) =
+            backend.edit_history(HistoryEdit::CherryPick(repo.tip()?, vec![removed]))?;
+        let record = record.context("missing cherry-pick undo record")?;
+        let after_removal = repo.tip()?;
+        fs::write(repo.root.join("artifact"), "local\n")?;
+        assert!(repo.git(["status", "--porcelain"])?.is_empty());
+        assert!(
+            backend
+                .edit_history(HistoryEdit::UndoRewrite(record.clone()))
+                .is_err()
+        );
+        assert_eq!(repo.tip()?, after_removal);
+        assert_eq!(fs::read_to_string(repo.root.join("artifact"))?, "local\n");
+        assert!(backend.history_progress().is_none());
+
+        fs::remove_file(repo.root.join("artifact"))?;
+        backend.edit_history(HistoryEdit::UndoRewrite(record))?;
+        assert_eq!(repo.tip()?, before_removal);
+        assert_eq!(fs::read_to_string(repo.root.join("artifact"))?, "source\n");
+        Ok(())
+    }
+
+    #[test]
+    fn cherry_pick_conflict_can_be_aborted_or_continued_and_undone() -> Result<()> {
+        let repo = Fixture::new()?;
+        let base = repo.change("shared", "base\n", "Base")?;
+        repo.change("local", "base\n", "Local file")?;
+        repo.git(["switch", "-qc", "source"])?;
+        let source = repo.change("shared", "source\n", "Source change")?;
+        repo.git(["switch", "-q", "main"])?;
+        let current = repo.change("shared", "current\n", "Current change")?;
+        let tip = repo.tip()?;
+        let backend = Backend::new(repo.root.clone(), None);
+        assert!(!backend.can_cherry_pick(&tip, std::slice::from_ref(&base))?);
+        assert!(backend.can_cherry_pick(&tip, std::slice::from_ref(&source))?);
+        assert!(
+            backend
+                .edit_history(HistoryEdit::CherryPick(tip.clone(), vec![base]))
+                .is_err()
+        );
+
+        fs::write(repo.root.join("local"), "unstaged\n")?;
+        fs::write(repo.root.join("untracked"), "keep\n")?;
+        let status = super::super::worktree_status(&repo.root)?;
+        let pick = HistoryEdit::CherryPick(tip, vec![source.clone()]);
+
+        for abort in [true, false] {
+            assert!(backend.edit_history(pick.clone()).is_err());
+            let paused = backend
+                .history_progress()
+                .context("missing paused cherry-pick")?;
+            assert!(paused.is_cherry_pick());
+            assert!(!paused.stopped_before_pick);
+            assert!(backup::load(&repo.root)?.is_none());
+            assert_eq!(paused.conflicts, ["shared"]);
+            assert_eq!(paused.commit.as_deref(), Some(source.as_str()));
+            if abort {
+                let (_, record) =
+                    backend.edit_history(HistoryEdit::Resume(paused, HistoryResolution::Abort))?;
+                assert!(record.is_none());
+            } else {
+                fs::write(repo.root.join("shared"), "resolved\n")?;
+                backend.edit_history(HistoryEdit::Resume(
+                    paused.clone(),
+                    HistoryResolution::Stage("shared".into()),
+                ))?;
+                let (head, record) = backend
+                    .edit_history(HistoryEdit::Resume(paused, HistoryResolution::Continue))?;
+                let record = record.context("missing cherry-pick undo record")?;
+                assert_eq!(record.kind, RewriteKind::CherryPick);
+                let commit = super::super::commit(&repo.root, &head.unwrap())?;
+                assert_eq!(commit.parents, [current.clone()]);
+                assert_eq!(commit.subject, "Source change");
+                assert_eq!(fs::read_to_string(repo.root.join("shared"))?, "resolved\n");
+                backend.edit_history(HistoryEdit::UndoRewrite(record))?;
+            }
+            assert!(backend.history_progress().is_none());
+            assert_eq!(repo.tip()?.oid, current);
+            assert_eq!(repo.git(["rev-parse", "source"])?, source);
+            assert_eq!(super::super::worktree_status(&repo.root)?, status);
+            assert_eq!(repo.git(["show", ":local"])?, "base");
+            assert_eq!(fs::read_to_string(repo.root.join("local"))?, "unstaged\n");
+            assert_eq!(fs::read_to_string(repo.root.join("untracked"))?, "keep\n");
+            assert_eq!(fs::read_to_string(repo.root.join("shared"))?, "current\n");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn cherry_pick_protects_the_index_before_starting_or_undoing_a_batch() -> Result<()> {
+        let repo = Fixture::new()?;
+        repo.change("local", "base\n", "Base")?;
+        repo.git(["switch", "-qc", "source"])?;
+        let first = repo.change("first", "first\n", "First")?;
+        let last = repo.change("last", "last\n", "Last")?;
+        repo.git(["switch", "-q", "main"])?;
+        let tip = repo.tip()?;
+        let backend = Backend::new(repo.root.clone(), None);
+        let pick = HistoryEdit::CherryPick(tip.clone(), vec![first, last]);
+
+        fs::write(repo.root.join("local"), "draft\n")?;
+        repo.git(["add", "local"])?;
+        assert!(backend.edit_history(pick.clone()).is_err());
+        assert_eq!(repo.tip()?, tip);
+        assert_eq!(repo.git(["status", "--porcelain"])?, "M  local");
+        assert!(!git_dir(&repo.root).join("sequencer").exists());
+        assert!(backup::load(&repo.root)?.is_none());
+
+        repo.git(["restore", "--staged", "local"])?;
+        let (_, record) = backend.edit_history(pick)?;
+        let undo = HistoryEdit::UndoRewrite(record.context("missing undo record")?);
+        let picked_tip = repo.tip()?;
+        repo.git(["add", "local"])?;
+        assert!(backend.edit_history(undo.clone()).is_err());
+        assert_eq!(repo.tip()?, picked_tip);
+        assert_eq!(repo.git(["status", "--porcelain"])?, "M  local");
+        assert!(backup::load(&repo.root)?.is_none());
+
+        repo.git(["restore", "--staged", "local"])?;
+        backend.edit_history(undo)?;
+        assert_eq!(repo.tip()?, tip);
+        assert_eq!(repo.git(["diff", "--name-only"])?, "local");
+        assert!(repo.git(["diff", "--cached", "--name-only"])?.is_empty());
+        assert_eq!(fs::read_to_string(repo.root.join("local"))?, "draft\n");
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_cherry_pick_backup_identifies_the_completed_pick() -> Result<()> {
+        let repo = Fixture::new()?;
+        repo.change("tracked", "base\n", "Base")?;
+        repo.git(["switch", "-qc", "source"])?;
+        let source = repo.change("tracked", "source\n", "Source")?;
+        repo.git(["switch", "-q", "main"])?;
+        fs::write(repo.root.join("tracked"), "draft\n")?;
+        let owner = Owner {
+            tip: repo.tip()?,
+            operation: Operation::CherryPick(source.clone()),
+            rewrite: Some(RewriteKind::CherryPick),
+        };
+        fs::create_dir_all(directory(&repo.root).parent().unwrap())?;
+        assert!(
+            with_saved_changes(&repo.root, &owner, b"tracked\0", |_| {
+                read(&repo.root, ["cherry-pick", &source]).map(|_| ())
+            })
+            .is_err()
+        );
+        let failed = progress(&repo.root).context("missing saved changes")?;
+        assert_eq!(failed.conflicts, ["tracked"]);
+        let saved = failed.saved.context("missing legacy backup")?;
+        assert_eq!(saved.completed_cherry_picks, Some(1));
+        assert!(!saved.can_restore);
+        assert_eq!(
+            repo.git(["show", &format!("{}:tracked", saved.reference)])?,
+            "draft"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn cherry_pick_sequence_resumes_after_head_advances_and_undoes_the_batch() -> Result<()> {
+        let repo = Fixture::new()?;
+        let base = repo.change("shared", "base\n", "Base")?;
+        repo.git(["switch", "-qc", "source"])?;
+        let first = repo.change("first", "first\n", "First")?;
+        repo.change("skipped", "skipped\n", "Skipped")?;
+        let conflict = repo.change("shared", "source\n", "Conflict")?;
+        let last = repo.change("last", "last\n", "Last")?;
+        repo.git(["switch", "-q", "main"])?;
+        let current = repo.change("shared", "current\n", "Current")?;
+        fs::write(repo.root.join("untracked"), "keep\n")?;
+
+        let tip = repo.tip()?;
+        let backend = Backend::new(repo.root.clone(), None);
+        assert!(!backend.can_cherry_pick(&tip, &[first.clone(), base])?);
+        let targets = vec![last.clone(), first, conflict.clone()];
+        assert!(backend.can_cherry_pick(&tip, &targets)?);
+        let edit = HistoryEdit::CherryPick(tip, targets);
+        for abort in [true, false] {
+            assert!(backend.edit_history(edit.clone()).is_err());
+            assert_ne!(repo.tip()?.oid, current);
+            assert_eq!(repo.git(["log", "-1", "--format=%s"])?, "First");
+            let paused = backend
+                .history_progress()
+                .context("missing paused cherry-pick sequence")?;
+            assert_eq!(paused.commit.as_deref(), Some(conflict.as_str()));
+            assert_eq!(paused.conflicts, ["shared"]);
+            if abort {
+                let (_, record) =
+                    backend.edit_history(HistoryEdit::Resume(paused, HistoryResolution::Abort))?;
+                assert!(record.is_none());
+            } else {
+                fs::write(repo.root.join("shared"), "resolved\n")?;
+                backend.edit_history(HistoryEdit::Resume(
+                    paused.clone(),
+                    HistoryResolution::Stage("shared".into()),
+                ))?;
+                let (_, record) = backend
+                    .edit_history(HistoryEdit::Resume(paused, HistoryResolution::Continue))?;
+                assert_eq!(
+                    repo.git(["log", "-4", "--format=%s"])?,
+                    "Last\nConflict\nFirst\nCurrent"
+                );
+                assert!(!repo.root.join("skipped").exists());
+                assert_eq!(fs::read_to_string(repo.root.join("untracked"))?, "keep\n");
+                backend.edit_history(HistoryEdit::UndoRewrite(
+                    record.context("missing batch undo record")?,
+                ))?;
+            }
+            assert_eq!(repo.tip()?.oid, current);
+            assert_eq!(repo.git(["rev-parse", "source"])?, last);
+            assert_eq!(fs::read_to_string(repo.root.join("untracked"))?, "keep\n");
+            assert!(!repo.root.join("first").exists());
+            assert!(!repo.root.join("last").exists());
+            assert!(backend.history_progress().is_none());
+        }
         Ok(())
     }
 
@@ -1143,7 +1573,7 @@ mod tests {
         plan.entries[0].action = HistoryAction::Drop;
         assert!(edit_history(&repo.root, HistoryEdit::Rebase(plan)).is_err());
         let paused = progress(&repo.root).context("expected rebase conflict")?;
-        assert!(paused.is_rebase() && paused.saved.is_none());
+        assert!(paused.owner.operation == Operation::Rebase && paused.saved.is_none());
         assert_eq!(paused.commit.as_deref(), Some(second.as_str()));
         assert!(!repo.root.join("local").exists());
         edit_history(

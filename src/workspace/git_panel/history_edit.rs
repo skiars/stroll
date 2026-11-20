@@ -276,11 +276,15 @@ impl GitPanel {
     }
 
     pub(super) fn editable_tip(&self) -> Option<HistoryTip> {
+        let tip = self.checked_out_history_tip()?;
+        (self.branch == tip.branch).then_some(tip)
+    }
+
+    fn checked_out_history_tip(&self) -> Option<HistoryTip> {
         let history = self.history.as_ref()?;
         let branch = history.checkout.as_ref()?;
         if !self.backend.supports_history_edit()
             || self.history_progress.is_some()
-            || self.branch != *branch
             || !branch.starts_with("refs/heads/")
         {
             return None;
@@ -289,6 +293,66 @@ impl GitPanel {
             branch: branch.clone(),
             oid: history.head.clone()?,
         })
+    }
+
+    pub(super) fn cherry_pick_selection(
+        &self,
+        oid: &SharedString,
+    ) -> Option<(HistoryTip, Vec<String>)> {
+        if !self.foreign_branch() {
+            return None;
+        }
+        let tip = self.checked_out_history_tip()?;
+        let selected = self
+            .history_pick
+            .rows
+            .as_ref()
+            .filter(|rows| rows.contains(oid));
+        let targets = self
+            .commits
+            .iter()
+            .filter(|row| selected.map_or(&row.oid == oid, |rows| rows.contains(&row.oid)))
+            .map(|row| (!row.merge && row.oid.as_str() != tip.oid).then(|| row.oid.to_string()))
+            .collect::<Option<Vec<_>>>()?;
+        (targets.len() == selected.map_or(1, |rows| rows.len())).then_some((tip, targets))
+    }
+
+    pub(super) fn cherry_pick_item(
+        &self,
+        oid: &SharedString,
+        expected: &(HistoryTip, Vec<String>),
+        owner: &WeakEntity<Self>,
+        cx: &App,
+    ) -> Option<PopupMenuItem> {
+        let selection = self.cherry_pick_selection(oid)?;
+        if &selection != expected {
+            return None;
+        }
+        let oid = oid.clone();
+        let owner = owner.clone();
+        let label = if selection.1.len() == 1 {
+            t!("git.history_edit_cherry_pick_commit")
+        } else {
+            t!("git.history_edit_cherry_pick_commits")
+        };
+        Some(
+            PopupMenuItem::new(label)
+                .icon(IconName::Cherry)
+                .disabled(self.writes_busy(cx) || self.history_preparing)
+                .on_click(move |_, window, cx| {
+                    _ = owner.update(cx, |panel, cx| {
+                        if !panel.history_preparing
+                            && panel.cherry_pick_selection(&oid).as_ref() == Some(&selection)
+                        {
+                            panel.start_history_edit(
+                                HistoryEdit::CherryPick(selection.0.clone(), selection.1.clone()),
+                                window,
+                                cx,
+                            );
+                        }
+                    });
+                }),
+        )
     }
 
     pub(super) fn history_commands(
@@ -350,6 +414,7 @@ impl GitPanel {
         if oid.as_str() == tip.oid
             && picked.is_none_or(|rows| rows.len() <= 1)
             && let Some(record) = &self.history_rewrite
+            && record.kind != RewriteKind::CherryPick
         {
             let owner = owner.clone();
             let record = record.clone();
@@ -452,6 +517,7 @@ impl GitPanel {
             RewriteKind::Squash => t!("git.history_rewrite_squashed"),
             RewriteKind::Rebase => t!("git.history_rewrite_rebased"),
             RewriteKind::Amend => t!("git.history_rewrite_amended"),
+            RewriteKind::CherryPick => t!("git.history_rewrite_cherry_picked"),
         };
         let owner = cx.weak_entity();
         window.push_notification(
@@ -609,7 +675,25 @@ impl GitPanel {
                     None
                 } {
                     panel.history_pick.clear();
-                    panel.load_review(Selection::Worktree(mode), false, window, cx);
+                    if entered
+                        && panel
+                            .history_progress
+                            .as_ref()
+                            .is_some_and(HistoryProgress::is_cherry_pick)
+                        && panel.foreign_branch()
+                        && let Some(branch) = panel
+                            .history
+                            .as_ref()
+                            .and_then(|history| history.checkout.clone())
+                    {
+                        panel.branches.update(cx, |state, cx| {
+                            state.set_selected_value(&branch, window, cx);
+                        });
+                        panel.selection = Some(Selection::Worktree(mode));
+                        panel.select_branch(branch, window, cx);
+                    } else {
+                        panel.load_review(Selection::Worktree(mode), false, window, cx);
+                    }
                 } else if completed
                     && update_commit
                     && let Ok((Some(oid), _)) = result
@@ -638,17 +722,26 @@ impl GitPanel {
         }
         let busy = self.writes_busy(cx);
         let blocked = !progress.conflicts.is_empty();
-        let title = if progress.is_rebase() {
-            t!("git.history_edit_rebase_paused")
-        } else {
-            t!("git.history_edit_revert_paused")
-        };
+        let title = progress.paused_label();
         let location = progress.commit.as_deref().map(git::short);
+        let (abort_label, abort_detail) = if progress.is_cherry_pick() {
+            (
+                t!("git.history_edit_cherry_pick_abort"),
+                t!("git.history_edit_cherry_pick_abort_detail"),
+            )
+        } else {
+            (
+                t!("git.history_edit_abort"),
+                t!("git.history_edit_abort_detail"),
+            )
+        };
         let detail = if blocked {
             t!(
                 "git.history_edit_conflict_count",
                 count = progress.conflicts.len()
             )
+        } else if progress.stopped_before_pick {
+            t!("git.history_edit_cherry_pick_retry")
         } else {
             t!("git.history_edit_resume_detail")
         };
@@ -682,9 +775,10 @@ impl GitPanel {
                     .gap_2()
                     .child(
                         action_button("git-history-continue")
+                            .debug_selector(|| "git-history-continue".into())
                             .small()
                             .label(t!("git.history_edit_continue"))
-                            .disabled(busy || blocked)
+                            .disabled(busy || blocked || progress.stopped_before_pick)
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 this.start_history_edit(
                                     HistoryEdit::Resume(
@@ -698,15 +792,16 @@ impl GitPanel {
                     )
                     .child(
                         action_button("git-history-abort")
+                            .debug_selector(|| "git-history-abort".into())
                             .secondary()
                             .small()
-                            .label(t!("git.history_edit_abort"))
+                            .label(abort_label.clone())
                             .disabled(busy)
                             .on_click(cx.listener(move |_, _, window, cx| {
                                 HistoryDialog::open(
-                                    t!("git.history_edit_abort"),
+                                    abort_label.clone(),
                                     DialogBody::Confirm(
-                                        t!("git.history_edit_abort_detail").into(),
+                                        abort_detail.clone().into(),
                                         HistoryEdit::Resume(
                                             abort_from.clone(),
                                             HistoryResolution::Abort,
@@ -742,12 +837,13 @@ impl GitPanel {
             .border_b_1()
             .border_color(colors.border)
             .bg(colors.elevated)
-            .child(
-                div()
-                    .font_semibold()
-                    .text_color(colors.warning)
-                    .child(t!("git.history_backup_retained")),
-            )
+            .child(div().font_semibold().text_color(colors.warning).child(
+                if let Some(count) = saved.completed_cherry_picks {
+                    t!("git.history_backup_cherry_pick_completed", count = count)
+                } else {
+                    t!("git.history_backup_retained")
+                },
+            ))
             .child(
                 div()
                     .text_xs()
