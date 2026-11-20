@@ -15,7 +15,7 @@ use crate::pty::{Command, PtySize};
 mod input;
 mod links;
 
-pub(crate) use links::Link;
+pub(crate) use links::{Link, LinkTarget};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub(crate) struct Rgb(pub u8, pub u8, pub u8);
@@ -599,7 +599,7 @@ mod tests {
         let mut frame = Frame::default();
         terminal.frame(&mut frame);
         assert_eq!(frame.links.len(), 1);
-        assert_eq!(frame.link_at(0, 0).unwrap().target.as_ref(), url);
+        assert_eq!(frame.link_at(0, 0).unwrap().target.text(), url);
         assert_eq!(frame.link_at(10, 0), frame.link_at(11, 0));
         assert!(
             frame.link_at(8, 1).is_none(),
@@ -612,13 +612,19 @@ mod tests {
             frame.link_at(0, 0).is_none(),
             "the opening parenthesis is outside the link"
         );
-        assert_eq!(frame.link_at(1, 0).unwrap().target.as_ref(), url);
-        assert_eq!(frame.link_at(0, 2).unwrap().target.as_ref(), url);
+        assert_eq!(frame.link_at(1, 0).unwrap().target.text(), url);
+        assert_eq!(frame.link_at(0, 2).unwrap().target.text(), url);
 
         terminal.write(b"\r\nhttps://\r\nexample.test\r\n");
         terminal.scroll_to(usize::MAX);
         terminal.frame(&mut frame);
-        assert!(frame.links.is_empty(), "hard line breaks cannot join URLs");
+        assert!(
+            !frame
+                .links
+                .iter()
+                .any(|link| matches!(link.target, LinkTarget::Web(_))),
+            "hard line breaks cannot join URLs"
+        );
     }
 
     #[test]
@@ -638,20 +644,71 @@ mod tests {
         terminal.frame(&mut frame);
         assert_eq!(frame.links.len(), 3);
         assert_eq!(
-            frame.link_at(0, 0).unwrap().target.as_ref(),
+            frame.link_at(0, 0).unwrap().target.text(),
             "HTTPS://target.test/real"
         );
         assert!(frame.link_at(0, 1).is_none());
         assert!(frame.link_at(0, 2).is_none());
         assert_eq!(
-            frame.link_at(0, 3).unwrap().target.as_ref(),
+            frame.link_at(0, 3).unwrap().target.text(),
             "http://[::1]:3000"
         );
         assert_eq!(frame.link_at(0, 3), frame.link_at(1, 3));
-        assert_eq!(
-            frame.link_at(5, 3).unwrap().target.as_ref(),
-            "https://a.test"
-        );
+        assert_eq!(frame.link_at(5, 3).unwrap().target.text(), "https://a.test");
         assert!(frame.link_at(0, 4).is_none());
+    }
+
+    #[test]
+    fn file_links_keep_wrapped_cells_and_parse_positions() {
+        let (mut wrapped, _) = terminal(13, 3);
+        wrapped.write("(src/中文.rs:12:3):".as_bytes());
+        let mut frame = Frame::default();
+        wrapped.frame(&mut frame);
+        assert_eq!(frame.links.len(), 1);
+        assert_eq!(frame.link_at(5, 0), frame.link_at(6, 0));
+        assert_eq!(frame.link_at(1, 0), frame.link_at(3, 1));
+        assert!(frame.link_at(0, 0).is_none());
+        assert!(frame.link_at(4, 1).is_none());
+        assert_eq!(
+            frame.links[0].target,
+            LinkTarget::File {
+                text: "src/中文.rs:12:3".into(),
+                path_end: "src/中文.rs".len(),
+                position: Some(lsp_types::Position::new(11, 2)),
+            },
+        );
+
+        let (mut terminal, _) = terminal(100, 3);
+        terminal.write(
+            br"https://host/path/to/file:4 /tmp/file Makefile:5 C:\src\main.rs:7:8 12:34 foo.rs:0 foo.rs:3:0",
+        );
+        terminal.frame(&mut frame);
+        assert_eq!(
+            frame
+                .links
+                .iter()
+                .map(|link| link.target.text())
+                .collect::<Vec<_>>(),
+            [
+                "https://host/path/to/file:4",
+                "/tmp/file",
+                "Makefile:5",
+                r"C:\src\main.rs:7:8"
+            ],
+        );
+        assert!(matches!(
+            frame.links[1].target,
+            LinkTarget::File { position: None, .. }
+        ));
+        assert!(matches!(
+            frame.links[2].target,
+            LinkTarget::File {
+                position: Some(lsp_types::Position {
+                    line: 4,
+                    character: 0
+                }),
+                ..
+            }
+        ));
     }
 }

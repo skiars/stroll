@@ -4,7 +4,6 @@ use std::{
     ffi::OsString,
     ops::Range,
     path::{Path, PathBuf},
-    rc::Rc,
     sync::mpsc::{self, Sender},
     time::{Duration, Instant},
 };
@@ -13,7 +12,8 @@ use gpui::*;
 use gpui_component::{ActiveTheme, ThemeMode, animation::ease_in_cubic, menu::ContextMenuExt as _};
 
 use crate::terminal::{
-    Command, Emulator, Event, Frame, Link, MouseAction, Process, PtySize, SelectionAction,
+    Command, Emulator, Event, Frame, Link, LinkTarget, MouseAction, Process, PtySize,
+    SelectionAction,
 };
 
 mod links;
@@ -33,6 +33,10 @@ pub(super) enum Status {
 pub(super) enum SessionEvent {
     Exited,
     StatusChanged,
+    OpenFile {
+        path: PathBuf,
+        position: Option<lsp_types::Position>,
+    },
 }
 
 pub(super) struct Session {
@@ -55,7 +59,7 @@ pub(super) struct Session {
     selection_pointer: Point<Pixels>,
     pressed_link: Option<(Link, Point<Pixels>)>,
     link_hover: Option<Point<Pixels>>,
-    context_link: Option<Rc<str>>,
+    context_link: Option<LinkTarget>,
     right_mouse_reported: bool,
     scroll_drag: Option<Pixels>,
     scrollbar_fade: Fade,
@@ -726,7 +730,7 @@ impl Session {
                 && self.link_at(event.position) == Some(&link)
                 && !self.reports_mouse()
             {
-                cx.open_url(&link.target);
+                Self::open_link(&link.target, cx);
             }
             self.end_mouse_selection(cx);
             return;
@@ -1152,8 +1156,8 @@ mod tests {
 
     use gpui::{
         AppContext as _, ClipboardItem, Context, Entity, EntityInputHandler as _, FocusHandle,
-        Hsla, InteractiveElement as _, IntoElement, KeyBinding, Modifiers, MouseButton,
-        ParentElement as _, Pixels, Render, Styled, TestAppContext, TestDispatcher,
+        Focusable as _, Hsla, InteractiveElement as _, IntoElement, KeyBinding, Modifiers,
+        MouseButton, ParentElement as _, Pixels, Render, Styled, TestAppContext, TestDispatcher,
         VisualTestContext, Window, div, point, px, rgb, size,
     };
     use gpui_component::{ActiveTheme as _, Root};
@@ -1864,6 +1868,107 @@ mod tests {
         });
         cx.simulate_click(first, primary);
         assert_eq!(app.opened_url().as_deref(), Some(url));
+    }
+
+    #[test]
+    fn terminal_file_links_open_and_position_the_workspace_editor() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().join("repo");
+        assert!(
+            std::process::Command::new("git")
+                .args(["init", "-q"])
+                .arg(&root)
+                .status()?
+                .success()
+        );
+        let path = Path::new("src/sample.txt");
+        fs::create_dir(root.join("src"))?;
+        let source = "first\n😀中target\nlast\n";
+        fs::write(root.join(path), source)?;
+        let repo = Repository::open(&root)?;
+        let store = Arc::new(Store::new(temp.path().join("state"))?);
+        let config = ConfigFile::load(Some(temp.path().join("config.toml")));
+        let mut app = TestAppContext::build_with_text_system(
+            TestDispatcher::new(0),
+            None,
+            crate::test_support::text_system(true),
+        );
+        app.update(gpui_component::init);
+        let mut workspace = None;
+        let (_, visual) = app.add_window_view(|window, cx| {
+            let view = cx
+                .new(|cx| Workspace::with_config(store, config, WorkspaceView::Editor, window, cx));
+            view.update(cx, |view, cx| {
+                view.apply_repository(repo, Default::default(), None, None, window, cx);
+            });
+            workspace = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        let workspace = workspace.unwrap();
+        visual.simulate_resize(size(px(1000.), px(760.)));
+        let terminal = visual.update(|window, cx| {
+            workspace.update(cx, |view, cx| {
+                view.show_terminal(window, cx);
+                let panel = view.current_terminal_mut().unwrap();
+                panel.maximized = true;
+                let terminal = panel.tabs[0].session.clone();
+                terminal.update(cx, |session, _| {
+                    session.pending = None;
+                    session.emulator = Some(Emulator::new(
+                        PtySize {
+                            cols: 80,
+                            rows: 24,
+                            cell_width: 8,
+                            cell_height: 16,
+                        },
+                        session.commands.clone(),
+                    ));
+                });
+                terminal
+            })
+        });
+        let (first, primary) = visual.update(|window, cx| {
+            window.draw(cx).clear(cx);
+            terminal.update(cx, |session, cx| {
+                session.output(
+                    vec![Event::Output(
+                        b"src/sample.txt:2:3\r\n./src/sample.txt:3".to_vec(),
+                    )],
+                    cx,
+                );
+            });
+            window.draw(cx).clear(cx);
+            (
+                terminal.read(cx).geometry.origin(0, 0) + point(px(1.), px(1.)),
+                Modifiers::secondary_key(cx),
+            )
+        });
+        visual.simulate_click(first, Modifiers::none());
+        assert!(visual.update(|_, cx| workspace.read(cx).terminal_maximized()));
+        visual.simulate_click(first, primary);
+        visual.run_until_parked();
+        let second = visual.update(|window, cx| {
+            window.draw(cx).clear(cx);
+            let view = workspace.read(cx);
+            assert!(!view.terminal_maximized());
+            assert_eq!(view.tabs.active(), Some(path));
+            assert!(!view.tabs.is_preview(path));
+            let editor = view.files[path].editor.read(cx);
+            assert_eq!(editor.cursor(), source.find("target").unwrap());
+            assert!(editor.focus_handle(cx).is_focused(window));
+            terminal.read(cx).geometry.origin(0, 1) + point(px(1.), px(1.))
+        });
+
+        visual.simulate_mouse_down(second, MouseButton::Right, Modifiers::none());
+        visual.simulate_mouse_up(second, MouseButton::Right, Modifiers::none());
+        visual.simulate_keystrokes("up up enter");
+        visual.run_until_parked();
+        visual.update(|window, cx| {
+            let editor = workspace.read(cx).files[path].editor.read(cx);
+            assert_eq!(editor.cursor(), source.find("last").unwrap());
+            assert!(editor.focus_handle(cx).is_focused(window));
+        });
+        Ok(())
     }
 
     #[gpui::test]

@@ -19,10 +19,33 @@ static WEB_URL: LazyLock<Regex> = LazyLock::new(|| {
         .expect("valid terminal URL pattern")
 });
 
+static PATH_TOKEN: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"[^\s\p{Cc}<>"'«»“”‘’〈〉《》「」『』【】（）［］｛｝，。！？；：()\[\]{},;=|]+"#)
+        .expect("valid terminal path token pattern")
+});
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Link {
-    pub target: Rc<str>,
+    pub target: LinkTarget,
     cells: RangeInclusive<Point>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum LinkTarget {
+    Web(Rc<str>),
+    File {
+        text: Rc<str>,
+        path_end: usize,
+        position: Option<lsp_types::Position>,
+    },
+}
+
+impl LinkTarget {
+    pub(crate) fn text(&self) -> &str {
+        match self {
+            Self::Web(text) | Self::File { text, .. } => text,
+        }
+    }
 }
 
 impl Link {
@@ -63,8 +86,8 @@ impl Emulator {
         let mut text = String::new();
         let mut cells = Vec::new();
         let mut explicit: Option<(Hyperlink, Point, Point)> = None;
-        let mut add_link = |target: Option<Rc<str>>, mut start: Point, mut end: Point| {
-            if let Some(target) = target.filter(|_| start.line <= bottom && end.line >= top) {
+        let mut add_link = |target: LinkTarget, mut start: Point, mut end: Point| {
+            if start.line <= bottom && end.line >= top {
                 start.line -= top.0;
                 end.line -= top.0;
                 links.push(Link {
@@ -96,8 +119,10 @@ impl Emulator {
                 {
                     *last = end;
                 } else {
-                    if let Some((previous, start, end)) = explicit.take() {
-                        add_link(web_target(previous.uri()), start, end);
+                    if let Some((previous, start, end)) = explicit.take()
+                        && let Some(target) = web_target(previous.uri())
+                    {
+                        add_link(target, start, end);
                     }
                     explicit = hyperlink.clone().map(|link| (link, start, end));
                 }
@@ -115,11 +140,22 @@ impl Emulator {
                     .flags
                     .contains(Flags::WRAPLINE)
             {
-                if let Some((link, start, end)) = explicit.take() {
-                    add_link(web_target(link.uri()), start, end);
+                if let Some((link, start, end)) = explicit.take()
+                    && let Some(target) = web_target(link.uri())
+                {
+                    add_link(target, start, end);
                 }
+                let mut add_text_link = |target: LinkTarget, start: usize| {
+                    let first = cells.partition_point(|(offset, _, _)| *offset < start);
+                    let end = cells
+                        .partition_point(|(offset, _, _)| *offset < start + target.text().len());
+                    add_link(target, cells[first].1, cells[end - 1].2);
+                };
+                let mut after_url = 0;
                 for candidate in WEB_URL.find_iter(&text) {
                     let start = candidate.start();
+                    file_links(&text[after_url..start], after_url, &mut add_text_link);
+                    after_url = candidate.end();
                     if text
                         .as_bytes()
                         .get(start.wrapping_sub(1))
@@ -127,14 +163,11 @@ impl Emulator {
                     {
                         continue;
                     }
-                    let url = trim_punctuation(candidate.as_str());
-                    if let Some(target) = web_target(url) {
-                        let first = cells.partition_point(|(offset, _, _)| *offset < start);
-                        let end =
-                            cells.partition_point(|(offset, _, _)| *offset < start + url.len());
-                        add_link(Some(target), cells[first].1, cells[end - 1].2);
+                    if let Some(target) = web_target(trim_punctuation(candidate.as_str())) {
+                        add_text_link(target, start);
                     }
                 }
+                file_links(&text[after_url..], after_url, &mut add_text_link);
                 text.clear();
                 cells.clear();
             }
@@ -142,7 +175,7 @@ impl Emulator {
     }
 }
 
-fn web_target(text: &str) -> Option<Rc<str>> {
+fn web_target(text: &str) -> Option<LinkTarget> {
     let (_, rest) = text.split_once("://")?;
     if rest.is_empty()
         || rest.starts_with(['/', '?', '#'])
@@ -152,7 +185,56 @@ fn web_target(text: &str) -> Option<Rc<str>> {
         return None;
     }
     let url = Url::parse(text).ok()?;
-    (matches!(url.scheme(), "http" | "https") && url.has_host()).then(|| Rc::from(text))
+    (matches!(url.scheme(), "http" | "https") && url.has_host())
+        .then(|| LinkTarget::Web(text.into()))
+}
+
+fn file_links(text: &str, offset: usize, add_link: &mut impl FnMut(LinkTarget, usize)) {
+    if !text.contains(['/', '\\', '.', ':']) {
+        return;
+    }
+    for candidate in PATH_TOKEN.find_iter(text) {
+        if let Some(target) = file_target(trim_punctuation(candidate.as_str())) {
+            add_link(target, offset + candidate.start());
+        }
+    }
+}
+
+fn file_target(text: &str) -> Option<LinkTarget> {
+    // A drive letter belongs to the path, and a numeric suffix belongs to the position.
+    let has_drive = matches!(
+        text.as_bytes(),
+        [b'a'..=b'z' | b'A'..=b'Z', b':', b'/' | b'\\', ..]
+    );
+    let path_start = if has_drive { 2 } else { 0 };
+    let (path, position) = match text[path_start..].split_once(':') {
+        Some((path, suffix)) => {
+            let (line, column) = suffix.split_once(':').unwrap_or((suffix, "1"));
+            let index = |value: &str| {
+                if !value.bytes().all(|byte| byte.is_ascii_digit()) {
+                    return None;
+                }
+                value.parse::<u32>().ok()?.checked_sub(1)
+            };
+            (
+                &text[..path_start + path.len()],
+                Some(lsp_types::Position::new(index(line)?, index(column)?)),
+            )
+        }
+        None => (text, None),
+    };
+    let name = path.rsplit(['/', '\\']).next()?;
+    if matches!(name, "" | "." | "..")
+        || !path.chars().any(|ch| ch.is_alphabetic() || ch == '_')
+        || !(position.is_some() || path.contains(['/', '\\']) || name.contains('.'))
+    {
+        return None;
+    }
+    Some(LinkTarget::File {
+        text: text.into(),
+        path_end: path.len(),
+        position,
+    })
 }
 
 fn trim_punctuation(mut text: &str) -> &str {

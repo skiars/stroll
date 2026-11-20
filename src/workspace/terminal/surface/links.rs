@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use gpui::*;
 use gpui_component::{
     menu::{PopupMenu, PopupMenuItem},
@@ -6,15 +8,29 @@ use gpui_component::{
 use gpui_kit_assets::IconName;
 use rust_i18n::t;
 
-use crate::terminal::{Emulator, Link};
+use crate::terminal::{Emulator, Link, LinkTarget};
 
-use super::Session;
+use super::{Session, SessionEvent};
 
 pub(super) fn link_modifier(mods: Modifiers, cx: &App) -> bool {
     mods == Modifiers::secondary_key(cx)
 }
 
 impl Session {
+    pub(super) fn open_link(target: &LinkTarget, cx: &mut Context<Self>) {
+        match target {
+            LinkTarget::Web(url) => cx.open_url(url),
+            LinkTarget::File {
+                text,
+                path_end,
+                position,
+            } => cx.emit(SessionEvent::OpenFile {
+                path: PathBuf::from(&text[..*path_end]),
+                position: *position,
+            }),
+        }
+    }
+
     pub(super) fn reports_mouse(&self) -> bool {
         self.emulator.as_ref().is_some_and(Emulator::reports_mouse)
     }
@@ -68,11 +84,11 @@ impl Session {
         let pointing = link_modifier(window.modifiers(), cx);
         let mut overlay = div().size_full();
         for link in &self.frame.links {
-            let url = SharedString::from(link.target.as_ref());
+            let label = SharedString::from(link.target.text());
             let hint = SharedString::from(
                 t!(
                     "terminal.link_hint",
-                    url = url.as_ref(),
+                    url = label.as_ref(),
                     gesture = gesture.as_ref()
                 )
                 .into_owned(),
@@ -85,7 +101,7 @@ impl Session {
                 let hint = hint.clone();
                 let mut trigger = div()
                     .id(ElementId::named_usize(
-                        url.clone(),
+                        label.clone(),
                         y * cols + columns.start,
                     ))
                     .absolute()
@@ -144,17 +160,25 @@ impl Session {
                     }),
             );
         if let Some(target) = target {
+            let open = session.downgrade();
+            let link_text = target.text().to_owned();
             menu = menu
                 .separator()
-                .item(PopupMenuItem::link(
-                    t!("terminal.open_link"),
-                    target.to_string(),
-                ))
+                .item(match target {
+                    LinkTarget::Web(url) => {
+                        PopupMenuItem::link(t!("terminal.open_link"), url.to_string())
+                    }
+                    file => {
+                        PopupMenuItem::new(t!("terminal.open_link")).on_click(move |_, _, cx| {
+                            _ = open.update(cx, |_, cx| Self::open_link(&file, cx));
+                        })
+                    }
+                })
                 .item(
                     PopupMenuItem::new(t!("terminal.copy_link"))
                         .icon(IconName::Link2)
                         .on_click(move |_, _, cx| {
-                            cx.write_to_clipboard(ClipboardItem::new_string(target.to_string()));
+                            cx.write_to_clipboard(ClipboardItem::new_string(link_text.clone()));
                         }),
                 );
         }

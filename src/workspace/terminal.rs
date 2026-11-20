@@ -2,7 +2,11 @@ use rust_i18n::t;
 
 mod surface;
 
-use std::{collections::HashMap, path::PathBuf, time::Duration};
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 use gpui::{prelude::FluentBuilder as _, *};
 use gpui_base::motion::{Easing, Transition, TransitionState};
@@ -17,11 +21,15 @@ use gpui_component::{
 };
 use gpui_kit_assets::IconName;
 
-use crate::{repository::Store, terminal::Process};
+use crate::{
+    remote::{RepoPath, SshTarget},
+    repository::{Repository, Store},
+    terminal::Process,
+};
 
 use super::{
-    NextTab, Palette, PreviousTab, ToggleTerminal, Workspace, WorkspaceView, compact_icon_button,
-    icon_button,
+    FileOpen, NextTab, Palette, PreviousTab, SourcePosition, ToggleTerminal, Workspace,
+    WorkspaceView, compact_icon_button, icon_button,
 };
 use surface::{Session, SessionEvent, Status};
 
@@ -245,6 +253,33 @@ impl Workspace {
                         this.close_terminal(&key, number, take_focus, window, cx);
                     }
                     SessionEvent::StatusChanged => cx.notify(),
+                    SessionEvent::OpenFile { path, position } => {
+                        let Some(repo) = this
+                            .repository
+                            .as_ref()
+                            .filter(|repo| repo.root == key && this.view == WorkspaceView::Editor)
+                        else {
+                            return;
+                        };
+                        if this.confirming_close
+                            || this.repository_ui.opening.is_some()
+                            || this.repository_overlay_open()
+                        {
+                            return;
+                        }
+                        match terminal_file_key(repo, path) {
+                            Ok(path) => this.request_file(
+                                path,
+                                FileOpen::Select {
+                                    preview: false,
+                                    position: Some(SourcePosition::Terminal(*position)),
+                                },
+                                window,
+                                cx,
+                            ),
+                            Err(error) => this.show_error(error, window, cx),
+                        }
+                    }
                 },
             );
         focus_session(&session, window, cx);
@@ -849,6 +884,34 @@ impl Workspace {
             .child(strip)
             .child(ScrollableMask::vertical_wheel(&panel.scroll))
     }
+}
+
+fn terminal_file_key(repo: &Repository, path: &Path) -> anyhow::Result<PathBuf> {
+    if repo.ssh.is_none() {
+        return repo.local_file_key(&repo.root.join(path));
+    }
+    let root = SshTarget::parse(&repo.root)?
+        .ok_or_else(|| anyhow::anyhow!(t!("ssh.absolute_repo_path")))?;
+    // The terminal runs on the SSH host. Interpret its paths as POSIX paths
+    // even when the desktop app is running on Windows.
+    let root = root
+        .path
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!(t!("ssh.path_encoding")))?
+        .trim_end_matches('/');
+    let path = path
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!(t!("ssh.path_encoding")))?;
+    let relative = if path.starts_with('/') {
+        path.strip_prefix(root)
+            .and_then(|path| path.strip_prefix('/'))
+            .ok_or_else(|| anyhow::anyhow!(t!("common.path_outside_repo")))?
+    } else {
+        path
+    };
+    Ok(RepoPath::from_local(Path::new(relative))?
+        .as_path()
+        .to_owned())
 }
 
 fn focus_session(session: &Entity<Session>, window: &mut Window, cx: &mut App) {

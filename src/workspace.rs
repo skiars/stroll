@@ -554,6 +554,7 @@ enum FileOpen {
 
 enum SourcePosition {
     Lsp(lsp_types::Position),
+    Terminal(Option<lsp_types::Position>),
     MarkdownFragment(String),
     Diff(DiffSource),
 }
@@ -2655,6 +2656,18 @@ impl Workspace {
             let offset = match position {
                 SourcePosition::Lsp(position) => lsp::editor_position(text, position)
                     .map(|position| text.position_to_offset(&position)),
+                SourcePosition::Terminal(position) => match position {
+                    Some(mut position) => {
+                        position.line =
+                            position.line.min(text.lines_len().saturating_sub(1) as u32);
+                        Some(text.position_to_offset(&position))
+                    }
+                    None => {
+                        file.editor
+                            .update(cx, |editor, cx| editor.focus(window, cx));
+                        None
+                    }
+                },
                 SourcePosition::MarkdownFragment(fragment) => {
                     let offset = docs::heading_source_offset(&text.to_string(), &fragment);
                     if offset.is_none() {
