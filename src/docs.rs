@@ -490,10 +490,12 @@ pub struct DocReader {
     selected_heading: Option<usize>,
     body_position: Option<ListOffset>,
     heading_jump_block: Option<usize>,
-    pending_heading: Option<usize>,
+    pending_heading: Option<(usize, bool)>,
+    pending_source_location: Option<(Range<usize>, bool)>,
     history_fragment: Option<String>,
     pending_position: Option<DocumentPosition>,
     restoring_line: bool,
+    navigate_saved_position: bool,
 }
 
 impl DocReader {
@@ -637,17 +639,21 @@ impl DocReader {
             body_position: None,
             heading_jump_block: None,
             pending_heading: None,
+            pending_source_location: None,
             history_fragment: None,
             pending_position: None,
             restoring_line: false,
+            navigate_saved_position: false,
         };
         if let Some(fragment) = fragment {
-            reader.jump_to_fragment(&fragment, cx);
+            reader.jump_to_fragment_with_motion(&fragment, false, cx);
         }
         reader
     }
 
     pub(crate) fn release_online_images(&mut self, cx: &mut Context<Self>) {
+        self.text
+            .update(cx, |text, _| text.cancel_scroll_navigation());
         self.online_images = online_images::DisplayedImages::new(cx);
         self.image_thumbnails = ImageThumbnails::new(cx);
         cx.notify();
@@ -666,19 +672,22 @@ impl DocReader {
         }
     }
 
-    pub(crate) fn restore_history_location(
+    pub(crate) fn replay_history_location(
         &mut self,
         location: DocumentLocation,
+        animate: bool,
         cx: &mut Context<Self>,
     ) {
+        self.pending_source_location = None;
         if let Some(position) = location.position {
             self.pending_heading = None;
             self.history_fragment = location.fragment;
             self.restore_position(Some(position));
+            self.navigate_saved_position = animate;
         } else if !location
             .fragment
             .as_deref()
-            .is_some_and(|fragment| self.jump_to_fragment(fragment, cx))
+            .is_some_and(|fragment| self.jump_to_fragment_with_motion(fragment, animate, cx))
         {
             self.pending_heading = None;
             self.history_fragment = None;
@@ -688,17 +697,21 @@ impl DocReader {
                 inset: 0.,
                 line: None,
             }));
+            self.navigate_saved_position = animate;
         }
         cx.notify();
     }
 
     pub(crate) fn session_position(&self, cx: &App) -> Option<DocumentPosition> {
-        if self.pending_position.is_some() || self.pending_heading.is_some() {
+        if self.pending_position.is_some()
+            || self.pending_heading.is_some()
+            || self.pending_source_location.is_some()
+        {
             return None;
         }
         let text = self.text.read(cx);
         let list = text.list_state();
-        if list.item_count() == 0 {
+        if list.item_count() == 0 || list.is_navigating() {
             return None;
         }
         let top = list.logical_scroll_top();
@@ -721,19 +734,20 @@ impl DocReader {
         }
         self.pending_position = position;
         self.restoring_line = false;
+        self.navigate_saved_position = false;
     }
 
     fn apply_saved_position(&mut self, cx: &mut Context<Self>) {
         let text = self.text.read(cx);
         let list = text.list_state();
-        if list.item_count() == 0 {
+        if text.rendered_text().source() != self.document.source.as_ref() {
             return;
         }
         let Some(position) = self.pending_position else {
             return;
         };
         if self.restoring_line {
-            if !text.has_pending_reveal() {
+            if !text.has_pending_reveal() && !list.is_navigating() {
                 self.restore_position(None);
             }
             cx.notify();
@@ -742,12 +756,15 @@ impl DocReader {
         let block = position
             .source_offset
             .and_then(|offset| text.block_for_source_offset(offset))
-            .unwrap_or(position.block)
-            .min(list.item_count() - 1);
-        list.scroll_to_preserving_position(ListOffset {
+            .unwrap_or(position.block);
+        let anchor = ListOffset {
             item_ix: block,
             offset_in_item: px(position.inset),
-        });
+        };
+        let animate = self.navigate_saved_position
+            && cx.smooth_scrolling()
+            && !cx.reduce_motion()
+            && list.viewport_bounds().size.height > px(0.);
         if let Some(line) = position.line {
             let rendered = text.rendered_text();
             let offset = line.source_offset;
@@ -759,13 +776,21 @@ impl DocReader {
                     rendered.range_for_source(offset..offset + character.len_utf8())
             {
                 self.restoring_line = self.text.update(cx, |text, cx| {
-                    text.reveal_range_at_top(range, px(line.viewport_inset), cx)
+                    text.scroll_to_range(range, Some(px(line.viewport_inset)), animate, cx)
                         .is_ok()
                 });
             }
         }
         if !self.restoring_line {
-            self.pending_position = None;
+            self.text.update(cx, |text, cx| {
+                text.scroll_to_block(anchor, animate);
+                cx.notify();
+            });
+            if animate {
+                self.restoring_line = true;
+            } else {
+                self.pending_position = None;
+            }
         }
         cx.notify();
     }
@@ -812,6 +837,7 @@ impl DocReader {
         &mut self,
         range: Range<usize>,
         fingerprint: [u8; 32],
+        animate: bool,
         cx: &mut Context<Self>,
     ) {
         let source = self.document.source.as_str();
@@ -835,6 +861,12 @@ impl DocReader {
         let source = to_source_offset(range.start)..to_source_offset(range.end);
         self.restore_position(None);
         self.heading_jump_block = None;
+        self.pending_heading = None;
+        self.pending_source_location = Some((source, animate));
+        self.reveal_pending(cx);
+    }
+
+    fn reveal_source_range(&mut self, source: Range<usize>, animate: bool, cx: &mut Context<Self>) {
         let accent = cx.theme().accent.alpha(0.48);
         self.text.update(cx, |text, cx| {
             let rendered = text.rendered_text();
@@ -854,49 +886,64 @@ impl DocReader {
                     rendered.range_for_source(line_start..line_end)
                 });
                 if let Some(range) = range {
-                    _ = text.reveal_range(range.start..range.start, cx);
+                    _ = text.scroll_to_range(range.start..range.start, None, animate, cx);
                 }
             } else if let Some(range) = rendered.range_for_source(source) {
                 _ = text.set_range_highlights([RangeHighlight::new(range.clone(), accent)], cx);
-                _ = text.reveal_range(range, cx);
+                _ = text.scroll_to_range(range, None, animate, cx);
             }
         });
     }
 
     pub fn jump_to_fragment(&mut self, fragment: &str, cx: &mut Context<Self>) -> bool {
+        self.jump_to_fragment_with_motion(fragment, true, cx)
+    }
+
+    pub(crate) fn jump_to_fragment_with_motion(
+        &mut self,
+        fragment: &str,
+        animate: bool,
+        cx: &mut Context<Self>,
+    ) -> bool {
         let Some(index) = heading_index(&self.document.headings, fragment) else {
             return false;
         };
-        self.jump_to_heading(index, cx);
+        self.jump_to_heading(index, animate, cx);
         true
     }
 
-    fn jump_to_heading(&mut self, index: usize, cx: &mut Context<Self>) {
+    fn jump_to_heading(&mut self, index: usize, animate: bool, cx: &mut Context<Self>) {
         self.restore_position(None);
         self.heading_jump_block = None;
+        self.pending_source_location = None;
         self.select_heading(index);
         self.history_fragment = Some(self.document.headings[index].slug.clone());
-        self.pending_heading = Some(index);
+        self.pending_heading = Some((index, animate));
         self.reveal_pending(cx);
         cx.notify();
     }
 
     fn reveal_pending(&mut self, cx: &mut Context<Self>) {
-        let Some(index) = self.pending_heading else {
+        if self.pending_heading.is_none() && self.pending_source_location.is_none() {
             return;
-        };
+        }
         let text = self.text.read(cx);
         let rendered = text.rendered_text();
         if rendered.source() != self.document.source.as_ref() {
             return;
         }
-        self.pending_heading = None;
+        let Some((index, animate)) = self.pending_heading.take() else {
+            if let Some((source, animate)) = self.pending_source_location.take() {
+                self.reveal_source_range(source, animate, cx);
+            }
+            return;
+        };
         if let Some(range) = rendered.range_for_source(self.document.headings[index].source.clone())
         {
             self.heading_jump_block =
                 text.block_for_source_offset(self.document.headings[index].source.start);
             self.text.update(cx, |text, cx| {
-                _ = text.reveal_range_at_top(range.start..range.start, px(12.), cx);
+                _ = text.scroll_to_range(range.start..range.start, Some(px(12.)), animate, cx);
             });
         }
     }
@@ -913,20 +960,23 @@ impl DocReader {
         let text = self.text.read(cx);
         let list = text.list_state();
         let top = list.logical_scroll_top();
-        if list.item_count() == 0 || self.document.headings.is_empty() {
+        if list.is_navigating() || list.item_count() == 0 || self.document.headings.is_empty() {
             return;
         }
         let previous = self.body_position.replace(top);
         // An explicit reveal can place a heading anywhere within the visible page.
         // Keep the clicked heading until the reader moves away from that position.
-        if let Some(target) = self.heading_jump_block {
+        if let Some(target) = self.heading_jump_block.take() {
             if list
                 .bounds_for_item(target)
                 .is_some_and(|bounds| list.viewport_bounds().intersects(&bounds))
             {
-                self.heading_jump_block = None;
+                return;
             }
-            return;
+            if text.has_pending_reveal() {
+                self.heading_jump_block = Some(target);
+                return;
+            }
         }
         if previous == Some(top) {
             return;
@@ -988,7 +1038,7 @@ impl DocReader {
                                 });
                             });
                         } else {
-                            this.jump_to_heading(index, cx);
+                            this.jump_to_heading(index, true, cx);
                         }
                     }))
                     .child(heading.title.clone())
@@ -1035,6 +1085,9 @@ impl DocReader {
 
 impl Render for DocReader {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.pending_position.is_some() && !self.restoring_line {
+            self.apply_saved_position(cx);
+        }
         if self.pending_position.is_some() {
             cx.on_next_frame(window, |this, _, cx| this.apply_saved_position(cx));
         }
@@ -1210,6 +1263,21 @@ impl Render for DocReader {
             .min_w_0()
             .min_h_0()
             .max_w(px(860.))
+            .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, window, cx| {
+                let text = this.text.read(cx);
+                if event.keystroke.modifiers.modified() || !text.focus_handle().is_focused(window) {
+                    return;
+                }
+                let direction = match event.keystroke.key.as_str() {
+                    "pageup" => -1.,
+                    "pagedown" => 1.,
+                    _ => return,
+                };
+                let list = text.list_state();
+                list.navigate_by(list.viewport_bounds().size.height * (direction * 0.9));
+                cx.stop_propagation();
+                cx.notify();
+            }))
             .when(colors.bg.is_opaque(), |viewport| {
                 viewport
                     .partial_scroll(move |_| list.painted_scroll_offset())
@@ -1498,6 +1566,23 @@ mod tests {
         assert_eq!(selected(visual), 20);
         assert!(outline.intersects(&row(20)));
 
+        let list = visual.update(|window, cx| {
+            cx.set_smooth_scrolling(true);
+            cx.set_reduce_motion(false);
+            let text = reader.read(cx).text.read(cx);
+            let list = text.list_state().clone();
+            text.focus_handle().clone().focus(window, cx);
+            list
+        });
+        let prior_page = list.logical_scroll_top();
+        visual.simulate_keystrokes("pagedown");
+        draw(visual);
+        assert_eq!(list.logical_scroll_top(), prior_page);
+        assert!(list.is_navigating());
+        crate::workspace::finish_scroll_navigation(visual);
+        assert!(list.logical_scroll_top().item_ix > prior_page.item_ix);
+        visual.update(|_, cx| cx.set_smooth_scrolling(false));
+
         visual.update(|window, cx| reader.update(cx, |reader, cx| reader.toggle_find(window, cx)));
         draw(visual);
         visual.simulate_input("Section 34");
@@ -1684,11 +1769,12 @@ mod tests {
         visual.update(|_, cx| {
             reader.update(cx, |reader, cx| {
                 reader.set_typography(typography, cx);
-                reader.restore_history_location(
+                reader.replay_history_location(
                     DocumentLocation {
                         position: Some(old),
                         fragment: None,
                     },
+                    true,
                     cx,
                 );
             })

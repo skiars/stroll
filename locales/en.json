@@ -603,7 +603,7 @@
   "settings.shell_description": "Enter an absolute path to an executable or leave this blank to use the system shell. Applies to new terminals.",
   "settings.windows_shell_description": "Enter an executable name on PATH, such as pwsh.exe, or its full path. Leave blank to use the system shell. Applies to new terminals.",
   "settings.smooth_scroll": "Smooth scrolling",
-  "settings.smooth_scroll_description": "Enable smooth scrolling for the mouse wheel and touchpad.",
+  "settings.smooth_scroll_description": "Enable smooth scrolling for the mouse wheel, touchpad, and navigation within content.",
   "settings.file_tree_sticky_scroll": "File Tree Sticky Scroll",
   "settings.file_tree_sticky_scroll_description": "Keep parent folders visible while scrolling the Workspace and Docs file trees.",
   "settings.split": "Side by side",

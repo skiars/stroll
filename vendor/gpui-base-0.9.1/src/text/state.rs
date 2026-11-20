@@ -758,7 +758,7 @@ impl TextViewState {
         range: Range<usize>,
         cx: &mut Context<Self>,
     ) -> Result<(), RangeHighlightError> {
-        self.reveal_range_with_inset(range, None, cx)
+        self.reveal_range_with_inset(range, None, None, cx)
     }
 
     /// Align the start of a rendered Markdown range to the top of its scrollable view.
@@ -768,13 +768,38 @@ impl TextViewState {
         inset: Pixels,
         cx: &mut Context<Self>,
     ) -> Result<(), RangeHighlightError> {
-        self.reveal_range_with_inset(range, Some(inset), cx)
+        self.reveal_range_with_inset(range, Some(inset), None, cx)
+    }
+
+    /// Reveal a rendered range as navigation within the existing viewport.
+    /// An inset aligns the target line to the top. Without an inset, scroll only as needed.
+    pub fn scroll_to_range(
+        &mut self,
+        range: Range<usize>,
+        top_inset: Option<Pixels>,
+        animate: bool,
+        cx: &mut Context<Self>,
+    ) -> Result<(), RangeHighlightError> {
+        self.reveal_range_with_inset(range, top_inset, Some(animate), cx)
+    }
+
+    /// Stop queued or in-progress navigation at the current reading position.
+    pub fn cancel_scroll_navigation(&mut self) {
+        if self
+            .pending_reveal
+            .as_ref()
+            .is_some_and(|pending| pending.scroll.is_some())
+        {
+            self.pending_reveal = None;
+        }
+        self.list_state.cancel_navigation();
     }
 
     fn reveal_range_with_inset(
         &mut self,
         range: Range<usize>,
         top_inset: Option<Pixels>,
+        scroll: Option<bool>,
         cx: &mut Context<Self>,
     ) -> Result<(), RangeHighlightError> {
         if self.format != TextViewFormat::Markdown {
@@ -787,10 +812,11 @@ impl TextViewState {
             return Ok(());
         }
         let now = cx.background_executor().now();
-        self.pending_reveal = Some(
-            PendingReveal::new(&text, &range, now, top_inset)
-                .ok_or(RangeHighlightError::InvalidRange(0))?,
-        );
+        let mut reveal = PendingReveal::new(&text, &range, now, top_inset)
+            .ok_or(RangeHighlightError::InvalidRange(0))?;
+        reveal.scroll = scroll;
+        self.list_state.cancel_navigation();
+        self.pending_reveal = Some(reveal);
         cx.notify();
         Ok(())
     }
@@ -950,6 +976,20 @@ impl TextViewState {
     /// Whether a requested reveal is still waiting for layout.
     pub fn has_pending_reveal(&self) -> bool {
         self.pending_reveal.is_some()
+    }
+
+    /// Restore a block-relative viewport position for the parsed document.
+    pub fn scroll_to_block(&mut self, mut position: gpui::ListOffset, animate: bool) {
+        let count = self.parsed_content.document.blocks.len();
+        if self.list_state.item_count() != count {
+            self.list_state.reset(count);
+        }
+        position.item_ix = position.item_ix.min(count.saturating_sub(1));
+        if animate {
+            self.list_state.navigate_to(position);
+        } else {
+            self.list_state.scroll_to_preserving_position(position);
+        }
     }
 
     /// Byte offset in the Markdown source at the start of a rendered list item.
@@ -1295,7 +1335,30 @@ impl Render for TextViewState {
                 });
             }));
         }
-        let (reveal, reveal_block) = self.reveal_frame(cx.background_executor().now(), window);
+        let now = cx.background_executor().now();
+        let navigation = if self.scrollable && self.max_lines.is_none() {
+            self.pending_reveal.as_ref().and_then(|pending| {
+                if let Some(animate) = pending.scroll
+                    && !pending.is_expired(now)
+                {
+                    pending
+                        .block_ix(&self.parsed_content.document)
+                        .map(|item| (item, pending.is_block(), pending.request(), animate))
+                } else {
+                    None
+                }
+            })
+        } else {
+            None
+        };
+        let (reveal, reveal_block, navigate) =
+            if let Some((item, entire_item, reveal, animate)) = navigation {
+                self.pending_reveal = None;
+                (reveal, None, Some((item, entire_item, animate)))
+            } else {
+                let (reveal, block) = self.reveal_frame(now, window);
+                (reveal, block, None)
+            };
         // Built every frame, so everything in it is shared, not copied.
         let node_cx = NodeContext {
             offset: self.parsed_content.node_cx.offset,
@@ -1390,6 +1453,10 @@ impl Render for TextViewState {
         // changed other than by an append, and with it the scroll position.
         if let Some(block_ix) = reveal_block {
             self.list_state.scroll_to_reveal_item(block_ix);
+        }
+        if let Some((item, entire_item, animate)) = navigate {
+            self.list_state
+                .navigate_to_reveal_item(item, entire_item, animate);
         }
         content
     }

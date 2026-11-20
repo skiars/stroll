@@ -1204,6 +1204,7 @@ impl GitPanel {
             return;
         };
         self.reveal_file(ix, true, window, cx);
+        self.editor.navigating_file = None;
         self.pending_file_reveal = Some(path.to_owned());
     }
 

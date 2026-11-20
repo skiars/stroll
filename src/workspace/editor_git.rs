@@ -861,9 +861,10 @@ impl Workspace {
                 use gpui_component::input::RopeExt as _;
                 let caret_line = line.min(editor.text().lines_len().saturating_sub(1));
                 let offset = editor.text().line_start_offset(caret_line);
-                reveal_editor_range(editor, offset..offset, Some(line), window, cx);
+                reveal_editor_range(editor, offset..offset, Some(line), true, window, cx);
                 if let Some(inset) = anchor.inset(editor.input_bounds(), px(0.)) {
                     editor.scroll_to_caret_with_inset(inset, Some(line), cx);
+                    editor.animate_pending_scroll();
                 }
             });
             self.record_source_navigation(source, cx);
@@ -1760,7 +1761,7 @@ mod tests {
         let click = point(next.center().x, next.top() + px(6.));
         visual.simulate_mouse_move(click, None, Modifiers::default());
         visual.simulate_click(click, Modifiers::default());
-        visual.run_until_parked();
+        crate::workspace::finish_scroll_navigation(visual);
         visual.update(|window, cx| {
             window.draw(cx).clear(cx);
             let file = &workspace.read(cx).files[&path];

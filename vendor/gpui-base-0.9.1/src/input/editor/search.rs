@@ -295,6 +295,7 @@ impl<M: InputModeKind> InputBaseState<M> {
         // Match order does not describe viewport direction after a manual
         // scroll. Always allow search navigation to reveal the active match.
         self.scroll_to_with_padding(self.cursor(), None, ScrollPadding::SurroundingLines, cx);
+        self.animate_pending_scroll();
     }
 
     /// Replace the current match and move on to the next one. Returns whether

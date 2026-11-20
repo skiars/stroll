@@ -26,6 +26,7 @@ fn frame(visual: &mut VisualTestContext) {
     });
 }
 
+#[track_caller]
 fn wait_for(visual: &mut VisualTestContext, ready: impl Fn(&App) -> bool) -> Result<()> {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
@@ -35,7 +36,8 @@ fn wait_for(visual: &mut VisualTestContext, ready: impl Fn(&App) -> bool) -> Res
         }
         ensure!(
             Instant::now() < deadline,
-            "Timed out waiting for source navigation"
+            "Timed out waiting for source navigation at {}",
+            std::panic::Location::caller()
         );
         std::thread::sleep(Duration::from_millis(10));
     }
@@ -229,7 +231,7 @@ fn source_history_replays_files_jumps_and_worktree_positions() -> Result<()> {
             );
         });
     });
-    frame(visual);
+    crate::workspace::finish_scroll_navigation(visual);
     let after_jump = visual.update(|_, cx| position(cx));
     assert_eq!(after_jump.selection_start, (110, 4));
     assert!(after_jump.top.0 > 80);
@@ -244,7 +246,7 @@ fn source_history_replays_files_jumps_and_worktree_positions() -> Result<()> {
     });
     visual.simulate_keystrokes("alt-left");
     press_side_button(visual, NavigationDirection::Back);
-    frame(visual);
+    crate::workspace::finish_scroll_navigation(visual);
     assert_eq!(visual.update(|_, cx| position(cx)), after_jump);
 
     visual.update(|window, cx| {

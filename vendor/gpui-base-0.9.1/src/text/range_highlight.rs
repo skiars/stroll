@@ -1580,6 +1580,8 @@ pub(super) struct PendingReveal {
     /// laid out.
     report: Arc<Mutex<Option<RevealReport>>>,
     attempts: usize,
+    /// Choose the scrollable list's prepaint reveal, with optional animation.
+    pub(super) scroll: Option<bool>,
 }
 
 /// How a pending reveal went in one frame.
@@ -1607,6 +1609,7 @@ impl PendingReveal {
             top_inset,
             report: Arc::default(),
             attempts: 0,
+            scroll: None,
         })
     }
 

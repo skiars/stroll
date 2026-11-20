@@ -564,10 +564,27 @@ struct DiffSource {
     snapshot: Option<Task<Option<Rope>>>,
 }
 
+fn map_diff_source_row(
+    row: usize,
+    snapshot: Task<Option<Rope>>,
+    current: Rope,
+    cx: &App,
+) -> Task<usize> {
+    cx.background_spawn(async move {
+        let Some(snapshot) = snapshot.await else {
+            return row;
+        };
+        line_alignment::LineAlignment::between(&snapshot, &current)
+            .and_then(|alignment| alignment.approximate_current_row(row))
+            .unwrap_or(row)
+    })
+}
+
 fn reveal_editor_range(
     editor: &mut EditorState,
     range: std::ops::Range<usize>,
     leading_block: Option<usize>,
+    animate: bool,
     window: &mut Window,
     cx: &mut Context<EditorState>,
 ) {
@@ -579,6 +596,9 @@ fn reveal_editor_range(
     editor.set_selected_range(range, cx);
     editor.focus(window, cx);
     editor.scroll_to_caret_with_context(EDITOR_JUMP_CONTEXT_LINES, leading_block, cx);
+    if animate {
+        editor.animate_pending_scroll();
+    }
 }
 
 enum DocumentNavigation {
@@ -824,6 +844,7 @@ pub struct Workspace {
     repository_watch: Task<()>,
     repository_watch_active: bool,
     loading_file: Option<(PathBuf, FileOpen)>,
+    visible_editor: Option<EntityId>,
     draft_task: Task<()>,
     session: WorktreeSession,
     session_write: Arc<Mutex<u64>>,
@@ -1021,6 +1042,7 @@ impl Workspace {
             repository_watch: Task::ready(()),
             repository_watch_active: false,
             loading_file: None,
+            visible_editor: None,
             draft_task: Task::ready(()),
             session: WorktreeSession::default(),
             session_write: Arc::default(),
@@ -1975,8 +1997,10 @@ impl Workspace {
         self.language_rename = Task::ready(());
         self.language_format = Task::ready(());
         if let Some(file) = self.active_file() {
-            file.editor
-                .update(cx, |editor, cx| editor.dismiss_lsp_overlays(cx));
+            file.editor.update(cx, |editor, cx| {
+                editor.cancel_scroll_navigation();
+                editor.dismiss_lsp_overlays(cx);
+            });
         }
         self.queue_drafts(window, cx);
         self.capture_session(cx);
@@ -2142,6 +2166,7 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let animate = self.view == WorkspaceView::Docs;
         self.switch_view(WorkspaceView::Docs, window, cx);
         if self.view != WorkspaceView::Docs {
             return;
@@ -2151,7 +2176,7 @@ impl Workspace {
             DocumentNavigation::Replay { index, location } => {
                 if let Some(reader) = &self.doc {
                     reader.update(cx, |reader, cx| {
-                        reader.restore_history_location(location, cx)
+                        reader.replay_history_location(location, animate, cx)
                     });
                 }
                 self.complete_navigation_replay(index);
@@ -2206,14 +2231,19 @@ impl Workspace {
                     self.doc_task = Task::ready(());
                 }
                 let previous_error = self.doc_error.take();
+                let animate = self.view == WorkspaceView::Docs;
                 if let Some(fragment) = &fragment {
-                    if !doc.update(cx, |doc, cx| doc.jump_to_fragment(fragment, cx)) {
+                    if !doc.update(cx, |doc, cx| {
+                        doc.jump_to_fragment_with_motion(fragment, animate, cx)
+                    }) {
                         self.doc_error =
                             Some(t!("docs.fragment_missing", fragment = fragment).into_owned());
                     }
                 }
                 if let Some((range, fingerprint)) = position {
-                    doc.update(cx, |doc, cx| doc.locate_source(range, fingerprint, cx));
+                    doc.update(cx, |doc, cx| {
+                        doc.locate_source(range, fingerprint, animate, cx)
+                    });
                 }
                 if self.doc_error.is_none()
                     && let Some(navigation) = navigation
@@ -2317,7 +2347,7 @@ impl Workspace {
                                 reader.restore_position(saved_position);
                             }
                             if let Some((range, fingerprint)) = position {
-                                reader.locate_source(range, fingerprint, cx);
+                                reader.locate_source(range, fingerprint, false, cx);
                             }
                             reader
                         });
@@ -2635,6 +2665,12 @@ impl Workspace {
             _ => navigate.then(|| self.source_location(cx)).flatten(),
         };
         let same_file = self.tabs.active() == Some(path.as_path());
+        let animate = same_file
+            && self.view == WorkspaceView::Editor
+            && self
+                .files
+                .get(&path)
+                .is_some_and(|file| Some(file.editor.entity_id()) == self.visible_editor);
         let (preview, position, location, replay) = match request {
             FileOpen::Select { preview, position } => (preview, position, None, None),
             FileOpen::DocumentLink { line, .. } => (
@@ -2646,6 +2682,16 @@ impl Workspace {
             FileOpen::Locate(location) => (false, None, location, None),
             FileOpen::History { index, position } => (true, None, None, Some((index, position))),
             FileOpen::Startup | FileOpen::Restore { .. } => (true, None, None, None),
+        };
+        let position = match position {
+            Some(SourcePosition::Diff(DiffSource {
+                row,
+                snapshot: Some(snapshot),
+            })) if !animate && self.files.contains_key(&path) => {
+                self.prepare_file_diff_position(path, preview, row, snapshot, window, cx);
+                return;
+            }
+            position => position,
         };
         self.select_file_tab(&path, preview, window, cx);
         if let Some(position) = position
@@ -2676,13 +2722,7 @@ impl Workspace {
                     offset
                 }
                 SourcePosition::Diff(source) => {
-                    self.reveal_diff_source(
-                        path.clone(),
-                        source,
-                        navigate && same_file,
-                        window,
-                        cx,
-                    );
+                    self.reveal_diff_source(path.clone(), source, animate, window, cx);
                     None
                 }
             };
@@ -2690,7 +2730,7 @@ impl Workspace {
                 let file = self.files.get_mut(&path).unwrap();
                 file.restore_position = None;
                 file.editor.update(cx, |editor, cx| {
-                    reveal_editor_range(editor, offset..offset, None, window, cx);
+                    reveal_editor_range(editor, offset..offset, None, animate, window, cx);
                 });
             }
         }
@@ -2705,7 +2745,7 @@ impl Workspace {
                 {
                     return false;
                 }
-                reveal_editor_range(editor, range, None, window, cx);
+                reveal_editor_range(editor, range, None, animate, window, cx);
                 true
             });
             if !applied {
@@ -2713,11 +2753,59 @@ impl Workspace {
             }
         }
         if let Some((index, position)) = replay {
-            self.complete_source_replay(&path, index, position, source, cx);
+            self.complete_source_replay(&path, index, position, source, animate, cx);
         } else if navigate {
             self.record_source_navigation(source, cx);
         }
         self.locator_visit(&path);
+    }
+
+    fn prepare_file_diff_position(
+        &mut self,
+        path: PathBuf,
+        preview: bool,
+        row: usize,
+        snapshot: Task<Option<Rope>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let editor = self.files[&path].editor.clone();
+        let revision = editor.read(cx).document_revision();
+        let mapping = map_diff_source_row(row, snapshot, editor.read(cx).text().clone(), cx);
+        self.loading_file = Some((
+            path,
+            FileOpen::Select {
+                preview,
+                position: Some(SourcePosition::Diff(DiffSource {
+                    row,
+                    snapshot: None,
+                })),
+            },
+        ));
+        self.file_task = cx.spawn_in(window, async move |this, cx| {
+            let mapped = mapping.await;
+            _ = this.update_in(cx, |this, window, cx| {
+                let Some((path, mut request)) = this.loading_file.take() else {
+                    return;
+                };
+                if let FileOpen::Select {
+                    position: Some(SourcePosition::Diff(source)),
+                    ..
+                } = &mut request
+                    && source.snapshot.is_none()
+                    && source.row == row
+                    && this
+                        .files
+                        .get(&path)
+                        .is_some_and(|file| file.editor == editor)
+                    && editor.read(cx).document_revision() == revision
+                {
+                    source.row = mapped;
+                }
+                this.select_loaded_file(path, request, window, cx);
+            });
+        });
+        cx.notify();
     }
 
     fn reveal_diff_source(
@@ -2731,7 +2819,7 @@ impl Workspace {
         let file = self.files.get_mut(&path).unwrap();
         let DiffSource { row, snapshot } = source;
         let Some(snapshot) = snapshot else {
-            Self::reveal_diff_row(file, row, window, cx);
+            Self::reveal_diff_row(file, row, record_delayed_jump, window, cx);
             return;
         };
         let editor = file.editor.clone();
@@ -2739,14 +2827,7 @@ impl Workspace {
         let revision = current.document_revision();
         let selection = current.selected_range();
         let current = current.text().clone();
-        let mapping = cx.background_spawn(async move {
-            let Some(snapshot) = snapshot.await else {
-                return row;
-            };
-            line_alignment::LineAlignment::between(&snapshot, &current)
-                .and_then(|alignment| alignment.approximate_current_row(row))
-                .unwrap_or(row)
-        });
+        let mapping = map_diff_source_row(row, snapshot, current, cx);
         self.file_task = cx.spawn_in(window, async move |this, cx| {
             let mapped = mapping.await;
             _ = this.update_in(cx, |this, window, cx| {
@@ -2774,7 +2855,7 @@ impl Workspace {
                 } else {
                     row
                 };
-                Self::reveal_diff_row(file, target, window, cx);
+                Self::reveal_diff_row(file, target, record_delayed_jump, window, cx);
                 if record_delayed_jump {
                     this.record_source_navigation(source, cx);
                 }
@@ -2785,6 +2866,7 @@ impl Workspace {
     fn reveal_diff_row(
         file: &mut OpenFile,
         row: usize,
+        animate: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -2794,7 +2876,7 @@ impl Workspace {
         file.editor.update(cx, |editor, cx| {
             let text = editor.text();
             let offset = text.line_start_offset(row.min(text.lines_len().saturating_sub(1)));
-            reveal_editor_range(editor, offset..offset, None, window, cx);
+            reveal_editor_range(editor, offset..offset, None, animate, window, cx);
         });
     }
 
@@ -3616,8 +3698,10 @@ impl Workspace {
             self.language_format = Task::ready(());
             self.lsp_panel_open = false;
             if let Some(file) = previous.and_then(|path| self.files.get(path)) {
-                file.editor
-                    .update(cx, |editor, cx| editor.dismiss_lsp_overlays(cx));
+                file.editor.update(cx, |editor, cx| {
+                    editor.cancel_scroll_navigation();
+                    editor.dismiss_lsp_overlays(cx);
+                });
             }
         }
         if self.view == WorkspaceView::Editor && !self.confirming_close {
@@ -4928,6 +5012,11 @@ impl Workspace {
 
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.visible_editor = if self.view == WorkspaceView::Editor && !self.terminal_maximized() {
+            self.active_file().map(|file| file.editor.entity_id())
+        } else {
+            None
+        };
         self.restore_file_viewport(window, cx);
         let scan = self.docs_scan_pending && self.view == WorkspaceView::Docs;
         let watch = self.repository_watch_pending
@@ -5938,7 +6027,7 @@ mod layout_tests {
             assert!(!workspace.files.contains_key(&target));
         });
 
-        let jump = |visual: &mut VisualTestContext, line, character| {
+        let jump = |visual: &mut VisualTestContext, line, character, animate| {
             visual.update(|window, cx| {
                 workspace.update(cx, |this, cx| {
                     let start = Position::new(line, character);
@@ -5955,6 +6044,9 @@ mod layout_tests {
                 });
             });
             visual.run_until_parked();
+            if animate {
+                crate::workspace::finish_scroll_navigation(visual);
+            }
             visual.update(|window, cx| {
                 window.draw(cx).clear(cx);
                 let workspace = workspace.read(cx);
@@ -5974,7 +6066,7 @@ mod layout_tests {
             })
         };
         let (position, inset, line_height, wrapped) =
-            jump(visual, 32, prefix.encode_utf16().count() as u32);
+            jump(visual, 32, prefix.encode_utf16().count() as u32, false);
         assert_eq!(position, Position::new(32, prefix.chars().count() as u32));
         assert!(wrapped > EDITOR_JUMP_CONTEXT_LINES);
         let expected = EDITOR_JUMP_CONTEXT_LINES * line_height;
@@ -5982,7 +6074,7 @@ mod layout_tests {
             (inset - expected).abs() < px(1.),
             "Wrapped caret at {inset:?}, expected {expected:?}"
         );
-        assert_eq!(jump(visual, 81, 4).0, Position::new(81, 4));
+        assert_eq!(jump(visual, 81, 4, true).0, Position::new(81, 4));
         Ok(())
     }
 
@@ -6262,5 +6354,19 @@ mod layout_tests {
             assert!(file.document.conflict);
         });
         Ok(())
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn finish_scroll_navigation(visual: &mut gpui::VisualTestContext) {
+    for _ in 0..12 {
+        visual
+            .executor()
+            .advance_clock(std::time::Duration::from_millis(20));
+        visual.run_until_parked();
+        visual.update(|window, cx| {
+            window.simulate_next_frame(cx);
+            window.draw(cx).clear(cx);
+        });
     }
 }

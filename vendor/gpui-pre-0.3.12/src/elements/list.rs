@@ -47,6 +47,166 @@ impl List {
         self.sizing_behavior = behavior;
         self
     }
+
+    fn begin_navigation(
+        &mut self,
+        request: NavigationRequest,
+        bounds: Bounds<Pixels>,
+        padding: Edges<Pixels>,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let (scroll, current, target, destination, preserve_end) = {
+            let mut state = self.state.0.borrow_mut();
+            let item_width = bounds.size.width - padding.along(Axis::Horizontal);
+            state.layout_all_items(item_width, &mut self.render_item, window, cx);
+            state.apply_uniform_item_height(window.line_height().max(px(1.)));
+            let current = state.scroll_top(&state.logical_scroll_top());
+            let max_scroll = |state: &StateInner| {
+                let end_padding = if state.scroll_past_end {
+                    (bounds.size.height * 0.5).max(state.scroll_end_padding)
+                } else {
+                    px(0.)
+                };
+                (state.items.summary().height + padding.top + padding.bottom + end_padding
+                    - bounds.size.height)
+                    .max(px(0.))
+            };
+            let mut preserve_end = false;
+            let destination = match request {
+                NavigationRequest::Position(position) => position,
+                NavigationRequest::Distance(distance) => {
+                    let origin = state.scroll_top(&state.navigation_scroll_top());
+                    let y = (origin + distance).clamp(px(0.), max_scroll(&state));
+                    state.position_at(y)
+                }
+                NavigationRequest::Reveal {
+                    item, entire_item, ..
+                } => {
+                    let mut cursor = state.items.cursor::<ListItemSummary>(());
+                    cursor.seek(&Count(item), Bias::Right);
+                    let Some(row) = cursor.item() else { return };
+                    let row = row.clone();
+                    let top = cursor.start().height;
+                    let mut element = (self.render_item)(item, window, cx);
+                    let size = element.layout_as_root(
+                        size(item_width.into(), AvailableSpace::MinContent),
+                        window,
+                        cx,
+                    );
+                    let mut origin = bounds.origin;
+                    origin.x += padding.left;
+                    origin.y += padding.top;
+                    let (relative_top, relative_bottom, inset) = if entire_item {
+                        (px(0.), size.height, None)
+                    } else {
+                        // Use the same inline geometry as immediate reveals. The probe
+                        // contributes no hitboxes or layout to the presented frame.
+                        let result: Result<(), _> = window.transact(|window| {
+                            window.take_autoscroll();
+                            window.with_content_mask(Some(ContentMask { bounds }), |window| {
+                                element.prepaint_at(origin, window, cx);
+                            });
+                            Err(window.take_aligned_autoscroll())
+                        });
+                        let Some((line, inset)) = result.err().flatten() else {
+                            return;
+                        };
+                        (line.top() - origin.y, line.bottom() - origin.y, inset)
+                    };
+                    let ready = state.is_item_ready(item, cx);
+                    drop(cursor);
+                    let mut cursor = state.items.cursor::<Count>(());
+                    let mut items = cursor.slice(&Count(item), Bias::Right);
+                    // Retain measurements and estimates on either side of the probed item.
+                    items.extend([row.with_measurement(size, ready)], ());
+                    cursor.seek_forward(&Count(item + 1), Bias::Right);
+                    items.append(cursor.suffix(), ());
+                    drop(cursor);
+                    state.items = items;
+
+                    let current = state.scroll_top(&state.logical_scroll_top());
+                    let line_top = top + padding.top + relative_top;
+                    let line_bottom = top + padding.top + relative_bottom;
+                    let y = if let Some(inset) = inset {
+                        preserve_end = true;
+                        line_top - inset
+                    } else if line_top < current {
+                        line_top
+                    } else if line_bottom > current + bounds.size.height {
+                        line_bottom - bounds.size.height
+                    } else {
+                        current
+                    }
+                    .max(px(0.));
+                    ListOffset {
+                        item_ix: item,
+                        offset_in_item: y - top,
+                    }
+                }
+            };
+            let current = if matches!(request, NavigationRequest::Reveal { .. }) {
+                state.scroll_top(&state.logical_scroll_top())
+            } else {
+                current
+            };
+            let y = state.scroll_top(&destination);
+            let max = max_scroll(&state);
+            let target = if preserve_end && state.scroll_past_end {
+                y.max(px(0.))
+            } else {
+                y.clamp(px(0.), max)
+            };
+            let destination = if target != y {
+                state.position_at(target)
+            } else {
+                destination
+            };
+            state.navigation_destination = Some(destination);
+            (
+                state.smooth_scroll.clone(),
+                point(px(0.), current),
+                point(px(0.), target),
+                destination,
+                preserve_end,
+            )
+        };
+        let animate = self.state.0.borrow().last_layout_bounds.is_some()
+            && !matches!(request, NavigationRequest::Reveal { animate: false, .. });
+        let state = Rc::downgrade(&self.state.0);
+        let view = window.current_view();
+        scroll.navigate(
+            current,
+            target,
+            if animate { bounds.size.height } else { px(0.) },
+            window,
+            cx,
+            move |last, next, _, cx| {
+                let state = state.upgrade()?;
+                let mut state = state.borrow_mut();
+                let end = state.scroll_top(&destination);
+                let position = if next == target {
+                    state.preserve_end_position |= preserve_end;
+                    if destination.offset_in_item >= px(0.) {
+                        destination
+                    } else {
+                        state.position_at(end.max(px(0.)))
+                    }
+                } else {
+                    let start = state.scroll_top(&state.logical_scroll_top());
+                    let fraction = (next.y - last.y) / (target.y - last.y);
+                    let y = (start + (end - start) * fraction).max(px(0.));
+                    state.position_at(y)
+                };
+                state.follow_state.stop_following();
+                state.set_scroll_anchor(Some(position));
+                cx.notify(view);
+                // Heights may change as rows enter the viewport. Keep the shared
+                // clock in its original coordinate space and resolve anchors here.
+                Some(next)
+            },
+        );
+    }
 }
 
 /// The list state that views must hold on behalf of the list element.
@@ -60,7 +220,9 @@ impl std::fmt::Debug for ListState {
 }
 
 struct StateInner {
-    smooth_scroll: Option<SmoothScroll>,
+    smooth_scroll: SmoothScroll,
+    navigation_request: Option<NavigationRequest>,
+    navigation_destination: Option<ListOffset>,
     last_layout_bounds: Option<Bounds<Pixels>>,
     last_padding: Option<Edges<Pixels>>,
     scroll_past_end: bool,
@@ -80,6 +242,17 @@ struct StateInner {
     measuring_behavior: ListMeasuringBehavior,
     item_measurement_ready: Option<Box<dyn Fn(usize, &App) -> bool>>,
     follow_state: FollowState,
+}
+
+#[derive(Clone, Copy)]
+enum NavigationRequest {
+    Position(ListOffset),
+    Distance(Pixels),
+    Reveal {
+        item: usize,
+        entire_item: bool,
+        animate: bool,
+    },
 }
 
 #[derive(Clone, Copy)]
@@ -324,7 +497,9 @@ impl ListState {
     /// that the list doesn't flicker or pop in when scrolling.
     pub fn new(item_count: usize, alignment: ListAlignment, overdraw: Pixels) -> Self {
         let state = Self(Rc::new(RefCell::new(StateInner {
-            smooth_scroll: None,
+            smooth_scroll: SmoothScroll::default(),
+            navigation_request: None,
+            navigation_destination: None,
             last_layout_bounds: None,
             last_padding: None,
             scroll_past_end: false,
@@ -392,7 +567,8 @@ impl ListState {
         let old_count = {
             let state = &mut *self.0.borrow_mut();
             state.reset = true;
-            state.smooth_scroll = None;
+            state.cancel_navigation();
+            state.smooth_scroll = SmoothScroll::default();
             state.measuring_behavior.reset();
             state.set_scroll_anchor(None);
             state.scrollbar_drag_start_height = None;
@@ -411,28 +587,7 @@ impl ListState {
     }
 
     fn apply_uniform_item_height(&self, height: Pixels) {
-        let size_hint = size(px(0.), height);
-        let mut state = self.0.borrow_mut();
-        if !state.items.summary().has_unknown_height {
-            return;
-        }
-        let new_items = state
-            .items
-            .iter()
-            .map(|item| match item {
-                ListItem::Unmeasured {
-                    size_hint: None,
-                    focus_handle,
-                } => ListItem::Unmeasured {
-                    size_hint: Some(size_hint),
-                    focus_handle: focus_handle.clone(),
-                },
-                item => item.clone(),
-            })
-            .collect::<Vec<_>>();
-        let mut tree = SumTree::default();
-        tree.extend(new_items, ());
-        state.items = tree;
+        self.0.borrow_mut().apply_uniform_item_height(height);
     }
 
     /// Remeasure all items while preserving proportional scroll position.
@@ -613,6 +768,56 @@ impl ListState {
         self.0.borrow().logical_scroll_top()
     }
 
+    /// Whether a previously laid-out viewport is moving to a navigation target.
+    pub fn is_navigating(&self) -> bool {
+        let state = self.0.borrow();
+        state.navigation_request.is_some() || state.smooth_scroll.is_navigating()
+    }
+
+    /// End queued or active navigation without moving the viewport.
+    pub fn cancel_navigation(&self) {
+        self.0.borrow_mut().cancel_navigation();
+    }
+
+    /// The destination used as the origin of a subsequent relative navigation.
+    pub fn navigation_scroll_top(&self) -> ListOffset {
+        let state = self.0.borrow();
+        if let Some(NavigationRequest::Position(position)) = state.navigation_request {
+            position
+        } else {
+            state.navigation_scroll_top()
+        }
+    }
+
+    /// Align an item-relative position using the viewport's navigation animation.
+    pub fn navigate_to(&self, position: ListOffset) {
+        self.0.borrow_mut().navigation_request = Some(NavigationRequest::Position(position));
+    }
+
+    /// Scroll by a distance relative to the latest navigation destination.
+    pub fn navigate_by(&self, distance: Pixels) {
+        let mut state = self.0.borrow_mut();
+        let distance = match state.navigation_request {
+            Some(NavigationRequest::Distance(previous)) => previous + distance,
+            Some(NavigationRequest::Position(position)) => {
+                distance + state.scroll_top(&position)
+                    - state.scroll_top(&state.navigation_scroll_top())
+            }
+            _ => distance,
+        };
+        state.navigation_request = Some(NavigationRequest::Distance(distance));
+    }
+
+    /// Measure an item's requested autoscroll bounds and reveal them through navigation.
+    /// For a whole-item reveal, use the item's layout bounds.
+    pub fn navigate_to_reveal_item(&self, item: usize, entire_item: bool, animate: bool) {
+        self.0.borrow_mut().navigation_request = Some(NavigationRequest::Reveal {
+            item,
+            entire_item,
+            animate,
+        });
+    }
+
     /// Scroll the list by the given offset
     pub fn scroll_by(&self, distance: Pixels) {
         if distance == px(0.) {
@@ -621,6 +826,7 @@ impl ListState {
 
         let current_offset = self.logical_scroll_top();
         let state = &mut *self.0.borrow_mut();
+        state.cancel_navigation();
 
         if distance < px(0.) {
             state.follow_state.stop_following();
@@ -653,6 +859,7 @@ impl ListState {
     /// growing (e.g. during streaming).
     pub fn scroll_to_end(&self) {
         let state = &mut *self.0.borrow_mut();
+        state.cancel_navigation();
         let item_count = state.items.summary().count;
         state.set_scroll_anchor(Some(ListOffset {
             item_ix: item_count,
@@ -736,6 +943,7 @@ impl ListState {
     /// Scroll the list to the given offset
     pub fn scroll_to(&self, mut scroll_top: ListOffset) {
         let state = &mut *self.0.borrow_mut();
+        state.cancel_navigation();
         let item_count = state.items.summary().count;
         if scroll_top.item_ix >= item_count {
             scroll_top.item_ix = item_count;
@@ -752,6 +960,7 @@ impl ListState {
     /// Scroll the list to the given item, such that the item is fully visible.
     pub fn scroll_to_reveal_item(&self, ix: usize) {
         let state = &mut *self.0.borrow_mut();
+        state.cancel_navigation();
 
         let mut scroll_top = state.logical_scroll_top();
         let height = state
@@ -833,6 +1042,7 @@ impl ListState {
     /// as items in the overdraw get measured, and help offset scroll position changes accordingly.
     pub fn scrollbar_drag_started(&self) {
         let mut state = self.0.borrow_mut();
+        state.cancel_navigation();
         state.scrollbar_drag_start_height = Some(state.items.summary().height);
     }
 
@@ -933,6 +1143,48 @@ impl ListState {
 }
 
 impl StateInner {
+    fn cancel_navigation(&mut self) {
+        self.navigation_request = None;
+        self.smooth_scroll.cancel_navigation();
+    }
+
+    fn navigation_scroll_top(&self) -> ListOffset {
+        if self.smooth_scroll.is_navigating()
+            && let Some(destination) = self.navigation_destination
+        {
+            return destination;
+        }
+        self.logical_scroll_top()
+    }
+
+    fn position_at(&self, y: Pixels) -> ListOffset {
+        let (start, ..) = self
+            .items
+            .find::<ListItemSummary, _>((), &Height(y), Bias::Right);
+        ListOffset {
+            item_ix: start.count,
+            offset_in_item: y - start.height,
+        }
+    }
+
+    fn apply_uniform_item_height(&mut self, height: Pixels) {
+        if !self.items.summary().has_unknown_height {
+            return;
+        }
+        let size_hint = Some(size(px(0.), height));
+        let items = self.items.iter().map(|item| match item {
+            ListItem::Unmeasured {
+                size_hint: None,
+                focus_handle,
+            } => ListItem::Unmeasured {
+                size_hint,
+                focus_handle: focus_handle.clone(),
+            },
+            item => item.clone(),
+        });
+        self.items = SumTree::from_iter(items, ());
+    }
+
     fn max_scroll_offset(&self) -> Pixels {
         let bounds = self.last_layout_bounds.unwrap_or_default();
         let height = self
@@ -1516,6 +1768,7 @@ impl StateInner {
     // Scrollbar support
 
     fn set_offset_from_scrollbar(&mut self, point: Point<Pixels>) {
+        self.cancel_navigation();
         let Some(bounds) = self.last_layout_bounds else {
             return;
         };
@@ -1679,7 +1932,7 @@ impl Element for List {
         window: &mut Window,
         cx: &mut App,
     ) -> ListPrepaintState {
-        let state = &mut *self.state.0.borrow_mut();
+        let mut state = self.state.0.borrow_mut();
         state.reset = false;
 
         let mut style = Style::default();
@@ -1714,7 +1967,13 @@ impl Element for List {
             state.measuring_behavior.reset();
         }
 
-        let mut autoscroll = true;
+        let navigation = state.navigation_request.take();
+        drop(state);
+        if let Some(request) = navigation {
+            self.begin_navigation(request, bounds, padding, window, cx);
+        }
+        let state = &mut *self.state.0.borrow_mut();
+        let mut autoscroll = !matches!(navigation, Some(NavigationRequest::Reveal { .. }));
         let layout = loop {
             match state.prepaint_items(
                 bounds,
@@ -1761,6 +2020,7 @@ impl Element for List {
         let mut accumulated_scroll_delta = ScrollDelta::default();
         window.on_mouse_event(move |event: &ScrollEvent, phase, window, cx| {
             if phase == DispatchPhase::Bubble && hitbox_id.should_handle_scroll(window) {
+                list_state.cancel_navigation();
                 if cx.smooth_scrolling()
                     && let ScrollDelta::Lines(lines) = event.delta
                 {
@@ -1769,12 +2029,7 @@ impl Element for List {
                     }
                     let current = list_state.scroll_px_offset_for_scrollbar();
                     let max = list_state.max_offset_for_scrollbar().y;
-                    let smooth_scroll = list_state
-                        .0
-                        .borrow_mut()
-                        .smooth_scroll
-                        .get_or_insert_with(SmoothScroll::default)
-                        .clone();
+                    let smooth_scroll = list_state.0.borrow().smooth_scroll.clone();
                     let target = smooth_scroll.target(
                         current,
                         point(px(0.), event.delta.content_delta().y),

@@ -1253,6 +1253,20 @@ impl<M: InputModeKind> TextElement<M> {
         line_height: Pixels,
         viewport_height: Pixels,
     ) {
+        state.deferred_scroll_offset = Some(Self::projected_scroll_offset(
+            state,
+            request,
+            line_height,
+            viewport_height,
+        ));
+    }
+
+    fn projected_scroll_offset(
+        state: &InputBaseState<M>,
+        request: ProjectedScroll,
+        line_height: Pixels,
+        viewport_height: Pixels,
+    ) -> Point<Pixels> {
         let map = &state.display_map;
         let (row, inset) = match request {
             ProjectedScroll::Line { line, inset } => (map.buffer_line_to_display_row(line), inset),
@@ -1271,9 +1285,117 @@ impl<M: InputModeKind> TextElement<M> {
                 });
                 (row, inset)
             }
+            ProjectedScroll::Viewport {
+                position,
+                inset,
+                horizontal,
+            } => {
+                let offset = state.text.position_to_offset(&position);
+                let row = map.offset_to_display_row(offset, false);
+                let top = map.display_row_top(row, line_height) + inset.clamp(px(0.), line_height);
+                let y = if top == px(0.) {
+                    px(0.)
+                } else {
+                    -top - state.editor_paddings.top
+                };
+                return point(horizontal, y);
+            }
         };
         let y = inset - map.display_row_top(row, line_height);
-        state.deferred_scroll_offset = Some(point(state.scroll_handle.offset().x, y));
+        point(state.scroll_handle.offset().x, y)
+    }
+
+    fn begin_scroll_navigation(
+        &self,
+        line_height: Pixels,
+        viewport_height: Pixels,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let state = self.state.read(cx);
+        if !state.pending_scroll_navigation
+            || state.last_layout.is_none()
+            || !cx.smooth_scrolling()
+            || cx.reduce_motion()
+        {
+            return;
+        }
+        let Some(target) = state.deferred_scroll_offset else {
+            return;
+        };
+        let projected = state.pending_projected_scroll;
+        let caret = state.cursor();
+        let revision = state.document_revision;
+        let caret_top = move |state: &InputBaseState<M>, height| {
+            let row = state
+                .display_map
+                .offset_to_display_row(caret, state.cursor_line_end_affinity);
+            state.display_map.display_row_top(row, height)
+        };
+        let inset = target.y + caret_top(state, line_height);
+        let clamp_y = |state: &InputBaseState<M>, y, height, viewport| {
+            let map = &state.display_map;
+            let rows = map.wrap_row_count() + map.block_row_count();
+            let content = map.display_row_top(rows, height)
+                + empty_bottom_height(
+                    state.is_code_editor(),
+                    state.scroll_beyond_last_line,
+                    viewport,
+                    height,
+                );
+            clamp_vertical_scroll_offset(y, content, viewport)
+        };
+        let current = state.scroll_offset();
+        let target = point(
+            target.x,
+            clamp_y(state, target.y, line_height, viewport_height),
+        );
+        if current == target {
+            return;
+        }
+        let scroll = state.scroll_handle.smooth_scroll();
+        self.state.update(cx, |state, _| {
+            state.deferred_scroll_offset = None;
+            state.overscroll.reset();
+        });
+        let editor = self.state.downgrade();
+        scroll.navigate(
+            current,
+            target,
+            viewport_height,
+            window,
+            cx,
+            move |last, next, _, cx| {
+                editor
+                    .update(cx, |state, cx| {
+                        if state.document_revision != revision || state.cursor() != caret {
+                            return None;
+                        }
+                        let current = state.scroll_offset();
+                        let height = state.line_height().unwrap_or(line_height);
+                        let viewport = state.input_bounds.size.height;
+                        let y = projected.map_or_else(
+                            || inset - caret_top(state, height),
+                            |request| {
+                                Self::projected_scroll_offset(state, request, height, viewport).y
+                            },
+                        );
+                        let y = clamp_y(state, y, height, viewport);
+                        let y = if next == target {
+                            y
+                        } else if target.y == last.y {
+                            current.y
+                        } else {
+                            current.y + (y - current.y) * ((next.y - last.y) / (target.y - last.y))
+                        };
+                        state.scroll_handle.set_offset(point(next.x, y));
+                        cx.notify();
+                        Some(next)
+                    })
+                    .ok()
+                    .flatten()
+            },
+        );
     }
 
     fn active_caret_selection(state: &InputBaseState<M>) -> CursorSelection {
@@ -1302,6 +1424,7 @@ impl<M: InputModeKind> TextElement<M> {
 
         let active_selection = Self::active_caret_selection(state);
         let edited = state.pending_edit_reveal;
+        let navigating = state.scroll_handle.smooth_scroll().is_navigating();
         let jump = matches!(
             state.pending_projected_scroll,
             Some(ProjectedScroll::Caret { .. })
@@ -1328,6 +1451,7 @@ impl<M: InputModeKind> TextElement<M> {
                 .as_ref()
                 .is_some_and(|old| old.line_height != line_height);
         let reveal_on_resize = resized
+            && !navigating
             && state.deferred_scroll_offset.is_none()
             && state.focus_handle.is_focused(window)
             && state.prepaint_caret_geometry.is_some_and(|old| {
@@ -1438,7 +1562,7 @@ impl<M: InputModeKind> TextElement<M> {
 
                     // Vertical cursor-follow is suppressed while auto-scroll manages the y axis,
                     // to prevent fighting the background scroll task.
-                    if !auto_scrolling && !edited {
+                    if !auto_scrolling && !navigating && !edited {
                         scroll_offset.y = reveal_row(
                             scroll_offset.y,
                             cursor_pos.y,
@@ -1455,7 +1579,10 @@ impl<M: InputModeKind> TextElement<M> {
                             // selection start is out of left
                             scroll_offset.x = -cursor_start.x;
                         }
-                        if !auto_scrolling && scroll_offset.y + cursor_start.y < px(0.) {
+                        if !auto_scrolling
+                            && !navigating
+                            && scroll_offset.y + cursor_start.y < px(0.)
+                        {
                             // selection start is out of top
                             scroll_offset.y = -cursor_start.y;
                         }
@@ -1466,7 +1593,10 @@ impl<M: InputModeKind> TextElement<M> {
                             // selection end is out of left
                             scroll_offset.x = -cursor_end.x;
                         }
-                        if !auto_scrolling && scroll_offset.y + cursor_end.y <= px(0.) {
+                        if !auto_scrolling
+                            && !navigating
+                            && scroll_offset.y + cursor_end.y <= px(0.)
+                        {
                             // selection end is out of top
                             scroll_offset.y = -cursor_end.y;
                         }
@@ -4279,12 +4409,18 @@ impl<M: InputModeKind> Element for TextElement<M> {
         let projected_scroll = self.state.read(cx).pending_projected_scroll;
         if let Some(request) = projected_scroll {
             self.state.update(cx, |state, cx| {
-                if matches!(request, ProjectedScroll::Caret { .. })
-                    && state.display_map.wrap_pending()
-                {
-                    let caret = state.text.offset_to_point(state.cursor()).row;
-                    state.display_map.prepare_wrap_rows(caret..caret + 1, cx);
-                    Self::update_block_projection(state, &hunk_rows, line_height);
+                if state.display_map.wrap_pending() {
+                    let row = match request {
+                        ProjectedScroll::Caret { .. } => {
+                            state.text.offset_to_point(state.cursor()).row
+                        }
+                        ProjectedScroll::Viewport { position, .. } => position.line as usize,
+                        ProjectedScroll::Line { line, .. } => line,
+                    };
+                    if row < state.text.lines_len() {
+                        state.display_map.prepare_wrap_rows(row..row + 1, cx);
+                        Self::update_block_projection(state, &hunk_rows, line_height);
+                    }
                 }
                 Self::resolve_projected_scroll(state, request, line_height, bounds.size.height);
             });
@@ -4317,7 +4453,7 @@ impl<M: InputModeKind> Element for TextElement<M> {
                     Self::update_block_projection(state, &hunk_rows, line_height);
                     true
                 });
-                if let Some(request @ ProjectedScroll::Caret { .. }) = projected_scroll {
+                if let Some(request) = projected_scroll {
                     Self::resolve_projected_scroll(state, request, line_height, bounds.size.height);
                 }
                 if let Some((job, batch)) = state.display_map.wrap_batch(cx) {
@@ -4360,6 +4496,7 @@ impl<M: InputModeKind> Element for TextElement<M> {
             window,
             cx,
         );
+        self.begin_scroll_navigation(line_height, bounds.size.height, window, cx);
         // Choose the destination viewport before shaping its rows. Editing
         // only needs enough scroll to reveal the caret in the fresh layout.
         self.reveal_edited_caret(line_height, bounds.size.height, cx);
@@ -4983,6 +5120,7 @@ impl<M: InputModeKind> Element for TextElement<M> {
             state.update_scroll_offset(Some(cursor_scroll_offset), cx);
             state.deferred_scroll_offset = None;
             state.pending_projected_scroll = None;
+            state.pending_scroll_navigation = false;
             M::validate_hover_anchor(state, window.content_mask().bounds, cx);
 
             // Layout consumers need changed geometry, not another notification

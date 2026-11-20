@@ -399,7 +399,10 @@ fn workspace_disclosures_animate_offscreen() -> Result<()> {
             diff.scroll_to_file("README.md", cx);
         });
     })?;
-    draw(&mut cx, handle)?;
+    for _ in 0..8 {
+        cx.advance_clock(Duration::from_millis(25));
+        draw(&mut cx, handle)?;
+    }
     let (tree_bottom, hunk_toggle) = cx.update_window(handle, |_, _, cx| {
         let bounds = panel.read(cx).tree_scroll.0.borrow().base_handle.bounds();
         (

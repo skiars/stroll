@@ -78,6 +78,13 @@ dialogs in a Wayland window after changes to paint order or focus handling.
 - After input changes, run `cargo test --release --locked --test touchpad_scroll --test smooth_scroll`
   to check logical document offsets and device-pixel paint offsets. Check continuous scrolling
   in documents, editors, and lists in a native Wayland session.
+- Explicit content navigation uses GPUI's scroll scheduler with a 140 ms ease-out,
+  a bounded arrival segment for long jumps, and an immediate path for reduced
+  motion. Editors resolve targets through their display maps. Scrollable
+  Markdown and diffs use virtual-list anchors. Markdown probes the target
+  row in a prepaint transaction before moving the viewport. The
+  `smooth_scroll` integration tests sample intermediate frames and final
+  positions.
 - Wayland IME edits retain the last submitted candidate rectangle until GPUI
   lays out the updated text. The platform tests cover deferred updates and
   protocol rectangle deduplication. For native verification, compose across

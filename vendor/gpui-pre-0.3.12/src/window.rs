@@ -6112,15 +6112,18 @@ impl Window {
             PlatformInput::Scroll(event) => {
                 if event.delta.precise() {
                     self.smooth_scroll.cancel();
+                } else {
+                    self.smooth_scroll.cancel_navigation();
                 }
                 if !event.source.is_touchpad() {
                     self.touchpad_scroll.cancel();
                 }
             }
-            PlatformInput::KeyDown(_)
-            | PlatformInput::MouseDown(_)
-            | PlatformInput::Touch(_)
-            | PlatformInput::Pinch(_) => {
+            PlatformInput::KeyDown(_) => {
+                self.smooth_scroll.cancel_wheel();
+                self.touchpad_scroll.cancel();
+            }
+            PlatformInput::MouseDown(_) | PlatformInput::Touch(_) | PlatformInput::Pinch(_) => {
                 self.smooth_scroll.cancel();
                 self.touchpad_scroll.cancel();
             }

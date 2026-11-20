@@ -555,18 +555,26 @@ impl Workspace {
         index: usize,
         position: Option<FilePosition>,
         source: Option<SourceLocation>,
+        animate: bool,
         cx: &mut Context<Self>,
     ) {
         if let Some(file) = self.files.get_mut(path)
             && let Some(position) = position
         {
-            file.restore_position = Some(position);
+            file.restore_position = None;
             file.editor.update(cx, |editor, cx| {
                 let (row, col) = position.selection_start;
                 editor.unfold_at(Position::new(row, col), cx);
                 let (row, col) = position.selection_end;
                 editor.unfold_at(Position::new(row, col), cx);
                 restore_file_selection(editor, position, cx);
+                editor.scroll_to_viewport_anchor(
+                    Position::new(position.top.0, position.top.1),
+                    px(position.inset),
+                    px(position.horizontal),
+                    animate,
+                    cx,
+                );
             });
         }
         if let Some(history) = self.source_history_mut() {

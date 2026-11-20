@@ -934,6 +934,7 @@ pub(super) struct ReviewEditor {
     viewport: Rc<std::cell::Cell<(usize, usize, usize, Pixels)>>,
     navigation_row: usize,
     navigation_source: Option<DiffLinePosition>,
+    pub(super) navigating_file: Option<String>,
     restore_viewport: bool,
     tail_rows: Rc<Cell<Option<usize>>>,
     wrap_rows: Rc<RefCell<Rc<Vec<usize>>>>,
@@ -1002,6 +1003,7 @@ impl ReviewEditor {
             viewport: Rc::default(),
             navigation_row: 0,
             navigation_source: None,
+            navigating_file: None,
             restore_viewport: false,
             tail_rows: Rc::default(),
             wrap_rows: Rc::default(),
@@ -1306,6 +1308,32 @@ impl ReviewEditor {
         self.modified
             .editor
             .update(cx, |editor, cx| editor.focus(window, cx));
+    }
+
+    fn scroll_to_rows(
+        &self,
+        rows: [usize; 2],
+        inset: Pixels,
+        animate: bool,
+        window: &Window,
+        cx: &mut App,
+    ) -> bool {
+        let driver = self.focused_column(window, cx);
+        let animate = animate
+            && cx.smooth_scrolling()
+            && !cx.reduce_motion()
+            && driver.read(cx).line_height().is_some();
+        for (column, row) in [(&self.original, rows[0]), (&self.modified, rows[1])] {
+            if !animate || &column.editor == driver {
+                column.editor.update(cx, |editor, cx| {
+                    editor.scroll_to_projected_line(row, inset, cx);
+                    if animate {
+                        editor.animate_pending_scroll();
+                    }
+                });
+            }
+        }
+        animate
     }
 
     pub(super) fn prepare(
@@ -1717,14 +1745,9 @@ impl ReviewEditor {
                 panel.editor.navigation_row = target;
                 panel.editor.navigation_source = None;
                 panel.editor.restore_viewport = false;
-                for (column, row) in [
-                    (&panel.editor.original.editor, row),
-                    (right, projected.start),
-                ] {
-                    column.update(cx, |editor, cx| {
-                        editor.scroll_to_projected_line(row, inset, cx)
-                    });
-                }
+                panel
+                    .editor
+                    .scroll_to_rows([row, projected.start], inset, true, window, cx);
                 return;
             }
         }
@@ -1733,11 +1756,22 @@ impl ReviewEditor {
                 matches!(&panel.editor.rows[row], DiffEditorRow::File(header) if header.as_str() == path)
             })
         });
+        if panel.editor.navigating_file.is_some()
+            && panel.editor.navigating_file == panel.pending_file_reveal
+        {
+            return;
+        }
         if row_mapping.is_none()
             && (file_row.is_some()
                 || panel.editor.restore_viewport
                 || panel.editor.navigation_row != target)
         {
+            let explicit = panel.diff.read(cx).has_projected_navigation();
+            if explicit {
+                panel
+                    .diff
+                    .update(cx, |diff, _| diff.clear_projected_navigation());
+            }
             let preserve_offset = std::mem::take(&mut panel.editor.restore_viewport);
             let target = file_row.unwrap_or(target);
             panel.editor.navigation_row = target;
@@ -1762,10 +1796,13 @@ impl ReviewEditor {
             } else {
                 px(0.)
             };
-            for column in [&panel.editor.original, &panel.editor.modified] {
-                column.editor.update(cx, |editor, cx| {
-                    editor.scroll_to_projected_line(target, inset, cx)
-                });
+            let animate =
+                !preserve_offset && !panel.single_file && (explicit || file_row.is_some());
+            if panel
+                .editor
+                .scroll_to_rows([target; 2], inset, animate, window, cx)
+            {
+                panel.editor.navigating_file = panel.pending_file_reveal.clone();
             }
         }
     }
@@ -1806,6 +1843,8 @@ impl ReviewEditor {
         let revision = self.row_revision.unwrap_or_default();
         let navigation = panel.diff.read(cx).editor_viewport_position();
         let pending_file = panel.pending_file_reveal.clone();
+        let navigating_file =
+            panel.editor.navigating_file.is_some() && panel.editor.navigating_file == pending_file;
         let headers = self.headers.clone();
         let blocks = self.blocks.clone();
         let mixed = panel.review.as_ref().is_some_and(|review| {
@@ -1885,14 +1924,20 @@ impl ReviewEditor {
                 }
                 let a = left.read(cx).scroll_offset().y;
                 let b = right.read(cx).scroll_offset().y;
+                let left_navigating = left.read(cx).is_scroll_navigating();
+                let right_navigating = right.read(cx).is_scroll_navigating();
                 let (old_a, old_b) = last_scroll.get();
                 if split && a != b {
                     // The follower can be applying the preceding frame's
                     // offset while the source advances on the same frame.
-                    match (a != old_a, b != old_b) {
+                    match (left_navigating, right_navigating) {
                         (true, false) => scroll_from_left.set(true),
                         (false, true) => scroll_from_left.set(false),
-                        _ => {}
+                        _ => match (a != old_a, b != old_b) {
+                            (true, false) => scroll_from_left.set(true),
+                            (false, true) => scroll_from_left.set(false),
+                            _ => {}
+                        },
                     }
                     // The columns use different row heights until the new
                     // padding lands. Let each preserve its source anchor first.
@@ -1961,7 +2006,8 @@ impl ReviewEditor {
                     matches!(rows.get(start), Some(DiffEditorRow::File(header)) if header.as_str() == path)
                         && measured_offset.is_some_and(|offset| offset.abs() < px(0.5))
                 });
-                if viewport.replace(report) != report || aligned {
+                let navigating = left_navigating || right_navigating;
+                if !navigating && (viewport.replace(report) != report || aligned || navigating_file) {
                     let weak = weak.clone();
                     let pending_file = pending_file.clone();
                     window.defer(cx, move |_, cx| {
@@ -1977,8 +2023,9 @@ impl ReviewEditor {
                             panel.diff.update(cx, |diff, cx| {
                                 diff.set_editor_viewport_offset(start..end, offset, cx)
                             });
-                            if aligned {
+                            if aligned || navigating_file {
                                 panel.pending_file_reveal = None;
+                                panel.editor.navigating_file = None;
                             }
                             if !panel.single_file
                                 && panel.pending_file_reveal.is_none()

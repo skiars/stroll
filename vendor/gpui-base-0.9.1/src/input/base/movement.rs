@@ -139,8 +139,22 @@ impl<M: InputModeKind> InputBaseState<M> {
                         target = (line_start + column, affinity);
                     }
                 } else {
-                    let max_line_len = self.text.slice_line(line).len();
-                    target = (line_start + column.min(max_line_len), false);
+                    // Rapid navigation can move the caret ahead of shaped rows.
+                    // Keep the intended wrap row even without its glyph layout.
+                    let column = if start.local_row == 0 {
+                        column
+                    } else {
+                        start.column
+                    };
+                    let offset =
+                        self.display_map
+                            .wrap_display_point_to_offset(WrapDisplayPoint::new(
+                                row,
+                                continuation,
+                                column,
+                            ));
+                    let affinity = self.display_map.offset_to_wrap_display_point(offset).row > row;
+                    target = (offset, affinity);
                 }
             }
             if row == start.row || self.display_map.inlay_line(line).is_none() {
@@ -223,6 +237,7 @@ impl<M: InputModeKind> InputBaseState<M> {
 
         self.cursor_line_end_affinity = active_affinity;
         self.scroll_to(self.cursor(), direction, cx);
+        self.animate_pending_scroll();
         self.pause_blink_cursor(cx);
         M::hide_context_menu(self, cx);
         M::clear_inline_completion(self, cx);
@@ -418,10 +433,12 @@ impl<M: InputModeKind> InputBaseState<M> {
         cx: &mut Context<Self>,
     ) {
         self.move_to(0, None, cx);
+        self.animate_pending_scroll();
     }
 
     pub(super) fn move_to_end(&mut self, _: &MoveToEnd, _: &mut Window, cx: &mut Context<Self>) {
         self.move_to(self.text.len(), None, cx);
+        self.animate_pending_scroll();
     }
 
     pub(super) fn move_to_previous_word(

@@ -181,7 +181,7 @@ fn check_hunk_toggles(split: bool) {
                 .clone()
                 .update(cx, |diff, cx| diff.scroll_to_line(position.clone(), cx));
         });
-        settle(visual);
+        crate::workspace::finish_scroll_navigation(visual);
         let bounds = source_bounds(visual, &position);
         let revision = visual.update(|_, cx| panel.read(cx).diff.read(cx).editor_row_revision());
         let hover = point(bounds.left() + px(56.), bounds.center().y);

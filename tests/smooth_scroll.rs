@@ -167,6 +167,217 @@ fn scroll(cx: &mut VisualTestContext, y: Pixels, delta: ScrollDelta) {
     });
 }
 
+#[gpui::test]
+fn editor_navigation_retargets_and_yields_to_direct_input(cx: &mut TestAppContext) {
+    struct EditorView(Entity<EditorState>);
+    impl Render for EditorView {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            Editor::new(&self.0).size_full()
+        }
+    }
+
+    let mut editor = None;
+    let (_, visual) = cx.add_window_view(|window, cx| {
+        gpui_component::init(cx);
+        cx.set_smooth_scrolling(true);
+        cx.set_reduce_motion(false);
+        let state = cx.new(|cx| {
+            EditorState::new(window, cx)
+                .soft_wrap(true)
+                .default_value(format!("{}\nshort\n", "wrapped words ".repeat(32)).repeat(45))
+        });
+        state.update(cx, |state, cx| state.focus(window, cx));
+        editor = Some(state.clone());
+        Root::new(cx.new(|_| EditorView(state)), window, cx)
+    });
+    let editor = editor.unwrap();
+    visual.simulate_resize(gpui::size(px(380.), px(220.)));
+    draw(visual);
+    let position = |visual: &mut VisualTestContext| {
+        visual.update(|_, cx| {
+            let editor = editor.read(cx);
+            (editor.selected_range().end, editor.scroll_offset().y)
+        })
+    };
+    let start = position(visual);
+    visual.simulate_keystrokes("pagedown");
+    draw(visual);
+    let first = position(visual);
+    assert!(first.0 > start.0);
+    assert_eq!(first.1, start.1);
+    advance_frame(visual, 16);
+    let intermediate = position(visual);
+    assert!(intermediate.1 < start.1);
+
+    visual.simulate_keystrokes("pagedown pagedown pageup");
+    draw(visual);
+    let latest = position(visual);
+    assert!(
+        latest.0 > first.0,
+        "{start:?} {first:?} {intermediate:?} {latest:?}"
+    );
+    assert_eq!(latest.1, intermediate.1);
+    finish_scroll(visual);
+    let end = position(visual);
+    assert_eq!(end.0, latest.0);
+    assert!(end.1 < latest.1);
+    visual.update(|_, cx| {
+        let state = editor.read(cx);
+        let row = state.cursor_position().line as usize;
+        assert!(state.visible_row_range().unwrap().contains(&row));
+    });
+
+    visual.simulate_keystrokes("pagedown");
+    draw(visual);
+    advance_frame(visual, 16);
+    let before_wheel = position(visual).1;
+    scroll(visual, px(100.), ScrollDelta::Pixels(point(px(0.), px(8.))));
+    let after_wheel = position(visual).1;
+    assert!(after_wheel > before_wheel);
+    finish_scroll(visual);
+    assert_eq!(position(visual).1, after_wheel);
+
+    visual.update(|_, cx| cx.set_reduce_motion(true));
+    visual.simulate_keystrokes("pagedown");
+    draw(visual);
+    let immediate = position(visual);
+    assert!(immediate.1 < after_wheel);
+    finish_scroll(visual);
+    assert_eq!(position(visual), immediate);
+
+    visual.update(|_, cx| {
+        cx.set_reduce_motion(false);
+        cx.set_smooth_scrolling(false);
+    });
+    visual.simulate_keystrokes("pagedown");
+    draw(visual);
+    let disabled = position(visual);
+    assert!(disabled.1 < immediate.1);
+    finish_scroll(visual);
+    assert_eq!(position(visual), disabled);
+}
+
+#[gpui::test]
+fn markdown_navigation_measures_the_target_before_painting_the_arrival(cx: &mut TestAppContext) {
+    let mut text = None;
+    let (_, visual) = cx.add_window_view(|window, cx| {
+        gpui_component::init(cx);
+        cx.set_smooth_scrolling(true);
+        cx.set_reduce_motion(false);
+        let paragraph = format!("{}\n\n", "a paragraph that wraps ".repeat(25));
+        let source = format!(
+            "# Start\n\n{}## Target\n\n{}",
+            paragraph.repeat(18),
+            paragraph
+        );
+        let document = cx.new(|cx| TextViewState::markdown(&source, cx).scrollable(true));
+        document.read(cx).list_state().set_scroll_past_end(true);
+        text = Some(document.clone());
+        Root::new(cx.new(|_| ScrollDocument(document)), window, cx)
+    });
+    struct ScrollDocument(Entity<TextViewState>);
+    impl Render for ScrollDocument {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            TextView::new(&self.0).scrollable(true).size_full()
+        }
+    }
+
+    let text = text.unwrap();
+    visual.simulate_resize(gpui::size(px(380.), px(220.)));
+    visual.run_until_parked();
+    draw(visual);
+    let (list, block, range) = visual.update(|_, cx| {
+        let text = text.read(cx);
+        let rendered = text.rendered_text();
+        let start = rendered.as_str().find("Target").unwrap();
+        let source = rendered.source().find("Target").unwrap();
+        (
+            text.list_state().clone(),
+            text.block_for_source_offset(source).unwrap(),
+            start..start,
+        )
+    });
+    let inset = px(12.);
+    visual.update(|_, cx| {
+        text.update(cx, |text, cx| {
+            text.scroll_to_range(range.clone(), Some(inset), true, cx)
+                .unwrap()
+        })
+    });
+    draw(visual);
+    let first = list.logical_scroll_top();
+    assert!(first.item_ix > 0, "{first:?}, destination block {block}");
+    assert!(list.is_navigating());
+    advance_frame(visual, 16);
+    assert_ne!(list.logical_scroll_top(), first);
+    finish_scroll(visual);
+    assert!(!list.is_navigating());
+    let target = list
+        .bounds_for_item(block)
+        .expect("the target block is laid out");
+    assert!(target.intersects(&list.viewport_bounds()));
+    let animated = list.scroll_px_offset_for_scrollbar().y;
+    list.scroll_to(Default::default());
+    visual.update(|_, cx| {
+        text.update(cx, |text, cx| {
+            text.reveal_range_at_top(range, inset, cx).unwrap()
+        })
+    });
+    draw(visual);
+    assert!((animated - list.scroll_px_offset_for_scrollbar().y).abs() <= px(1.));
+}
+
+#[gpui::test]
+fn diff_file_navigation_scrolls_through_intermediate_rows(cx: &mut TestAppContext) {
+    struct DiffView(Entity<DiffState>);
+    impl Render for DiffView {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            Diff::new(&self.0)
+        }
+    }
+
+    let mut state = None;
+    let (_, visual) = cx.add_window_view(|window, cx| {
+        gpui_component::init(cx);
+        cx.set_smooth_scrolling(true);
+        cx.set_reduce_motion(false);
+        let files = (1..=4).map(|index| {
+            DiffFile::parse(&format!(
+                "--- /dev/null\n+++ b/file-{index}.txt\n@@ -0,0 +1,8 @@\n{}",
+                "+line\n".repeat(8),
+            ))
+            .unwrap()
+            .remove(0)
+        });
+        let diff = cx.new(|cx| DiffState::new(files, cx));
+        state = Some(diff.clone());
+        Root::new(cx.new(|_| DiffView(diff)), window, cx)
+    });
+    let state = state.unwrap();
+    visual.simulate_resize(gpui::size(px(430.), px(260.)));
+    draw(visual);
+    let anchor = |visual: &mut VisualTestContext| {
+        visual.update(|_, cx| {
+            let anchor = state.read(cx).viewport_anchor().unwrap();
+            (
+                anchor.path().to_owned(),
+                anchor.line().cloned(),
+                anchor.offset(),
+            )
+        })
+    };
+    let start = anchor(visual);
+    visual.update(|_, cx| state.update(cx, |diff, cx| diff.scroll_to_file("file-2.txt", cx)));
+    draw(visual);
+    assert_eq!(anchor(visual), start);
+    advance_frame(visual, 16);
+    let middle = anchor(visual);
+    assert_eq!(middle.0, "file-1.txt");
+    assert_ne!(middle, start);
+    finish_scroll(visual);
+    assert_eq!(anchor(visual), ("file-2.txt".to_owned(), None, px(0.)));
+}
+
 #[test]
 fn wheel_scrolling_animates_through_the_desktop_viewports() {
     let platform = gpui_platform::current_platform(cfg!(target_os = "linux"));

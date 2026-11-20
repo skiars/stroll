@@ -2089,7 +2089,7 @@ mod tests {
                 diff.scroll_to_file(target, cx);
             });
         });
-        draw(visual);
+        crate::workspace::finish_scroll_navigation(visual);
         assert_eq!(active(visual).as_deref(), Some(target));
         assert!(tree(visual).offset().y < px(0.));
         let viewport = tree(visual).bounds();

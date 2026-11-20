@@ -1419,7 +1419,7 @@ impl App {
         }
     }
 
-    /// Enables short scroll animations for discrete mouse wheel input.
+    /// Enables short scroll animations for wheel input and viewport navigation.
     pub fn set_smooth_scrolling(&mut self, enabled: bool) {
         if self.smooth_scrolling != enabled {
             self.smooth_scrolling = enabled;
@@ -1427,7 +1427,7 @@ impl App {
         }
     }
 
-    /// Whether the application enables smooth wheel scrolling.
+    /// Whether the application enables smooth scrolling.
     pub fn smooth_scrolling(&self) -> bool {
         self.smooth_scrolling
     }

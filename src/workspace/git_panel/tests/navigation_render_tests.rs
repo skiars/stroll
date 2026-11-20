@@ -1173,15 +1173,15 @@ fn check_file_tree_navigation(split: bool) {
         );
         assert!(viewport.contains(&position));
         visual.simulate_click(position, Modifiers::default());
-        for _ in 0..3 {
+        for _ in 0..8 {
             draw_frame(visual);
-            check_target(visual, path, selector);
             assert_eq!(
                 tree_viewport(visual),
                 (viewport, offset),
                 "{path} while loading"
             );
         }
+        check_target(visual, path, selector);
 
         visual.update(|window, cx| {
             panel.update(cx, |panel, cx| {

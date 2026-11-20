@@ -311,6 +311,8 @@ pub struct DiffState {
     line_number_digits: usize,
     viewport: Size<Pixels>,
     reported_visible_files: Option<(usize, usize)>,
+    projected_viewport: bool,
+    projected_navigation: bool,
     layout: Option<LayoutKey>,
     content_width: Pixels,
     width_dirty: bool,
@@ -457,6 +459,8 @@ impl DiffState {
             syntax_highlighter: None,
             viewport: Size::default(),
             reported_visible_files: None,
+            projected_viewport: false,
+            projected_navigation: false,
             layout: None,
             content_width: px(0.),
             width_dirty: true,
@@ -846,6 +850,7 @@ impl DiffState {
         offset: Pixels,
         cx: &mut Context<Self>,
     ) {
+        self.projected_viewport = true;
         let first = self
             .rows
             .get(rows.clone())
@@ -869,6 +874,16 @@ impl DiffState {
     pub fn editor_viewport_position(&self) -> (usize, Pixels) {
         let top = self.list.logical_scroll_top();
         (top.item_ix, top.offset_in_item)
+    }
+
+    /// Whether a projected editor has an explicit destination to consume.
+    pub fn has_projected_navigation(&self) -> bool {
+        self.projected_navigation
+    }
+
+    /// Consume the explicit destination before applying it to the editor viewport.
+    pub fn clear_projected_navigation(&mut self) {
+        self.projected_navigation = false;
     }
 
     pub(crate) fn hunk_on_path(
@@ -1467,7 +1482,7 @@ impl DiffState {
             self.rebuild_at_anchor();
         }
         if let Some(row) = self.expand_line(&position) {
-            self.scroll_to_change(row);
+            self.scroll_to_change(row, cx);
             cx.notify();
         }
     }
@@ -1480,10 +1495,13 @@ impl DiffState {
         else {
             return;
         };
-        self.list.scroll_to(ListOffset {
-            item_ix,
-            offset_in_item: px(0.),
-        });
+        self.navigate_to(
+            ListOffset {
+                item_ix,
+                offset_in_item: px(0.),
+            },
+            cx,
+        );
         cx.notify();
     }
 
@@ -1712,6 +1730,8 @@ impl DiffState {
 
     /// Records the window that renders this state, for clearing its text selection.
     pub(crate) fn set_window(&mut self, window: WindowId) {
+        self.projected_viewport = false;
+        self.projected_navigation = false;
         self.window = Some(window);
     }
 
@@ -1878,7 +1898,7 @@ impl DiffState {
     }
 
     fn move_change(&mut self, forward: bool, cx: &mut Context<Self>) {
-        let top = self.list.logical_scroll_top().item_ix;
+        let top = self.list.navigation_scroll_top().item_ix;
         let groups = &self.change_rows;
         let target = if forward {
             // Scrolled to the end, the list clamps any later change below the
@@ -1905,16 +1925,33 @@ impl DiffState {
                 .or(groups.last().copied())
         };
         if let Some(ix) = target {
-            self.scroll_to_change(ix);
+            self.scroll_to_change(ix, cx);
             cx.notify();
         }
     }
 
-    fn scroll_to_change(&self, item_ix: usize) {
-        self.list.scroll_to(ListOffset {
-            item_ix,
-            offset_in_item: -self.sticky_header_height,
-        });
+    fn scroll_to_change(&mut self, item_ix: usize, cx: &App) {
+        self.navigate_to(
+            ListOffset {
+                item_ix,
+                offset_in_item: -self.sticky_header_height,
+            },
+            cx,
+        );
+    }
+
+    fn navigate_to(&mut self, position: ListOffset, cx: &App) {
+        if self.projected_viewport {
+            self.projected_navigation = true;
+            self.list.scroll_to(position);
+        } else if cx.smooth_scrolling()
+            && !cx.reduce_motion()
+            && self.list.viewport_bounds().size.height > px(0.)
+        {
+            self.list.navigate_to(position);
+        } else {
+            self.list.scroll_to(position);
+        }
     }
 
     /// The source line shown by a row, looking past headers within its file.

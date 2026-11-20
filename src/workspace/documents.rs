@@ -654,7 +654,7 @@ mod tests {
                 assert!(reader.jump_to_fragment("section-20", cx));
             })
         });
-        draw(visual);
+        crate::workspace::finish_scroll_navigation(visual);
         let position =
             visual.update(|_, cx| original_reader.read(cx).session_position(cx).unwrap());
         assert!(position.block > 0);
@@ -782,7 +782,7 @@ mod tests {
                 assert!(reader.jump_to_fragment("section-20", cx))
             });
         });
-        draw(visual);
+        crate::workspace::finish_scroll_navigation(visual);
 
         let position = visual.update(|window, cx| {
             workspace.update(cx, |this, cx| {

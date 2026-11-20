@@ -805,14 +805,14 @@ fn render_diff(
             if !body_focused(this, window, cx) {
                 return;
             }
-            this.list().scroll_by(-this.viewport().height * 0.9);
+            this.list().navigate_by(-this.viewport().height * 0.9);
             cx.notify();
         }))
         .on_action(cx.listener(|this, _: &PageDown, window, cx| {
             if !body_focused(this, window, cx) {
                 return;
             }
-            this.list().scroll_by(this.viewport().height * 0.9);
+            this.list().navigate_by(this.viewport().height * 0.9);
             cx.notify();
         }))
         .on_action(cx.listener(|this, _: &First, window, cx| {

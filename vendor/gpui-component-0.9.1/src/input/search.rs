@@ -139,7 +139,7 @@ fn paint_document_matches(
         active.map(|range| RangeHighlight::new(range.clone(), accent.opacity(0.48)));
     _ = text.set_range_highlights(passive.chain(active_highlight), cx);
     if let Some(range) = active {
-        _ = text.reveal_range(range.clone(), cx);
+        _ = text.scroll_to_range(range.clone(), None, true, cx);
     }
 }
 

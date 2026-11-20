@@ -67,6 +67,11 @@ pub(super) enum ProjectedScroll {
         leading_block: Option<usize>,
         inset: Option<Pixels>,
     },
+    Viewport {
+        position: Position,
+        inset: Pixels,
+        horizontal: Pixels,
+    },
 }
 
 const LINE_CLIPBOARD_METADATA: &str = "gpui-editor:whole-lines";
@@ -491,6 +496,7 @@ pub struct InputBaseState<M: InputModeKind> {
     grouped_history_handler: Option<GroupedHistoryHandler>,
     pub(super) projected_block_heights: std::rc::Rc<Vec<(usize, Pixels)>>,
     pub(super) pending_projected_scroll: Option<ProjectedScroll>,
+    pub(super) pending_scroll_navigation: bool,
     pub(super) projected_min_rows: std::rc::Rc<Vec<usize>>,
     pub(super) projected_rows: Option<std::rc::Rc<Vec<(Option<usize>, Option<gpui::Hsla>)>>>,
     pub(super) display_map: DisplayMap,
@@ -1104,6 +1110,7 @@ impl<M: InputModeKind> InputBaseState<M> {
             grouped_history_handler: None,
             projected_block_heights: std::rc::Rc::default(),
             pending_projected_scroll: None,
+            pending_scroll_navigation: false,
             projected_min_rows: std::rc::Rc::default(),
             projected_rows: None,
             last_input_edits: Vec::new(),
@@ -1488,6 +1495,7 @@ impl<M: InputModeKind> InputBaseState<M> {
     }
 
     fn reset_scroll_to_start(&mut self) {
+        self.cancel_scroll_navigation();
         // Move scroll to the start. For single-line the caret is at the end, so
         // override the cursor-follow scroll for the next painted frame to keep
         // the start visible; the deferred offset is consumed during that paint.
@@ -3112,6 +3120,7 @@ impl<M: InputModeKind> InputBaseState<M> {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.cancel_scroll_navigation();
         let delta = event.delta.content_delta();
 
         let old_offset = self.scroll_handle.offset();
@@ -3287,6 +3296,8 @@ impl<M: InputModeKind> InputBaseState<M> {
         padding: ScrollPadding,
         cx: &mut Context<Self>,
     ) {
+        let retargeting = self.is_scroll_navigating() && cx.smooth_scrolling() && !cx.reduce_motion();
+        self.cancel_scroll_navigation();
         let Some(last_layout) = self.last_layout.as_ref() else {
             return;
         };
@@ -3358,9 +3369,9 @@ impl<M: InputModeKind> InputBaseState<M> {
         );
 
         // Avoid necessary scroll, when it was already in the correct position.
-        if direction == Some(MoveDirection::Up) {
+        if !retargeting && direction == Some(MoveDirection::Up) {
             scroll_offset.y = scroll_offset.y.max(was_offset.y);
-        } else if direction == Some(MoveDirection::Down) {
+        } else if !retargeting && direction == Some(MoveDirection::Down) {
             scroll_offset.y = scroll_offset.y.min(was_offset.y);
         }
 
@@ -3676,6 +3687,7 @@ impl<M: InputModeKind> InputBaseState<M> {
         selection_before: CursorSelection,
         selection_after: Option<CursorSelection>,
     ) -> bool {
+        self.cancel_scroll_navigation();
         self.document_revision = self.document_revision.wrapping_add(1);
         self.pending_edit_reveal = false;
         let token_delta = self.edit_tokens(range, new_text.len());
@@ -3883,14 +3895,24 @@ impl<M: InputModeKind> InputBaseState<M> {
     ///
     /// The offset will be clamped to the valid range, and applied after the next layout.
     pub fn set_scroll_offset(&mut self, offset: gpui::Point<gpui::Pixels>, cx: &mut Context<Self>) {
+        self.cancel_scroll_navigation();
         self.pending_projected_scroll = None;
         self.deferred_scroll_offset = Some(offset);
         cx.notify();
     }
 
+    /// Cancel an in-progress or queued content navigation for this editor.
+    pub fn cancel_scroll_navigation(&mut self) {
+        if std::mem::take(&mut self.pending_scroll_navigation) {
+            self.deferred_scroll_offset = None;
+            self.pending_projected_scroll = None;
+        }
+        self.scroll_handle.smooth_scroll().cancel_navigation();
+    }
+
     /// Follow a peer projection without scheduling frames for an unreachable scroll offset.
     pub fn sync_projected_scroll_y(&mut self, y: Pixels, cx: &mut Context<Self>) {
-        if self.pending_projected_scroll.is_some() {
+        if self.pending_projected_scroll.is_some() || self.is_scroll_navigating() {
             return;
         }
         let current = self.scroll_offset();
@@ -3903,7 +3925,11 @@ impl<M: InputModeKind> InputBaseState<M> {
     /// Source position of the first visible display row and its vertical inset.
     pub fn viewport_anchor(&self) -> Option<(Position, Pixels)> {
         let height = self.line_height()?;
-        if self.deferred_scroll_offset.is_some() || height <= px(0.) {
+        // A queued animation still has a valid presented position. History
+        // can use it as the origin of the next navigation before prepaint.
+        if (self.deferred_scroll_offset.is_some() && !self.pending_scroll_navigation)
+            || height <= px(0.)
+        {
             return None;
         }
         let top = (-self.scroll_offset().y - self.editor_paddings.top).max(px(0.));
@@ -3927,17 +3953,26 @@ impl<M: InputModeKind> InputBaseState<M> {
         horizontal: Pixels,
         cx: &mut Context<Self>,
     ) {
-        if let Some(height) = self.line_height() {
-            let offset = self.text.position_to_offset(&position);
-            let row = self.display_map.offset_to_display_row(offset, false);
-            let top = self.display_map.display_row_top(row, height) + inset.clamp(px(0.), height);
-            let y = if top == px(0.) {
-                px(0.)
-            } else {
-                -top - self.editor_paddings.top
-            };
-            self.set_scroll_offset(point(horizontal, y), cx);
-        }
+        self.scroll_to_viewport_anchor(position, inset, horizontal, false, cx);
+    }
+
+    /// Resolve a source viewport anchor in layout, optionally animating from the current view.
+    pub fn scroll_to_viewport_anchor(
+        &mut self,
+        position: Position,
+        inset: Pixels,
+        horizontal: Pixels,
+        navigate: bool,
+        cx: &mut Context<Self>,
+    ) {
+        self.cancel_scroll_navigation();
+        self.pending_projected_scroll = Some(ProjectedScroll::Viewport {
+            position,
+            inset,
+            horizontal,
+        });
+        self.pending_scroll_navigation = navigate;
+        cx.notify();
     }
 
     /// Install line numbers and full-width backgrounds for a projected document.
@@ -4262,6 +4297,7 @@ impl<M: InputModeKind> InputBaseState<M> {
     }
 
     pub fn scroll_to_projected_line(&mut self, line: usize, inset: Pixels, cx: &mut Context<Self>) {
+        self.cancel_scroll_navigation();
         self.pending_projected_scroll = Some(ProjectedScroll::Line { line, inset });
         cx.notify();
     }
@@ -4276,6 +4312,7 @@ impl<M: InputModeKind> InputBaseState<M> {
         leading_block: Option<usize>,
         cx: &mut Context<Self>,
     ) {
+        self.cancel_scroll_navigation();
         self.pending_projected_scroll = Some(ProjectedScroll::Caret {
             context_lines,
             leading_block,
@@ -4291,12 +4328,24 @@ impl<M: InputModeKind> InputBaseState<M> {
         leading_block: Option<usize>,
         cx: &mut Context<Self>,
     ) {
+        self.cancel_scroll_navigation();
         self.pending_projected_scroll = Some(ProjectedScroll::Caret {
             context_lines: 0,
             leading_block,
             inset: Some(inset),
         });
         cx.notify();
+    }
+
+    /// Animate the queued scroll when the editor already has a viewport.
+    pub fn animate_pending_scroll(&mut self) {
+        self.pending_scroll_navigation = self.is_code_editor()
+            && (self.deferred_scroll_offset.is_some() || self.pending_projected_scroll.is_some());
+    }
+
+    /// Whether this editor owns a queued or animated viewport navigation.
+    pub fn is_scroll_navigating(&self) -> bool {
+        self.pending_scroll_navigation || self.scroll_handle.smooth_scroll().is_navigating()
     }
 
     /// Laid-out line height; `None` before first layout.
