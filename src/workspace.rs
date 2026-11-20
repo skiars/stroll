@@ -2508,6 +2508,10 @@ impl Workspace {
             if !preview {
                 self.keep_tab(&path, cx);
             }
+            if self.view == WorkspaceView::Editor {
+                self.reveal_active_tab();
+                cx.notify();
+            }
             return;
         }
         self.cancel_file_open();

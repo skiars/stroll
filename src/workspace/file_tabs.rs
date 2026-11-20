@@ -79,7 +79,25 @@ impl Workspace {
             .gap(px(6.))
             .overflow_x_scroll()
             .lock_scroll_axis()
-            .track_scroll(&scroll)
+            .track_scroll(&self.tab_scroll)
+            .children(
+                self.tabs
+                    .paths()
+                    .iter()
+                    .zip(labels)
+                    .map(|(path, label)| self.tab_element(path, label, cx, colors)),
+            );
+
+        // Observe the wrapper so the measurement canvas is outside the
+        // scroll handle's indexed tab children.
+        div()
+            .relative()
+            .flex_1()
+            .min_w_0()
+            .h_full()
+            .flex()
+            .items_center()
+            .child(strip)
             .on_prepaint(move |bounds, window, _| {
                 // The trigger uses 28px plus the toolbar gap. Measure against
                 // the space available without it so it can disappear again.
@@ -105,23 +123,6 @@ impl Workspace {
                     });
                 }
             })
-            .children(
-                self.tabs
-                    .paths()
-                    .iter()
-                    .zip(labels)
-                    .map(|(path, label)| self.tab_element(path, label, cx, colors)),
-            );
-
-        // Fill the bar so the overflow indicator sits below the tabs.
-        div()
-            .relative()
-            .flex_1()
-            .min_w_0()
-            .h_full()
-            .flex()
-            .items_center()
-            .child(strip)
             .child(ScrollableMask::vertical_wheel(&self.tab_scroll))
             .when(self.tabs_overflow, |this| {
                 this.child(tab_overflow_indicator(&self.tab_scroll, colors))
@@ -714,12 +715,13 @@ mod tests {
             view: Some(WorkspaceView::Editor),
             ..Default::default()
         };
-        session.tabs.open(target.clone(), false);
         for index in 1..=20 {
             let path = PathBuf::from(format!("buffer-{index:02}.ts"));
             fs::write(root.join(&path), "// overflow fixture\n")?;
             session.tabs.open(path, false);
         }
+        session.tabs.open(target.clone(), false);
+        session.tabs.open("buffer-01.ts".into(), false);
         let repo = Repository::open(&root)?;
         let store = Arc::new(Store::new(fixture.path().join("state"))?);
         let config = ConfigFile::load(Some(fixture.path().join("config.toml")));
@@ -752,8 +754,10 @@ mod tests {
         draw(visual);
         let scroll = visual.update(|_, cx| workspace.read(cx).tab_scroll.clone());
         let viewport = scroll.bounds();
-        let first = scroll.bounds_for_item(0).expect("first tab is laid out");
-        assert!(first.right() + scroll.offset().x <= viewport.left());
+        let select = visual
+            .debug_bounds("select-tab:editor-interactions.ts")
+            .expect("the target tab is laid out");
+        assert!(select.left() >= viewport.right());
 
         visual.update(|window, cx| {
             workspace.update(cx, |this, cx| this.choose_local_file(window, cx));
@@ -774,9 +778,37 @@ mod tests {
             assert_eq!(view.tabs.paths().len(), 21);
         });
         let viewport = scroll.bounds();
-        let first = scroll.bounds_for_item(0).expect("first tab is laid out");
-        assert!(first.left() + scroll.offset().x >= viewport.left());
-        assert!(first.right() + scroll.offset().x <= viewport.right());
+        let select = visual
+            .debug_bounds("select-tab:editor-interactions.ts")
+            .expect("the active tab is laid out");
+        let close = visual
+            .debug_bounds("close-tab-slot:editor-interactions.ts")
+            .expect("the active tab has a close button");
+        assert!(select.left() >= viewport.left());
+        assert!(close.right() <= viewport.right());
+
+        scroll.set_offset(point(px(0.), px(0.)));
+        draw(visual);
+        assert!(
+            visual
+                .debug_bounds("select-tab:editor-interactions.ts")
+                .unwrap()
+                .left()
+                >= scroll.bounds().right()
+        );
+        visual.update(|window, cx| {
+            workspace.update(cx, |this, cx| {
+                this.open_chosen_local_file(root.join(&target), window, cx);
+            });
+        });
+        draw(visual);
+        assert!(
+            visual
+                .debug_bounds("close-tab-slot:editor-interactions.ts")
+                .unwrap()
+                .right()
+                <= scroll.bounds().right()
+        );
         Ok(())
     }
 
