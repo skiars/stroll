@@ -403,8 +403,10 @@ impl Workspace {
     ) -> impl IntoElement + use<> {
         let path = path.to_owned();
         let workspace = cx.weak_entity();
+        let focus = self.focus.clone();
         element
             .context_menu(move |mut menu, _, cx| {
+                menu = menu.action_context(focus.clone());
                 let (has_others, has_right, has_saved) = workspace
                     .update(cx, |this, _| {
                         let paths = this.tabs.paths();
@@ -428,7 +430,7 @@ impl Workspace {
                     menu = menu.item(
                         PopupMenuItem::new(label)
                             .when(matches!(action, TabClose::This), |item| {
-                                item.icon(IconName::X)
+                                item.icon(IconName::X).action(Box::new(super::CloseTab))
                             })
                             .disabled(!enabled)
                             .on_click(move |_, window, cx| {

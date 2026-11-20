@@ -1604,12 +1604,13 @@ impl Workspace {
                     )
                     .disabled(opening)
                     .when_some(open_focus, |button, focus| button.track_focus(focus))
-                    .child(
-                        div()
-                            .text_size(px(11.))
-                            .text_color(colors.muted)
-                            .child("Ctrl+O"),
-                    )
+                    .child(div().text_size(px(11.)).text_color(colors.muted).child(
+                        if cfg!(target_os = "macos") {
+                            "⌘O"
+                        } else {
+                            "Ctrl+O"
+                        },
+                    ))
                     .on_click(cx.listener(|this, _, window, cx| {
                         this.choose_repository(&OpenRepository, window, cx)
                     })),

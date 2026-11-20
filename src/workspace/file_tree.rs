@@ -128,7 +128,7 @@ impl TreeEdit {
 }
 
 #[derive(Clone, Copy)]
-enum TreeAction {
+pub(super) enum TreeAction {
     Open(bool),
     OpenInDocs,
     PreviewAudio,
@@ -143,7 +143,21 @@ enum TreeAction {
     Collapse,
 }
 
+actions!(workspace, [RenameTreeEntry, DeleteTreeEntry, RefreshTree]);
+
 impl TreeAction {
+    fn shortcut_action(self) -> Option<Box<dyn Action>> {
+        match self {
+            Self::CopyEntry(false) => Some(Box::new(tree_transfer::CopyTreeEntry)),
+            Self::CopyEntry(true) => Some(Box::new(tree_transfer::CutTreeEntry)),
+            Self::PasteEntry => Some(Box::new(tree_transfer::PasteTreeEntry)),
+            Self::Rename => Some(Box::new(RenameTreeEntry)),
+            Self::Delete => Some(Box::new(DeleteTreeEntry)),
+            Self::Refresh => Some(Box::new(RefreshTree)),
+            _ => None,
+        }
+    }
+
     fn icon(self) -> IconName {
         match self {
             Self::Open(true) => IconName::FileInput,
@@ -172,7 +186,7 @@ pub(super) fn tree_menu(
 ) -> AnyElement {
     element
         .context_menu(move |mut menu, _, cx| {
-            let Some((repo, busy, clipboard, paste)) = workspace
+            let Some((repo, busy, clipboard, paste, focus)) = workspace
                 .read_with(cx, |this, _| {
                     this.repository.clone().map(|repo| {
                         (
@@ -180,6 +194,7 @@ pub(super) fn tree_menu(
                             this.tree_busy || this.tree_edit.is_some(),
                             this.tree_clipboard_available(cx),
                             this.tree_paste_available(cx),
+                            this.tree_focus.clone(),
                         )
                     })
                 })
@@ -188,6 +203,7 @@ pub(super) fn tree_menu(
             else {
                 return menu;
             };
+            menu = menu.action_context(focus);
             let mutable = !busy
                 && repo
                     .ssh
@@ -216,6 +232,7 @@ pub(super) fn tree_menu(
                 let entry = entry.clone();
                 PopupMenuItem::new(label)
                     .icon(action.icon())
+                    .when_some(action.shortcut_action(), |item, action| item.action(action))
                     .disabled(!enabled)
                     .on_click(move |_, window, cx| {
                         _ = workspace.update(cx, |this, cx| {
@@ -374,6 +391,36 @@ fn system_menu_for_entry(
 }
 
 impl Workspace {
+    pub(super) fn tree_key_action(
+        &mut self,
+        action: TreeAction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.view != WorkspaceView::Editor || self.tree_busy || self.tree_edit.is_some() {
+            return;
+        }
+        let Some(repo) = &self.repository else {
+            return;
+        };
+        if !matches!(action, TreeAction::Refresh)
+            && repo
+                .ssh
+                .as_ref()
+                .is_some_and(|ssh| !ssh.supports_workspace_files())
+        {
+            return;
+        }
+        let entry = self
+            .rows
+            .iter()
+            .find(|row| row.entry.path == self.tree_keyboard_path)
+            .map(|row| row.entry.clone());
+        if entry.is_some() || matches!(action, TreeAction::Refresh) {
+            self.tree_action(action, entry, window, cx);
+        }
+    }
+
     fn tree_action(
         &mut self,
         action: TreeAction,
@@ -2130,6 +2177,108 @@ mod tests {
         Ok(())
     }
 
+    #[::core::prelude::v1::test]
+    fn file_tree_shortcuts_and_context_menu_hints() -> Result<()> {
+        let fixture = tempfile::tempdir()?;
+        let root = fixture.path().join("repo");
+        fs::create_dir(&root)?;
+        assert!(
+            std::process::Command::new("git")
+                .args(["init", "-qb", "main"])
+                .arg(&root)
+                .status()?
+                .success()
+        );
+        fs::write(root.join("original.txt"), "original\n")?;
+        let mut cx = TestAppContext::build_with_text_system(
+            TestDispatcher::new(0),
+            None,
+            crate::test_support::text_system(true),
+        );
+        cx.update(gpui_component::init);
+        let store = Arc::new(Store::new(fixture.path().join("state"))?);
+        let config = ConfigFile::load(Some(fixture.path().join("config.toml")));
+        let mut workspace = None;
+        let (_, visual) = cx.add_window_view(|window, cx| {
+            let view = cx
+                .new(|cx| Workspace::with_config(store, config, WorkspaceView::Editor, window, cx));
+            workspace = Some(view.clone());
+            gpui_component::Root::new(view, window, cx)
+        });
+        let workspace = workspace.unwrap();
+        visual.simulate_resize(size(px(1024.), px(700.)));
+        visual.update(|window, cx| {
+            workspace.update(cx, |this, cx| {
+                this.open_repository(
+                    Location {
+                        root: root.clone(),
+                        file: Some("original.txt".into()),
+                    },
+                    window,
+                    cx,
+                )
+            });
+        });
+        settle(visual, &workspace, |this| {
+            this.repository_watch_active && this.active_file().is_some()
+        });
+        let original = visual
+            .debug_bounds("workspace-tree-row:original.txt")
+            .unwrap()
+            .center();
+        visual.simulate_mouse_down(original, MouseButton::Right, Modifiers::default());
+        visual.simulate_mouse_up(original, MouseButton::Right, Modifiers::default());
+        settle(visual, &workspace, |_| true);
+        for shortcut in if cfg!(target_os = "macos") {
+            ["kbd:cmd-c", "kbd:cmd-x", "kbd:enter", "kbd:cmd-backspace"]
+        } else {
+            ["kbd:ctrl-c", "kbd:ctrl-x", "kbd:f2", "kbd:delete"]
+        } {
+            assert!(
+                visual.debug_bounds(shortcut).is_some(),
+                "file context menu must paint {shortcut}"
+            );
+        }
+        visual.simulate_keystrokes("escape");
+        visual.update(|window, cx| {
+            workspace.update(cx, |this, cx| {
+                this.focus_tree("original.txt".into(), window, cx);
+            });
+        });
+        settle(visual, &workspace, |_| true);
+        visual.simulate_keystrokes("f2");
+        settle(visual, &workspace, |this| this.tree_edit.is_some());
+        visual.simulate_input("keyboard.txt");
+        // File tree shortcuts must not intercept editing in the rename input.
+        visual.simulate_keystrokes("f2");
+        assert!(visual.update(|_, cx| workspace.read(cx).tree_edit.is_some()));
+        visual.simulate_keystrokes("enter");
+        settle(visual, &workspace, |this| {
+            this.tabs.active() == Some(Path::new("keyboard.txt"))
+        });
+        assert!(root.join("keyboard.txt").is_file());
+        assert!(!root.join("original.txt").exists());
+        visual.update(|window, cx| {
+            workspace.update(cx, |this, cx| {
+                this.focus_tree("keyboard.txt".into(), window, cx)
+            });
+        });
+        settle(visual, &workspace, |_| true);
+        visual.simulate_keystrokes(if cfg!(target_os = "macos") {
+            "cmd-backspace"
+        } else {
+            "delete"
+        });
+        settle(visual, &workspace, |this| !this.tree_busy);
+        assert!(visual.update(|window, cx| window.has_active_dialog(cx)));
+        assert!(
+            root.join("keyboard.txt").is_file(),
+            "delete requires confirmation"
+        );
+        visual.update(|window, cx| window.close_dialog(cx));
+        Ok(())
+    }
+
     #[cfg(target_os = "linux")]
     #[::core::prelude::v1::test]
     fn workspace_file_tree_watcher_and_inline_edit() -> Result<()> {
@@ -2292,6 +2441,16 @@ mod tests {
         visual.simulate_mouse_down(original.center(), MouseButton::Right, Modifiers::default());
         visual.simulate_mouse_up(original.center(), MouseButton::Right, Modifiers::default());
         settle(visual, &workspace, |_| true);
+        for shortcut in if cfg!(target_os = "macos") {
+            ["kbd:cmd-c", "kbd:cmd-x", "kbd:enter", "kbd:cmd-backspace"]
+        } else {
+            ["kbd:ctrl-c", "kbd:ctrl-x", "kbd:f2", "kbd:delete"]
+        } {
+            assert!(
+                visual.debug_bounds(shortcut).is_some(),
+                "file context menu must paint {shortcut}"
+            );
+        }
         visual.simulate_keystrokes("down down down enter");
         assert!(
             visual.did_prompt_for_new_path(),

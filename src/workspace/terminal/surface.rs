@@ -428,7 +428,7 @@ impl Session {
             return;
         }
         let clipboard_shortcut = if cfg!(target_os = "macos") {
-            (mods.platform || mods.control) && !mods.alt
+            mods.platform && !mods.control && !mods.alt
         } else {
             mods == Modifiers {
                 control: true,
@@ -439,10 +439,9 @@ impl Session {
         if clipboard_shortcut {
             match key {
                 "c" => {
-                    if self.copy_selection(cx) || !cfg!(target_os = "macos") || mods.platform {
-                        cx.stop_propagation();
-                        return;
-                    }
+                    self.copy_selection(cx);
+                    cx.stop_propagation();
+                    return;
                 }
                 "v" => {
                     self.paste_clipboard(cx);
@@ -1711,23 +1710,11 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         assert!(writes().is_empty());
-        if cfg!(target_os = "macos") {
-            cx.simulate_keystrokes("ctrl-c ctrl-v ctrl-c insert");
-            assert_eq!(
-                writes(),
-                [
-                    selected.replace('\n', "\r").into_bytes(),
-                    b"\x03".to_vec(),
-                    b"\x1b[2~".to_vec()
-                ]
-            );
-        } else {
-            cx.simulate_keystrokes("ctrl-c ctrl-v insert");
-            assert_eq!(
-                writes(),
-                [b"\x03".to_vec(), b"\x16".to_vec(), b"\x1b[2~".to_vec()]
-            );
-        }
+        cx.simulate_keystrokes("ctrl-c ctrl-v insert");
+        assert_eq!(
+            writes(),
+            [b"\x03".to_vec(), b"\x16".to_vec(), b"\x1b[2~".to_vec()]
+        );
         cx.simulate_keystrokes(copy);
         assert!(
             writes().is_empty(),

@@ -15,6 +15,111 @@ use stroll::workspace::{
     Workspace, WorkspaceView, repository_window_bounds,
 };
 
+fn primary<'a>(mac: &'a str, other: &'a str) -> &'a str {
+    if cfg!(target_os = "macos") {
+        mac
+    } else {
+        other
+    }
+}
+
+fn bind_workspace_keys(cx: &mut App) {
+    cx.bind_keys([
+        KeyBinding::new(
+            primary("cmd-p", "ctrl-p"),
+            OpenLocator,
+            Some("!Terminal && !SettingsPage"),
+        ),
+        KeyBinding::new("escape", gpui_component::input::Escape, Some("Locator")),
+        KeyBinding::new(
+            "escape",
+            gpui_component::input::Escape,
+            Some("Locator > Input"),
+        ),
+        KeyBinding::new(
+            if cfg!(target_os = "macos") {
+                "cmd-,"
+            } else {
+                "ctrl-,"
+            },
+            ToggleSettings,
+            Some("!Locator"),
+        ),
+        KeyBinding::new("escape", CloseSettings, Some("SettingsPage")),
+        KeyBinding::new(
+            "f12",
+            gpui_component::input::GoToDefinition,
+            Some("Input && mode == editor && !Locator"),
+        ),
+        #[cfg(target_os = "macos")]
+        KeyBinding::new(
+            "alt-escape",
+            gpui_component::input::ShowCompletions,
+            Some("WorkspaceEditor > (Input && mode == editor && !Locator)"),
+        ),
+        KeyBinding::new(
+            "ctrl-space",
+            gpui_component::input::ShowCompletions,
+            Some("WorkspaceEditor > (Input && mode == editor && !Locator)"),
+        ),
+        KeyBinding::new(
+            "shift-f12",
+            FindReferences,
+            Some("WorkspaceEditor > (Input && mode == editor && !Locator)"),
+        ),
+        KeyBinding::new(
+            primary("cmd-o", "ctrl-o"),
+            OpenRepository,
+            Some("!Terminal && !Locator"),
+        ),
+        KeyBinding::new("ctrl-`", ToggleTerminal, Some("!Locator")),
+        KeyBinding::new("escape", CloseRepositoryPicker, Some("RepoPicker")),
+        KeyBinding::new("escape", CloseRepositoryPicker, Some("RepoPicker > Input")),
+        KeyBinding::new("down", NextRepositoryPath, Some("RepoPicker > Input")),
+        KeyBinding::new(
+            "up",
+            PreviousRepositoryPath,
+            Some("RepoPathSuggestions > Input"),
+        ),
+        KeyBinding::new(
+            "tab",
+            CompleteRepositoryPath,
+            Some("RepoPathSuggestions > Input"),
+        ),
+        KeyBinding::new(
+            primary("cmd-f", "ctrl-f"),
+            FindInDocument,
+            Some("Reader && !Locator"),
+        ),
+        KeyBinding::new(
+            primary("cmd-s", "ctrl-s"),
+            SaveFile,
+            Some("!Terminal && !Locator"),
+        ),
+        KeyBinding::new(
+            "alt-shift-f",
+            FormatDocument,
+            Some("WorkspaceEditor > (Input && mode == editor && !Locator)"),
+        ),
+        KeyBinding::new("alt-z", ToggleWrap, Some("!Terminal && !Locator")),
+        KeyBinding::new(
+            primary("cmd-w", "ctrl-w"),
+            CloseTab,
+            Some("WorkspaceEditor && !Terminal && !Locator"),
+        ),
+        KeyBinding::new(
+            "ctrl-tab",
+            NextTab,
+            Some("WorkspaceEditor && !Terminal && !Locator"),
+        ),
+        KeyBinding::new(
+            "ctrl-shift-tab",
+            PreviousTab,
+            Some("WorkspaceEditor && !Terminal && !Locator"),
+        ),
+    ]);
+}
+
 fn launch() -> Result<()> {
     let config = ConfigFile::load_for_desktop();
     let mut arguments = env::args_os().skip(1).peekable();
@@ -63,85 +168,7 @@ fn launch() -> Result<()> {
         .run(move |cx| {
             gpui_component::init(cx);
             Workspace::bind_terminal_keys(cx);
-            if cfg!(target_os = "macos") {
-                cx.bind_keys([KeyBinding::new(
-                    "cmd-p",
-                    OpenLocator,
-                    Some("!Terminal && !SettingsPage"),
-                )]);
-            }
-            cx.bind_keys([
-                KeyBinding::new("ctrl-p", OpenLocator, Some("!Terminal && !SettingsPage")),
-                KeyBinding::new("escape", gpui_component::input::Escape, Some("Locator")),
-                KeyBinding::new(
-                    "escape",
-                    gpui_component::input::Escape,
-                    Some("Locator > Input"),
-                ),
-                KeyBinding::new(
-                    if cfg!(target_os = "macos") {
-                        "cmd-,"
-                    } else {
-                        "ctrl-,"
-                    },
-                    ToggleSettings,
-                    Some("!Locator"),
-                ),
-                KeyBinding::new("escape", CloseSettings, Some("SettingsPage")),
-                KeyBinding::new(
-                    "f12",
-                    gpui_component::input::GoToDefinition,
-                    Some("Input && mode == editor && !Locator"),
-                ),
-                KeyBinding::new(
-                    "ctrl-space",
-                    gpui_component::input::ShowCompletions,
-                    Some("WorkspaceEditor > (Input && mode == editor && !Locator)"),
-                ),
-                KeyBinding::new(
-                    "shift-f12",
-                    FindReferences,
-                    Some("WorkspaceEditor > (Input && mode == editor && !Locator)"),
-                ),
-                KeyBinding::new("ctrl-o", OpenRepository, Some("!Terminal && !Locator")),
-                KeyBinding::new("ctrl-`", ToggleTerminal, Some("!Locator")),
-                KeyBinding::new("escape", CloseRepositoryPicker, Some("RepoPicker")),
-                KeyBinding::new("escape", CloseRepositoryPicker, Some("RepoPicker > Input")),
-                KeyBinding::new("down", NextRepositoryPath, Some("RepoPicker > Input")),
-                KeyBinding::new(
-                    "up",
-                    PreviousRepositoryPath,
-                    Some("RepoPathSuggestions > Input"),
-                ),
-                KeyBinding::new(
-                    "tab",
-                    CompleteRepositoryPath,
-                    Some("RepoPathSuggestions > Input"),
-                ),
-                KeyBinding::new("ctrl-f", FindInDocument, Some("Reader && !Locator")),
-                KeyBinding::new("ctrl-s", SaveFile, Some("!Terminal && !Locator")),
-                KeyBinding::new(
-                    "alt-shift-f",
-                    FormatDocument,
-                    Some("WorkspaceEditor > (Input && mode == editor && !Locator)"),
-                ),
-                KeyBinding::new("alt-z", ToggleWrap, Some("!Terminal && !Locator")),
-                KeyBinding::new(
-                    "ctrl-w",
-                    CloseTab,
-                    Some("WorkspaceEditor && !Terminal && !Locator"),
-                ),
-                KeyBinding::new(
-                    "ctrl-tab",
-                    NextTab,
-                    Some("WorkspaceEditor && !Terminal && !Locator"),
-                ),
-                KeyBinding::new(
-                    "ctrl-shift-tab",
-                    PreviousTab,
-                    Some("WorkspaceEditor && !Terminal && !Locator"),
-                ),
-            ]);
+            bind_workspace_keys(cx);
             if let Some(path) = standalone {
                 if let Err(error) = Workspace::open_standalone(store, config, path, None, cx) {
                     eprintln!("{error:#}");
@@ -210,4 +237,129 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
     ExitCode::SUCCESS
+}
+
+#[cfg(test)]
+mod shortcut_tests {
+    use super::*;
+
+    struct Probe {
+        focus: FocusHandle,
+        context: &'static str,
+        seen: Vec<&'static str>,
+    }
+
+    impl Render for Probe {
+        fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .key_context(self.context)
+                .child(
+                    div()
+                        .key_context("Input mode=editor")
+                        .track_focus(&self.focus),
+                )
+                .on_action(cx.listener(|this, _: &SaveFile, _, _| this.seen.push("save")))
+                .on_action(cx.listener(|this, _: &OpenRepository, _, _| this.seen.push("open")))
+                .on_action(cx.listener(|this, _: &CloseTab, _, _| this.seen.push("close")))
+                .on_action(cx.listener(|this, _: &OpenLocator, _, _| this.seen.push("locator")))
+                .on_action(cx.listener(|this, _: &FindInDocument, _, _| this.seen.push("find")))
+                .on_action(
+                    cx.listener(|this, _: &gpui_component::input::ShowCompletions, _, _| {
+                        this.seen.push("complete")
+                    }),
+                )
+                .on_action(
+                    cx.listener(|this, _: &gpui_component::input::GoToDefinition, _, _| {
+                        this.seen.push("definition")
+                    }),
+                )
+                .on_action(
+                    cx.listener(|this, _: &FindReferences, _, _| this.seen.push("references")),
+                )
+        }
+    }
+
+    #[::core::prelude::v1::test]
+    fn platform_shortcuts_dispatch_in_their_intended_contexts() {
+        let mut cx = TestAppContext::single();
+        cx.update(bind_workspace_keys);
+        let (probe, visual) = cx.add_window_view(|window, cx| {
+            let focus = cx.focus_handle();
+            focus.focus(window, cx);
+            Probe {
+                focus,
+                context: "WorkspaceEditor",
+                seen: Vec::new(),
+            }
+        });
+        visual.simulate_keystrokes(primary(
+            "cmd-s cmd-o cmd-w cmd-p",
+            "ctrl-s ctrl-o ctrl-w ctrl-p",
+        ));
+        visual.simulate_keystrokes("ctrl-space f12 shift-f12");
+        #[cfg(target_os = "macos")]
+        visual.simulate_keystrokes("alt-escape");
+        visual.update(|_, cx| {
+            let expected = if cfg!(target_os = "macos") {
+                vec![
+                    "save",
+                    "open",
+                    "close",
+                    "locator",
+                    "complete",
+                    "definition",
+                    "references",
+                    "complete",
+                ]
+            } else {
+                vec![
+                    "save",
+                    "open",
+                    "close",
+                    "locator",
+                    "complete",
+                    "definition",
+                    "references",
+                ]
+            };
+            assert_eq!(probe.read(cx).seen, expected);
+        });
+        for (context, keys, expected) in [
+            ("Reader", primary("cmd-f", "ctrl-f"), vec!["find"]),
+            (
+                "Terminal",
+                primary("cmd-s cmd-o cmd-w cmd-p", "ctrl-s ctrl-o ctrl-w ctrl-p"),
+                vec![],
+            ),
+            (
+                "Locator",
+                primary("cmd-s cmd-o cmd-w", "ctrl-s ctrl-o ctrl-w"),
+                vec![],
+            ),
+        ] {
+            visual.update(|window, cx| {
+                probe.update(cx, |this, cx| {
+                    this.context = context;
+                    this.seen.clear();
+                    cx.notify();
+                });
+                window.draw(cx).clear(cx);
+            });
+            visual.simulate_keystrokes(keys);
+            visual.update(|_, cx| assert_eq!(probe.read(cx).seen, expected, "context {context}"));
+        }
+        #[cfg(target_os = "macos")]
+        {
+            visual.update(|window, cx| {
+                probe.update(cx, |this, cx| {
+                    this.context = "WorkspaceEditor";
+                    this.seen.clear();
+                    cx.notify();
+                });
+                window.draw(cx).clear(cx);
+            });
+            visual.simulate_keystrokes("ctrl-s ctrl-o ctrl-w ctrl-p");
+            visual.update(|_, cx| assert!(probe.read(cx).seen.is_empty()));
+        }
+    }
 }

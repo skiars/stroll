@@ -72,6 +72,19 @@ impl Workspace {
         };
         let context = Some("WorkspaceFileTree && !Input");
         cx.bind_keys([
+            KeyBinding::new("f2", file_tree::RenameTreeEntry, context),
+            #[cfg(target_os = "macos")]
+            KeyBinding::new("enter", file_tree::RenameTreeEntry, context),
+            KeyBinding::new(
+                if cfg!(target_os = "macos") {
+                    "cmd-backspace"
+                } else {
+                    "delete"
+                },
+                file_tree::DeleteTreeEntry,
+                context,
+            ),
+            KeyBinding::new("f5", file_tree::RefreshTree, context),
             KeyBinding::new(copy, CopyTreeEntry, context),
             KeyBinding::new(cut, CutTreeEntry, context),
             KeyBinding::new(paste, PasteTreeEntry, context),

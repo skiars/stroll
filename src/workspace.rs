@@ -907,6 +907,10 @@ impl Workspace {
         Self::bind_source_navigation_keys(cx);
         let find_context = Some("WorkspaceEditor > (Input && mode == editor && !Locator)");
         cx.bind_keys([
+            #[cfg(target_os = "macos")]
+            KeyBinding::new("cmd-g", FindNextMatch, find_context),
+            #[cfg(target_os = "macos")]
+            KeyBinding::new("cmd-shift-g", FindPreviousMatch, find_context),
             KeyBinding::new("f3", FindNextMatch, find_context),
             KeyBinding::new("shift-f3", FindPreviousMatch, find_context),
         ]);
@@ -4361,6 +4365,19 @@ impl Workspace {
             .track_focus(&self.tree_focus)
             .when(in_workspace, |pane| {
                 pane.key_context("WorkspaceFileTree")
+                    .on_action(
+                        cx.listener(|this, _: &file_tree::RenameTreeEntry, window, cx| {
+                            this.tree_key_action(file_tree::TreeAction::Rename, window, cx);
+                        }),
+                    )
+                    .on_action(
+                        cx.listener(|this, _: &file_tree::DeleteTreeEntry, window, cx| {
+                            this.tree_key_action(file_tree::TreeAction::Delete, window, cx);
+                        }),
+                    )
+                    .on_action(cx.listener(|this, _: &file_tree::RefreshTree, window, cx| {
+                        this.tree_key_action(file_tree::TreeAction::Refresh, window, cx);
+                    }))
                     .on_drop(|_: &ExternalPaths, _, _| {})
                     .on_action(
                         cx.listener(|this, _: &tree_transfer::CopyTreeEntry, window, cx| {
