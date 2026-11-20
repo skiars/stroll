@@ -604,6 +604,8 @@
   "settings.windows_shell_description": "Enter an executable name on PATH, such as pwsh.exe, or its full path. Leave blank to use the system shell. Applies to new terminals.",
   "settings.smooth_scroll": "Smooth scrolling",
   "settings.smooth_scroll_description": "Enable smooth scrolling for the mouse wheel and touchpad.",
+  "settings.file_tree_sticky_scroll": "File Tree Sticky Scroll",
+  "settings.file_tree_sticky_scroll_description": "Keep parent folders visible while scrolling the Workspace and Docs file trees.",
   "settings.split": "Side by side",
   "settings.system_fallback": "System fallback only",
   "settings.system_monospace_font": "System monospace font",

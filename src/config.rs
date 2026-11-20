@@ -46,6 +46,7 @@ pub(crate) struct Appearance {
     pub ui_font_size: f64,
     pub fallback_font_family: String,
     pub smooth_scroll: bool,
+    pub file_tree_sticky_scroll: bool,
     pub text_rendering: TextRenderingPreference,
 }
 
@@ -60,6 +61,7 @@ impl Default for Appearance {
             ui_font_size: 13.,
             fallback_font_family: String::new(),
             smooth_scroll: true,
+            file_tree_sticky_scroll: true,
             text_rendering: TextRenderingPreference::Auto,
         }
     }

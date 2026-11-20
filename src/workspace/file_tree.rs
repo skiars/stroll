@@ -1112,6 +1112,251 @@ mod tests {
     }
 
     #[::core::prelude::v1::test]
+    fn workspace_and_docs_tree_sticky_scroll() -> Result<()> {
+        let fixture = tempfile::tempdir()?;
+        let root = fixture.path().join("repo");
+        for directory in ["a/b", "a/c"] {
+            fs::create_dir_all(root.join(directory))?;
+            for index in 0..30 {
+                fs::write(
+                    root.join(directory).join(format!("{index:02}.md")),
+                    "# Page\n",
+                )?;
+            }
+        }
+        fs::write(root.join("README.md"), "# Project\n")?;
+        assert!(
+            std::process::Command::new("git")
+                .args(["init", "-qb", "main"])
+                .arg(&root)
+                .status()?
+                .success()
+        );
+        let mut cx = TestAppContext::build_with_text_system(
+            TestDispatcher::new(0),
+            None,
+            crate::test_support::text_system(true),
+        );
+        cx.update(gpui_component::init);
+        let store = Arc::new(Store::new(fixture.path().join("state"))?);
+        let config_path = fixture.path().join("config.toml");
+        let config = ConfigFile::load(Some(config_path.clone()));
+        let mut workspace = None;
+        let (_, visual) = cx.add_window_view(|window, cx| {
+            let view = cx
+                .new(|cx| Workspace::with_config(store, config, WorkspaceView::Editor, window, cx));
+            workspace = Some(view.clone());
+            gpui_component::Root::new(view, window, cx)
+        });
+        let workspace = workspace.unwrap();
+        visual.simulate_resize(size(px(900.), px(560.)));
+        visual.update(|window, cx| {
+            window.activate_window();
+            workspace.update(cx, |this, cx| {
+                this.open_repository(Location { root, file: None }, window, cx);
+            });
+        });
+
+        let scroll = |visual: &mut VisualTestContext, position, rows: f32| {
+            visual.simulate_event(ScrollEvent {
+                position,
+                delta: ScrollDelta::Pixels(point(px(0.), -tree_motion::ROW_HEIGHT * rows)),
+                modifiers: Modifiers::default(),
+                touch_phase: TouchPhase::Moved,
+                source: ScrollSource::Pointer,
+            });
+            settle(visual, &workspace, |_| true);
+        };
+        for (view, mode) in [
+            (WorkspaceView::Editor, ThemeMode::Light),
+            (WorkspaceView::Docs, ThemeMode::Dark),
+        ] {
+            visual.update(|window, cx| {
+                workspace.update(cx, |this, cx| this.switch_view(view, window, cx));
+                cx.set_reduce_motion(true);
+            });
+            settle(visual, &workspace, |this| {
+                (view != WorkspaceView::Docs || this.docs_tree_complete)
+                    && this.rows.iter().any(|row| row.entry.path == Path::new("a"))
+            });
+            for (folder, child) in [("a", "a/b"), ("a/b", "a/b/00.md"), ("a/c", "a/c/00.md")] {
+                visual.update(|window, cx| {
+                    workspace.update(cx, |this, cx| {
+                        this.toggle_tree_directory(folder.into(), window, cx);
+                    });
+                });
+                settle(visual, &workspace, |this| {
+                    this.rows
+                        .iter()
+                        .any(|row| row.entry.path == Path::new(child))
+                });
+            }
+            let root_id = "workspace-tree-sticky-row:a";
+            let b_id = "workspace-tree-sticky-row:a/b";
+            let c_id = "workspace-tree-sticky-row:a/c";
+            let b_icon_id = "workspace-tree-sticky-collapse:a/b";
+            visual.update(|window, cx| {
+                apply_theme(mode, cx);
+                window.draw(cx).clear(cx);
+            });
+            assert!(visual.debug_bounds(root_id).is_none());
+            let initial = visual.debug_bounds("workspace-tree-row:a").unwrap();
+            scroll(visual, initial.center(), 6.);
+            let pinned_root = visual.debug_bounds(root_id).unwrap();
+            let pinned_b = visual.debug_bounds(b_id).unwrap();
+            assert_eq!(pinned_root.top(), initial.top());
+            assert_eq!(pinned_b.top(), initial.bottom());
+            let folder = visual.debug_bounds(b_icon_id).unwrap();
+            assert_eq!(folder.left(), initial.left() + tree_indent(1));
+            assert_eq!(pinned_b.left(), folder.right() + px(5.));
+            assert!(visual.debug_bounds(c_id).is_none());
+
+            visual.update(|window, _| {
+                let scale = window.scale_factor();
+                let quads = window.painted_quads();
+                let guide_x = initial.left() + px(TREE_GUTTER + 7.);
+                let seam = pinned_b.bottom();
+                let guide = Palette::for_mode(mode).muted.opacity(0.35);
+                for y in [seam - px(4.), seam] {
+                    let dash = Bounds::new(point(guide_x, y), size(px(1.), px(2.))).scale(scale);
+                    assert!(
+                        quads.iter().any(|quad| {
+                            quad.bounds == dash && quad.background.as_solid() == Some(guide)
+                        }),
+                        "missing {mode:?} guide dash at {y:?}"
+                    );
+                }
+                let shadow_bounds = Bounds::new(
+                    point(initial.left(), seam),
+                    size(initial.size.width, px(5.)),
+                )
+                .scale(scale);
+                let black = Hsla::black();
+                let opacity = if mode.is_dark() { 0.24 } else { 0.07 };
+                let shadow = linear_gradient(
+                    180.,
+                    linear_color_stop(black.opacity(opacity), 0.),
+                    linear_color_stop(black.opacity(0.), 1.),
+                );
+                assert!(
+                    quads
+                        .iter()
+                        .any(|quad| { quad.bounds == shadow_bounds && quad.background == shadow }),
+                    "missing {mode:?} shadow"
+                );
+                assert!(
+                    !quads.iter().any(|quad| {
+                        quad.bounds.size.width == shadow_bounds.size.width
+                            && quad.bounds.size.height.0 == scale
+                            && (quad.bounds.bottom() == shadow_bounds.top()
+                                || quad.bounds.top() == shadow_bounds.top())
+                    }),
+                    "unexpected divider at the {mode:?} seam"
+                );
+            });
+
+            let seam = pinned_b.center().y;
+            for position in [
+                folder.center(),
+                pinned_b.center(),
+                point(initial.left() + px(4.), seam),
+                point(folder.right() + px(2.), seam),
+            ] {
+                visual.simulate_mouse_move(position, None, Modifiers::default());
+                visual.update(|window, cx| {
+                    window.draw(cx).clear(cx);
+                    let row = Bounds::new(point(initial.left(), pinned_b.top()), initial.size)
+                        .scale(window.scale_factor());
+                    let hover = Palette::for_mode(mode).hover;
+                    assert!(
+                        window.painted_quads().iter().any(|quad| {
+                            quad.bounds == row && quad.background.as_solid() == Some(hover)
+                        }),
+                        "missing full-row hover at {position:?} in {mode:?}"
+                    );
+                });
+            }
+
+            visual.simulate_resize(size(px(900.), px(238.)));
+            settle(visual, &workspace, |_| true);
+            assert!(visual.debug_bounds(root_id).is_none());
+            assert_eq!(visual.debug_bounds(b_id).unwrap().top(), initial.top());
+            assert_eq!(
+                visual.debug_bounds(b_icon_id).unwrap().left(),
+                folder.left()
+            );
+            visual.simulate_resize(size(px(900.), px(560.)));
+            settle(visual, &workspace, |_| true);
+
+            scroll(visual, pinned_root.center(), 24.5);
+            assert!(visual.debug_bounds(b_id).is_some());
+            assert!(visual.debug_bounds(c_id).is_none());
+            scroll(visual, pinned_root.center(), 4.5);
+            assert_eq!(visual.debug_bounds(root_id), Some(pinned_root));
+            assert!(visual.debug_bounds(b_id).is_none());
+            let sticky_c = visual.debug_bounds(c_id).unwrap();
+            visual.simulate_click(sticky_c.center(), Modifiers::default());
+            settle(visual, &workspace, |this| {
+                this.tree_keyboard_path == Path::new("a/c")
+            });
+            let c = visual.debug_bounds("workspace-tree-row:a/c").unwrap();
+            assert!(c.top() >= pinned_root.bottom());
+            assert!(visual.debug_bounds(c_id).is_none());
+            visual.update(|window, cx| {
+                let this = workspace.read(cx);
+                assert!(this.tree_focus.is_focused(window));
+                assert!(
+                    this.rows
+                        .iter()
+                        .any(|row| { row.entry.path == Path::new("a/c") && row.expanded })
+                );
+            });
+
+            scroll(visual, c.center(), 18.);
+            visual.update(|_, cx| cx.set_reduce_motion(false));
+            let collapse = visual
+                .debug_bounds("workspace-tree-sticky-collapse:a/c")
+                .unwrap();
+            visual.simulate_click(collapse.center(), Modifiers::default());
+            settle(visual, &workspace, |this| {
+                this.rows
+                    .iter()
+                    .any(|row| row.entry.path == Path::new("a/c") && !row.expanded)
+            });
+            assert!(visual.debug_bounds(c_id).is_none());
+            assert!(visual.debug_bounds("workspace-tree-row:a/c").is_some());
+            visual.executor().advance_clock(Duration::from_millis(200));
+            settle(visual, &workspace, |_| true);
+            assert!(visual.debug_bounds(c_id).is_none());
+            assert!(visual.debug_bounds("workspace-tree-row:a/c").is_some());
+        }
+
+        let root_id = "workspace-tree-sticky-row:a";
+        let b_id = "workspace-tree-sticky-row:a/b";
+        let top = visual.debug_bounds(root_id).unwrap();
+        scroll(visual, top.center(), -14.);
+        assert!(visual.debug_bounds(b_id).is_some());
+        visual.update(|_, cx| {
+            workspace.update(cx, |this, cx| {
+                let mut config = this.config.current().clone();
+                config.appearance.file_tree_sticky_scroll = false;
+                this.config.save(config).unwrap();
+                cx.notify();
+            });
+        });
+        settle(visual, &workspace, |_| true);
+        assert!(visual.debug_bounds(root_id).is_none());
+        assert!(visual.debug_bounds(b_id).is_none());
+        assert!(
+            !ConfigFile::load(Some(config_path))
+                .current()
+                .appearance
+                .file_tree_sticky_scroll
+        );
+        Ok(())
+    }
+
+    #[::core::prelude::v1::test]
     fn workspace_tree_context_menu_opens_markdown_in_docs() -> Result<()> {
         let fixture = tempfile::tempdir()?;
         let root = fixture.path().join("repo");

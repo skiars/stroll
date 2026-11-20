@@ -32,6 +32,7 @@ mod system_files;
 mod terminal;
 mod toast;
 mod tree_motion;
+mod tree_sticky_scroll;
 mod tree_transfer;
 mod window_bounds;
 #[cfg(test)]
@@ -719,6 +720,8 @@ pub use crate::session::WorkspaceView;
 struct TreeRow {
     entry: Entry,
     depth: usize,
+    parent: Option<usize>,
+    subtree_end: usize,
     expanded: bool,
     dimmed: bool,
     guides: file_tree::TreeGuides,
@@ -1774,6 +1777,7 @@ impl Workspace {
             depth: usize,
             ignored_ancestor: bool,
             continuing_guides: u16,
+            parent: Option<usize>,
             expanded: &BTreeSet<PathBuf>,
             rows: &mut Vec<TreeRow>,
         ) {
@@ -1785,9 +1789,12 @@ impl Workspace {
                         index + 1 == children.len(),
                     );
                     let open = entry.directory && expanded.contains(&entry.path);
+                    let row = rows.len();
                     rows.push(TreeRow {
                         entry: entry.clone(),
                         depth,
+                        parent,
+                        subtree_end: row + 1,
                         expanded: open,
                         dimmed: entry.ignored && !ignored_ancestor,
                         guides,
@@ -1799,9 +1806,11 @@ impl Workspace {
                             depth + 1,
                             ignored_ancestor || entry.ignored,
                             guides.continuing(),
+                            Some(row),
                             expanded,
                             rows,
                         );
+                        rows[row].subtree_end = rows.len();
                     }
                 }
             }
@@ -1814,6 +1823,7 @@ impl Workspace {
                 0,
                 false,
                 0,
+                None,
                 &self.docs_expanded,
                 &mut rows,
             );
@@ -1828,6 +1838,7 @@ impl Workspace {
                 0,
                 false,
                 0,
+                None,
                 &self.expanded,
                 &mut rows,
             );
@@ -1850,37 +1861,11 @@ impl Workspace {
             } else if self.tree_focus.is_focused(window) {
                 self.focus.focus(window, cx);
             }
+        } else if self.view == WorkspaceView::Docs && self.tree_focus.is_focused(window) {
+            self.tree_keyboard_path = entry.path.clone();
         }
         if entry.directory {
-            self.tree_motion.get_mut().start();
-            let expanded = if self.view == WorkspaceView::Docs {
-                &mut self.docs_expanded
-            } else {
-                &mut self.expanded
-            };
-            if !expanded.remove(&entry.path) {
-                expanded.insert(entry.path.clone());
-                if self.view == WorkspaceView::Editor {
-                    self.load_tree_directory(entry.path, window, cx);
-                }
-            } else if self.view == WorkspaceView::Editor
-                && self
-                    .tree_reveal
-                    .as_ref()
-                    .is_some_and(|path| path.starts_with(&entry.path))
-            {
-                self.tree_reveal = None;
-            }
-            self.rebuild_tree();
-            if self
-                .tree_edit
-                .as_ref()
-                .is_some_and(|edit| edit.row(&self.rows).is_none())
-                && !self.tree_busy
-            {
-                self.finish_tree_edit(window, cx);
-            }
-            cx.notify();
+            self.toggle_tree_directory(entry.path, window, cx);
         } else if entry.symlink {
         } else if self.view == WorkspaceView::Editor && audio_preview::is_audio(&entry.path) {
             if event.click_count() < 2 {
@@ -1891,6 +1876,43 @@ impl Workspace {
         } else {
             self.open_file(entry.path, preview_click(event), window, cx);
         }
+    }
+
+    fn toggle_tree_directory(
+        &mut self,
+        path: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.tree_motion.get_mut().start();
+        let expanded = if self.view == WorkspaceView::Docs {
+            &mut self.docs_expanded
+        } else {
+            &mut self.expanded
+        };
+        if !expanded.remove(&path) {
+            expanded.insert(path.clone());
+            if self.view == WorkspaceView::Editor {
+                self.load_tree_directory(path, window, cx);
+            }
+        } else if self.view == WorkspaceView::Editor
+            && self
+                .tree_reveal
+                .as_ref()
+                .is_some_and(|reveal| reveal.starts_with(&path))
+        {
+            self.tree_reveal = None;
+        }
+        self.rebuild_tree();
+        if self
+            .tree_edit
+            .as_ref()
+            .is_some_and(|edit| edit.row(&self.rows).is_none())
+            && !self.tree_busy
+        {
+            self.finish_tree_edit(window, cx);
+        }
+        cx.notify();
     }
 
     fn switch_view(&mut self, view: WorkspaceView, window: &mut Window, cx: &mut Context<Self>) {
@@ -4035,10 +4057,10 @@ impl Workspace {
             Some((index, depth, replace, guides))
         });
         let row_count = rows.len() + usize::from(inline.is_some_and(|(_, _, replace, _)| !replace));
-        let active = if self.view == WorkspaceView::Docs {
-            self.session.document.clone()
-        } else if self.tree_focus.is_focused(window) {
+        let active = if self.tree_focus.is_focused(window) {
             Some(self.tree_keyboard_path.clone())
+        } else if self.view == WorkspaceView::Docs {
+            self.session.document.clone()
         } else {
             self.tabs.active().map(Path::to_owned)
         };
@@ -4051,6 +4073,18 @@ impl Workspace {
             window,
             cx,
         );
+        // Keep the inline create/rename field clear of the overlay while it has focus.
+        let sticky = (self.config.current().appearance.file_tree_sticky_scroll && inline.is_none())
+            .then(|| {
+                tree_sticky_scroll::overlay(
+                    rows.clone(),
+                    frame.clone(),
+                    self.tree_scroll.0.borrow().base_handle.clone(),
+                    weak.clone(),
+                    active.clone(),
+                    colors,
+                )
+            });
         let rows = frame.as_ref().map_or(rows, |frame| frame.rows.clone());
         let list = tree_motion::tree_list(
             cx.entity(),
@@ -4186,9 +4220,9 @@ impl Workspace {
             .w(width)
             .h_full()
             .flex_shrink_0()
+            .track_focus(&self.tree_focus)
             .when(in_workspace, |pane| {
-                pane.track_focus(&self.tree_focus)
-                    .key_context("WorkspaceFileTree")
+                pane.key_context("WorkspaceFileTree")
                     .on_drop(|_: &ExternalPaths, _, _| {})
                     .on_action(
                         cx.listener(|this, _: &tree_transfer::CopyTreeEntry, window, cx| {
@@ -4297,6 +4331,7 @@ impl Workspace {
                     } else {
                         list.into_any_element()
                     })
+                    .children(sticky)
                     .child(
                         div().absolute().inset_0().child(
                             pane_scrollbar(&self.tree_scroll)

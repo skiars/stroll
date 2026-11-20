@@ -39,7 +39,7 @@ impl<R: Clone + 'static> TreeMotion<R> {
         enabled: bool,
         window: &Window,
         cx: &App,
-    ) -> Option<TreeFrame<R>> {
+    ) -> Option<Rc<TreeFrame<R>>> {
         let requested = std::mem::take(&mut self.requested);
         let now = cx.background_executor().now();
         let previous = self.last.replace(rows.clone());
@@ -80,7 +80,7 @@ impl<R: Clone + 'static> TreeMotion<R> {
             return None;
         }
         window.request_animation_frame();
-        Some(TreeFrame::new(motion, progress, rows.len()))
+        Some(Rc::new(TreeFrame::new(motion, progress, rows.len())))
     }
 }
 
@@ -200,8 +200,16 @@ pub(super) struct RowVisual {
 
 pub(super) struct TreeFrame<R> {
     pub rows: Rc<Vec<R>>,
-    visible: Vec<(usize, Pixels, RowVisual)>,
+    visible: Vec<PlacedRow>,
     positions: Vec<Option<(usize, Pixels)>>,
+    height: Pixels,
+}
+
+struct PlacedRow {
+    index: usize,
+    target: Option<usize>,
+    top: Pixels,
+    height: Pixels,
 }
 
 impl<R: Clone> TreeFrame<R> {
@@ -219,24 +227,35 @@ impl<R: Clone> TreeFrame<R> {
             if let Some(target) = row.target {
                 positions[target] = Some((visible.len(), top));
             }
-            visible.push((
+            visible.push(PlacedRow {
                 index,
+                target: row.target,
+                top,
                 height,
-                RowVisual {
-                    exiting: row.target.is_none(),
-                },
-            ));
+            });
             top += height;
         }
         Self {
             rows: motion.rows.clone(),
             visible,
             positions,
+            height: top,
         }
     }
 
     pub(super) fn row_top(&self, index: usize) -> Option<Pixels> {
         Some(self.positions.get(index)?.as_ref()?.1)
+    }
+
+    pub(super) fn row_at(&self, offset: Pixels) -> Option<usize> {
+        let index = self
+            .visible
+            .partition_point(|row| row.top + row.height <= offset);
+        self.visible.get(index)?.target
+    }
+
+    pub(super) fn height(&self) -> Pixels {
+        self.height
     }
 }
 
@@ -245,7 +264,7 @@ pub(super) fn tree_list<V: Render, R: Clone + 'static, E: IntoElement>(
     id: &'static str,
     count: usize,
     scroll: &UniformListScrollHandle,
-    frame: Option<TreeFrame<R>>,
+    frame: Option<Rc<TreeFrame<R>>>,
     render: impl Fn(usize, RowVisual, &mut App) -> Option<E> + 'static,
 ) -> AnyElement {
     if let Some(frame) = frame {
@@ -262,7 +281,7 @@ pub(super) fn tree_list<V: Render, R: Clone + 'static, E: IntoElement>(
             frame
                 .visible
                 .iter()
-                .map(|(_, height, _)| size(px(0.), *height))
+                .map(|row| size(px(0.), row.height))
                 .collect(),
         );
         v_virtual_list(
@@ -272,13 +291,16 @@ pub(super) fn tree_list<V: Render, R: Clone + 'static, E: IntoElement>(
             move |_, range, _, cx| {
                 range
                     .map(|ix| {
-                        let (index, height, visual) = frame.visible[ix];
+                        let row = &frame.visible[ix];
+                        let visual = RowVisual {
+                            exiting: row.target.is_none(),
+                        };
                         div()
                             .relative()
                             .w_full()
-                            .h(height)
+                            .h(row.height)
                             .overflow_hidden()
-                            .children(render(index, visual, cx))
+                            .children(render(row.index, visual, cx))
                             .when(visual.exiting, |row| {
                                 row.child(div().absolute().inset_0().block_mouse_except_scroll())
                             })
@@ -338,7 +360,7 @@ mod tests {
         assert!(
             reversed.visible[1..5_001]
                 .iter()
-                .all(|(_, _, row)| row.exiting)
+                .all(|row| row.target.is_none())
         );
         let settled = TreeFrame::new(&closing, 1., closed.len());
         assert_eq!(settled.visible.len(), 2);
