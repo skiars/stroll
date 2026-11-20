@@ -2631,6 +2631,15 @@ fn commit_markers_share_the_editor_gutter_and_keep_local_priority() -> Result<()
     visual.simulate_keystrokes("escape");
     draw(visual);
     assert!(visual.debug_bounds("editor-git-hunk-controls").is_none());
+    // Navigation keeps the clicked label at its screen position. Return to
+    // the viewport where the gutter positions below were measured.
+    visual.update(|_, cx| {
+        let editor = workspace.read(cx).files[&path].editor.clone();
+        editor.update(cx, |editor, cx| {
+            editor.set_scroll_offset(point(px(0.), px(0.)), cx);
+        });
+    });
+    draw(visual);
     for (mark, action) in [
         (markers.1, "git-hunk-action:1"),
         (markers.2, "git-hunk-action:0"),

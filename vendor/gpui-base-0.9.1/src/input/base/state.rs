@@ -65,6 +65,7 @@ pub(super) enum ProjectedScroll {
     Caret {
         context_lines: usize,
         leading_block: Option<usize>,
+        inset: Option<Pixels>,
     },
 }
 
@@ -4278,6 +4279,22 @@ impl<M: InputModeKind> InputBaseState<M> {
         self.pending_projected_scroll = Some(ProjectedScroll::Caret {
             context_lines,
             leading_block,
+            inset: None,
+        });
+        cx.notify();
+    }
+
+    /// Scroll to the caret or its leading block at a pixel inset from the viewport top.
+    pub fn scroll_to_caret_with_inset(
+        &mut self,
+        inset: Pixels,
+        leading_block: Option<usize>,
+        cx: &mut Context<Self>,
+    ) {
+        self.pending_projected_scroll = Some(ProjectedScroll::Caret {
+            context_lines: 0,
+            leading_block,
+            inset: Some(inset),
         });
         cx.notify();
     }

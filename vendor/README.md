@@ -23,6 +23,8 @@ dialogs in a Wayland window after changes to paint order or focus handling.
 - The application uses the UI font size as its window rem size and as the shared
   control font size for inputs, searchable select rows, dropdown buttons, and
   popup menu options. The Git comparison integration test covers live changes.
+- Editor caret scrolling accepts a pixel inset for anchoring an expanded Git
+  hunk, including deleted rows, under the pointer after layout.
 - In-window context menus use a leading icon column two logical pixels wider
   than the default menu icon size. The popup integration test checks the
   leading column and label alignment.

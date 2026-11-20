@@ -1244,8 +1244,8 @@ fn split_tree_click_keeps_file_header_and_tree_position() {
 }
 
 #[::core::prelude::v1::test]
-fn hunk_arrows_reveal_the_adjacent_label_in_both_layouts() {
-    use gpui_component::diff::DiffEditorRow;
+fn hunk_arrows_align_under_the_pointer_across_files_in_both_layouts() {
+    use gpui_component::diff::{DiffEditorRow, DiffSide};
 
     let fixture = tempfile::tempdir().unwrap();
     let root = fixture.path().join("repo");
@@ -1257,14 +1257,33 @@ fn hunk_arrows_reveal_the_adjacent_label_in_both_layouts() {
     let original = (0..120)
         .map(|ix| format!("line {ix}\n"))
         .collect::<String>();
-    let path = "long.txt";
+    let path = "a.txt";
+    let binary = "b.bin";
+    let last = "c.txt";
+    let added = "new line\n".repeat(120);
     fs::write(root.join(path), &original).unwrap();
+    fs::write(root.join(binary), b"base\0data").unwrap();
     git(&root, &["add", "."]);
     git(&root, &["commit", "-qm", "Initial"]);
     let staged = original.replace("line 2\n", "staged\n");
-    fs::write(root.join(path), &staged).unwrap();
+    let mixed = staged.replace("line 110\n", "changed\n");
+    fs::write(root.join(path), &mixed).unwrap();
+    fs::write(root.join(binary), b"changed\0data").unwrap();
+    fs::write(root.join(last), &added).unwrap();
     git(&root, &["add", "."]);
-    fs::write(root.join(path), staged.replace("line 110\n", "changed\n")).unwrap();
+    git(&root, &["commit", "-qm", "Review"]);
+    let commit = std::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(&root)
+        .output()
+        .unwrap();
+    let commit = String::from_utf8(commit.stdout).unwrap().trim().to_owned();
+    git(&root, &["reset", "--hard", "HEAD^"]);
+    fs::write(root.join(path), &staged).unwrap();
+    git(&root, &["add", path]);
+    fs::write(root.join(path), &mixed).unwrap();
+    fs::write(root.join(binary), b"changed\0data").unwrap();
+    fs::write(root.join(last), &added).unwrap();
 
     let platform = gpui_platform::current_platform(true);
     let mut cx = TestAppContext::build_with_text_system(
@@ -1286,46 +1305,107 @@ fn hunk_arrows_reveal_the_adjacent_label_in_both_layouts() {
     });
     visual.run_until_parked();
     let panel = visual.update(|_, cx| workspace.read(cx).git.clone().unwrap());
-    for split in [false, true] {
+    for (split, selection) in [
+        (false, Selection::Worktree(Mode::All)),
+        (true, Selection::Commit(commit, None)),
+    ] {
+        let read_only = split;
         visual.update(|window, cx| {
             panel.update(cx, |panel, cx| {
                 panel.show_history = false;
                 panel.show_tree = false;
                 panel.split = split;
-                panel.load_review(Selection::Worktree(Mode::All), false, window, cx);
+                panel.only_matching = true;
+                panel.filter = path.to_owned();
+                panel.load_review(selection, true, window, cx);
                 cx.notify();
             });
         });
         settle(visual);
-        let (first, second) = visual.update(|_, cx| {
-            let diff = panel.read(cx).diff.read(cx);
-            let rows = diff
-                .editor_rows()
-                .enumerate()
-                .filter_map(|(row, item)| matches!(item, DiffEditorRow::Hunk(..)).then_some(row))
-                .collect::<Vec<_>>();
-            assert_eq!(rows.len(), 2);
-            (rows[0], rows[1])
+        visual.update(|_, cx| {
+            panel.update(cx, |panel, cx| {
+                let review = panel.review.as_mut().unwrap();
+                assert!(matches!(
+                    review.patches[review.by_path[last]],
+                    PatchState::Pending
+                ));
+                review.collapsed.insert(last.to_owned());
+                panel.only_matching = false;
+                panel.sync_documents(cx);
+                cx.notify();
+            });
         });
-        let next: &'static str = Box::leak(format!("git-next-hunk:{first}").into_boxed_str());
-        let previous: &'static str =
-            Box::leak(format!("git-previous-hunk:{second}").into_boxed_str());
-        for (click, target) in [(next, previous), (previous, next)] {
-            let button = visual
-                .debug_bounds(click)
-                .expect("the arrow is in the viewport");
-            assert!(button.size.width >= px(24.));
-            visual.simulate_click(button.center(), Modifiers::default());
+        settle(visual);
+        let arrow = |visual: &mut VisualTestContext, file, hunk, direction| {
+            let header = visual.update(|_, cx| {
+                panel.read(cx).diff.read(cx).editor_rows().position(|row| {
+                    matches!(row, DiffEditorRow::Hunk(path, index, _) if path.as_str() == file && index == hunk)
+                }).unwrap()
+            });
+            let selector =
+                Box::leak(format!("editor-git-{direction}-hunk:diff-{header}").into_boxed_str());
+            visual.debug_bounds(selector)
+        };
+        let hover = visual.update(|_, cx| {
+            let line = DiffLinePosition::new(path, DiffSide::Original, 3);
+            let bounds = panel.read(cx).review_source_bounds(&line, cx).unwrap();
+            point(bounds.left() + px(100.), bounds.center().y)
+        });
+        assert!(
+            arrow(visual, path, 0, "next").is_none(),
+            "the header has no arrows"
+        );
+        visual.simulate_mouse_move(hover, None, Modifiers::default());
+        settle(visual);
+        let next = arrow(visual, path, 0, "next").unwrap();
+        assert_eq!(next.size.width, px(32.));
+        if read_only {
+            assert!(visual.debug_bounds("git-hunk-action:0").is_none());
+            assert!(visual.debug_bounds("git-hunk-action:1").is_none());
+        }
+        let disabled = arrow(visual, path, 0, "previous").unwrap();
+        visual.simulate_mouse_move(disabled.center(), None, Modifiers::default());
+        visual.simulate_click(disabled.center(), Modifiers::default());
+        settle(visual);
+        assert!(
+            arrow(visual, path, 0, "next")
+                .unwrap()
+                .contains(&next.center())
+        );
+
+        let next_click = point(next.center().x, next.top() + px(6.));
+        visual.simulate_mouse_move(next_click, None, Modifiers::default());
+        for (file, index) in [(path, 1), (last, 0)] {
+            visual.simulate_click(next_click, Modifiers::default());
             settle(visual);
-            let viewport = visual.debug_bounds("git-diff-editor").unwrap();
-            let destination = visual
-                .debug_bounds(target)
-                .expect("the destination label is visible");
-            assert!(viewport.contains(&destination.center()));
+            let destination = arrow(visual, file, index, "next")
+                .unwrap_or_else(|| panic!("missing {file} hunk {index} in split={split}"));
+            assert!(destination.contains(&next_click));
             assert!(
-                destination.top() >= viewport.top() + px(27.),
-                "split={split}, {click} -> {target}: {destination:?} in {viewport:?}"
+                (destination.top() - next.top()).abs() < px(1.),
+                "split={split}, {file} hunk {index}: {next:?} -> {destination:?}"
             );
+        }
+        visual.update(|_, cx| {
+            let panel = panel.read(cx);
+            assert!(panel.pending_hunk_navigation.is_none());
+            assert!(!panel.diff.read(cx).is_file_collapsed(last));
+            assert!(matches!(
+                panel.review.as_ref().unwrap().patches
+                    [panel.review.as_ref().unwrap().by_path[last]],
+                PatchState::Ready
+            ));
+        });
+
+        let previous = arrow(visual, last, 0, "previous").unwrap();
+        let back_click = point(previous.center().x, next_click.y);
+        visual.simulate_mouse_move(back_click, None, Modifiers::default());
+        for (file, index) in [(path, 1), (path, 0)] {
+            visual.simulate_click(back_click, Modifiers::default());
+            settle(visual);
+            let destination = arrow(visual, file, index, "previous").unwrap();
+            assert!(destination.contains(&back_click));
+            assert!((destination.top() - next.top()).abs() < px(1.));
         }
     }
 }

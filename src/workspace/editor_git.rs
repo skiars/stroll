@@ -819,6 +819,7 @@ impl Workspace {
         &mut self,
         path: &Path,
         target: usize,
+        anchor: HunkNavigationAnchor,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -842,7 +843,7 @@ impl Workspace {
             self.expand_editor_git(path, target, cx)
         };
         if let Some(line) = line {
-            self.reveal_git_hunk(path, line, source, window, cx);
+            self.reveal_git_hunk(path, line, anchor, source, window, cx);
         }
     }
 
@@ -850,6 +851,7 @@ impl Workspace {
         &mut self,
         path: &Path,
         line: usize,
+        anchor: HunkNavigationAnchor,
         source: Option<crate::session::SourceLocation>,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -860,6 +862,9 @@ impl Workspace {
                 let caret_line = line.min(editor.text().lines_len().saturating_sub(1));
                 let offset = editor.text().line_start_offset(caret_line);
                 reveal_editor_range(editor, offset..offset, Some(line), window, cx);
+                if let Some(inset) = anchor.inset(editor.input_bounds(), px(0.)) {
+                    editor.scroll_to_caret_with_inset(inset, Some(line), cx);
+                }
             });
             self.record_source_navigation(source, cx);
         }
@@ -941,26 +946,33 @@ impl Workspace {
                 .map(|index| COMMIT_ACTION_START + index)
         })?;
         let code_font_size = px(self.config.current().editor.font_size as f32);
-        let [previous, next] = hunk_neighbors(file, selected);
+        let neighbors = hunk_neighbors(file, selected);
         let (nav_path, nav_owner) = (path.to_owned(), owner.clone());
-        let navigation = editor_hunk_navigation(
-            selected,
-            previous,
-            next,
-            code_font_size,
-            move |target, window, cx| {
-                _ = nav_owner.update(cx, |workspace, cx| {
-                    workspace.navigate_editor_git(&nav_path, target, window, cx);
-                });
-            },
-        );
         let controls = if selected >= COMMIT_ACTION_START {
             status_hunk_controls(t!("git.editor_history_hunk").into_owned(), cx)
         } else {
             self.local_hunk_controls(path, file, selected, owner, code_font_size, cx)?
         };
-        let buttons = h_flex().h_full().child(controls).child(navigation);
-        Some(source_hunk_toolbar(buttons.into_any_element(), cx))
+        let key = if selected >= COMMIT_ACTION_START {
+            format!("history-{}", selected - COMMIT_ACTION_START)
+        } else {
+            selected.to_string()
+        };
+        let toolbar = hunk_label(
+            Some(controls),
+            key,
+            neighbors.map(|target| target.is_some()),
+            code_font_size,
+            move |direction, anchor, window, cx| {
+                if let Some(target) = neighbors[direction as usize] {
+                    _ = nav_owner.update(cx, |workspace, cx| {
+                        workspace.navigate_editor_git(&nav_path, target, anchor, window, cx);
+                    });
+                }
+            },
+            cx,
+        );
+        Some(source_hunk_toolbar(toolbar))
     }
 
     fn local_hunk_controls(
@@ -1169,57 +1181,111 @@ impl Workspace {
     }
 }
 
-fn editor_hunk_navigation(
-    selected: usize,
-    previous: Option<usize>,
-    next: Option<usize>,
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum HunkDirection {
+    Previous,
+    Next,
+}
+
+impl HunkDirection {
+    pub(super) fn neighbor(self, index: usize) -> Option<usize> {
+        match self {
+            Self::Previous => index.checked_sub(1),
+            Self::Next => index.checked_add(1),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct HunkNavigationAnchor(Option<(Point<Pixels>, Pixels)>);
+
+impl HunkNavigationAnchor {
+    pub(super) fn pointer(self) -> Option<Point<Pixels>> {
+        self.0.map(|(pointer, _)| pointer)
+    }
+
+    pub(super) fn inset(self, viewport: Bounds<Pixels>, obstruction: Pixels) -> Option<Pixels> {
+        let (pointer, offset) = self.0?;
+        let bottom = viewport.size.height - HUNK_TOOLBAR_HEIGHT;
+        Some(
+            (pointer.y - offset - viewport.top())
+                .min(bottom)
+                .max(obstruction),
+        )
+    }
+}
+
+pub(super) fn hunk_label(
+    controls: Option<AnyElement>,
+    key: String,
+    available: [bool; 2],
     icon_size: Pixels,
-    navigate: impl Fn(usize, &mut Window, &mut App) + Clone + 'static,
+    navigate: impl Fn(HunkDirection, HunkNavigationAnchor, &mut Window, &mut App) + 'static,
+    cx: &App,
 ) -> AnyElement {
-    let button = |id, icon, label, target: Option<usize>| {
-        let navigate = navigate.clone();
-        compact_icon_button((id, selected), icon, label)
-            .debug_selector(move || {
-                if selected >= COMMIT_ACTION_START {
-                    format!("{id}:history-{}", selected - COMMIT_ACTION_START)
-                } else {
-                    format!("{id}:{selected}")
-                }
-            })
-            .w(px(32.))
-            .min_w(px(32.))
+    let navigate = Rc::new(navigate);
+    let button_top = Rc::new(std::cell::Cell::new(None));
+    let measure = button_top.clone();
+    let has_controls = controls.is_some();
+    let navigation =
+        h_flex()
             .h_full()
             .flex_shrink_0()
-            .icon_size(icon_size)
-            .rounded(px(0.))
-            .disabled(target.is_none())
-            .on_click(move |_, window, cx| {
-                cx.stop_propagation();
-                if let Some(target) = target {
-                    navigate(target, window, cx);
-                }
+            .on_children_prepainted(move |bounds, _, _| {
+                measure.set(bounds.first().map(Bounds::top));
             })
-    };
-    h_flex()
-        .id("editor-git-hunk-navigation")
-        .h_full()
-        .flex_shrink_0()
-        .child(button(
-            "editor-git-previous-hunk",
-            IconName::ArrowUp,
-            t!("git.previous_hunk"),
-            previous,
-        ))
-        .child(
-            button(
-                "editor-git-next-hunk",
-                IconName::ArrowDown,
-                t!("git.next_hunk"),
-                next,
-            )
-            .rounded_br(HUNK_TOOLBAR_RADIUS),
-        )
-        .into_any_element()
+            .id("editor-git-hunk-navigation")
+            .children(
+                [
+                    (
+                        HunkDirection::Previous,
+                        "editor-git-previous-hunk",
+                        IconName::ArrowUp,
+                        t!("git.previous_hunk"),
+                    ),
+                    (
+                        HunkDirection::Next,
+                        "editor-git-next-hunk",
+                        IconName::ArrowDown,
+                        t!("git.next_hunk"),
+                    ),
+                ]
+                .into_iter()
+                .map(|(direction, id, icon, label)| {
+                    let selector = format!("{id}:{key}");
+                    let navigate = navigate.clone();
+                    let button_top = button_top.clone();
+                    compact_icon_button(SharedString::from(selector.clone()), icon, label)
+                        .debug_selector(move || selector)
+                        .w(px(32.))
+                        .min_w(px(32.))
+                        .h_full()
+                        .flex_shrink_0()
+                        .icon_size(icon_size)
+                        .rounded(px(0.))
+                        .when(direction == HunkDirection::Next, |button| {
+                            button.rounded_br(HUNK_TOOLBAR_RADIUS)
+                        })
+                        .when(
+                            direction == HunkDirection::Previous && !has_controls,
+                            |button| button.rounded_bl(HUNK_TOOLBAR_RADIUS),
+                        )
+                        .disabled(!available[direction as usize])
+                        .on_click(move |event, window, cx| {
+                            cx.stop_propagation();
+                            let anchor = event.mouse_position().zip(button_top.get()).map(
+                                |(pointer, top)| {
+                                    let offset =
+                                        (pointer.y - top).clamp(px(0.), HUNK_TOOLBAR_HEIGHT);
+                                    (pointer, offset)
+                                },
+                            );
+                            navigate(direction, HunkNavigationAnchor(anchor), window, cx);
+                        })
+                }),
+            );
+    let buttons = h_flex().h_full().children(controls).child(navigation);
+    hanging_hunk_toolbar(buttons.into_any_element(), cx)
 }
 
 fn status_hunk_controls(label: String, cx: &App) -> AnyElement {
@@ -1241,8 +1307,8 @@ fn status_hunk_controls(label: String, cx: &App) -> AnyElement {
         .into_any_element()
 }
 
-fn source_hunk_toolbar(buttons: AnyElement, cx: &App) -> AnyElement {
-    let row = hunk_toolbar_row(Some(hanging_hunk_toolbar(buttons, cx)));
+fn source_hunk_toolbar(toolbar: AnyElement) -> AnyElement {
+    let row = hunk_toolbar_row(toolbar);
     canvas(
         move |bounds, window, cx| {
             // Paint and hit-test above the deferred inline blame annotation.
@@ -1266,7 +1332,7 @@ fn source_hunk_toolbar(buttons: AnyElement, cx: &App) -> AnyElement {
     .into_any_element()
 }
 
-pub(super) fn hunk_toolbar_row(toolbar: Option<AnyElement>) -> AnyElement {
+pub(super) fn hunk_toolbar_row(toolbar: AnyElement) -> AnyElement {
     h_flex()
         .id("editor-git-hunk")
         .w_full()
@@ -1274,11 +1340,11 @@ pub(super) fn hunk_toolbar_row(toolbar: Option<AnyElement>) -> AnyElement {
         .items_start()
         .justify_end()
         .pr_3()
-        .children(toolbar)
+        .child(toolbar)
         .into_any_element()
 }
 
-pub(super) fn hanging_hunk_toolbar(buttons: AnyElement, cx: &App) -> AnyElement {
+fn hanging_hunk_toolbar(buttons: AnyElement, cx: &App) -> AnyElement {
     let colors = Palette::for_mode(cx.theme().mode);
     h_flex()
         .id("editor-git-hunk-controls")
@@ -1537,10 +1603,10 @@ mod tests {
                 div()
                     .relative()
                     .size_full()
-                    .child(source_hunk_toolbar(
+                    .child(source_hunk_toolbar(hanging_hunk_toolbar(
                         div().w(px(100.)).h_full().into_any_element(),
                         cx,
-                    ))
+                    )))
                     .child(deferred(
                         div()
                             .absolute()
@@ -1691,8 +1757,9 @@ mod tests {
         assert!(previous.size.width >= px(32.));
         assert!(next.size.width >= px(32.));
 
-        visual.simulate_mouse_move(next.center(), None, Modifiers::default());
-        visual.simulate_click(next.center(), Modifiers::default());
+        let click = point(next.center().x, next.top() + px(6.));
+        visual.simulate_mouse_move(click, None, Modifiers::default());
+        visual.simulate_click(click, Modifiers::default());
         visual.run_until_parked();
         visual.update(|window, cx| {
             window.draw(cx).clear(cx);
@@ -1701,7 +1768,6 @@ mod tests {
             assert!(file.git.pending_hunk.is_none());
             let editor = file.editor.read(cx);
             let viewport = editor.input_bounds();
-            let line_height = editor.line_height().unwrap();
             let scale = window.scale_factor();
             let color =
                 Background::from(code_theme::HunkPalette::for_mode(cx.theme().mode).removed_row);
@@ -1715,12 +1781,13 @@ mod tests {
                 .map(|quad| px(quad.bounds.top().0 / scale))
                 .min()
                 .expect("the next hunk is expanded");
-            let expected = viewport.top() + line_height * EDITOR_JUMP_CONTEXT_LINES as f32;
             assert!(
-                (target_top - expected).abs() < px(1.),
-                "the hunk starts {target_top:?} instead of five rows below {expected:?}"
+                (target_top - next.top()).abs() < px(1.),
+                "{target_top:?} vs {next:?}"
             );
         });
+        let target = visual.debug_bounds("editor-git-next-hunk:1").unwrap();
+        assert!(target.contains(&click));
 
         visual.update(|window, cx| {
             let editor = workspace.read(cx).files[&path].editor.clone();

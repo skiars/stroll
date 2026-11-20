@@ -3,7 +3,11 @@ use std::path::Path;
 use rust_i18n::t;
 
 use super::*;
-use crate::workspace::{SourcePosition, WorkspaceView, baseline_shift, file_name_font_size};
+use crate::workspace::{
+    SourcePosition, WorkspaceView, baseline_shift,
+    editor_git::{HunkDirection, HunkNavigationAnchor, hunk_toolbar},
+    file_name_font_size,
+};
 
 use gpui_component::{
     diff::DiffSide,
@@ -56,6 +60,18 @@ struct HunkActions {
 pub(super) struct ActionBlocks {
     pub(super) staged: Option<usize>,
     pub(super) unstaged: Option<usize>,
+}
+
+pub(super) enum HunkTarget {
+    Index(usize),
+    FileEdge(HunkDirection),
+    Load(HunkDirection),
+}
+
+pub(super) struct HunkNavigation {
+    pub(super) path: SharedString,
+    pub(super) target: HunkTarget,
+    pub(super) anchor: HunkNavigationAnchor,
 }
 
 impl FileOperations {
@@ -645,6 +661,7 @@ impl GitPanel {
         self.loading_session_diff = position;
         self.pending_file_reveal = None;
         if !keep || !background {
+            self.pending_hunk_navigation = None;
             self.pending_editor_open = None;
         }
         self.pending_review_anchor = None;
@@ -960,6 +977,17 @@ impl GitPanel {
                         }
                     }
                 }
+                if let Some(path) = this.hunk_load_path() {
+                    if let Some(&ix) = this
+                        .review
+                        .as_ref()
+                        .and_then(|review| review.by_path.get(path))
+                    {
+                        this.resume_hunk_navigation(ix, window, cx);
+                    } else {
+                        this.pending_hunk_navigation = None;
+                    }
+                }
                 this.apply_repo_changes(window, cx);
                 cx.notify();
             });
@@ -1031,6 +1059,7 @@ impl GitPanel {
 
     pub(super) fn sync_documents(&mut self, cx: &mut Context<Self>) {
         self.pending_file_reveal = None;
+        self.pending_hunk_navigation = None;
         self.sync_review_documents(false, cx);
     }
 
@@ -1139,6 +1168,7 @@ impl GitPanel {
         self.snapshot = None;
         self.snapshot_task = Task::ready(());
         self.pending_file_reveal = None;
+        self.pending_hunk_navigation = None;
         self.pending_position = None;
         self.pending_review_anchor = None;
         if clear_filter {
@@ -1174,6 +1204,132 @@ impl GitPanel {
         };
         self.reveal_file(ix, true, window, cx);
         self.pending_file_reveal = Some(path.to_owned());
+    }
+
+    pub(super) fn adjacent_hunk_file(
+        &self,
+        from: &str,
+        direction: HunkDirection,
+    ) -> Option<(usize, HunkTarget)> {
+        let review = self.review.as_ref().filter(|_| !self.single_file)?;
+        let mut index = *review.by_path.get(from)?;
+        while let Some(next) = direction.neighbor(index) {
+            let file = review.detail.files.get(next)?;
+            index = next;
+            if self.only_matching && !super::tree::matches(file, &self.filter) {
+                continue;
+            }
+            if review.documents[index].hunk_locations().next().is_some() {
+                return Some((index, HunkTarget::FileEdge(direction)));
+            }
+            if matches!(
+                review.patches[index],
+                PatchState::Pending | PatchState::Loading
+            ) && !change_stat(&review.stats, file).binary
+            {
+                return Some((index, HunkTarget::Load(direction)));
+            }
+        }
+        None
+    }
+
+    pub(super) fn navigate_hunk_in_file(
+        &mut self,
+        path: SharedString,
+        index: usize,
+        anchor: HunkNavigationAnchor,
+        cx: &mut Context<Self>,
+    ) {
+        self.reveal_hunk(
+            HunkNavigation {
+                path,
+                target: HunkTarget::Index(index),
+                anchor,
+            },
+            cx,
+        );
+    }
+
+    pub(super) fn navigate_hunk_across_files(
+        &mut self,
+        from: &str,
+        direction: HunkDirection,
+        anchor: HunkNavigationAnchor,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((index, target)) = self.adjacent_hunk_file(from, direction) else {
+            return;
+        };
+        let path = self.review.as_ref().unwrap().detail.files[index]
+            .path
+            .clone()
+            .into();
+        let jump = HunkNavigation {
+            path,
+            target,
+            anchor,
+        };
+        if matches!(jump.target, HunkTarget::Load(_)) {
+            self.pending_file_reveal = None;
+            self.pending_hunk_navigation = Some(jump);
+            self.request_patch(index, window, cx);
+        } else {
+            self.reveal_hunk(jump, cx);
+        }
+    }
+
+    fn reveal_hunk(&mut self, jump: HunkNavigation, cx: &mut Context<Self>) {
+        if let Some(review) = &mut self.review
+            && review.collapsed.remove(jump.path.as_str())
+        {
+            self.diff.update(cx, |diff, cx| {
+                diff.set_file_collapsed(&jump.path, false, cx)
+            });
+        }
+        self.confirm_restore = None;
+        self.pending_file_reveal = None;
+        self.pending_hunk_navigation = Some(jump);
+        App::notify(cx, self.review_pane.entity_id());
+        App::notify(cx, self.tree_pane.entity_id());
+    }
+
+    fn hunk_load_path(&self) -> Option<&str> {
+        let jump = self.pending_hunk_navigation.as_ref()?;
+        matches!(jump.target, HunkTarget::Load(_)).then_some(jump.path.as_str())
+    }
+
+    fn resume_hunk_navigation(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let review = self.review.as_ref().unwrap();
+        if self.hunk_load_path() != Some(review.detail.files[ix].path.as_str()) {
+            return;
+        }
+        match review.patches[ix] {
+            PatchState::Pending => {
+                self.request_patch(ix, window, cx);
+                return;
+            }
+            PatchState::Loading => return,
+            PatchState::Ready | PatchState::Failed => {}
+        }
+        let has_hunks = review.documents[ix].hunk_locations().next().is_some();
+        let Some(jump) = self.pending_hunk_navigation.take() else {
+            return;
+        };
+        let HunkTarget::Load(direction) = jump.target else {
+            return;
+        };
+        if has_hunks {
+            self.reveal_hunk(
+                HunkNavigation {
+                    target: HunkTarget::FileEdge(direction),
+                    ..jump
+                },
+                cx,
+            );
+        } else {
+            self.navigate_hunk_across_files(jump.path.as_str(), direction, jump.anchor, window, cx);
+        }
     }
 
     pub(super) fn openable_review_file(&self, path: &str) -> Option<usize> {
@@ -1333,15 +1489,21 @@ impl GitPanel {
             .as_ref()
             .and_then(|path| review.by_path.get(path))
             .copied();
+        let hunk_request = self
+            .hunk_load_path()
+            .and_then(|path| review.by_path.get(path))
+            .copied();
         if self.detail_loading
             || (editor_request != Some(ix)
+                && hunk_request != Some(ix)
                 && review.collapsed.contains(&review.detail.files[ix].path))
             || !matches!(review.patches[ix], PatchState::Pending)
         {
             return;
         }
-        self.patch_requests
-            .retain(|&request| request != ix && editor_request == Some(request));
+        self.patch_requests.retain(|&request| {
+            request != ix && (editor_request == Some(request) || hunk_request == Some(request))
+        });
         self.patch_requests.push_front(ix);
         self.start_next_patch(window, cx);
     }
@@ -1357,6 +1519,7 @@ impl GitPanel {
         if self.patch_loading[lane] || self.detail_loading {
             return;
         }
+        let hunk_request = self.hunk_load_path().map(str::to_owned);
         let Some(review) = &mut self.review else {
             return;
         };
@@ -1371,6 +1534,7 @@ impl GitPanel {
             let path = &review.detail.files[ix].path;
             if matches!(review.patches[ix], PatchState::Pending)
                 && (self.pending_editor_open.as_ref() == Some(path)
+                    || hunk_request.as_ref() == Some(path)
                     || !review.collapsed.contains(path))
             {
                 review.patches[ix] = PatchState::Loading;
@@ -1581,6 +1745,7 @@ impl GitPanel {
         {
             self.open_first_hunk_in_editor(ix, window, cx);
         }
+        self.resume_hunk_navigation(ix, window, cx);
     }
 
     fn start_patch_assets(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1734,6 +1899,7 @@ impl GitPanel {
         let Some(review) = &mut self.review else {
             return;
         };
+        self.pending_hunk_navigation = None;
         review.collapsed.clear();
         if collapsed {
             review
@@ -1991,49 +2157,46 @@ impl GitPanel {
                 })
                 .unwrap_or((false, false))
         };
-        Some(super::super::editor_git::hanging_hunk_toolbar(
-            super::super::editor_git::hunk_toolbar(
-                &actions,
-                confirm,
-                whole_file,
-                None,
-                None,
-                available,
-                move |action, window, cx| {
-                    _ = owner.update(cx, |panel, cx| {
-                        if whole_file
-                            && action == git::FileAction::Restore
-                            && panel.confirm_restore.as_ref() != Some(&key)
-                        {
-                            panel.confirm_restore = Some(key.clone());
-                            cx.notify();
-                            return;
-                        }
-                        panel.edit_worktree_file(
-                            git::FileEdit {
-                                path: file_path.clone(),
-                                version: version.clone(),
-                                action,
-                                block: targets
-                                    .iter()
-                                    .find(|(candidate, _)| *candidate == action)
-                                    .and_then(|(_, target)| target.clone()),
-                            },
-                            window,
-                            cx,
-                        );
-                    });
-                },
-                move |_, cx| {
-                    _ = cancel_owner.update(cx, |panel, cx| {
-                        panel.confirm_restore = None;
+        Some(hunk_toolbar(
+            &actions,
+            confirm,
+            whole_file,
+            None,
+            None,
+            available,
+            move |action, window, cx| {
+                _ = owner.update(cx, |panel, cx| {
+                    if whole_file
+                        && action == git::FileAction::Restore
+                        && panel.confirm_restore.as_ref() != Some(&key)
+                    {
+                        panel.confirm_restore = Some(key.clone());
                         cx.notify();
-                    });
-                },
-                cx,
-                true,
-            ),
+                        return;
+                    }
+                    panel.edit_worktree_file(
+                        git::FileEdit {
+                            path: file_path.clone(),
+                            version: version.clone(),
+                            action,
+                            block: targets
+                                .iter()
+                                .find(|(candidate, _)| *candidate == action)
+                                .and_then(|(_, target)| target.clone()),
+                        },
+                        window,
+                        cx,
+                    );
+                });
+            },
+            move |_, cx| {
+                _ = cancel_owner.update(cx, |panel, cx| {
+                    panel.confirm_restore = None;
+                    cx.notify();
+                });
+            },
             cx,
+            true,
         ))
     }
 
@@ -2197,6 +2360,7 @@ impl GitPanel {
         self.confirm_restore = None;
         self.viewport_queue.clear();
         self.pending_file_reveal = None;
+        self.pending_hunk_navigation = None;
         self.pending_editor_open = None;
         self.snapshot = Some(Snapshot {
             detail: review.detail.clone(),
@@ -2307,6 +2471,7 @@ impl GitPanel {
         let anchor = self.editor.change_anchor(self.diff.read(cx), cx);
         self.single_file = !self.single_file;
         self.pending_file_reveal = None;
+        self.pending_hunk_navigation = None;
         self.sync_review_documents(true, cx);
         if let Some(anchor) = anchor {
             self.diff.read(cx).restore_viewport_anchor(&anchor);
@@ -2652,6 +2817,7 @@ impl GitPanel {
                 PopupMenuItem::new(t!("git.previous_hunk")).on_click(move |_, _, cx| {
                     _ = previous.update(cx, |this, cx| {
                         this.pending_file_reveal = None;
+                        this.pending_hunk_navigation = None;
                         this.diff.update(cx, |diff, cx| diff.previous_change(cx))
                     });
                 }),
@@ -2660,6 +2826,7 @@ impl GitPanel {
                 PopupMenuItem::new(t!("git.next_hunk")).on_click(move |_, _, cx| {
                     _ = next.update(cx, |this, cx| {
                         this.pending_file_reveal = None;
+                        this.pending_hunk_navigation = None;
                         this.diff.update(cx, |diff, cx| diff.next_change(cx))
                     });
                 }),

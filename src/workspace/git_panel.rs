@@ -304,6 +304,7 @@ pub(super) struct GitPanel {
     snapshot: Option<Snapshot>,
     editor: editor::ReviewEditor,
     pending_file_reveal: Option<String>,
+    pending_hunk_navigation: Option<review::HunkNavigation>,
     pending_editor_open: Option<String>,
     pending_position: Option<DiffLinePosition>,
     pending_review_anchor: Option<DiffViewportAnchor>,
@@ -476,6 +477,7 @@ impl GitPanel {
                     && let Some(review) = &mut this.review
                     && let Some(&ix) = review.by_path.get(path.as_str())
                 {
+                    this.pending_hunk_navigation = None;
                     review.active = Some(ix);
                     let primary = review.detail.files[ix].path.clone();
                     let expanded = matches!(event, DiffEvent::FileExpanded(_));
@@ -566,6 +568,7 @@ impl GitPanel {
             snapshot: None,
             editor,
             pending_file_reveal: None,
+            pending_hunk_navigation: None,
             pending_editor_open: None,
             pending_position: None,
             pending_review_anchor: None,

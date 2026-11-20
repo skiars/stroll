@@ -1259,14 +1259,16 @@ impl<M: InputModeKind> TextElement<M> {
             ProjectedScroll::Caret {
                 context_lines,
                 leading_block,
+                inset,
             } => {
                 let row = leading_block
                     .and_then(|line| map.block_start(line))
                     .unwrap_or_else(|| {
                         map.offset_to_display_row(state.cursor(), state.cursor_line_end_affinity)
                     });
-                let inset =
-                    (context_lines * line_height).min((viewport_height - line_height).max(px(0.)));
+                let inset = inset.unwrap_or_else(|| {
+                    (context_lines * line_height).min((viewport_height - line_height).max(px(0.)))
+                });
                 (row, inset)
             }
         };

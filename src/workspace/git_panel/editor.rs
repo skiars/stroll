@@ -1,8 +1,11 @@
-use super::{review::ActionBlocks, *};
+use super::{
+    review::{ActionBlocks, HunkTarget},
+    *,
+};
 use crate::workspace::{
     DiffSource, OpenFile, WorkspaceView,
     code_theme::HunkPalette,
-    editor_git::{hunk_toolbar_row, restore_text_edit},
+    editor_git::{HunkDirection, hunk_label, hunk_toolbar_row, restore_text_edit},
     inlay_hints::InlayHints,
     line_alignment::LineAlignment,
 };
@@ -126,6 +129,13 @@ impl RowMapping {
     fn patch_end(&self, projected: usize, len: usize) -> usize {
         let index = self.0.partition_point(|&(_, row)| row < projected);
         self.0.get(index).map_or(len, |&(row, _)| row)
+    }
+
+    fn projected_rows(&self, rows: Range<usize>) -> Option<Range<usize>> {
+        let start = self.0.partition_point(|&(row, _)| row < rows.start);
+        let end = self.0.partition_point(|&(row, _)| row < rows.end);
+        let entries = &self.0[start..end];
+        Some(entries.first()?.1..entries.last()?.1 + 1)
     }
 }
 
@@ -759,7 +769,8 @@ pub(super) struct ReviewEditor {
     rows: Rc<Vec<DiffEditorRow>>,
     row_revision: Option<usize>,
     headers: Rc<Vec<usize>>,
-    hunk_neighbors: Rc<HashMap<usize, [Option<usize>; 2]>>,
+    hunks: Rc<Vec<ReviewHunk>>,
+    revealed_hunk: Rc<Cell<Option<RevealedHunk>>>,
     blocks: Rc<Vec<Option<(SharedString, ActionBlocks, usize)>>>,
     actions_valid: bool,
     dirty_sources: HashSet<PathBuf>,
@@ -781,6 +792,39 @@ pub(super) struct ReviewEditor {
     alignment_task: Option<Task<()>>,
 }
 
+struct ReviewHunk {
+    path: SharedString,
+    index: usize,
+    header: usize,
+    changes: Range<usize>,
+}
+
+#[derive(Clone, Copy)]
+struct RevealedHunk {
+    revision: usize,
+    header: usize,
+    pointer: Point<Pixels>,
+}
+
+impl ReviewHunk {
+    fn in_direction(hunks: &[Self], selected: usize, direction: HunkDirection) -> Option<&Self> {
+        hunks
+            .get(direction.neighbor(selected)?)
+            .filter(|target| target.path == hunks[selected].path)
+    }
+
+    fn projected_changes(&self, mapping: Option<&RowMapping>) -> Option<Range<usize>> {
+        if let Some(mapping) = mapping {
+            mapping.projected_rows(self.changes.clone()).or_else(|| {
+                let header = mapping.projected(self.header)?;
+                Some(header..header + 1)
+            })
+        } else {
+            Some(self.changes.clone())
+        }
+    }
+}
+
 impl ReviewEditor {
     pub(super) fn has_pending_projection(&self, panel: &GitPanel) -> bool {
         self.modified.projection.borrow().edited && !panel.live_tasks.is_empty()
@@ -793,7 +837,8 @@ impl ReviewEditor {
             rows: Rc::default(),
             row_revision: None,
             headers: Rc::default(),
-            hunk_neighbors: Rc::default(),
+            hunks: Rc::default(),
+            revealed_hunk: Rc::default(),
             blocks: Rc::default(),
             actions_valid: false,
             dirty_sources: HashSet::new(),
@@ -1311,7 +1356,7 @@ impl ReviewEditor {
                     .filter_map(|(row, item)| matches!(item, DiffEditorRow::File(_)).then_some(row))
                     .collect(),
             );
-            panel.editor.hunk_neighbors = Rc::new(hunk_neighbors(&rows));
+            panel.editor.hunks = Rc::new(review_hunks(&rows));
             panel.editor.rows = Rc::new(rows);
             panel.editor.row_revision = Some(revision);
             panel.editor.theme = Some(theme);
@@ -1476,6 +1521,55 @@ impl ReviewEditor {
                 editor.set_soft_wrap(panel.wrap, window, cx)
             });
         }
+        if panel.editor.row_revision == Some(revision)
+            && let Some(jump) = panel
+                .pending_hunk_navigation
+                .take_if(|jump| !matches!(jump.target, HunkTarget::Load(_)))
+        {
+            let hunks = &panel.editor.hunks;
+            let hunk = match jump.target {
+                HunkTarget::Index(index) => hunks
+                    .iter()
+                    .find(|hunk| hunk.path == jump.path && hunk.index == index),
+                HunkTarget::FileEdge(HunkDirection::Next) => {
+                    hunks.iter().find(|hunk| hunk.path == jump.path)
+                }
+                HunkTarget::FileEdge(HunkDirection::Previous) => {
+                    hunks.iter().rfind(|hunk| hunk.path == jump.path)
+                }
+                HunkTarget::Load(_) => None,
+            };
+            if let Some(hunk) = hunk
+                && let Some(projected) = hunk.projected_changes(row_mapping.as_deref())
+            {
+                let right = &panel.editor.modified.editor;
+                let inset = jump
+                    .anchor
+                    .inset(right.read(cx).input_bounds(), FILE_HEADER_HEIGHT)
+                    .unwrap_or(FILE_HEADER_HEIGHT);
+                let row = hunk.changes.start;
+                panel
+                    .editor
+                    .revealed_hunk
+                    .set(jump.anchor.pointer().map(|pointer| RevealedHunk {
+                        revision,
+                        header: hunk.header,
+                        pointer,
+                    }));
+                panel.editor.navigation_row = target;
+                panel.editor.navigation_source = None;
+                panel.editor.restore_viewport = false;
+                for (column, row) in [
+                    (&panel.editor.original.editor, row),
+                    (right, projected.start),
+                ] {
+                    column.update(cx, |editor, cx| {
+                        editor.scroll_to_projected_line(row, inset, cx)
+                    });
+                }
+                return;
+            }
+        }
         let file_row = panel.pending_file_reveal.as_deref().and_then(|path| {
             panel.editor.headers.iter().copied().find(|&row| {
                 matches!(&panel.editor.rows[row], DiffEditorRow::File(header) if header.as_str() == path)
@@ -1549,7 +1643,8 @@ impl ReviewEditor {
         let left = self.original.editor.clone();
         let rows = self.rows.clone();
         let row_mapping = self.modified.projection.borrow().row_mapping.clone();
-        let hunk_neighbors = self.hunk_neighbors.clone();
+        let hunks = self.hunks.clone();
+        let revealed_hunk = self.revealed_hunk.clone();
         let revision = self.row_revision.unwrap_or_default();
         let navigation = panel.diff.read(cx).editor_viewport_position();
         let pending_file = panel.pending_file_reveal.clone();
@@ -1850,41 +1945,6 @@ impl ReviewEditor {
                                 .when_some(hunk_font.clone(), |row, font| row.font_family(font))
                                 .text_color(colors.muted)
                                 .child(div().flex_1().min_w_0().truncate().child(label.clone()))
-                                .children(
-                                    [
-                                        ("git-previous-hunk", IconName::ArrowUp, "git.previous_hunk"),
-                                        ("git-next-hunk", IconName::ArrowDown, "git.next_hunk"),
-                                    ]
-                                    .into_iter()
-                                    .zip(hunk_neighbors.get(&row).copied().unwrap_or_default())
-                                    .map(|((id, icon, label), target)| {
-                                        let view = hover.clone();
-                                        compact_icon_button((id, row), icon, t!(label))
-                                            .debug_selector(|| format!("{id}:{row}"))
-                                            .min_w(px(24.))
-                                            .h_full()
-                                            .flex_shrink_0()
-                                            .disabled(target.is_none() || row_mapping.is_some())
-                                            .on_click(move |_, _, cx| {
-                                                if let Some(target) = target {
-                                                    _ = view.update(cx, |panel, cx| {
-                                                        if panel.editor.row_revision != Some(revision) {
-                                                            return;
-                                                        }
-                                                        panel.pending_file_reveal = None;
-                                                        panel.editor.navigation_source = None;
-                                                        let inset = FILE_HEADER_HEIGHT + panel.editor.modified.editor.read(cx).line_height().unwrap_or_default();
-                                                        for column in [&panel.editor.original, &panel.editor.modified] {
-                                                            column.editor.update(cx, |editor, cx| {
-                                                                editor.scroll_to_projected_line(target, inset, cx);
-                                                            });
-                                                        }
-                                                        cx.notify();
-                                                    });
-                                                }
-                                            })
-                                    }),
-                                )
                                 .into_any_element(),
                         ),
                         DiffEditorRow::Fold(path, pairs) => {
@@ -1939,10 +1999,12 @@ impl ReviewEditor {
                         FILE_HEADER_HEIGHT,
                     ));
                 }
-                if hunk_actions && row_mapping.is_none()
-                    && let Some((path, hunk, row, bottom)) = active_hunk
-                    && let Some(line) = bounds_at(row, cx)
-                {
+                // Keep the destination label visible if scroll limits keep it off the click.
+                let revealed = revealed_hunk
+                    .get()
+                    .filter(|hunk| hunk.revision == revision && hunk.pointer == mouse);
+                revealed_hunk.set(revealed);
+                if bounds.contains(&mouse) {
                     let clip_top = if header_stuck {
                         next_header_top.map_or(bounds.top() + FILE_HEADER_HEIGHT, |next| {
                             next.min(bounds.top() + FILE_HEADER_HEIGHT)
@@ -1952,17 +2014,64 @@ impl ReviewEditor {
                     };
                     let clip =
                         Bounds::from_corners(point(bounds.left(), clip_top), bounds.bottom_right());
-                    let block = Bounds::from_corners(
-                        point(bounds.left(), line.top()),
-                        point(bounds.right(), bottom),
-                    );
-                    if let Some(top) = hovered_hunk_top(block, clip, mouse)
-                        && let Some(toolbar) = hover
-                            .update(cx, |panel, cx| panel.hunk_actions(path.as_str(), hunk, cx))
-                            .ok()
-                            .flatten()
-                    {
-                        elements.push((hunk_toolbar_row(Some(toolbar)), bounds.left(), top, HUNK_TOOLBAR_HEIGHT));
+                    let placement = |hunk: &ReviewHunk, revealed: bool, cx: &App| {
+                        let rows = hunk.projected_changes(row_mapping.as_deref())?;
+                        let right_state = right.read(cx);
+                        let start = right_state.projected_line_bounds(rows.start)?.top();
+                        let bottom = right_state.projected_line_bounds(rows.end - 1)?.bottom();
+                        if bottom <= clip.top() || start >= clip.bottom() {
+                            return None;
+                        }
+                        let top = start.max(clip.top());
+                        if revealed {
+                            return Some(top.min((clip.bottom() - HUNK_TOOLBAR_HEIGHT).max(clip.top())));
+                        }
+                        let block = Bounds::from_corners(
+                            point(bounds.left(), start),
+                            point(bounds.right(), bottom.max(top + HUNK_TOOLBAR_HEIGHT)),
+                        );
+                        hovered_hunk_top(block, clip, mouse)
+                    };
+                    let revealed = revealed.and_then(|revealed| {
+                        let selected = hunks.binary_search_by_key(&revealed.header, |hunk| hunk.header).ok()?;
+                        Some((selected, placement(&hunks[selected], true, cx)?))
+                    });
+                    let hovered = revealed.or_else(|| {
+                        let first = hunks.partition_point(|hunk| hunk.changes.end <= start);
+                        hunks.iter().enumerate().skip(first)
+                            .take_while(|(_, hunk)| hunk.changes.start < end)
+                            .find_map(|(selected, hunk)| Some((selected, placement(hunk, false, cx)?)))
+                    });
+                    if let Some((selected, top)) = hovered {
+                        let hunk = &hunks[selected];
+                        let mut top = top;
+                        let action = if hunk_actions && row_mapping.is_none() {
+                            let first = blocks[hunk.changes.start].as_ref();
+                            if revealed.is_some() {
+                                first.map(|(path, blocks, _)| (path, *blocks))
+                            } else if let Some((path, blocks, row, bottom)) = active_hunk
+                                && hunk.changes.contains(&row)
+                                && let Some(line) = bounds_at(row, cx)
+                            {
+                                let block = Bounds::from_corners(
+                                    point(bounds.left(), line.top()),
+                                    point(bounds.right(), bottom),
+                                );
+                                top = hovered_hunk_top(block, clip, mouse).unwrap_or(top);
+                                Some((path, blocks))
+                            } else if mouse.y < top + HUNK_TOOLBAR_HEIGHT {
+                                first.map(|(path, blocks, _)| (path, *blocks))
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        };
+                        if let Ok(Some(label)) = hover.update(cx, |panel, cx| {
+                            panel.review_hunk_label(selected, action, font_size, cx)
+                        }) {
+                            elements.push((hunk_toolbar_row(label), bounds.left(), top, HUNK_TOOLBAR_HEIGHT));
+                        }
                     }
                 }
                 elements
@@ -1993,6 +2102,8 @@ impl ReviewEditor {
                         && event.delta.pixel_delta(px(1.)).y != px(0.)
                     {
                         _ = wheel_view.update(cx, |panel, cx| {
+                            panel.pending_hunk_navigation = None;
+                            panel.editor.revealed_hunk.set(None);
                             if panel.pending_file_reveal.take().is_none() {
                                 return;
                             }
@@ -2084,23 +2195,32 @@ impl ReviewEditor {
     }
 }
 
-fn hunk_neighbors(rows: &[DiffEditorRow]) -> HashMap<usize, [Option<usize>; 2]> {
-    let mut neighbors = HashMap::<_, [Option<usize>; 2]>::new();
-    let mut previous = None;
+fn review_hunks(rows: &[DiffEditorRow]) -> Vec<ReviewHunk> {
+    // Group displayed changes by patch hunk independently of their Git actions.
+    let mut hunks = Vec::<ReviewHunk>::new();
+    let mut header = None;
     for (row, entry) in rows.iter().enumerate() {
-        let DiffEditorRow::Hunk(path, _, _) = entry else {
-            continue;
-        };
-        let path = path.as_str();
-        if let Some((previous_row, previous_path)) = previous
-            && previous_path == path
-        {
-            neighbors.entry(previous_row).or_default()[1] = Some(row);
-            neighbors.entry(row).or_default()[0] = Some(previous_row);
+        match entry {
+            DiffEditorRow::Hunk(path, index, _) => header = Some((path, *index, row)),
+            DiffEditorRow::File(_) => header = None,
+            DiffEditorRow::Code { changed: true, .. } => {
+                if let Some((path, index, header)) = header {
+                    if let Some(hunk) = hunks.last_mut().filter(|hunk| hunk.header == header) {
+                        hunk.changes.end = row + 1;
+                    } else {
+                        hunks.push(ReviewHunk {
+                            path: path.clone(),
+                            index,
+                            header,
+                            changes: row..row + 1,
+                        });
+                    }
+                }
+            }
+            _ => {}
         }
-        previous = Some((row, path));
     }
-    neighbors
+    hunks
 }
 
 fn deletion_target(document: &DiffFile, line: usize) -> Option<usize> {
@@ -2675,6 +2795,52 @@ impl FileHeaderLight {
 }
 
 impl GitPanel {
+    fn review_hunk_label(
+        &self,
+        selected: usize,
+        action: Option<(&SharedString, ActionBlocks)>,
+        font_size: Pixels,
+        cx: &Context<Self>,
+    ) -> Option<AnyElement> {
+        let revision = self.editor.row_revision?;
+        let hunks = &self.editor.hunks;
+        let hunk = hunks.get(selected)?;
+        let directions = [HunkDirection::Previous, HunkDirection::Next];
+        let neighbors = directions.map(|direction| {
+            ReviewHunk::in_direction(hunks, selected, direction).map(|target| target.index)
+        });
+        let available = directions.map(|direction| {
+            neighbors[direction as usize].is_some()
+                || self
+                    .adjacent_hunk_file(hunk.path.as_str(), direction)
+                    .is_some()
+        });
+        let controls = action.and_then(|(path, blocks)| self.hunk_actions(path, blocks, cx));
+        let path = hunk.path.clone();
+        let view = cx.weak_entity();
+        Some(hunk_label(
+            controls,
+            format!("diff-{}", hunk.header),
+            available,
+            font_size,
+            move |direction, anchor, window, cx| {
+                _ = view.update(cx, |panel, cx| {
+                    if panel.editor.row_revision != Some(revision)
+                        || panel.diff.read(cx).editor_row_revision() != revision
+                    {
+                        return;
+                    }
+                    if let Some(target) = neighbors[direction as usize] {
+                        panel.navigate_hunk_in_file(path.clone(), target, anchor, cx);
+                    } else {
+                        panel.navigate_hunk_across_files(&path, direction, anchor, window, cx);
+                    }
+                });
+            },
+            cx,
+        ))
+    }
+
     pub(in crate::workspace) fn schedule_snapshot_alignment(&self, cx: &mut Context<Self>) {
         if !self.review.as_ref().is_some_and(|review| {
             super::review::aligns_historical_snapshots(&review.detail.comparison)
