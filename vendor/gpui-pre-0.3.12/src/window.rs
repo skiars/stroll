@@ -6110,7 +6110,7 @@ impl Window {
         };
         match &event {
             PlatformInput::Scroll(event) => {
-                if event.delta.precise() {
+                if !event.is_wheel() || !cx.smooth_scrolling() {
                     self.smooth_scroll.cancel();
                 } else {
                     self.smooth_scroll.cancel_navigation();

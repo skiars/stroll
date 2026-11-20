@@ -550,6 +550,9 @@ pub enum ScrollSource {
     /// this source, so GPUI does not add a second momentum phase.
     #[default]
     Pointer,
+    /// A precise mouse wheel without native gesture or momentum phases.
+    /// Keep its pixel units while applying the shared wheel interpolation.
+    PreciseWheel,
     /// Raw finger movement on a touchpad: precise pixel deltas without the
     /// platform's own inertia. GPUI resamples these at frame rate and
     /// synthesizes momentum after the gesture ends.
@@ -564,6 +567,14 @@ pub enum ScrollSource {
 impl ScrollSource {
     pub(crate) fn is_touchpad(self) -> bool {
         matches!(self, Self::Touchpad | Self::TimedTouchpad(_))
+    }
+}
+
+impl ScrollEvent {
+    /// Whether this input uses wheel interpolation rather than native gesture
+    /// scrolling. Precision describes units, not whether a device is a wheel.
+    pub fn is_wheel(&self) -> bool {
+        !self.delta.precise() || self.source == ScrollSource::PreciseWheel
     }
 }
 

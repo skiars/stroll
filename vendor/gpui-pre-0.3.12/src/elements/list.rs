@@ -2021,10 +2021,8 @@ impl Element for List {
         window.on_mouse_event(move |event: &ScrollEvent, phase, window, cx| {
             if phase == DispatchPhase::Bubble && hitbox_id.should_handle_scroll(window) {
                 list_state.cancel_navigation();
-                if cx.smooth_scrolling()
-                    && let ScrollDelta::Lines(lines) = event.delta
-                {
-                    if lines.y == 0. || list_state.0.borrow().reset {
+                if cx.smooth_scrolling() && event.is_wheel() {
+                    if event.delta.content_delta().y == px(0.) || list_state.0.borrow().reset {
                         return;
                     }
                     let current = list_state.scroll_px_offset_for_scrollbar();

@@ -1,11 +1,12 @@
-#![cfg(any(target_os = "linux", target_os = "windows"))]
+#[path = "../src/test_support.rs"]
+mod test_support;
 
 use std::{cell::Cell, rc::Rc, time::Duration};
 
 use gpui::{
     AppContext as _, Context, Entity, InteractiveElement as _, IntoElement, ListAlignment,
     ListState, ParentElement as _, Pixels, Render, ScrollDelta, ScrollEvent, ScrollHandle,
-    StatefulInteractiveElement as _, Styled as _, TestAppContext, TestDispatcher,
+    ScrollSource, StatefulInteractiveElement as _, Styled as _, TestAppContext, TestDispatcher,
     UniformListScrollHandle, VisualTestContext, Window, div, list, point, px, uniform_list,
 };
 use gpui_component::{
@@ -380,11 +381,19 @@ fn diff_file_navigation_scrolls_through_intermediate_rows(cx: &mut TestAppContex
 
 #[test]
 fn wheel_scrolling_animates_through_the_desktop_viewports() {
-    let platform = gpui_platform::current_platform(cfg!(target_os = "linux"));
+    check_wheel_viewports(false);
+}
+
+#[test]
+fn precise_wheel_scrolling_animates_through_the_desktop_viewports() {
+    check_wheel_viewports(true);
+}
+
+fn check_wheel_viewports(precise: bool) {
     let mut cx = TestAppContext::build_with_text_system(
         TestDispatcher::new(0),
         None,
-        platform.text_system(),
+        test_support::text_system(cfg!(target_os = "linux")),
     );
     let outer = ScrollHandle::new();
     let uniform = UniformListScrollHandle::new();
@@ -428,7 +437,23 @@ fn wheel_scrolling_animates_through_the_desktop_viewports() {
             views.document.read(cx).list_state().clone(),
         )
     });
-    let lines = |distance| ScrollDelta::Lines(point(0., distance));
+    let wheel = |cx: &mut VisualTestContext, y, distance| {
+        cx.simulate_event(ScrollEvent {
+            position: point(px(100.), y),
+            delta: if precise {
+                ScrollDelta::Pixels(point(px(0.), px(distance * 20.)))
+            } else {
+                ScrollDelta::Lines(point(0., distance))
+            },
+            source: if precise {
+                ScrollSource::PreciseWheel
+            } else {
+                ScrollSource::Pointer
+            },
+            ..Default::default()
+        });
+    };
+    let document_notch = if precise { 20. } else { 30. };
     let editor_y = px(280.);
     let uniform_offset = || uniform.0.borrow().base_handle.offset().y;
     let list_offset = || rows.scroll_px_offset_for_scrollbar().y;
@@ -439,10 +464,10 @@ fn wheel_scrolling_animates_through_the_desktop_viewports() {
         (px(40.), &uniform_offset as &dyn Fn() -> Pixels, px(-60.)),
         (px(120.), &list_offset, px(-60.)),
         (px(200.), &|| horizontal.offset().x, px(-60.)),
-        (document_y, &document_offset, px(-90.)),
+        (document_y, &document_offset, px(-3. * document_notch)),
     ];
     for (y, offset, _) in viewports {
-        scroll(cx, y, lines(-3.));
+        wheel(cx, y, -3.);
         assert_eq!(offset(), px(0.));
     }
     advance_frame(cx, 40);
@@ -454,7 +479,7 @@ fn wheel_scrolling_animates_through_the_desktop_viewports() {
         assert_eq!(outer.offset().y, px(0.));
     }
 
-    scroll(cx, editor_y, lines(-3.));
+    wheel(cx, editor_y, -3.);
     let editor_offset =
         |cx: &mut VisualTestContext| cx.update(|_, cx| editor.read(cx).scroll_offset().y);
     assert_eq!(editor_offset(cx), px(0.));
@@ -478,7 +503,7 @@ fn wheel_scrolling_animates_through_the_desktop_viewports() {
             }
         })
     });
-    scroll(cx, diff_y, lines(-3.));
+    wheel(cx, diff_y, if precise { -4.5 } else { -3. });
     assert_eq!(diff_steps.get(), 0);
     advance_frame(cx, 40);
     assert_eq!(outer.offset().y, px(0.));
@@ -487,27 +512,27 @@ fn wheel_scrolling_animates_through_the_desktop_viewports() {
     assert_eq!(diff_steps.get(), 2);
     finish_scroll(cx);
     assert!(diff_top_file(cx).is_some());
-    // The 90 px preamble ends exactly one wheel notch from the top.
+    // Move just above the 90 px preamble boundary with a native gesture.
     scroll(cx, diff_y, ScrollDelta::Pixels(point(px(0.), px(1.))));
     assert_eq!(diff_top_file(cx), None);
 
     let outer_y = px(490.);
-    scroll(cx, outer_y, lines(-2.));
-    scroll(cx, outer_y, lines(-2.));
+    wheel(cx, outer_y, -2.);
+    wheel(cx, outer_y, -2.);
     assert_eq!(outer.offset().y, px(0.));
     finish_scroll(cx);
     let combined = outer.offset().y;
     assert_eq!(combined, px(-80.));
     outer.set_offset(point(px(0.), px(0.)));
     draw(cx);
-    scroll(cx, outer_y, lines(-4.));
+    wheel(cx, outer_y, -4.);
     finish_scroll(cx);
     assert_eq!(outer.offset().y, combined);
 
-    scroll(cx, outer_y, lines(-6.));
+    wheel(cx, outer_y, -6.);
     advance_frame(cx, 30);
     let before_reverse = outer.offset().y;
-    scroll(cx, outer_y, lines(2.));
+    wheel(cx, outer_y, 2.);
     advance_frame(cx, 30);
     assert!(outer.offset().y > before_reverse);
 
@@ -521,14 +546,17 @@ fn wheel_scrolling_animates_through_the_desktop_viewports() {
     outer.set_offset(point(px(0.), px(0.)));
     draw(cx);
     let before_document = document_offset();
-    scroll(cx, document_y, lines(-3.));
-    assert_eq!(document_offset(), before_document - px(90.));
+    wheel(cx, document_y, -3.);
+    assert_eq!(document_offset(), before_document - px(3. * document_notch));
     draw(cx);
     scroll(cx, document_y, ScrollDelta::Pixels(point(px(0.), px(-13.))));
-    assert_eq!(document_offset(), before_document - px(103.));
+    assert_eq!(
+        document_offset(),
+        before_document - px(3. * document_notch + 13.)
+    );
 
     let before = outer.offset().y;
-    scroll(cx, outer_y, lines(-2.));
+    wheel(cx, outer_y, -2.);
     let after = outer.offset().y;
     assert_eq!(after, before - px(40.));
     advance_frame(cx, 140);
@@ -583,11 +611,10 @@ fn replacing_an_earlier_patch_keeps_the_current_source_in_view() {
         .unwrap()
         .remove(0)
     };
-    let platform = gpui_platform::current_platform(cfg!(target_os = "linux"));
     let mut cx = TestAppContext::build_with_text_system(
         TestDispatcher::new(0),
         None,
-        platform.text_system(),
+        test_support::text_system(cfg!(target_os = "linux")),
     );
     let state = cx.new(|cx| DiffState::new([patch("first", 2), patch("second", 100)], cx));
     state.update(&mut cx, |state, cx| {
@@ -618,11 +645,10 @@ fn split_diff_padding_keeps_the_source_line_at_the_same_viewport_position() {
         }
     }
 
-    let platform = gpui_platform::current_platform(cfg!(target_os = "linux"));
     let mut cx = TestAppContext::build_with_text_system(
         TestDispatcher::new(0),
         None,
-        platform.text_system(),
+        test_support::text_system(cfg!(target_os = "linux")),
     );
     cx.update(gpui_component::init);
     let mut columns = None;
@@ -699,4 +725,144 @@ fn split_diff_padding_keeps_the_source_line_at_the_same_viewport_position() {
         );
     });
     set_padding(visual, Rc::default());
+}
+
+#[test]
+fn precise_wheel_replay_preserves_distance_and_yields_to_native_gestures() {
+    struct EditorView(Entity<EditorState>);
+    impl Render for EditorView {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            Editor::new(&self.0).size_full()
+        }
+    }
+
+    let mut cx = TestAppContext::build_with_text_system(
+        TestDispatcher::new(0),
+        None,
+        test_support::text_system(cfg!(target_os = "linux")),
+    );
+    let mut editor = None;
+    let (_, cx) = cx.add_window_view(|window, cx| {
+        gpui_component::init(cx);
+        cx.set_smooth_scrolling(true);
+        cx.set_reduce_motion(false);
+        let state = cx.new(|cx| {
+            EditorState::new(window, cx).default_value("scroll replay line\n".repeat(1000))
+        });
+        editor = Some(state.clone());
+        Root::new(cx.new(|_| EditorView(state)), window, cx)
+    });
+    let editor = editor.unwrap();
+    cx.simulate_resize(gpui::size(px(600.), px(360.)));
+    draw(cx);
+    let position = cx.update(|_, cx| editor.read(cx).input_bounds().center());
+    let offset = |cx: &mut VisualTestContext| cx.update(|_, cx| editor.read(cx).scroll_offset().y);
+    let packet = |cx: &mut VisualTestContext, delta, source| {
+        cx.simulate_event(ScrollEvent {
+            position,
+            delta: ScrollDelta::Pixels(point(px(0.), px(delta))),
+            source,
+            ..Default::default()
+        });
+    };
+
+    // The first two physical wheel bursts captured by scroll_probe on macOS.
+    // Microsecond gaps include packets arriving more slowly than a 60 Hz frame.
+    let samples = [
+        (0, -13.),
+        (17041, -28.),
+        (25753, -88.),
+        (23000, -103.),
+        (17452, -102.),
+        (29026, -103.),
+        (50358, -103.),
+        (203328, -13.),
+        (17932, -103.),
+        (15993, -103.),
+        (16640, -102.),
+        (24439, -103.),
+        (37325, -103.),
+        (204522, -129.),
+        (23694, -308.),
+        (18011, -206.),
+        (15197, -205.),
+        (16658, -206.),
+    ];
+    let mut now = 0;
+    let mut next_frame = 16667;
+    let mut total = 0.;
+    for (gap, delta) in samples {
+        let at = now + gap;
+        while next_frame <= at {
+            cx.executor()
+                .advance_clock(Duration::from_micros(next_frame - now));
+            now = next_frame;
+            cx.update(|window, cx| {
+                window.simulate_next_frame(cx);
+                window.draw(cx).clear(cx);
+            });
+            next_frame += 16667;
+        }
+        cx.executor().advance_clock(Duration::from_micros(at - now));
+        now = at;
+        let before = offset(cx);
+        packet(cx, delta, ScrollSource::PreciseWheel);
+        assert_eq!(offset(cx), before, "wheel input waits for the frame");
+        total += delta;
+    }
+    packet(cx, 0., ScrollSource::PreciseWheel);
+    finish_scroll(cx);
+    assert_eq!(
+        offset(cx),
+        px(total),
+        "pixel distances must not become line units"
+    );
+
+    // Retarget before a frame: direction reversal drops the old pending tail.
+    packet(cx, -308., ScrollSource::PreciseWheel);
+    advance_frame(cx, 17);
+    let reversed_at = offset(cx);
+    packet(cx, 103., ScrollSource::PreciseWheel);
+    advance_frame(cx, 17);
+    assert!(offset(cx) > reversed_at);
+    finish_scroll(cx);
+    assert_eq!(offset(cx), reversed_at + px(103.));
+
+    // A native trackpad packet cancels a wheel tail and remains immediate.
+    packet(cx, -308., ScrollSource::PreciseWheel);
+    advance_frame(cx, 17);
+    let before_native = offset(cx);
+    packet(cx, 13., ScrollSource::Pointer);
+    assert_eq!(offset(cx), before_native + px(13.));
+    finish_scroll(cx);
+    assert_eq!(offset(cx), before_native + px(13.));
+
+    // Changing the switch while a wheel animation is active leaves no stale tail.
+    packet(cx, -205., ScrollSource::PreciseWheel);
+    advance_frame(cx, 17);
+    let before_disabled = offset(cx);
+    cx.update(|_, cx| cx.set_smooth_scrolling(false));
+    packet(cx, -28., ScrollSource::PreciseWheel);
+    assert_eq!(offset(cx), before_disabled - px(28.));
+    finish_scroll(cx);
+    assert_eq!(offset(cx), before_disabled - px(28.));
+
+    cx.update(|_, cx| cx.set_smooth_scrolling(true));
+    packet(cx, 100000., ScrollSource::PreciseWheel);
+    for _ in 0..40 {
+        advance_frame(cx, 17);
+    }
+    assert_eq!(offset(cx), px(0.));
+    packet(cx, 103., ScrollSource::PreciseWheel);
+    finish_scroll(cx);
+    assert_eq!(
+        offset(cx),
+        px(0.),
+        "the upper boundary must not bounce for a wheel"
+    );
+    packet(cx, -103., ScrollSource::PreciseWheel);
+    advance_frame(cx, 17);
+    assert!(offset(cx) < px(0.) && offset(cx) > px(-103.));
+    finish_scroll(cx);
+    assert_eq!(offset(cx), px(-103.));
 }

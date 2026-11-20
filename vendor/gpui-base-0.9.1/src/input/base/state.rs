@@ -3124,8 +3124,8 @@ impl<M: InputModeKind> InputBaseState<M> {
         let delta = event.delta.content_delta();
 
         let old_offset = self.scroll_handle.offset();
-        let precise = matches!(event.delta, gpui::ScrollDelta::Pixels(_));
-        if !precise || !self.scroll_bounce || cx.reduce_motion() || !self.overflows_vertically() {
+        let gesture = !event.is_wheel();
+        if !gesture || !self.scroll_bounce || cx.reduce_motion() || !self.overflows_vertically() {
             let displaced = self.overscroll.offset() != 0.;
             self.overscroll.reset();
             if displaced {
@@ -3133,12 +3133,12 @@ impl<M: InputModeKind> InputBaseState<M> {
             }
         }
         let bounces = self.scroll_bounce
-            && precise
+            && gesture
             && !cx.reduce_motion()
             && delta.y.abs() >= delta.x.abs()
             && self.overflows_vertically();
         let mut animated = false;
-        if !precise && cx.smooth_scrolling() {
+        if event.is_wheel() && cx.smooth_scrolling() {
             let smooth_scroll = self.scroll_handle.smooth_scroll();
             let target = self.clamp_scroll_offset(smooth_scroll.target(old_offset, delta, window));
             let input = cx.entity().downgrade();

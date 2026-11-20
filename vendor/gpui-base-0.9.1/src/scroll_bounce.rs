@@ -420,17 +420,20 @@ impl Element for ScrollBounce {
             let mut before = 0.;
             let mut allow_end_bounce = false;
             window.on_mouse_event(move |event: &ScrollEvent, phase, window, cx| {
-                let ScrollDelta::Pixels(mut delta) = event.delta else {
-                    if phase == DispatchPhase::Capture && hitbox.should_handle_scroll(window) {
-                        let mut state = state.borrow_mut();
-                        let displaced = state.physics.offset() != 0.;
-                        *state = State::default();
-                        drop(state);
-                        if displaced {
-                            cx.notify(view);
+                let mut delta = match event.delta {
+                    ScrollDelta::Pixels(delta) if !event.is_wheel() => delta,
+                    _ => {
+                        if phase == DispatchPhase::Capture && hitbox.should_handle_scroll(window) {
+                            let mut state = state.borrow_mut();
+                            let displaced = state.physics.offset() != 0.;
+                            *state = State::default();
+                            drop(state);
+                            if displaced {
+                                cx.notify(view);
+                            }
                         }
+                        return;
                     }
-                    return;
                 };
                 if !hitbox.should_handle_scroll(window) {
                     return;
@@ -440,9 +443,7 @@ impl Element for ScrollBounce {
                 // swipe cannot wobble out of the stretch from one packet to
                 // the next. Both dispatch phases see the same packet, and the
                 // lock gives both the same answer.
-                state
-                    .ongoing_scroll
-                    .lock_axis(&mut delta, event.touch_phase);
+                state.ongoing_scroll.lock_axis(&mut delta, event.touch_phase);
                 if delta.x.abs() > delta.y.abs() {
                     return;
                 }
@@ -585,9 +586,9 @@ impl Element for ScrollBounce {
                     None => event.delta.content_delta(),
                 };
                 let mut state = state.borrow_mut();
-                state
-                    .ongoing_scroll
-                    .lock_axis(&mut delta, event.touch_phase);
+                if !event.is_wheel() {
+                    state.ongoing_scroll.lock_axis(&mut delta, event.touch_phase);
+                }
                 let max = max_scroll_extent(handle.as_ref());
                 if max <= px(0.) {
                     state.overscroll.reset();
@@ -601,7 +602,7 @@ impl Element for ScrollBounce {
                 }
                 let before = handle.offset();
                 if cx.smooth_scrolling()
-                    && matches!(event.delta, ScrollDelta::Lines(_))
+                    && event.is_wheel()
                     && let Some(smooth_scroll) = &smooth_scroll
                 {
                     let displaced = state.overscroll.offset() != 0.;
@@ -638,7 +639,7 @@ impl Element for ScrollBounce {
                     cx.stop_propagation();
                     return;
                 }
-                let changed = if !bounces || matches!(event.delta, ScrollDelta::Lines(_)) {
+                let changed = if !bounces || event.is_wheel() {
                     let displaced = state.overscroll.offset() != 0.;
                     state.overscroll.reset();
                     let mut offset = before;

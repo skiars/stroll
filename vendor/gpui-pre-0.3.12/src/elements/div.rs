@@ -23,7 +23,7 @@ use crate::{
     KeyUpEvent, KeyboardButton, KeyboardClickEvent, LayoutId, LongPressEvent,
     ModifiersChangedEvent, MouseButton, MouseClickEvent, MouseDownEvent, MouseExitEvent,
     MouseMoveEvent, MousePressureEvent, MouseUpEvent, OngoingScroll, Overflow, ParentElement,
-    PinchEvent, Pixels, Point, Render, ScrollDelta, ScrollEvent, SharedString, Size, SmoothScroll,
+    PinchEvent, Pixels, Point, Render, ScrollEvent, SharedString, Size, SmoothScroll,
     Style, StyleRefinement, Styled, Task, TooltipId, TouchPhase, Visibility, Window,
     WindowControlArea, point, px, size,
 };
@@ -3517,7 +3517,7 @@ impl Interactivity {
                     let mut delta = event.delta.content_delta();
 
                     if restrict_scroll_to_axis
-                        && event.delta.precise()
+                        && !event.is_wheel()
                         && let Some(ongoing_scroll) = &ongoing_scroll
                     {
                         ongoing_scroll
@@ -3556,7 +3556,7 @@ impl Interactivity {
                     }
                     let current = *scroll_offset.borrow();
                     if cx.smooth_scrolling()
-                        && matches!(event.delta, ScrollDelta::Lines(_))
+                        && event.is_wheel()
                         && let Some(smooth_scroll) = &smooth_scroll
                     {
                         let target = smooth_scroll.target(current, delta, window);

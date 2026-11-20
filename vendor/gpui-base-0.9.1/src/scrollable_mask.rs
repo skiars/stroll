@@ -6,7 +6,7 @@ use instant::Instant;
 use gpui::{
     Along as _, App, Axis, BorderStyle, Bounds, ContentMask, Edges, Element, ElementId,
     GlobalElementId, Hitbox, Hsla, InteractiveElement as _, IntoElement, IsZero as _, LayoutId,
-    OngoingScroll, PaintQuad, ParentElement as _, Point, Position, ScrollDelta, ScrollEvent,
+    OngoingScroll, PaintQuad, ParentElement as _, Point, Position, ScrollEvent,
     ScrollHandle, SmoothScroll, StatefulInteractiveElement as _, Style, StyleRefinement,
     Styled as _, Window, div, px, relative,
 };
@@ -538,7 +538,7 @@ impl<H: ScrollbarHandle + Clone> Element for ScrollableMask<H> {
 
                     let mut offset = scroll_handle.offset();
                     let mut delta = event.delta.content_delta();
-                    let animate_lines = smooth_scroll.is_some() && cx.smooth_scrolling();
+                    let animate_wheel = smooth_scroll.is_some() && cx.smooth_scrolling();
 
                     let mut animate = |axis: Axis, distance: Pixels| {
                         let Some(smooth_scroll) = &smooth_scroll else {
@@ -582,17 +582,18 @@ impl<H: ScrollbarHandle + Clone> Element for ScrollableMask<H> {
                         handled
                     };
 
-                    // A plain mouse wheel's vertical lines move the scroller
+                    // A mouse wheel's vertical deltas move the scroller
                     // sideways; once it is at its edge the parent scrolls
                     // instead, as for a vertical mask.
                     if vertical_wheel {
-                        let ScrollDelta::Lines(lines) = event.delta else {
-                            return;
-                        };
-                        if lines.x != 0. || lines.y == 0. || !lines.y.is_finite() {
+                        if !event.is_wheel()
+                            || !delta.x.is_zero()
+                            || delta.y.is_zero()
+                            || !delta.y.as_f32().is_finite()
+                        {
                             return;
                         }
-                        if animate_lines {
+                        if animate_wheel {
                             if animate(Axis::Horizontal, delta.y) {
                                 cx.stop_propagation();
                             }
@@ -627,7 +628,7 @@ impl<H: ScrollbarHandle + Clone> Element for ScrollableMask<H> {
                     // Lock the gesture to the axis it started on, so a diagonal
                     // trackpad swipe cannot flip which mask consumes it from one
                     // event to the next. Line deltas carry no touch phase.
-                    if event.delta.precise() {
+                    if !event.is_wheel() {
                         ongoing_scroll
                             .borrow_mut()
                             .lock_axis(&mut delta, event.touch_phase);
@@ -644,7 +645,7 @@ impl<H: ScrollbarHandle + Clone> Element for ScrollableMask<H> {
                         }
                     }
 
-                    if !event.delta.precise() && animate_lines {
+                    if event.is_wheel() && animate_wheel {
                         let distance = delta.along(axis);
                         if !distance.is_zero() && (animate(axis, distance) || is_horizontal) {
                             cx.stop_propagation();
