@@ -1445,3 +1445,91 @@ fn cold_bottom_probe() {
         );
     });
 }
+
+#[::core::prelude::v1::test]
+fn historical_binary_thumbnails_skip_automatic_patches_and_keep_text_diffs() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("repo");
+    fs::create_dir(&root).unwrap();
+    setup(&root);
+    let png = image::RgbImage::from_pixel(8, 8, image::Rgb([32, 160, 144]));
+    png.save(root.join("b-deleted.jpg")).unwrap();
+    fs::write(root.join("d-text.svg"), "<svg>old</svg>\n").unwrap();
+    command(&root, &["add", "."]);
+    command(&root, &["commit", "-qm", "Initial"]);
+    png.save(root.join("a-added.png")).unwrap();
+    fs::remove_file(root.join("b-deleted.jpg")).unwrap();
+    fs::write(root.join("c-text.png"), "Text despite the suffix\n").unwrap();
+    fs::write(root.join("d-text.svg"), "<svg>new</svg>\n").unwrap();
+    command(&root, &["add", "-A"]);
+    command(&root, &["commit", "-qm", "Image changes"]);
+    let mut app = test_context();
+    let (panel, visual) = open(&mut app, temp.path(), &root);
+    visual.update(|window, cx| {
+        panel.update(cx, |panel, cx| {
+            let oid = panel.history.as_ref().unwrap().head.clone().unwrap();
+            panel.select_history_target(Some(&oid), window, cx);
+        });
+    });
+    wait_for_review(
+        visual,
+        "binary metadata, image previews, and text patches",
+        |visual| {
+            visual.update(|_, cx| {
+                let panel = panel.read(cx);
+                let Some(review) = panel.review.as_ref() else {
+                    return false;
+                };
+                if panel.stats_loading || review.detail.comparison.commit_target().is_none() {
+                    return false;
+                }
+                let ix = |path| review.by_path[path];
+                let added = ix("a-added.png");
+                let deleted = ix("b-deleted.jpg");
+                if !review.images.contains_key(&added) || !review.images.contains_key(&deleted) {
+                    return false;
+                }
+                for index in [added, deleted] {
+                    assert!(matches!(review.patches[index], PatchState::Pending));
+                    assert!(change_stat(&review.stats, &review.detail.files[index]).binary);
+                }
+                assert!(matches!(
+                    review.images[&added],
+                    [DiffImage::Missing, DiffImage::Ready(_)]
+                ));
+                assert!(matches!(
+                    review.images[&deleted],
+                    [DiffImage::Ready(_), DiffImage::Missing]
+                ));
+                ["c-text.png", "d-text.svg"].into_iter().all(|path| {
+                    let index = ix(path);
+                    matches!(review.patches[index], PatchState::Ready)
+                        && review.documents[index].hunk_locations().next().is_some()
+                })
+            })
+        },
+    );
+
+    visual.update(|window, cx| {
+        panel.update(cx, |panel, cx| {
+            let ix = panel.review.as_ref().unwrap().by_path["a-added.png"];
+            panel.reveal_file(ix, true, window, cx);
+        });
+    });
+    settle(visual);
+    visual.update(|window, cx| {
+        panel.update(cx, |panel, cx| {
+            let review = panel.review.as_ref().unwrap();
+            let ix = review.by_path["a-added.png"];
+            assert!(matches!(review.patches[ix], PatchState::Pending));
+            panel.request_patch(ix, window, cx);
+        });
+    });
+    wait_for_review(visual, "explicit binary patch", |visual| {
+        visual.update(|_, cx| {
+            let review = panel.read(cx).review.as_ref().unwrap();
+            let ix = review.by_path["a-added.png"];
+            matches!(review.patches[ix], PatchState::Ready) && review.documents[ix].is_binary()
+        })
+    });
+}

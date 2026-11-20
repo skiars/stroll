@@ -181,6 +181,7 @@ struct Review {
     image_files: Vec<bool>,
     images: HashMap<usize, [review::DiffImage; 2]>,
     image_order: VecDeque<usize>,
+    image_redraw_pending: bool,
     documents: Vec<DiffFile>,
     operations: HashMap<usize, review::FileOperations>,
     pending_assets: HashMap<usize, review::PatchAssets>,
@@ -458,22 +459,9 @@ impl GitPanel {
                     cx.notify();
                 }
             }),
-            cx.subscribe_in(&diff, window, |this, diff, event, window, cx| {
-                if matches!(event, DiffEvent::Scrolled | DiffEvent::VisibleFilesChanged)
-                    && !this.single_file
-                    && this.snapshot.is_none()
-                    && this.pending_file_reveal.is_none()
-                    && let Some(review) = &mut this.review
-                {
-                    let active = diff
-                        .read(cx)
-                        .top_file()
-                        .and_then(|path| review.by_path.get(path.as_str()).copied());
-                    if review.active != active {
-                        review.active = active;
-                        App::notify(cx, this.tree_pane.entity_id());
-                        App::notify(cx, this.review_pane.entity_id());
-                    }
+            cx.subscribe_in(&diff, window, |this, _, event, window, cx| {
+                if matches!(event, DiffEvent::Scrolled | DiffEvent::VisibleFilesChanged) {
+                    this.follow_review_viewport(cx);
                 }
                 if matches!(event, DiffEvent::VisibleFilesChanged) {
                     this.prefetch_patches(window, cx);
@@ -483,7 +471,10 @@ impl GitPanel {
                     && let Some(&ix) = review.by_path.get(path.as_str())
                 {
                     this.pending_hunk_navigation = None;
-                    review.active = Some(ix);
+                    if review.active != Some(ix) {
+                        review.active = Some(ix);
+                        App::notify(cx, this.tree_pane.entity_id());
+                    }
                     let primary = review.detail.files[ix].path.clone();
                     let expanded = matches!(event, DiffEvent::FileExpanded(_));
                     if expanded {
@@ -492,7 +483,7 @@ impl GitPanel {
                         review.collapsed.insert(primary);
                     }
                     if expanded {
-                        this.request_patch(ix, window, cx);
+                        this.request_visible_patch(ix, window, cx);
                         this.prefetch_patches(window, cx);
                     }
                     cx.notify();
@@ -1967,6 +1958,8 @@ mod tests {
 
     mod ai_commit_tests;
     mod collapse_render_tests;
+    #[cfg(target_os = "linux")]
+    mod diff_scroll_benchmark;
     mod history_render_tests;
     mod inlay_hints_tests;
     mod navigation_render_tests;
@@ -3598,8 +3591,8 @@ mod tests {
             else {
                 panic!("both images should decode");
             };
-            assert_eq!(before.size(0).width, before.size(0).height);
-            let thumbnail = after.size(0);
+            assert_eq!(before.image.size(0).width, before.image.size(0).height);
+            let thumbnail = after.image.size(0);
             let scale = window.scale_factor();
             assert!(thumbnail.width > thumbnail.height);
             assert!(thumbnail.width.0 <= (160. * scale).ceil() as i32);

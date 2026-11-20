@@ -1604,10 +1604,9 @@ impl ReviewEditor {
             window.rem_size(),
             window.scale_factor(),
             panel.active_file(cx).filter(|&ix| {
-                panel
-                    .review
-                    .as_ref()
-                    .is_some_and(|review| review.patch_display[ix].truncated.is_none())
+                panel.review.as_ref().is_some_and(|review| {
+                    !review.image_files[ix] && review.patch_display[ix].truncated.is_none()
+                })
             }),
         );
         let row_mapping = panel
@@ -2051,16 +2050,7 @@ impl ReviewEditor {
                                 panel.pending_file_reveal = None;
                                 panel.editor.navigating_file = None;
                             }
-                            if !panel.single_file
-                                && panel.pending_file_reveal.is_none()
-                                && let Some(review) = &mut panel.review
-                            {
-                                review.active =
-                                    panel.diff.read(cx).top_file().and_then(|path| {
-                                        review.by_path.get(path.as_str()).copied()
-                                    });
-                            }
-                            App::notify(cx, panel.tree_pane.entity_id());
+                            panel.follow_review_viewport(cx);
                         });
                     });
                 }
@@ -2159,8 +2149,14 @@ impl ReviewEditor {
                                     FILE_HEADER_HEIGHT,
                                 ));
                             }
-                            if let Ok(Some(images)) = hover.read_with(cx, |panel, _| panel.image_diff_row(path, colors)) {
-                                elements.push((images, controls_left(row), line.top() + FILE_HEADER_HEIGHT, super::review::IMAGE_DIFF_HEIGHT));
+                            let x = controls_left(row);
+                            let top = line.top() + FILE_HEADER_HEIGHT;
+                            if top < bounds.bottom() && line.bottom() > bounds.top()
+                                && let Ok(Some(images)) = hover.read_with(cx, |panel, _| {
+                                    panel.image_diff_row(path, bounds.right() - x, window.rem_size(), colors)
+                                })
+                            {
+                                elements.push((images, x, top, super::review::IMAGE_DIFF_HEIGHT));
                             }
                             None
                         }

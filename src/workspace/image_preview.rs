@@ -131,14 +131,43 @@ impl ImageHoverDismiss {
 
 const HOVER_PADDING: Pixels = px(6.);
 
+#[derive(Clone)]
+pub(super) struct ImageHoverSource {
+    read: Arc<dyn Fn() -> anyhow::Result<Vec<u8>> + Send + Sync>,
+    path: Arc<Path>,
+}
+
+impl ImageHoverSource {
+    pub(super) fn new(
+        path: std::path::PathBuf,
+        read: impl Fn() -> anyhow::Result<Vec<u8>> + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            read: Arc::new(read),
+            path: path.into(),
+        }
+    }
+}
+
 pub(super) fn hover_image(
     trigger: Stateful<gpui::Div>,
     dismiss_on_diff_scroll: Option<ImageHoverDismiss>,
     read: impl Fn() -> anyhow::Result<Vec<u8>> + Send + Sync + 'static,
     path: std::path::PathBuf,
 ) -> Stateful<gpui::Div> {
+    hover_image_source(
+        trigger,
+        dismiss_on_diff_scroll,
+        ImageHoverSource::new(path, read),
+    )
+}
+
+pub(super) fn hover_image_source(
+    trigger: Stateful<gpui::Div>,
+    dismiss_on_diff_scroll: Option<ImageHoverDismiss>,
+    ImageHoverSource { read, path }: ImageHoverSource,
+) -> Stateful<gpui::Div> {
     const MAX_SIZE: Size<Pixels> = size(px(320.), px(240.));
-    let read = Arc::new(read);
     let beside_tree = dismiss_on_diff_scroll.is_none();
     trigger.managed_tooltip_request(true, move |bounds, window, _| {
         // A moving row should dismiss the preview without starting another decode.

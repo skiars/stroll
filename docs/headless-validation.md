@@ -24,6 +24,34 @@ On Windows, run `cargo test --release --locked --test smooth_scroll`. The popup 
 cargo test --release --locked -- --skip directx_blurs_the_scene_under_the_popup
 ```
 
+## Git image diff scrolling
+
+The release benchmark generates a temporary Git repository containing synthetic images and a dense text patch. With the history and file panes visible, it replays the same image range with cold and warm thumbnails, reverses direction, and repeats in split view. The offscreen run also measures the text patch.
+
+```sh
+bench_dir=$(mktemp -d)
+env -u DISPLAY -u WAYLAND_DISPLAY \
+  STROLL_GPUI_DATA="$bench_dir/data" STROLL_CONFIG="$bench_dir/config.toml" \
+  STROLL_DIFF_BENCH_GPU=1 cargo test --release --locked --lib \
+  git_image_diff_scroll_budget -- --ignored --nocapture
+```
+
+On Linux, `STROLL_DIFF_BENCH_GPU=1` includes GPU submission in the reported CPU-path P95, with an 8 ms target. Omitting it measures input and draw only.
+
+For presentation timing, use a 60 Hz Wayland output that supports `wp_presentation`. The benchmark opens a focused 1180×780 logical pixel window and sends 660 scroll events per case. It also scrolls past the largest JPEG, reverses, and checks the viewport after the remaining thumbnails settle. Run it three times with fresh state, then summarize the presentation intervals.
+
+```sh
+for run in 1 2 3; do
+  STROLL_GPUI_DATA="$bench_dir/data-$run" STROLL_CONFIG="$bench_dir/config-$run.toml" \
+    STROLL_FRAME_TIMINGS=1 cargo test --release --locked --lib \
+    git_image_diff_wayland_presentation -- --ignored --nocapture \
+    >"$bench_dir/wayland-$run.log" 2>&1 || break
+done
+python3 scripts/git-diff-presentation.py "$bench_dir"/wayland-*.log
+```
+
+Each case needs at least 10 seconds of feedback, at least 99% of refreshes presented, and at most one consecutive missed refresh. A private KWin virtual output at 2360×1560 with scale 2 can exercise the same Wayland path on a physical GPU.
+
 ## Select a GPU
 
 Run `vulkaninfo --summary` in the environment where the test will run. Pixel tests can use a software adapter such as llvmpipe. For GPU performance tests, check that the test uses the intended hardware.
