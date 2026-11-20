@@ -626,6 +626,7 @@ impl Column {
         cx: &mut App,
     ) -> bool {
         let mut projection = self.projection.borrow_mut();
+        let replace_all = old_rows == (0..projection.lines.len());
         let range = projection.text.line_start_offset(old_rows.start)
             ..projection.text.line_start_offset(old_rows.end);
         let editor = self.editor.read(cx);
@@ -668,7 +669,12 @@ impl Column {
         projection.snapshots = snapshots;
 
         let mut rows = self.presentation.borrow_mut();
-        Rc::make_mut(&mut rows).splice(old_rows, presentation);
+        // Local edits shift the projection before the diff refreshes its presentation.
+        if replace_all {
+            *rows = Rc::new(presentation);
+        } else {
+            Rc::make_mut(&mut rows).splice(old_rows, presentation);
+        }
         let rows = rows.clone();
         let map = |offset, anchor: Option<(DiffLinePosition, usize)>| {
             anchor

@@ -50,6 +50,23 @@ fn settle(visual: &mut VisualTestContext) {
     }
 }
 
+fn wait_for_review(
+    visual: &mut VisualTestContext,
+    expected: &str,
+    mut ready: impl FnMut(&mut VisualTestContext) -> bool,
+) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        visual.executor().advance_clock(Duration::from_millis(100));
+        settle(visual);
+        if ready(visual) {
+            return;
+        }
+        assert!(Instant::now() < deadline, "Waiting for {expected}");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
 fn open<'a>(
     cx: &'a mut TestAppContext,
     temp: &Path,
@@ -550,6 +567,55 @@ fn changed_worktree_status_keeps_net_diff_readable_without_edit_targets() {
         .collect::<Vec<_>>();
     assert_eq!(lines, ["original", "worktree change"]);
     assert!(assets.version.is_none() && assets.operations.is_none());
+}
+
+#[::core::prelude::v1::test]
+fn inserting_a_blank_line_in_a_staged_new_file_refreshes_the_diff() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("repo");
+    fs::create_dir(&root).unwrap();
+    setup(&root);
+    command(&root, &["commit", "--allow-empty", "-qm", "Initial"]);
+    let name = "package.sh";
+    let path = Path::new(name);
+    let shebang = "#!/usr/bin/env bash";
+    let source = format!("{shebang}\nset -euo pipefail\n");
+    fs::write(root.join(path), &source).unwrap();
+    command(&root, &["add", name]);
+
+    let mut cx = test_context();
+    let (panel, visual) = open(&mut cx, temp.path(), &root);
+    wait_for_review(visual, "the editable staged diff", |visual| {
+        visual.update(|window, cx| {
+            let editor = panel.read(cx).editor.focused_column(window, cx).clone();
+            let Some(offset) = editor.read(cx).text().to_string().find(shebang) else {
+                return false;
+            };
+            let caret = offset + shebang.len();
+            editor.update(cx, |editor, cx| {
+                editor.set_selected_range(caret..caret, cx);
+                editor.focus(window, cx);
+            });
+            panel.read(cx).editing_path(window, cx).as_deref() == Some(path)
+        })
+    });
+
+    visual.simulate_keystrokes("enter");
+    wait_for_review(visual, "the refreshed live diff", |visual| {
+        visual.update(|_, cx| {
+            let review = panel.read(cx).review.as_ref().unwrap();
+            review.live.contains_key(&review.by_path[name])
+        })
+    });
+    let expected = format!("{shebang}\n\nset -euo pipefail\n");
+    visual.update(|window, cx| {
+        let panel = panel.read(cx);
+        let editor = panel.editor.focused_column(window, cx).read(cx);
+        assert!(editor.text().to_string().contains(&expected));
+        let workspace = panel.workspace.upgrade().unwrap();
+        let file = &workspace.read(cx).files[path];
+        assert_eq!(file.committed.to_string(), expected);
+    });
 }
 
 #[::core::prelude::v1::test]
