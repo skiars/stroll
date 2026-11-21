@@ -2298,7 +2298,10 @@ impl ReviewEditor {
                         if let Ok(Some(label)) = hover.update(cx, |panel, cx| {
                             panel.review_hunk_label(selected, action, font_size, cx)
                         }) {
-                            elements.push((hunk_toolbar_row(label), bounds.left(), top, HUNK_TOOLBAR_HEIGHT));
+                            // This overlay spans the outer viewport. Match the source
+                            // editor's text inset before applying the shared row padding.
+                            let inset = gpui_component::Size::default().input_px();
+                            elements.push((hunk_toolbar_row(label, inset, window), bounds.left(), top, HUNK_TOOLBAR_HEIGHT));
                         }
                     }
                 }
@@ -3109,7 +3112,8 @@ impl GitPanel {
                     .adjacent_hunk_file(hunk.path.as_str(), direction)
                     .is_some()
         });
-        let controls = action.and_then(|(path, blocks)| self.hunk_actions(path, blocks, cx));
+        let controls =
+            action.and_then(|(path, blocks)| self.hunk_actions(path, blocks, font_size, cx));
         let path = hunk.path.clone();
         let view = cx.weak_entity();
         Some(hunk_label(

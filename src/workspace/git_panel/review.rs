@@ -2419,6 +2419,7 @@ impl GitPanel {
         &self,
         path: &str,
         blocks: ActionBlocks,
+        font_size: Pixels,
         cx: &Context<Self>,
     ) -> Option<AnyElement> {
         let review = self.review.as_ref()?;
@@ -2496,8 +2497,7 @@ impl GitPanel {
             &actions,
             confirm,
             whole_file,
-            None,
-            None,
+            font_size,
             available,
             move |action, window, cx| {
                 _ = owner.update(cx, |panel, cx| {
@@ -2531,7 +2531,6 @@ impl GitPanel {
                 });
             },
             cx,
-            true,
         ))
     }
 

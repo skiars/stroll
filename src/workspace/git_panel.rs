@@ -3000,6 +3000,8 @@ mod tests {
                 gpui_component::input::HUNK_TOOLBAR_HEIGHT
             );
             assert!((label.top() - first_row.top()).abs() < px(1.));
+            let viewport = visual.debug_bounds("git-diff-editor").unwrap();
+            assert!(label.right() < viewport.right() - Scrollbar::width());
             visual.simulate_keystrokes("right right right");
             visual.update(|window, cx| window.draw(cx).clear(cx));
             let after_scroll = visual.debug_bounds(selector).unwrap();
@@ -3038,9 +3040,22 @@ mod tests {
         });
         visual.simulate_mouse_move(hover, None, Modifiers::default());
         visual.update(|window, cx| window.draw(cx).clear(cx));
-        let restore = visual.debug_bounds("git-hunk-action:2").unwrap().center();
-        visual.simulate_mouse_move(restore, None, Modifiers::default());
-        visual.simulate_click(restore, Modifiers::default());
+        let restore = visual.debug_bounds("git-hunk-action:2").unwrap();
+        visual.simulate_mouse_move(restore.center(), None, Modifiers::default());
+        visual.update(|window, cx| {
+            window.draw(cx).clear(cx);
+            let bounds = restore.scale(window.scale_factor());
+            let quads = window.painted_quads();
+            let hover = quads
+                .iter()
+                .find(|quad| {
+                    quad.bounds == bounds
+                        && quad.background.as_solid().is_some_and(|color| color.a > 0.)
+                })
+                .expect("the restore button paints a hover background");
+            assert_eq!(hover.corner_radii.bottom_right.as_f32(), 0.);
+        });
+        visual.simulate_click(restore.center(), Modifiers::default());
         visual.run_until_parked();
         visual.update(|window, cx| window.draw(cx).clear(cx));
         assert_eq!(fs::read_to_string(root.join(path)).unwrap(), "before\n");

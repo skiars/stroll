@@ -1017,8 +1017,7 @@ impl Workspace {
             patch.layer.actions(),
             false,
             false,
-            None,
-            Some(code_font_size),
+            code_font_size,
             available,
             move |action, window, cx| {
                 _ = click_owner.update(cx, |workspace, cx| {
@@ -1033,7 +1032,6 @@ impl Workspace {
             },
             |_, _| {},
             cx,
-            true,
         ))
     }
 
@@ -1309,7 +1307,6 @@ fn status_hunk_controls(label: String, cx: &App) -> AnyElement {
 }
 
 fn source_hunk_toolbar(toolbar: AnyElement) -> AnyElement {
-    let row = hunk_toolbar_row(toolbar);
     canvas(
         move |bounds, window, cx| {
             // Paint and hit-test above the deferred inline blame annotation.
@@ -1320,7 +1317,7 @@ fn source_hunk_toolbar(toolbar: AnyElement) -> AnyElement {
                     .w_full()
                     .h(height)
                     .overflow_hidden()
-                    .child(row)
+                    .child(hunk_toolbar_row(toolbar, px(0.), window))
                     .into_any_element();
                 overlay.layout_as_root(bounds.size.map(AvailableSpace::Definite), window, cx);
                 window.defer_draw(overlay, bounds.origin, 1, Some(clip));
@@ -1333,14 +1330,18 @@ fn source_hunk_toolbar(toolbar: AnyElement) -> AnyElement {
     .into_any_element()
 }
 
-pub(super) fn hunk_toolbar_row(toolbar: AnyElement) -> AnyElement {
+pub(super) fn hunk_toolbar_row(
+    toolbar: AnyElement,
+    viewport_right_inset: Pixels,
+    window: &Window,
+) -> AnyElement {
     h_flex()
         .id("editor-git-hunk")
         .w_full()
         .h(HUNK_TOOLBAR_HEIGHT)
         .items_start()
         .justify_end()
-        .pr_3()
+        .pr(viewport_right_inset + window.rem_size() * 0.75)
         .child(toolbar)
         .into_any_element()
 }
@@ -1370,33 +1371,24 @@ pub(super) fn hunk_toolbar(
     actions: &[FileAction],
     confirm: bool,
     whole_file: bool,
-    leading: Option<AnyElement>,
-    text_size: Option<Pixels>,
+    text_size: Pixels,
     available: impl Fn(FileAction) -> (bool, bool),
     activate: impl Fn(FileAction, &mut Window, &mut App) + 'static,
     cancel: impl Fn(&mut Window, &mut App) + 'static,
     cx: &App,
-    hanging: bool,
 ) -> AnyElement {
-    let colors = Palette::for_mode(cx.theme().mode);
     let activate = Rc::new(activate);
-    let has_leading = leading.is_some();
     h_flex()
         .id("git-hunk-toolbar")
         .min_w_0()
-        .when(hanging, |bar| bar.h_full())
-        .when(!hanging, |bar| {
-            bar.gap_1().rounded(px(4.)).bg(colors.elevated)
-        })
-        .children(leading)
+        .h_full()
         .when(confirm, |bar| {
             bar.child(
                 div()
                     .min_w_0()
                     .truncate()
                     .px_1()
-                    .when_some(text_size, |label, size| label.text_size(size))
-                    .when(text_size.is_none(), |label| label.text_xs())
+                    .text_size(text_size)
                     .child(if whole_file {
                         t!("git.restore_file_question")
                     } else {
@@ -1409,28 +1401,20 @@ pub(super) fn hunk_toolbar(
                 .iter()
                 .copied()
                 .filter(|action| !confirm || *action == FileAction::Restore)
-                .map(|action| {
+                .enumerate()
+                .map(|(index, action)| {
                     let activate = activate.clone();
                     let (ready, busy) = available(action);
                     quiet_button(("git-hunk-action", action as usize))
                         .debug_selector(|| format!("git-hunk-action:{}", action as usize))
                         .small()
                         .h_full()
-                        .when(hanging, |button| {
-                            button
-                                .rounded(px(0.))
-                                .when(
-                                    !confirm && !has_leading && action != FileAction::Restore,
-                                    |button| button.rounded_bl(HUNK_TOOLBAR_RADIUS),
-                                )
-                                .when(!confirm && action != FileAction::Stage, |button| {
-                                    button.rounded_br(HUNK_TOOLBAR_RADIUS)
-                                })
+                        .rounded(px(0.))
+                        .when(!confirm && index == 0, |button| {
+                            button.rounded_bl(HUNK_TOOLBAR_RADIUS)
                         })
-                        .when_some(text_size, |button, size| {
-                            button.label_size(size).icon_size(size)
-                        })
-                        .when(text_size.is_none(), |button| button.text_xs())
+                        .label_size(text_size)
+                        .icon_size(text_size)
                         .min_w(px(32.))
                         .flex_shrink_0()
                         .label(action.label())
@@ -1458,11 +1442,8 @@ pub(super) fn hunk_toolbar(
                 quiet_button("git-cancel-restore")
                     .small()
                     .h_full()
-                    .when(hanging, |button| {
-                        button.rounded(px(0.)).rounded_br(HUNK_TOOLBAR_RADIUS)
-                    })
-                    .when_some(text_size, |button, size| button.label_size(size))
-                    .when(text_size.is_none(), |button| button.text_xs())
+                    .rounded(px(0.))
+                    .label_size(text_size)
                     .min_w(px(32.))
                     .flex_shrink_0()
                     .label(t!("common.cancel"))
