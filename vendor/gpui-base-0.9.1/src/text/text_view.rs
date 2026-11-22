@@ -114,6 +114,9 @@ pub(crate) type LinkClickHandlerFn =
 pub(crate) type ImageClickHandlerFn =
     dyn Fn(&SharedString, &ClickEvent, &mut Window, &mut App) + Send + Sync;
 
+pub(crate) type ImageContextMenuHandlerFn =
+    dyn Fn(&SharedString, Option<&SharedString>, &ClickEvent, &mut Window, &mut App) + Send + Sync;
+
 pub(crate) type LinkTooltipFn =
     dyn Fn(&SharedString, &mut Window, &mut App) -> AnyView + Send + Sync;
 pub(crate) type TaskToggleHandlerFn = dyn Fn(&TaskToggleEvent, &mut Window, &mut App) + Send + Sync;
@@ -217,6 +220,7 @@ pub struct TextView {
     table_actions: Option<Arc<TableActionsFn>>,
     link_click_handler: Option<Arc<LinkClickHandlerFn>>,
     image_click_handler: Option<Arc<ImageClickHandlerFn>>,
+    image_context_menu_handler: Option<Arc<ImageContextMenuHandlerFn>>,
     link_tooltip: Option<Arc<LinkTooltipFn>>,
     task_toggle_handler: Option<Arc<TaskToggleHandlerFn>>,
     image_source: Option<Arc<ImageSourceFn>>,
@@ -271,6 +275,7 @@ impl TextView {
             table_actions: None,
             link_click_handler: None,
             image_click_handler: None,
+            image_context_menu_handler: None,
             link_tooltip: None,
             task_toggle_handler: None,
             image_source: None,
@@ -302,6 +307,7 @@ impl TextView {
             table_actions: None,
             link_click_handler: None,
             image_click_handler: None,
+            image_context_menu_handler: None,
             link_tooltip: None,
             task_toggle_handler: None,
             image_source: None,
@@ -333,6 +339,7 @@ impl TextView {
             table_actions: None,
             link_click_handler: None,
             image_click_handler: None,
+            image_context_menu_handler: None,
             link_tooltip: None,
             task_toggle_handler: None,
             image_source: None,
@@ -535,6 +542,21 @@ impl TextView {
         F: Fn(&SharedString, &ClickEvent, &mut Window, &mut App) + Send + Sync + 'static,
     {
         self.image_click_handler = Some(Arc::new(handler));
+        self
+    }
+
+    /// Handle right clicks on rendered images.
+    ///
+    /// The handler receives the image URL, the enclosing link URL when present,
+    /// and the original GPUI click event.
+    pub fn on_image_context_menu<F>(mut self, handler: F) -> Self
+    where
+        F: Fn(&SharedString, Option<&SharedString>, &ClickEvent, &mut Window, &mut App)
+            + Send
+            + Sync
+            + 'static,
+    {
+        self.image_context_menu_handler = Some(Arc::new(handler));
         self
     }
 
@@ -872,6 +894,7 @@ impl Element for TextView {
             state.table_actions = self.table_actions.clone();
             state.link_click_handler = self.link_click_handler.clone();
             state.image_click_handler = self.image_click_handler.clone();
+            state.image_context_menu_handler = self.image_context_menu_handler.clone();
             match (&self.link_tooltip, &mut state.link_preview) {
                 (Some(builder), Some(preview)) => preview.builder = builder.clone(),
                 (Some(builder), slot @ None) => {

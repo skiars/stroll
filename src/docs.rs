@@ -43,6 +43,7 @@ use crate::{
     },
 };
 
+mod context_menu;
 mod online_images;
 
 pub fn is_markdown(path: &Path) -> bool {
@@ -1213,16 +1214,9 @@ impl Render for DocReader {
         let theme = cx.theme();
         let colors = Palette::for_mode(theme.mode);
         let dark = theme.mode == gpui_component::ThemeMode::Dark;
-        let workspace = self.workspace.clone();
+        let reader = cx.weak_entity();
         let code_font = crate::workspace::ui_code_font(cx);
-        let source_path = self.path.clone();
-        let images = online_images::DocumentImages {
-            root: self.root.clone(),
-            document: self.path.clone(),
-            remote: self.document.remote.clone(),
-            allow_embedded: self.standalone,
-            display: self.displayed_images.clone(),
-        };
+        let images = self.images();
         let mut table = StyleRefinement::default().rounded(px(9.));
         table.overflow.x = Some(Overflow::Scroll);
         let mut code_block = StyleRefinement::default()
@@ -1296,26 +1290,44 @@ impl Render for DocReader {
                 }
             })
             .on_image_click({
-                let workspace = workspace.clone();
+                let reader = reader.clone();
                 move |uri, _, window, cx| {
-                    let Some(source) = images.preview_source(uri, cx) else {
-                        return;
-                    };
-                    let title = if online_images::is_data_url(uri) {
-                        t!("image.embedded").into_owned().into()
-                    } else {
-                        uri.clone()
-                    };
-                    _ = workspace.update(cx, |workspace, cx| {
-                        workspace.open_image_preview(source, title, window, cx)
-                    });
+                    _ = reader.update(cx, |reader, cx| reader.preview_image(uri, window, cx));
+                }
+            })
+            .on_image_context_menu({
+                let reader = reader.clone();
+                move |uri, link, event, window, cx| {
+                    context_menu::show(
+                        reader.clone(),
+                        link.cloned(),
+                        Some(uri.clone()),
+                        event.position(),
+                        window,
+                        cx,
+                    );
                 }
             })
             .link_tooltip(|target, window, cx| Tooltip::new(target.clone()).build(window, cx))
             .on_link_click({
-                let workspace = workspace.clone();
-                let path = source_path.clone();
-                move |target, _, window, cx| {
+                let reader = reader.clone();
+                let workspace = self.workspace.clone();
+                let path = self.path.clone();
+                move |target, event, window, cx| {
+                    if event.is_right_click() {
+                        context_menu::show(
+                            reader.clone(),
+                            Some(target.clone()),
+                            None,
+                            event.position(),
+                            window,
+                            cx,
+                        );
+                        return;
+                    }
+                    if matches!(event, ClickEvent::Mouse(click) if matches!(click.up.button, MouseButton::Navigate(_))) {
+                        return;
+                    }
                     let workspace = workspace.clone();
                     let path = path.clone();
                     let target = target.clone();
@@ -1344,7 +1356,6 @@ impl Render for DocReader {
         }
         self.outline_was_visible = show_outline;
         let list = self.text.read(cx).list_state().clone();
-        let reader = cx.weak_entity();
         let body = div()
             .relative()
             .flex()
@@ -1475,6 +1486,17 @@ pub fn load(repo: &Repository, path: &Path) -> Result<PreparedDocument> {
     let mut document = PreparedDocument::new(source)?;
     document.remote = remote;
     Ok(document)
+}
+
+#[cfg(test)]
+impl DocReader {
+    pub(crate) fn block_bounds(&self, index: usize, cx: &App) -> Bounds<Pixels> {
+        self.text
+            .read(cx)
+            .list_state()
+            .bounds_for_item(index)
+            .unwrap()
+    }
 }
 
 #[cfg(test)]

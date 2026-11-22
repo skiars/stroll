@@ -91,6 +91,10 @@ impl DocumentImages {
         ))
     }
 
+    pub(super) fn can_preview(&self, uri: &SharedString) -> bool {
+        self.request(uri, true).is_some()
+    }
+
     pub(super) fn preview_source(&self, uri: &SharedString, cx: &mut App) -> Option<ImageSource> {
         let request = self.request(uri, true)?;
         let display = if matches!(request, ImageRequest::Online { .. }) {

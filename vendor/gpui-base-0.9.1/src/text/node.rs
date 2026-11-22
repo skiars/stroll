@@ -19,8 +19,9 @@ use crate::{
     GlobalState, ScrollableMask, Scrollbar, StyledExt, h_flex,
     scrollable_mask::horizontal_scroll_area,
     text::{
-        CodeBlockActionsFn, CodeBlockHighlighterFn, ImageClickHandlerFn, LinkClickHandlerFn,
-        MarkdownExtensions, MarkdownNode, TableActionsFn, TaskToggleEvent, TaskToggleHandlerFn,
+        CodeBlockActionsFn, CodeBlockHighlighterFn, ImageClickHandlerFn, ImageContextMenuHandlerFn,
+        LinkClickHandlerFn, MarkdownExtensions, MarkdownNode, TableActionsFn, TaskToggleEvent,
+        TaskToggleHandlerFn,
         document::{NodeRenderOptions, PrevBlock, flow_position},
         inline::{
             Inline, InlineHighlight, InlineState, code_insets, combine_highlights, fade_highlights,
@@ -2972,6 +2973,7 @@ pub(crate) struct NodeContext {
     pub(crate) block_index: Option<usize>,
     pub(crate) link_click_handler: Option<Arc<LinkClickHandlerFn>>,
     pub(crate) image_click_handler: Option<Arc<ImageClickHandlerFn>>,
+    pub(crate) image_context_menu_handler: Option<Arc<ImageContextMenuHandlerFn>>,
     pub(crate) task_toggle_handler: Option<Arc<TaskToggleHandlerFn>>,
     pub(crate) markdown_extensions: Arc<MarkdownExtensions>,
     /// This frame's streamed fade-in, when any text is still fading.
@@ -3232,6 +3234,7 @@ impl Paragraph {
                 self.inline_flow_items(fade_key, fades, backgrounds, node_cx, cx),
                 node_cx.link_click_handler.clone(),
                 node_cx.image_click_handler.clone(),
+                node_cx.image_context_menu_handler.clone(),
             )
             .editor_key(self.leaf_key())
             .into_any_element();
@@ -3250,6 +3253,7 @@ impl Paragraph {
                                 vec![item],
                                 node_cx.link_click_handler.clone(),
                                 node_cx.image_click_handler.clone(),
+                                node_cx.image_context_menu_handler.clone(),
                             )
                             .centered()
                         }),

@@ -946,7 +946,11 @@ fn parse_paragraph(
         }
         Node::LinkReference(link) => {
             let link_mark = LinkMark {
-                url: "".into(),
+                url: cx
+                    .link_refs
+                    .get(link.identifier.as_str())
+                    .map(|definition| definition.url.clone())
+                    .unwrap_or_default(),
                 title: link.label.clone().map(Into::into),
                 identifier: Some(link.identifier.clone().into()),
             };

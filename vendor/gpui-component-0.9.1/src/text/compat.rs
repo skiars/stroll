@@ -216,6 +216,17 @@ impl TextView {
         self.inner = self.inner.on_image_click(f);
         self
     }
+    /// Handles right clicks on rendered images with their optional enclosing link.
+    pub fn on_image_context_menu<F>(mut self, f: F) -> Self
+    where
+        F: Fn(&SharedString, Option<&SharedString>, &ClickEvent, &mut Window, &mut App)
+            + Send
+            + Sync
+            + 'static,
+    {
+        self.inner = self.inner.on_image_context_menu(f);
+        self
+    }
     /// Shows an application-supplied tooltip after the pointer rests over a link for 300 ms.
     pub fn link_tooltip<F>(mut self, builder: F) -> Self
     where

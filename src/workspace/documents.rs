@@ -508,6 +508,214 @@ mod tests {
     use std::{fs, process::Command, sync::Arc};
 
     #[test]
+    fn markdown_link_context_menu_opens_links_and_images() -> anyhow::Result<()> {
+        const WEB: &str = "https://example.test/screenshot";
+        const GUIDE: &str = "./guide.md#details";
+        const IMAGE: &str = "./shot.svg";
+
+        let fixture = tempfile::tempdir()?;
+        let root = fixture.path().join("repo");
+        assert!(
+            Command::new("git")
+                .args(["init", "-q"])
+                .arg(&root)
+                .status()?
+                .success()
+        );
+        fs::write(
+            root.join("README.md"),
+            format!("[Guide]({GUIDE})\n\n[![Screenshot]({IMAGE})][site]\n\n[site]: {WEB}\n"),
+        )?;
+        fs::write(root.join("guide.md"), "# Guide\n\n## Details\n")?;
+        fs::write(
+            root.join("shot.svg"),
+            r#"<svg xmlns="http://www.w3.org/2000/svg" width="96" height="64"><rect width="96" height="64" fill="blue"/></svg>"#,
+        )?;
+
+        let mut app = TestAppContext::build_with_text_system(
+            TestDispatcher::new(0),
+            None,
+            crate::test_support::text_system(true),
+        );
+        app.update(|cx| {
+            gpui_component::init(cx);
+            cx.set_reduce_motion(true);
+        });
+        let store = Arc::new(Store::new(fixture.path().join("state"))?);
+        let config = ConfigFile::load(Some(fixture.path().join("config.toml")));
+        let repo = Repository::open(&root)?;
+        let mut workspace = None;
+        let (_, visual) = app.add_window_view(|window, cx| {
+            let view =
+                cx.new(|cx| Workspace::with_config(store, config, WorkspaceView::Docs, window, cx));
+            workspace = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        let workspace = workspace.unwrap();
+        visual.simulate_resize(size(px(900.), px(620.)));
+        visual.update(|window, cx| {
+            window.activate_window();
+            workspace.update(cx, |this, cx| {
+                let session = WorktreeSession {
+                    view: Some(WorkspaceView::Docs),
+                    document: Some("README.md".into()),
+                    ..Default::default()
+                };
+                this.apply_repository(repo, session, None, None, window, cx);
+            });
+        });
+
+        use std::time::{Duration, Instant};
+
+        let frame = crate::workspace::finish_scroll_navigation;
+        let wait_for_doc = |visual: &mut VisualTestContext, path: &str| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                frame(visual);
+                let (ready, history) = visual.update(|_, cx| {
+                    let this = workspace.read(cx);
+                    let ready = this.view == WorkspaceView::Docs
+                        && this
+                            .doc
+                            .as_ref()
+                            .is_some_and(|doc| doc.read(cx).path == Path::new(path));
+                    (ready, this.session.source_history.clone())
+                });
+                if ready {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "Timed out opening {path}: {history:?}"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        };
+        let doc_path = |visual: &mut VisualTestContext| {
+            visual.update(|_, cx| {
+                workspace
+                    .read(cx)
+                    .doc
+                    .as_ref()
+                    .unwrap()
+                    .read(cx)
+                    .path
+                    .clone()
+            })
+        };
+        let image_position = |visual: &mut VisualTestContext| {
+            visual.update(|_, cx| {
+                workspace
+                    .read(cx)
+                    .doc
+                    .as_ref()
+                    .unwrap()
+                    .read(cx)
+                    .block_bounds(1, cx)
+                    .center()
+            })
+        };
+        let open_menu = |visual: &mut VisualTestContext, position| {
+            visual.simulate_mouse_down(position, MouseButton::Right, Modifiers::none());
+            visual.simulate_mouse_up(position, MouseButton::Right, Modifiers::none());
+            frame(visual);
+            assert!(visual.debug_bounds("popup-menu-surface").is_some());
+        };
+        let assert_clipboard = |visual: &VisualTestContext, expected: &str| {
+            assert_eq!(
+                visual.read_from_clipboard().and_then(|item| item.text()),
+                Some(expected.to_owned())
+            );
+        };
+        let back = |visual: &mut VisualTestContext, position| {
+            let button = MouseButton::Navigate(NavigationDirection::Back);
+            visual.simulate_mouse_down(position, button, Modifiers::none());
+            visual.simulate_mouse_up(position, button, Modifiers::none());
+            wait_for_doc(visual, "README.md");
+        };
+
+        wait_for_doc(visual, "README.md");
+        let text_link = visual.update(|window, cx| {
+            let doc = workspace.read(cx).doc.as_ref().unwrap().read(cx);
+            let block = doc.block_bounds(0, cx);
+            let underline = window
+                .painted_underlines()
+                .into_iter()
+                .map(|line| line.bounds.map(|value| px(value.0 / window.scale_factor())))
+                .find(|bounds| block.contains(&bounds.center()))
+                .unwrap();
+            point(underline.center().x, block.center().y)
+        });
+        open_menu(visual, text_link);
+        assert_eq!(doc_path(visual), Path::new("README.md"));
+        visual.simulate_keystrokes("down down enter");
+        assert_clipboard(visual, GUIDE);
+        frame(visual);
+        open_menu(visual, text_link);
+        visual.simulate_keystrokes("down enter");
+        wait_for_doc(visual, "guide.md");
+        visual.update(|_, cx| {
+            let doc = workspace.read(cx).doc.as_ref().unwrap().read(cx);
+            assert_eq!(
+                doc.history_location(cx).fragment.as_deref(),
+                Some("details")
+            );
+        });
+        back(visual, text_link);
+
+        let image = image_position(visual);
+        visual.simulate_click(image, Modifiers::none());
+        frame(visual);
+        assert!(visual.debug_bounds("image-preview-close").is_some());
+        assert!(visual.debug_bounds("popup-menu-surface").is_none());
+        assert!(visual.opened_url().is_none());
+        visual.simulate_keystrokes("escape");
+        frame(visual);
+
+        open_menu(visual, image);
+        assert!(visual.debug_bounds("popup-menu-separator").is_some());
+        assert!(visual.debug_bounds("image-preview-close").is_none());
+        assert!(visual.opened_url().is_none());
+        visual.simulate_keystrokes("down down enter");
+        assert_clipboard(visual, WEB);
+        frame(visual);
+
+        open_menu(visual, image);
+        visual.simulate_keystrokes("down down down down down enter");
+        assert_clipboard(visual, IMAGE);
+        frame(visual);
+
+        open_menu(visual, image);
+        visual.simulate_keystrokes("down enter");
+        assert_eq!(visual.opened_url().as_deref(), Some(WEB));
+        frame(visual);
+
+        let focus = visual.update(|window, cx| window.focused(cx));
+        open_menu(visual, image);
+        visual.simulate_keystrokes("down down down enter");
+        frame(visual);
+        assert!(visual.debug_bounds("image-preview-close").is_some());
+        visual.simulate_keystrokes("escape");
+        frame(visual);
+        assert_eq!(visual.update(|window, cx| window.focused(cx)), focus);
+
+        open_menu(visual, image);
+        visual.simulate_keystrokes("down down down down enter");
+        frame(visual);
+        visual.update(|_, cx| {
+            let this = workspace.read(cx);
+            assert_eq!(this.view, WorkspaceView::Editor);
+            assert_eq!(
+                this.active_image_tab().map(|(path, _)| path),
+                Some(Path::new("shot.svg"))
+            );
+        });
+        back(visual, image);
+        visual.update(|_, cx| assert_eq!(workspace.read(cx).view, WorkspaceView::Docs));
+        Ok(())
+    }
+
+    #[test]
     fn document_tree_publishes_in_stages_and_restores_cached_reader() -> anyhow::Result<()> {
         use crate::repository::Location;
         use std::time::{Duration, Instant};
