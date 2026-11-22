@@ -105,7 +105,8 @@ impl TextViewDefaults {
 pub(crate) type TableActionsFn =
     dyn Fn(&TableData, &mut Window, &mut App) -> AnyElement + Send + Sync;
 
-pub(crate) type ImageSourceFn = dyn Fn(&gpui::SharedUri) -> gpui::ImageSource + Send + Sync;
+pub(crate) type ImageSourceFn =
+    dyn Fn(&gpui::SharedUri, Option<usize>) -> gpui::ImageSource + Send + Sync;
 
 pub(crate) type LinkClickHandlerFn =
     dyn Fn(&SharedString, &ClickEvent, &mut Window, &mut App) + Send + Sync;
@@ -346,9 +347,17 @@ impl TextView {
     /// Used for both rendering and intrinsic-size measurement. The returned source
     /// is authoritative: pending or failed loads never fall back to the document URL.
     /// Without this override, images use Base's default URI and data URL handling.
-    pub fn image_source<F>(mut self, resolver: F) -> Self
+    pub fn image_source<F>(self, resolver: F) -> Self
     where
         F: Fn(&gpui::SharedUri) -> gpui::ImageSource + Send + Sync + 'static,
+    {
+        self.image_source_with_block(move |uri, _| resolver(uri))
+    }
+
+    /// Resolves an image with the index of its containing scrollable block, if any.
+    pub fn image_source_with_block<F>(mut self, resolver: F) -> Self
+    where
+        F: Fn(&gpui::SharedUri, Option<usize>) -> gpui::ImageSource + Send + Sync + 'static,
     {
         self.image_source = Some(Arc::new(resolver));
         self

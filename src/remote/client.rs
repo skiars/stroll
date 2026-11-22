@@ -138,8 +138,18 @@ impl SshSession {
         Ok(Self(Connection::open(target)?))
     }
 
+    #[cfg(all(test, feature = "desktop"))]
+    pub(crate) fn connect_test_helper(target: SshTarget, helper: Command) -> Result<Self> {
+        Ok(Self(Connection::open_with_helper(target, helper)?))
+    }
+
     pub fn target(&self) -> &SshTarget {
         &self.0.target
+    }
+
+    #[cfg(feature = "desktop")]
+    pub(crate) fn connection_id(&self) -> usize {
+        Arc::as_ptr(&self.0) as usize
     }
 
     #[cfg(feature = "desktop")]
@@ -268,7 +278,12 @@ impl SshSession {
 
 impl Connection {
     fn open(target: SshTarget) -> Result<Arc<Self>> {
-        let mut child = helper_command(&target, "")
+        let helper = helper_command(&target, "");
+        Self::open_with_helper(target, helper)
+    }
+
+    fn open_with_helper(target: SshTarget, mut helper: Command) -> Result<Arc<Self>> {
+        let mut child = helper
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())

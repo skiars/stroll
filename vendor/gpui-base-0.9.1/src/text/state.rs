@@ -193,7 +193,7 @@ pub struct TextViewState {
     pub(super) pending_reveal: Option<PendingReveal>,
     pub(super) selection_revision: usize,
     compatible_layout_update: bool,
-    layout_text_style: Option<(gpui::TextStyle, Pixels)>,
+    layout_text_style: Option<(gpui::TextStyle, Pixels, f32)>,
     parsed_error: Option<SharedString>,
     tx: Sender<UpdateOptions>,
     _parse_task: Task<()>,
@@ -568,6 +568,23 @@ impl TextViewState {
     /// Existing logical selection is retained until the next selection gesture.
     pub fn invalidate_inline_layout(&mut self, cx: &mut Context<Self>) {
         self.preserve_selection_for_reflow();
+        cx.notify();
+    }
+
+    /// Remeasure the list blocks that contain an updated inline resource.
+    pub fn invalidate_inline_blocks(
+        &mut self,
+        blocks: impl IntoIterator<Item = usize>,
+        cx: &mut Context<Self>,
+    ) {
+        self.preserve_inline_selection = true;
+        self.compatible_layout_update = true;
+        let count = self.list_state.item_count();
+        for block in blocks {
+            if block < count {
+                self.list_state.remeasure_items(block..block + 1);
+            }
+        }
         cx.notify();
     }
 
@@ -1324,7 +1341,7 @@ impl TextViewState {
 
 impl Render for TextViewState {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let typography = (window.text_style(), window.rem_size());
+        let typography = (window.text_style(), window.rem_size(), window.scale_factor());
         let body_font_size = typography.0.font_size.to_pixels(typography.1);
         if self
             .layout_text_style
@@ -1332,8 +1349,8 @@ impl Render for TextViewState {
             .is_some_and(|previous| previous != &typography)
         {
             // ListState invalidates its cached rows for width changes, but does
-            // not know that an inherited font or rem change affects offscreen
-            // inline metrics. Retain logical selections just as for resources.
+            // not know that inherited typography or the display scale can
+            // change offscreen inline metrics. Retain logical selections.
             self.preserve_selection_for_reflow();
         }
         self.layout_text_style = Some(typography);
@@ -1384,6 +1401,7 @@ impl Render for TextViewState {
             image_click_handler: self.image_click_handler.clone(),
             task_toggle_handler: self.task_toggle_handler.clone(),
             image_source: self.image_source.clone(),
+            block_index: None,
             markdown_extensions: self.markdown_extensions.clone(),
             stream_fade,
             range_highlights: self.range_highlights.clone(),

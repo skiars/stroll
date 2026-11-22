@@ -1,10 +1,10 @@
 use rust_i18n::t;
 
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeSet, HashMap, HashSet},
     ops::Range,
     path::{Component, Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::Arc,
 };
 
 use anyhow::{Context as _, Result};
@@ -19,7 +19,7 @@ use gpui_component::{
     scroll::ScrollbarViewport as _,
     text::{
         MarkdownExtensions, MarkdownNode, MarkdownParseContext, MarkdownPlugin, RangeHighlight,
-        TextView, TextViewState, TextViewStyle, data_url_image, markdown_ast::Node,
+        TextView, TextViewState, TextViewStyle, markdown_ast::Node,
     },
     tooltip::Tooltip,
     v_flex,
@@ -31,6 +31,7 @@ use url::Url;
 use crate::{
     doc_graphics::{self, GraphicKind, Graphics},
     paths,
+    remote::SshSession,
     repository::{Entry, Repository},
     session::{DocumentLinePosition, DocumentLocation, DocumentPosition},
     workspace::{
@@ -169,7 +170,8 @@ pub struct PreparedDocument {
     source: SharedString,
     headings: Vec<Heading>,
     extensions: MarkdownExtensions,
-    images: Arc<HashMap<String, Arc<gpui::Image>>>,
+    graphics: Arc<Graphics>,
+    ssh: Option<SshSession>,
 }
 
 impl PreparedDocument {
@@ -195,19 +197,23 @@ impl PreparedDocument {
                 GraphicKind::DisplayMath,
                 GraphicKind::InlineMath,
             ] {
-                if let Some(source) = kind.source(node) {
-                    graphics.prepare(kind, source);
+                if let Some(source) = kind.source(node)
+                    && let Some(position) = node.position()
+                {
+                    graphics.prepare(kind, source, position.start.offset);
                 }
             }
             if let Node::Table(table) = node {
                 collect_task_cells(table, &source, &mut task_cells);
             }
         });
+        let graphics = Arc::new(graphics);
         Ok(Self {
             source: source.into(),
             headings,
-            images: Arc::default(),
-            extensions: doc_graphics::extensions(Arc::new(graphics)).plugin(TaskTable(task_cells)),
+            extensions: doc_graphics::extensions(graphics.clone()).plugin(TaskTable(task_cells)),
+            graphics,
+            ssh: None,
         })
     }
 }
@@ -440,44 +446,14 @@ pub(crate) fn line_fragment(fragment: &str) -> Option<u32> {
         .map(|line| line.saturating_sub(1))
 }
 
-fn local_image_source(root: &Path, current: &Path, uri: &str) -> Option<ImageSource> {
-    let Destination::Local { path, .. } = destination(current, uri)? else {
-        return None;
-    };
-    let target = if path.is_absolute() {
-        path
-    } else {
-        root.join(path)
-    };
-    let image = target.canonicalize().ok()?;
-    (image.is_file()
-        && image.components().all(|part| part.as_os_str() != ".git")
-        && image
-            .metadata()
-            .is_ok_and(|metadata| metadata.len() <= 16 * 1024 * 1024))
-    .then(|| image.into())
-}
-
-fn empty_image_source() -> ImageSource {
-    // A missing local image has no fallback source.
-    ImageSource::Custom(Arc::new(|_, _| None))
-}
-
-fn is_data_url(uri: &str) -> bool {
-    uri.get(..5)
-        .is_some_and(|scheme| scheme.eq_ignore_ascii_case("data:"))
-}
-
-type EmbeddedImages = Arc<Mutex<HashMap<SharedString, Option<Arc<Image>>>>>;
-
 pub struct DocReader {
     typography: crate::config::Docs,
     root: PathBuf,
     pub path: PathBuf,
     document: PreparedDocument,
-    online_images: Entity<online_images::DisplayedImages>,
+    displayed_images: Entity<online_images::DisplayedImages>,
     image_thumbnails: Entity<ImageThumbnails>,
-    embedded_images: EmbeddedImages,
+    image_subscription: Subscription,
     text: Entity<TextViewState>,
     search: Entity<DocumentFind>,
     workspace: WeakEntity<Workspace>,
@@ -619,14 +595,17 @@ impl DocReader {
             }
             cx.notify();
         });
+        let displayed_images = online_images::DisplayedImages::new(cx);
+        let image_subscription = cx.observe(&displayed_images, Self::refresh_image_layout);
+        document.graphics.observe(cx.weak_entity());
         let mut reader = Self {
             typography: crate::config::Docs::default(),
             root,
             path,
             document,
-            online_images: online_images::DisplayedImages::new(cx),
+            displayed_images,
             image_thumbnails: ImageThumbnails::new(cx),
-            embedded_images: Arc::default(),
+            image_subscription,
             text,
             search,
             workspace,
@@ -655,8 +634,49 @@ impl DocReader {
     pub(crate) fn release_online_images(&mut self, cx: &mut Context<Self>) {
         self.text
             .update(cx, |text, _| text.cancel_scroll_navigation());
-        self.online_images = online_images::DisplayedImages::new(cx);
+        self.displayed_images = online_images::DisplayedImages::new(cx);
+        self.image_subscription = cx.observe(&self.displayed_images, Self::refresh_image_layout);
         self.image_thumbnails = ImageThumbnails::new(cx);
+        cx.notify();
+    }
+
+    fn refresh_image_layout(
+        &mut self,
+        display: Entity<online_images::DisplayedImages>,
+        cx: &mut Context<Self>,
+    ) {
+        let blocks = display.update(cx, |images, _| images.take_changed_blocks());
+        self.refresh_inline_resources(blocks, cx);
+    }
+
+    pub(crate) fn refresh_graphic_layout(&mut self, offsets: &[usize], cx: &mut Context<Self>) {
+        let text = self.text.read(cx);
+        let blocks = offsets
+            .iter()
+            .filter_map(|offset| text.block_for_source_offset(*offset))
+            .collect();
+        self.refresh_inline_resources(blocks, cx);
+    }
+
+    fn refresh_inline_resources(&mut self, blocks: HashSet<usize>, cx: &mut Context<Self>) {
+        if blocks.is_empty() {
+            return;
+        }
+        let text = self.text.read(cx);
+        let top = text.list_state().logical_scroll_top();
+        let position = if blocks.contains(&top.item_ix)
+            && self.heading_jump_block.is_none()
+            && !text.has_pending_reveal()
+        {
+            self.session_position(cx)
+        } else {
+            None
+        };
+        if let Some(position) = position.filter(|position| position.line.is_some()) {
+            self.restore_position(Some(position));
+        }
+        self.text
+            .update(cx, |text, cx| text.invalidate_inline_blocks(blocks, cx));
         cx.notify();
     }
 
@@ -1098,33 +1118,12 @@ impl Render for DocReader {
         let workspace = self.workspace.clone();
         let code_font = crate::workspace::ui_code_font(cx);
         let source_path = self.path.clone();
-        let image_path = self.path.clone();
-        let images = self.document.images.clone();
-        let online_images = self.online_images.clone();
-        let root = self.root.clone();
-        let remote = !self.path.is_absolute()
-            && root.to_str().is_some_and(|root| root.starts_with("ssh://"));
-        let resolve_image = {
-            Arc::new(move |uri: &str| -> Option<ImageSource> {
-                if remote {
-                    images.get(uri).cloned().map(ImageSource::Image)
-                } else {
-                    local_image_source(&root, &image_path, uri)
-                }
-            })
-        };
-        let embedded_image = {
-            let images = self.standalone.then(|| self.embedded_images.clone());
-            move |uri: &SharedString| -> Option<ImageSource> {
-                images
-                    .as_ref()?
-                    .lock()
-                    .unwrap()
-                    .entry(uri.clone())
-                    .or_insert_with(|| data_url_image(uri.as_ref()))
-                    .clone()
-                    .map(ImageSource::Image)
-            }
+        let images = online_images::DocumentImages {
+            root: self.root.clone(),
+            document: self.path.clone(),
+            ssh: self.document.ssh.clone(),
+            allow_embedded: self.standalone,
+            display: self.displayed_images.clone(),
         };
         let mut table = StyleRefinement::default().rounded(px(9.));
         table.overflow.x = Some(Overflow::Scroll);
@@ -1182,39 +1181,33 @@ impl Render for DocReader {
             .min_h_0()
             .w_full()
             .markdown_extensions(self.document.extensions.clone())
-            .image_source({
-                let resolve_image = resolve_image.clone();
+            .image_source_with_block({
+                let images = images.clone();
                 let thumbnails = self.image_thumbnails.clone();
-                let embedded_image = embedded_image.clone();
-                move |uri| {
-                    let source = if is_data_url(uri.as_ref()) {
-                        embedded_image(uri)
-                    } else {
-                        online_images::source(uri.as_ref(), &online_images)
-                            .or_else(|| resolve_image(uri.as_ref()))
-                    };
-                    source
+                move |uri, block| {
+                    images
+                        .source(uri, block)
                         .map(|source| source.fit_to_display(&thumbnails))
-                        .unwrap_or_else(empty_image_source)
+                        .unwrap_or_else(|| {
+                            ImageSource::Custom(Arc::new(|_, _| {
+                                Some(Err(
+                                    anyhow::anyhow!("Unsupported document image source").into()
+                                ))
+                            }))
+                        })
                 }
             })
             .on_image_click({
-                let resolve_image = resolve_image.clone();
                 let workspace = workspace.clone();
                 move |uri, _, window, cx| {
-                    let (source, title) = if is_data_url(uri.as_ref()) {
-                        (
-                            embedded_image(uri),
-                            t!("image.embedded").into_owned().into(),
-                        )
-                    } else {
-                        (
-                            online_images::preview_source(uri.as_ref(), cx)
-                                .or_else(|| resolve_image(uri.as_ref())),
-                            uri.clone(),
-                        )
+                    let Some(source) = images.preview_source(uri, cx) else {
+                        return;
                     };
-                    let Some(source) = source else { return };
+                    let title = if online_images::is_data_url(uri) {
+                        t!("image.embedded").into_owned().into()
+                    } else {
+                        uri.clone()
+                    };
                     _ = workspace.update(cx, |workspace, cx| {
                         workspace.open_image_preview(source, title, window, cx)
                     });
@@ -1376,37 +1369,9 @@ pub fn load(repo: &Repository, path: &Path) -> Result<PreparedDocument> {
     };
     let source =
         read().with_context(|| t!("docs.read_failed", path = paths::display(path)).into_owned())?;
-    let mut document = PreparedDocument::new(source.clone())?;
+    let mut document = PreparedDocument::new(source)?;
     if remote {
-        let ast = markdown::to_mdast(&source, &markdown::ParseOptions::gfm())
-            .map_err(|error| anyhow::anyhow!("{error}"))?;
-        let mut urls = BTreeSet::new();
-        visit(&ast, &mut |node| match node {
-            Node::Image(image) => {
-                urls.insert(image.url.clone());
-            }
-            Node::Definition(definition) => {
-                urls.insert(definition.url.clone());
-            }
-            _ => {}
-        });
-        let mut budget = 32 * 1024 * 1024;
-        for uri in urls.into_iter().take(128) {
-            let Some(Destination::Local { path: image, .. }) = destination(path, &uri) else {
-                continue;
-            };
-            let Some(format) = crate::image_viewer::format(&image) else {
-                continue;
-            };
-            if let Ok(bytes) = repo.bytes(&image, true) {
-                if bytes.len() > budget {
-                    break;
-                }
-                budget -= bytes.len();
-                Arc::make_mut(&mut document.images)
-                    .insert(uri, Arc::new(gpui::Image::from_bytes(format, bytes)));
-            }
-        }
+        document.ssh = repo.ssh.clone();
     }
     Ok(document)
 }
@@ -1443,6 +1408,160 @@ mod tests {
                 window.draw(cx).clear(cx);
             });
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[gpui::test]
+    fn ssh_document_paints_before_images_arrive_and_keeps_its_reading_position(
+        cx: &mut TestAppContext,
+    ) {
+        use std::{
+            fs,
+            process::Command,
+            thread,
+            time::{Duration, Instant},
+        };
+
+        use crate::remote::SshTarget;
+
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path();
+        let read_log = root.join("image-requests");
+        let release = root.join("release-image");
+        let source = format!(
+            "# Ready before images\n\n![Delayed](visible.svg)\n\nReading anchor\n\n{}\n![Below](offscreen.svg)\n",
+            "Another paragraph.\n\n".repeat(80),
+        );
+        fs::write(root.join("README.md"), &source).unwrap();
+        fs::write(
+            root.join("visible.svg"),
+            r#"<svg xmlns="http://www.w3.org/2000/svg" width="120" height="120"><rect width="120" height="120" fill="red"/></svg>"#,
+        )
+        .unwrap();
+
+        // Speak the same framed protocol as the remote helper and hold image replies.
+        let mut helper = Command::new("python3");
+        helper
+            .arg("-u")
+            .arg("-c")
+            .arg(
+                r#"
+import base64
+import json
+from pathlib import Path
+import struct
+import sys
+import time
+
+root = Path(sys.argv[1])
+reader = sys.stdin.buffer
+writer = sys.stdout.buffer
+while header := reader.read(4):
+    call = json.loads(reader.read(struct.unpack(">I", header)[0]))
+    request = call["request"]
+    if "Hello" in request:
+        reply = {"Ok": request["Hello"]}
+    elif "OpenWorkspace" in request:
+        reply = {"Ok": {
+            "identity": "document-fixture", "root": str(root), "common_dir": str(root / ".git"),
+            "name": "documents", "branch": "main", "children": {},
+        }}
+    elif "Read" in request:
+        path, asset = request["Read"]
+        if asset:
+            with (root / "image-requests").open("a") as log:
+                log.write(path + "\n")
+            deadline = time.monotonic() + 10
+            while not (root / "release-image").is_file() and time.monotonic() < deadline:
+                time.sleep(.005)
+        try:
+            reply = {"Ok": base64.b64encode((root / path).read_bytes()).decode()}
+        except OSError:
+            reply = {"Err": "Missing fixture image"}
+    else:
+        reply = {"Err": "Unexpected fixture request"}
+    data = json.dumps({"id": call["id"], "result": reply}).encode()
+    writer.write(struct.pack(">I", len(data)) + data)
+    writer.flush()
+"#,
+            )
+            .arg(root);
+        let target = SshTarget {
+            host: "fixture".into(),
+            port: None,
+            path: root.to_owned(),
+        };
+        let session = SshSession::connect_test_helper(target, helper).unwrap();
+        let repo = Repository::open_ssh(session, root.to_owned()).unwrap();
+        let document = load(&repo, Path::new("README.md")).unwrap();
+        assert!(
+            !read_log.exists(),
+            "document preparation reads only Markdown"
+        );
+
+        cx.update(gpui_component::init);
+        let (reader, visual) = cx.add_window_view(|window, cx| {
+            DocReader::new(
+                repo.root,
+                "README.md".into(),
+                document,
+                None,
+                WeakEntity::new_invalid(),
+                window,
+                cx,
+            )
+        });
+        visual.executor().allow_parking();
+        visual.simulate_resize(size(px(640.), px(260.)));
+        let until = |visual: &mut VisualTestContext,
+                     ready: &mut dyn FnMut(&mut VisualTestContext) -> bool| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                draw_scroll_test_frame(visual);
+                if ready(visual) {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "timed out waiting for document resource"
+                );
+                thread::sleep(Duration::from_millis(5));
+            }
+        };
+        until(visual, &mut |_| read_log.exists());
+        visual.update(|_, cx| {
+            let text = reader.read(cx).text.read(cx);
+            assert!(
+                text.viewport_line().is_some(),
+                "the first frame painted text"
+            );
+        });
+        assert_eq!(fs::read_to_string(&read_log).unwrap(), "visible.svg\n");
+        assert!(!release.exists());
+
+        let list = visual.update(|_, cx| {
+            let text = reader.read(cx).text.read(cx);
+            let list = text.list_state().clone();
+            list.scroll_to(ListOffset {
+                item_ix: text
+                    .block_for_source_offset(source.find("Reading anchor").unwrap())
+                    .unwrap(),
+                offset_in_item: px(0.),
+            });
+            list
+        });
+        draw_scroll_test_frame(visual);
+        let reading_line = |visual: &mut VisualTestContext| {
+            visual.update(|_, cx| reader.read(cx).text.read(cx).viewport_line().unwrap())
+        };
+        let before = reading_line(visual);
+        let old_height = list.max_offset_for_scrollbar().y;
+        fs::write(&release, "").unwrap();
+        until(visual, &mut |_| {
+            list.max_offset_for_scrollbar().y > old_height + px(40.)
+        });
+        assert_eq!(reading_line(visual), before);
+        assert_eq!(fs::read_to_string(&read_log).unwrap(), "visible.svg\n");
     }
 
     #[cfg(target_os = "linux")]

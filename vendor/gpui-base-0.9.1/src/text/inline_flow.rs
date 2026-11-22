@@ -9,10 +9,10 @@ use unicode_segmentation::UnicodeSegmentation as _;
 use gpui::{
     AbsoluteLength, AnyElement, App, AvailableSpace, Bounds, DefiniteLength, Element, ElementId,
     GlobalElementId, Hsla, ImageSource, InspectorElementId, InteractiveElement as _, IntoElement,
-    LayoutId, LineFragment as WrapLineFragment, ObjectFit, Pixels, Refineable as _, ShapedLine,
-    SharedString, Size, StatefulInteractiveElement as _, StyleRefinement, Styled, StyledImage as _,
-    TextRun, TextStyle, WhiteSpace, Window, img, point, prelude::FluentBuilder as _, px, relative,
-    size,
+    LayoutId, LineFragment as WrapLineFragment, ObjectFit, ParentElement as _, Pixels,
+    Refineable as _, ShapedLine, SharedString, Size, StatefulInteractiveElement as _,
+    StyleRefinement, Styled, StyledImage as _, TextRun, TextStyle, WhiteSpace, Window, div, img,
+    point, px, size,
 };
 
 use crate::text::text_view::{ImageClickHandlerFn, LinkClickHandlerFn, handle_link_click};
@@ -36,6 +36,7 @@ pub(super) struct InlineFlow {
     /// The block editor leaf this flow renders (design D3): its fragments
     /// and atoms are reported to the editor sink as pieces.
     editor_key: Option<u64>,
+    centered: bool,
 }
 
 /// Bytes an image or custom inline node occupies in an editor leaf (one
@@ -72,7 +73,7 @@ pub(super) enum InlineFlowItem {
         source: ImageSource,
         url: SharedString,
         link: Option<LinkMark>,
-        title: String,
+        alt: SharedString,
         width: Option<DefiniteLength>,
         height: Option<DefiniteLength>,
     },
@@ -228,6 +229,7 @@ enum MeasureItem {
     },
     Image {
         source: ImageSource,
+        alt: SharedString,
         width: Option<DefiniteLength>,
         height: Option<DefiniteLength>,
     },
@@ -290,6 +292,7 @@ impl InlineFlow {
             link_click_handler,
             image_click_handler,
             editor_key: None,
+            centered: false,
         }
     }
 
@@ -301,22 +304,31 @@ impl InlineFlow {
         self
     }
 
+    pub(super) fn centered(mut self) -> Self {
+        self.centered = true;
+        self
+    }
+
     fn image_element(
         ix: usize,
         source: &ImageSource,
         url: &SharedString,
         link: &Option<LinkMark>,
-        _title: &str,
+        alt: &SharedString,
         size: Size<Pixels>,
         link_click_handler: Option<Arc<LinkClickHandlerFn>>,
         image_click_handler: Option<Arc<ImageClickHandlerFn>>,
     ) -> AnyElement {
-        let mut element = img(source.clone())
+        let mut element = image_with_fallback(source, alt)
             .id(ix)
             .object_fit(ObjectFit::Contain)
-            .max_w(relative(1.))
+            // The flow already sized the box. The image's own aspect ratio
+            // applies to its painted contents inside this rectangle.
+            .aspect_ratio(size.width.max(px(1.)) / size.height.max(px(1.)))
             .w(size.width)
-            .h(size.height);
+            .h(size.height)
+            .max_w(size.width)
+            .max_h(size.height);
         if let Some(image_click_handler) = image_click_handler {
             let url = url.clone();
             element = element.cursor_pointer().on_click(move |event, window, cx| {
@@ -396,27 +408,7 @@ impl Element for InlineFlow {
             rem_size: window.rem_size(),
             line_height: window.line_height(),
         };
-        let image_sizes = measure_items
-            .iter()
-            .enumerate()
-            .map(|(ix, item)| match item {
-                MeasureItem::Image {
-                    source,
-                    width,
-                    height,
-                } => Some(measure_image_size(
-                    ix,
-                    source,
-                    *width,
-                    *height,
-                    typography.line_height,
-                    typography.rem_size,
-                    window,
-                    cx,
-                )),
-                MeasureItem::Text { .. } | MeasureItem::Object { .. } => None,
-            })
-            .collect::<Vec<_>>();
+        let image_sizes = intrinsic_image_sizes(&measure_items, window, cx);
         let objects = prepare_objects(&measure_items, &typography.text_style, window, cx);
         frame_state.borrow_mut().set_key(FlowLayoutKey {
             items: measure_items,
@@ -479,7 +471,7 @@ impl Element for InlineFlow {
         &mut self,
         _id: Option<&GlobalElementId>,
         _inspector_id: Option<&InspectorElementId>,
-        bounds: Bounds<Pixels>,
+        mut bounds: Bounds<Pixels>,
         request_layout: &mut Self::RequestLayoutState,
         window: &mut Window,
         cx: &mut App,
@@ -488,6 +480,9 @@ impl Element for InlineFlow {
         let Some(layout) = request_layout.current.borrow().clone() else {
             return Vec::new();
         };
+        if self.centered {
+            bounds.origin.x += (bounds.size.width - layout.size.width).max(px(0.)) / 2.;
+        }
         let typography = request_layout.typography.clone();
         let text_style = &typography.text_style;
         let mut elements = Vec::with_capacity(layout.fragments.len());
@@ -755,7 +750,7 @@ impl Element for InlineFlow {
                         source,
                         url,
                         link,
-                        title,
+                        alt,
                         ..
                     } = &self.items[*item_ix]
                     else {
@@ -769,7 +764,7 @@ impl Element for InlineFlow {
                         source,
                         url,
                         link,
-                        title.as_str(),
+                        alt,
                         fragment_size,
                         self.link_click_handler.clone(),
                         self.image_click_handler.clone(),
@@ -875,11 +870,13 @@ impl From<&InlineFlowItem> for MeasureItem {
             },
             InlineFlowItem::Image {
                 source,
+                alt,
                 width,
                 height,
                 ..
             } => MeasureItem::Image {
                 source: source.clone(),
+                alt: alt.clone(),
                 width: *width,
                 height: *height,
             },
@@ -931,29 +928,7 @@ pub(super) fn intrinsic_width(
     cx: &mut App,
 ) -> Pixels {
     let items = items.iter().map(MeasureItem::from).collect::<Vec<_>>();
-    let line_height = window.line_height();
-    let rem_size = window.rem_size();
-    let images = items
-        .iter()
-        .enumerate()
-        .map(|(ix, item)| match item {
-            MeasureItem::Image {
-                source,
-                width,
-                height,
-            } => Some(measure_image_size(
-                ix,
-                source,
-                *width,
-                *height,
-                line_height,
-                rem_size,
-                window,
-                cx,
-            )),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
+    let images = intrinsic_image_sizes(&items, window, cx);
     layout_flow(&items, &images, &window.text_style(), None, window, cx)
         .size
         .width
@@ -1046,22 +1021,28 @@ fn layout_measured_flow(
         .iter()
         .map(|object| object.clone().map(|object| object.fit_text(wrap_width)))
         .collect::<Vec<_>>();
-    // An image wider than the wrap is narrowed to it, in its ratio, the way
-    // the image-alone path narrows with `max_w(relative(1.))`; text objects
-    // already fit above. The measured sizes stay cached: this makes a
-    // per-layout copy, as `fit_text` does for objects.
-    let image_sizes = image_sizes
+    let image_sizes = items
         .iter()
-        .map(|image_size| {
-            image_size.map(|mut size| {
-                if let Some(wrap_width) = wrap_width
-                    && size.width > wrap_width
-                {
-                    size.height *= wrap_width / size.width;
-                    size.width = wrap_width;
-                }
-                size
-            })
+        .zip(image_sizes)
+        .map(|(item, intrinsic_size)| {
+            let MeasureItem::Image { width, height, .. } = item else {
+                return None;
+            };
+            let mut size = image_size(
+                *width,
+                *height,
+                *intrinsic_size,
+                line_height,
+                rem_size,
+                wrap_width,
+            );
+            if let Some(wrap_width) = wrap_width
+                && size.width > wrap_width
+            {
+                size.height *= wrap_width / size.width;
+                size.width = wrap_width;
+            }
+            Some(size)
         })
         .collect::<Vec<_>>();
     let line_ranges = line_ranges(
@@ -1722,47 +1703,48 @@ fn push_text_wrap_fragments<'a>(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn measure_image_size(
-    ix: usize,
-    source: &ImageSource,
-    width: Option<DefiniteLength>,
-    height: Option<DefiniteLength>,
-    line_height: Pixels,
-    rem_size: Pixels,
-    window: &mut Window,
-    cx: &mut App,
-) -> Size<Pixels> {
-    let intrinsic_size = if width.is_some() && height.is_some() {
-        None
-    } else {
-        intrinsic_image_size(ix, source, width, height, window, cx)
-    };
-    image_size(width, height, intrinsic_size, line_height, rem_size)
+fn image_with_fallback(source: &ImageSource, alt: &SharedString) -> gpui::Img {
+    let element = img(source.clone());
+    if alt.is_empty() {
+        return element;
+    }
+    let alt = alt.clone();
+    element.with_fallback(move || {
+        div()
+            .overflow_hidden()
+            .child(alt.clone())
+            .into_any_element()
+    })
 }
 
-fn intrinsic_image_size(
-    ix: usize,
-    source: &ImageSource,
-    width: Option<DefiniteLength>,
-    height: Option<DefiniteLength>,
+fn intrinsic_image_sizes(
+    items: &[MeasureItem],
     window: &mut Window,
     cx: &mut App,
-) -> Option<Size<Pixels>> {
-    let mut element = img(source.clone())
-        .id(ix)
-        .object_fit(ObjectFit::Contain)
-        .max_w(relative(1.))
-        .when_some(width, |this, width| this.w(width))
-        .when_some(height, |this, height| this.h(height))
-        .into_any_element();
-    let measured_size = element.layout_as_root(AvailableSpace::min_size(), window, cx);
-
-    if measured_size.width <= Pixels::ZERO || measured_size.height <= Pixels::ZERO {
-        None
-    } else {
-        Some(measured_size)
-    }
+) -> Vec<Option<Size<Pixels>>> {
+    items
+        .iter()
+        .map(|item| match item {
+            MeasureItem::Image {
+                source,
+                alt,
+                width,
+                height,
+            } => {
+                if width.is_some() && height.is_some() {
+                    return None;
+                }
+                let mut element = image_with_fallback(source, alt);
+                if width.is_none() && height.is_none() {
+                    element = element.limit_intrinsic_size_to_device_pixels();
+                }
+                let mut element = element.into_any_element();
+                let size = element.layout_as_root(AvailableSpace::min_size(), window, cx);
+                (size.width > Pixels::ZERO && size.height > Pixels::ZERO).then_some(size)
+            }
+            _ => None,
+        })
+        .collect()
 }
 
 fn image_size(
@@ -1771,15 +1753,19 @@ fn image_size(
     intrinsic_size: Option<Size<Pixels>>,
     line_height: Pixels,
     rem_size: Pixels,
+    wrap_width: Option<Pixels>,
 ) -> Size<Pixels> {
-    let base_size = AbsoluteLength::Pixels(line_height);
+    let width_base = AbsoluteLength::Pixels(
+        wrap_width
+            .or(intrinsic_size.map(|size| size.width))
+            .unwrap_or(line_height),
+    );
+    let height_base = AbsoluteLength::Pixels(line_height);
+    let width = width.map(|width| width.to_pixels(width_base, rem_size).max(px(1.)));
+    let height = height.map(|height| height.to_pixels(height_base, rem_size).max(px(1.)));
     match (width, height) {
-        (Some(width), Some(height)) => size(
-            width.to_pixels(base_size, rem_size),
-            height.to_pixels(base_size, rem_size),
-        ),
+        (Some(width), Some(height)) => size(width, height),
         (Some(width), None) => {
-            let width = width.to_pixels(base_size, rem_size);
             let height = intrinsic_size
                 .and_then(|intrinsic_size| {
                     (intrinsic_size.width > Pixels::ZERO && intrinsic_size.height > Pixels::ZERO)
@@ -1789,7 +1775,6 @@ fn image_size(
             size(width, height)
         }
         (None, Some(height)) => {
-            let height = height.to_pixels(base_size, rem_size);
             let width = intrinsic_size
                 .and_then(|intrinsic_size| {
                     (intrinsic_size.width > Pixels::ZERO && intrinsic_size.height > Pixels::ZERO)
@@ -2028,14 +2013,14 @@ mod tests {
     fn inline_image_without_explicit_size_is_drawn_at_its_intrinsic_size() {
         let intrinsic_size = size(px(160.), px(40.));
 
-        let measured = image_size(None, None, Some(intrinsic_size), px(20.), px(16.));
+        let measured = image_size(None, None, Some(intrinsic_size), px(20.), px(16.), None);
 
         assert_eq!(measured, intrinsic_size);
     }
 
     #[test]
     fn inline_image_before_it_loads_keeps_a_compact_square() {
-        let measured = image_size(None, None, None, px(20.), px(16.));
+        let measured = image_size(None, None, None, px(20.), px(16.), None);
 
         assert_eq!(measured, size(px(15.), px(15.)));
     }
@@ -2054,6 +2039,7 @@ mod tests {
         };
         let items = vec![MeasureItem::Image {
             source: SharedUri::from("https://example.com/photo.png").into(),
+            alt: SharedString::default(),
             width: None,
             height: None,
         }];
@@ -2116,6 +2102,7 @@ mod tests {
             },
             MeasureItem::Image {
                 source: SharedUri::from("https://example.com/badge.png").into(),
+                alt: SharedString::default(),
                 width: None,
                 height: None,
             },
@@ -2208,6 +2195,7 @@ mod tests {
             let items = vec![
                 MeasureItem::Image {
                     source: SharedUri::from("https://example.com/icon.png").into(),
+                    alt: SharedString::default(),
                     width: None,
                     height: None,
                 },

@@ -355,6 +355,15 @@ dialogs in a Wayland window after changes to paint order or focus handling.
   viewport inset of the top painted text line. Restoring that source byte
   resolves it against the new line layout after typography or width changes.
 
+- The reader uses deferred GPUI image sources. Layout can measure a cached
+  image, and only a paint within the viewport starts a pending load. Markdown
+  image-only paragraphs and inline images share intrinsic sizing, explicit
+  HTML dimensions, fitted paragraph width, and alternate text on failure.
+  Images without explicit dimensions use at most one device pixel per raster
+  pixel, including on high-DPI displays.
+  Run `cargo test --release --locked --test documents` for reader layout and
+  rendering coverage.
+
 - macOS precise wheels without native gesture or momentum phases use the existing
   wheel interpolator in pixel units. Native gestures and AppKit momentum remain
   direct, and disabling smooth scrolling cancels any previous wheel tail when

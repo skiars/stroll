@@ -34,6 +34,9 @@ pub const LOADING_DELAY: Duration = Duration::from_millis(200);
 /// Custom loaders, or external images will not use this asset loader
 pub type ImgResourceLoader = AssetLogger<ImageAssetLoader>;
 
+type DeferredImageLoader =
+    dyn Fn(bool, &mut Window, &mut App) -> Option<Result<Arc<RenderImage>, ImageCacheError>>;
+
 /// A source of image content.
 #[derive(Clone)]
 pub enum ImageSource {
@@ -45,6 +48,8 @@ pub enum ImageSource {
     Image(Arc<Image>),
     /// A custom loading function to use
     Custom(Arc<dyn Fn(&mut Window, &mut App) -> Option<Result<Arc<RenderImage>, ImageCacheError>>>),
+    /// An image source whose loading starts only when a visible element is painted.
+    Deferred(Arc<DeferredImageLoader>),
     /// 保留原始布局尺寸，按实际绘制尺寸生成缩略图。
     Fit(Arc<ImageSource>, Entity<ImageThumbnails>),
 }
@@ -139,6 +144,7 @@ pub struct ImageStyle {
     grayscale: bool,
     object_fit: ObjectFit,
     sampling: ImageSampling,
+    limit_intrinsic_size_to_device_pixels: bool,
     loading: Option<Box<dyn Fn() -> AnyElement>>,
     fallback: Option<Box<dyn Fn() -> AnyElement>>,
 }
@@ -149,6 +155,7 @@ impl Default for ImageStyle {
             grayscale: false,
             object_fit: ObjectFit::Contain,
             sampling: ImageSampling::default(),
+            limit_intrinsic_size_to_device_pixels: false,
             loading: None,
             fallback: None,
         }
@@ -169,6 +176,13 @@ pub trait StyledImage: Sized {
     /// Set the object fit for the image.
     fn object_fit(mut self, object_fit: ObjectFit) -> Self {
         self.image_style().object_fit = object_fit;
+        self
+    }
+
+    /// Keep the intrinsic layout size within the available raster pixels at
+    /// the window's display scale. Explicit element sizes can still override it.
+    fn limit_intrinsic_size_to_device_pixels(mut self) -> Self {
+        self.image_style().limit_intrinsic_size_to_device_pixels = true;
         self
     }
 
@@ -322,7 +336,8 @@ impl Element for Img {
                 |mut style, window, cx| {
                     let mut replacement_id = None;
 
-                    match self.source.use_data(
+                    match self.source.load_data(
+                        false,
                         self.image_cache
                             .clone()
                             .or_else(|| window.image_cache_stack.last().cloned()),
@@ -362,7 +377,12 @@ impl Element for Img {
                                 frame_index = state.frame_index;
                             }
 
-                            let image_size = data.render_size(frame_index);
+                            let image_size = if self.style.limit_intrinsic_size_to_device_pixels {
+                                let scale = window.scale_factor().max(data.scale_factor);
+                                data.size(frame_index).map(|dimension| px(i32::from(dimension) as f32 / scale))
+                            } else {
+                                data.render_size(frame_index)
+                            };
 
                             if style.aspect_ratio.is_none() {
                                 style.aspect_ratio = Some(image_size.width / image_size.height);
@@ -415,11 +435,11 @@ impl Element for Img {
                             }
                         }
                         None => {
-                            if let Some(state) = &mut state {
+                            if let Some(state) = &mut state
+                                && let Some(loading) = self.style.loading.as_ref()
+                            {
                                 if let Some((started_loading, _)) = state.started_loading {
-                                    if started_loading.elapsed() > LOADING_DELAY
-                                        && let Some(loading) = self.style.loading.as_ref()
-                                    {
+                                    if started_loading.elapsed() > LOADING_DELAY {
                                         let mut element = loading();
                                         replacement_id = Some(element.request_layout(window, cx));
                                         layout_state.replacement = Some(element);
@@ -497,7 +517,8 @@ impl Element for Img {
                 if bounds.intersect(&window.content_mask().bounds).is_empty() {
                     return;
                 }
-                if let Some(Ok(data)) = source.use_data(
+                if let Some(Ok(data)) = source.load_data(
+                    true,
                     self.image_cache
                         .clone()
                         .or_else(|| window.image_cache_stack.last().cloned()),
@@ -573,8 +594,27 @@ impl ImageSource {
         Self::Fit(Arc::new(self), thumbnails.clone())
     }
 
+    /// Creates a source whose callback should only start loading when requested
+    /// with `visible` set. Layout calls can read a previously loaded result.
+    pub fn deferred(
+        load: impl Fn(bool, &mut Window, &mut App) -> Option<Result<Arc<RenderImage>, ImageCacheError>>
+        + 'static,
+    ) -> Self {
+        Self::Deferred(Arc::new(load))
+    }
+
     pub(crate) fn use_data(
         &self,
+        cache: Option<AnyImageCache>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Option<Result<Arc<RenderImage>, ImageCacheError>> {
+        self.load_data(true, cache, window, cx)
+    }
+
+    fn load_data(
+        &self,
+        visible: bool,
         cache: Option<AnyImageCache>,
         window: &mut Window,
         cx: &mut App,
@@ -590,7 +630,8 @@ impl ImageSource {
             ImageSource::Custom(loading_fn) => loading_fn(window, cx),
             ImageSource::Render(data) => Some(Ok(data.to_owned())),
             ImageSource::Image(data) => window.use_asset::<AssetLogger<ImageDecoder>>(data, cx),
-            ImageSource::Fit(source, _) => source.use_data(cache, window, cx),
+            ImageSource::Deferred(load) => load(visible, window, cx),
+            ImageSource::Fit(source, _) => source.load_data(visible, cache, window, cx),
         }
     }
 
@@ -611,6 +652,7 @@ impl ImageSource {
             ImageSource::Custom(loading_fn) => loading_fn(window, cx),
             ImageSource::Render(data) => Some(Ok(data.to_owned())),
             ImageSource::Image(data) => window.get_asset::<AssetLogger<ImageDecoder>>(data, cx),
+            ImageSource::Deferred(load) => load(false, window, cx),
             ImageSource::Fit(source, _) => source.get_data(cache, window, cx),
         }
     }
@@ -621,7 +663,7 @@ impl ImageSource {
             ImageSource::Resource(resource) => {
                 cx.remove_asset::<ImgResourceLoader>(resource);
             }
-            ImageSource::Custom(_) | ImageSource::Render(_) => {}
+            ImageSource::Custom(_) | ImageSource::Deferred(_) | ImageSource::Render(_) => {}
             ImageSource::Image(data) => cx.remove_asset::<AssetLogger<ImageDecoder>>(data),
             ImageSource::Fit(source, _) => source.remove_asset(cx),
         }
@@ -633,7 +675,7 @@ impl ImageSource {
     pub fn is_asset_cached(&self, cx: &App) -> bool {
         match self {
             ImageSource::Resource(resource) => cx.has_asset::<ImgResourceLoader>(resource),
-            ImageSource::Custom(_) | ImageSource::Render(_) => false,
+            ImageSource::Custom(_) | ImageSource::Deferred(_) | ImageSource::Render(_) => false,
             ImageSource::Image(data) => cx.has_asset::<AssetLogger<ImageDecoder>>(data),
             ImageSource::Fit(source, _) => source.is_asset_cached(cx),
         }
@@ -710,19 +752,28 @@ impl Asset for ImageAssetLoader {
                 }
             };
 
-            if let Ok(format) = image::guess_format(&bytes) {
-                let data = match format {
-                    ImageFormat::Gif => decode_gif_image(&bytes)?,
-                    ImageFormat::WebP => decode_webp_image(&bytes)?,
-                    _ => decode_static_image(&bytes, format)?,
-                };
+            Self::decode(&bytes, &svg_renderer)
+        }
+    }
+}
 
-                Ok(Arc::new(RenderImage::new(data)))
-            } else {
-                svg_renderer
-                    .render_single_frame(&bytes, 1.0)
-                    .map_err(Into::into)
-            }
+impl ImageAssetLoader {
+    /// Decodes image bytes already read by the caller.
+    pub fn decode(
+        bytes: &[u8],
+        svg_renderer: &crate::SvgRenderer,
+    ) -> Result<Arc<RenderImage>, ImageCacheError> {
+        if let Ok(format) = image::guess_format(bytes) {
+            let data = match format {
+                ImageFormat::Gif => decode_gif_image(bytes)?,
+                ImageFormat::WebP => decode_webp_image(bytes)?,
+                _ => decode_static_image(bytes, format)?,
+            };
+            Ok(Arc::new(RenderImage::new(data)))
+        } else {
+            svg_renderer
+                .render_single_frame(bytes, 1.0)
+                .map_err(Into::into)
         }
     }
 }

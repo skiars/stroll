@@ -46,6 +46,7 @@ pub(crate) fn is_markdown(path: &Path) -> bool {
 }
 
 pub(crate) const MAX_FILE_BYTES: u64 = 8 * 1024 * 1024;
+pub(crate) const MAX_ASSET_BYTES: u64 = 16 * 1024 * 1024;
 
 #[derive(Clone)]
 pub struct Repository {
@@ -392,9 +393,7 @@ impl Repository {
 
     pub(crate) fn bytes(&self, path: &Path, asset: bool) -> Result<Vec<u8>> {
         match &self.ssh {
-            Some(ssh) => Ok(ssh
-                .call::<Bytes>(Request::Read(RepoPath::from_local(path)?, asset))?
-                .0),
+            Some(ssh) => read_remote_bytes(ssh, path, asset),
             None if asset => read_asset(&self.root, path),
             None => read_bytes(&self.resolve(path)?),
         }
@@ -430,6 +429,12 @@ impl Repository {
     pub fn read_markdown(&self, path: &Path) -> Result<String> {
         decode_markdown(self.bytes(path, false)?)
     }
+}
+
+pub(crate) fn read_remote_bytes(ssh: &SshSession, path: &Path, asset: bool) -> Result<Vec<u8>> {
+    Ok(ssh
+        .call::<Bytes>(Request::Read(RepoPath::from_local(path)?, asset))?
+        .0)
 }
 
 /// Reads a Markdown file from the local filesystem without requiring it to be
@@ -794,7 +799,7 @@ fn read_asset(root: &Path, path: &Path) -> Result<Vec<u8>> {
                 .all(|part| part.as_os_str() != ".git"),
         t!("storage.image_outside_repo")
     );
-    let limit = 16 * 1024 * 1024;
+    let limit = MAX_ASSET_BYTES;
     let mut bytes = Vec::new();
     File::open(target)?
         .take(limit + 1)

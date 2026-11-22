@@ -12,9 +12,10 @@ use std::{
 
 use anyhow::{Context as _, Result, ensure};
 use gpui::{
-    App, AppContext as _, Entity, EntityId, Global, ImageCacheError, ImageSource, RenderImage,
-    SvgRenderer, WeakEntity, Window,
+    App, AppContext as _, Entity, EntityId, Global, Image, ImageAssetLoader, ImageCacheError,
+    ImageSource, RenderImage, SharedString, SvgRenderer, WeakEntity, Window,
 };
+use gpui_component::text::data_url_image;
 use image::{
     DynamicImage, Frame, ImageDecoder, ImageFormat, ImageReader, Limits, imageops::FilterType,
 };
@@ -30,12 +31,24 @@ use ureq::{
 };
 use url::Url;
 
+use crate::{
+    image_viewer,
+    remote::SshSession,
+    repository::{MAX_ASSET_BYTES, read_remote_bytes},
+};
+
+use super::{Destination, destination};
+
 const MAX_DOWNLOAD_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_PIXELS: u64 = 24_000_000;
 const MAX_RENDER_DIMENSION: u32 = 1720;
 const MAX_CACHE_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_CACHE_ENTRIES: usize = 256;
 const MAX_CONCURRENT_DOWNLOADS: usize = 4;
+const MAX_CONCURRENT_FILE_LOADS: usize = 4;
+const MAX_CONCURRENT_SSH_LOADS: usize = 2;
+const MAX_DOCUMENT_SSH_IMAGES: usize = 128;
+const MAX_DOCUMENT_SSH_BYTES: usize = 32 * 1024 * 1024;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const RETRY_DELAY: Duration = Duration::from_secs(30);
 const MAX_REDIRECTS: usize = 5;
@@ -43,21 +56,81 @@ const MAX_REDIRECTS: usize = 5;
 type LoadedImage = std::result::Result<Arc<RenderImage>, ImageCacheError>;
 
 #[derive(Clone, PartialEq, Eq, Hash)]
-struct ImageRequest {
-    url: Url,
-    original: bool,
+enum ImageRequest {
+    Online { url: Url, original: bool },
+    Local(PathBuf),
+    Remote { connection: usize, path: PathBuf },
+    Embedded(SharedString),
 }
 
-pub(super) fn source(uri: &str, display: &Entity<DisplayedImages>) -> Option<ImageSource> {
-    Some(image_source(image_url(uri)?, display.clone(), false))
+#[derive(Clone)]
+pub(super) struct DocumentImages {
+    pub root: PathBuf,
+    pub document: PathBuf,
+    pub ssh: Option<SshSession>,
+    pub allow_embedded: bool,
+    pub display: Entity<DisplayedImages>,
 }
 
-pub(super) fn preview_source(uri: &str, cx: &mut App) -> Option<ImageSource> {
-    Some(image_source(
-        image_url(uri)?,
-        DisplayedImages::new(cx),
-        true,
-    ))
+impl DocumentImages {
+    pub(super) fn source(&self, uri: &SharedString, block: Option<usize>) -> Option<ImageSource> {
+        let request = self.request(uri, false)?;
+        Some(request_source(
+            request,
+            self.ssh.clone(),
+            self.display.clone(),
+            block,
+            false,
+        ))
+    }
+
+    pub(super) fn preview_source(&self, uri: &SharedString, cx: &mut App) -> Option<ImageSource> {
+        let request = self.request(uri, true)?;
+        let display = if matches!(request, ImageRequest::Online { .. }) {
+            DisplayedImages::new(cx)
+        } else {
+            if let Some((Ok(image), _)) = self.display.read(cx).results.get(&request) {
+                return Some(ImageSource::Render(image.clone()));
+            }
+            self.display.clone()
+        };
+        Some(request_source(
+            request,
+            self.ssh.clone(),
+            display,
+            None,
+            true,
+        ))
+    }
+
+    fn request(&self, uri: &SharedString, original: bool) -> Option<ImageRequest> {
+        Some(if let Some(url) = image_url(uri) {
+            ImageRequest::Online { url, original }
+        } else if is_data_url(uri) {
+            if !self.allow_embedded {
+                return None;
+            }
+            ImageRequest::Embedded(uri.clone())
+        } else {
+            let Destination::Local { path, .. } = destination(&self.document, uri)? else {
+                return None;
+            };
+            if let Some(ssh) = &self.ssh {
+                image_viewer::format(&path)?;
+                ImageRequest::Remote {
+                    connection: ssh.connection_id(),
+                    path,
+                }
+            } else {
+                ImageRequest::Local(self.root.join(path))
+            }
+        })
+    }
+}
+
+pub(super) fn is_data_url(uri: &str) -> bool {
+    uri.get(..5)
+        .is_some_and(|scheme| scheme.eq_ignore_ascii_case("data:"))
 }
 
 fn image_url(uri: &str) -> Option<Url> {
@@ -69,23 +142,40 @@ fn image_url(uri: &str) -> Option<Url> {
     Some(url)
 }
 
-fn image_source(url: Url, display: Entity<DisplayedImages>, original: bool) -> ImageSource {
-    let request = ImageRequest { url, original };
-    ImageSource::Custom(Arc::new(move |window, cx| {
-        use_image(&request, &display, window, cx)
-    }))
+fn request_source(
+    request: ImageRequest,
+    ssh: Option<SshSession>,
+    display: Entity<DisplayedImages>,
+    block: Option<usize>,
+    preview: bool,
+) -> ImageSource {
+    if preview {
+        ImageSource::Custom(Arc::new(move |window, cx| {
+            use_image(&request, ssh.as_ref(), &display, None, true, window, cx)
+        }))
+    } else {
+        ImageSource::deferred(move |visible, window, cx| {
+            use_image(&request, ssh.as_ref(), &display, block, visible, window, cx)
+        })
+    }
 }
 
 // Decoded pixels are owned by the open reader for layout and painting. The
 // shared cache stores the original image files, including across app launches.
 #[derive(Default)]
-pub(super) struct DisplayedImages(HashMap<ImageRequest, (LoadedImage, Instant)>);
+pub(super) struct DisplayedImages {
+    results: HashMap<ImageRequest, (LoadedImage, Instant)>,
+    blocks: RefCell<HashMap<ImageRequest, HashSet<usize>>>,
+    changed: HashSet<usize>,
+    ssh_images: usize,
+    ssh_bytes: usize,
+}
 
 impl DisplayedImages {
     pub(super) fn new(cx: &mut App) -> Entity<Self> {
         cx.new(|cx| {
             cx.on_release(|images: &mut Self, cx| {
-                let images = std::mem::take(&mut images.0);
+                let images = std::mem::take(&mut images.results);
                 cx.defer(move |cx| {
                     for (result, _) in images.into_values() {
                         if let Ok(image) = result
@@ -100,6 +190,27 @@ impl DisplayedImages {
             Self::default()
         })
     }
+    fn can_load_ssh_image(&self) -> bool {
+        self.ssh_images < MAX_DOCUMENT_SSH_IMAGES && self.ssh_bytes < MAX_DOCUMENT_SSH_BYTES
+    }
+
+    fn record_ssh_image(&mut self, bytes: usize) -> Result<(), ImageCacheError> {
+        if !self.can_load_ssh_image() || bytes > MAX_DOCUMENT_SSH_BYTES - self.ssh_bytes {
+            self.ssh_bytes = MAX_DOCUMENT_SSH_BYTES;
+            return Err(ssh_budget_error());
+        }
+        self.ssh_images += 1;
+        self.ssh_bytes += bytes;
+        Ok(())
+    }
+
+    pub(super) fn take_changed_blocks(&mut self) -> HashSet<usize> {
+        std::mem::take(&mut self.changed)
+    }
+}
+
+fn ssh_budget_error() -> ImageCacheError {
+    ImageCacheError::Asset("Document SSH image budget exceeded".into())
 }
 
 struct OnlineImages {
@@ -130,16 +241,35 @@ struct PendingImages {
 
 fn use_image(
     request: &ImageRequest,
+    ssh: Option<&SshSession>,
     display: &Entity<DisplayedImages>,
+    block: Option<usize>,
+    visible: bool,
     window: &mut Window,
     cx: &mut App,
 ) -> Option<LoadedImage> {
-    if let Some((result, completed)) = display.read(cx).0.get(request)
-        && (result.is_ok() || completed.elapsed() < RETRY_DELAY)
+    let displayed = display.read(cx);
+    if let Some((result, completed)) = displayed.results.get(request)
+        && (!visible || result.is_ok() || completed.elapsed() < RETRY_DELAY)
     {
         return Some(result.clone());
     }
 
+    if matches!(request, ImageRequest::Remote { .. }) && !displayed.can_load_ssh_image() {
+        return Some(Err(ssh_budget_error()));
+    }
+    if let Some(block) = block {
+        displayed
+            .blocks
+            .borrow_mut()
+            .entry(request.clone())
+            .or_default()
+            .insert(block);
+    }
+
+    if !visible {
+        return None;
+    }
     if !cx.has_global::<OnlineImages>() {
         cx.set_global(OnlineImages::default());
     }
@@ -153,7 +283,7 @@ fn use_image(
     }
 
     // Wake visible readers when a slot opens, without queuing closed documents.
-    if state.loads.len() >= MAX_CONCURRENT_DOWNLOADS {
+    if !has_capacity(request, state.loads.keys()) {
         state.waiting_views.insert(view);
         return None;
     }
@@ -166,14 +296,44 @@ fn use_image(
     let directory = online.directory.clone();
     let agent = online.agent.clone();
     let svg = cx.svg_renderer();
+    let ssh = ssh.cloned();
     let request = request.clone();
     let load = request.clone();
     cx.spawn(async move |cx| {
-        let result = blocking::unblock(move || {
-            load_image(&load.url, directory.as_deref(), &agent, &svg, load.original)
-        })
-        .await
-        .map_err(ImageCacheError::from);
+        let fetched = if let ImageRequest::Embedded(uri) = load {
+            cx.background_executor()
+                .spawn(async move {
+                    let image = data_url_image(&uri)
+                        .context("Invalid embedded image")?
+                        .to_image_data(svg)?;
+                    Ok((image, None))
+                })
+                .await
+        } else {
+            blocking::unblock(move || -> Result<_, ImageCacheError> {
+                let mut ssh_bytes = None;
+                let image = match load {
+                    ImageRequest::Online { url, original } => {
+                        load_image(&url, directory.as_deref(), &agent, &svg, original)?
+                    }
+                    ImageRequest::Local(path) => {
+                        let bytes = read_local_image(&path)?;
+                        ImageAssetLoader::decode(&bytes, &svg)?
+                    }
+                    ImageRequest::Remote { path, .. } => {
+                        let format =
+                            image_viewer::format(&path).context("Unsupported image format")?;
+                        let ssh = ssh.as_ref().context("Missing SSH image session")?;
+                        let bytes = read_remote_bytes(ssh, &path, true)?;
+                        ssh_bytes = Some(bytes.len());
+                        Image::from_bytes(format, bytes).to_image_data(svg)?
+                    }
+                    ImageRequest::Embedded(_) => unreachable!(),
+                };
+                Ok((image, ssh_bytes))
+            })
+            .await
+        };
         cx.update(|cx| {
             let mut pending = pending.borrow_mut();
             let views = pending
@@ -185,13 +345,30 @@ fn use_image(
             for (view, display) in views {
                 if let Some(display) = display.upgrade() {
                     displayed = true;
-                    display.update(cx, |images, _| {
-                        images.0.insert(request.clone(), (result.clone(), now));
+                    display.update(cx, |images, cx| {
+                        if images
+                            .results
+                            .get(&request)
+                            .is_some_and(|(image, _)| image.is_ok())
+                        {
+                            return;
+                        }
+                        let result = fetched.clone().and_then(|(image, ssh_bytes)| {
+                            if let Some(bytes) = ssh_bytes {
+                                images.record_ssh_image(bytes)?;
+                            }
+                            Ok(image)
+                        });
+                        images.results.insert(request.clone(), (result, now));
+                        if let Some(blocks) = images.blocks.get_mut().get(&request) {
+                            images.changed.extend(blocks);
+                            cx.notify();
+                        }
                     });
                     cx.notify(view);
                 }
             }
-            if !displayed && let Ok(image) = result {
+            if !displayed && let Ok((image, _)) = fetched {
                 cx.drop_image(image, None);
             }
             for view in pending.waiting_views.drain() {
@@ -201,6 +378,46 @@ fn use_image(
     })
     .detach();
     None
+}
+
+fn has_capacity<'a>(
+    request: &ImageRequest,
+    active: impl Iterator<Item = &'a ImageRequest>,
+) -> bool {
+    match request {
+        ImageRequest::Online { .. } => {
+            active.filter(|key| matches!(key, ImageRequest::Online { .. })).count()
+                < MAX_CONCURRENT_DOWNLOADS
+        }
+        ImageRequest::Remote { connection, .. } => {
+            active.filter(|key| matches!(key, ImageRequest::Remote { connection: other, .. } if other == connection)).count()
+                < MAX_CONCURRENT_SSH_LOADS
+        }
+        ImageRequest::Local(_) | ImageRequest::Embedded(_) => {
+            active.filter(|key| matches!(key, ImageRequest::Local(_) | ImageRequest::Embedded(_))).count()
+                < MAX_CONCURRENT_FILE_LOADS
+        }
+    }
+}
+
+fn read_local_image(path: &Path) -> Result<Vec<u8>> {
+    let path = path.canonicalize()?;
+    ensure!(
+        path.is_file() && path.components().all(|part| part.as_os_str() != ".git"),
+        "Invalid local image path",
+    );
+    let file = File::open(path)?;
+    ensure!(
+        file.metadata()?.len() <= MAX_ASSET_BYTES,
+        "Local image is too large"
+    );
+    let mut bytes = Vec::new();
+    file.take(MAX_ASSET_BYTES + 1).read_to_end(&mut bytes)?;
+    ensure!(
+        bytes.len() as u64 <= MAX_ASSET_BYTES,
+        "Local image is too large"
+    );
+    Ok(bytes)
 }
 
 fn load_image(
@@ -688,7 +905,8 @@ mod tests {
         struct Preview(ImageSource);
         impl Render for Preview {
             fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl gpui::IntoElement {
-                img(self.0.clone())
+                use gpui::Styled as _;
+                img(self.0.clone()).w(gpui::px(8.)).h(gpui::px(4.))
             }
         }
 
@@ -716,16 +934,26 @@ mod tests {
         });
 
         let url = Url::parse("https://example.com/image")?;
-        let mut first = app
-            .open_window(|_, _| Preview(source(&format!("{url}#first"), &first_display).unwrap()));
-        let mut second = app.open_window(|_, _| {
-            Preview(source(&format!("{url}#second"), &second_display).unwrap())
-        });
+        let source = |fragment: &str, display: &Entity<DisplayedImages>| {
+            let url = image_url(&format!("{url}#{fragment}")).unwrap();
+            request_source(
+                ImageRequest::Online {
+                    url,
+                    original: false,
+                },
+                None,
+                display.clone(),
+                None,
+                false,
+            )
+        };
+        let mut first = app.open_window(|_, _| Preview(source("first", &first_display)));
+        let mut second = app.open_window(|_, _| Preview(source("second", &second_display)));
         first.draw();
         second.draw();
         release_response.send_blocking(())?;
 
-        let request = ImageRequest {
+        let request = ImageRequest::Online {
             url,
             original: false,
         };
@@ -733,7 +961,7 @@ mod tests {
         let loaded = loop {
             app.run_until_parked();
             if let Some((result, _)) =
-                app.read(|cx| first_display.read(cx).0.get(&request).cloned())
+                app.read(|cx| first_display.read(cx).results.get(&request).cloned())
             {
                 break result?;
             }
@@ -743,7 +971,7 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(5));
         };
-        let second_image = app.read(|cx| second_display.read(cx).0[&request].0.clone())?;
+        let second_image = app.read(|cx| second_display.read(cx).results[&request].0.clone())?;
         assert!(Arc::ptr_eq(&loaded, &second_image));
         first.draw();
         second.draw();

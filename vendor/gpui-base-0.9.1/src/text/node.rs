@@ -8,10 +8,10 @@ use std::{
 use gpui::{
     AnyElement, App, Axis, Bounds, DefiniteLength, Div, Element, ElementId, FontStyle, FontWeight,
     GlobalElementId, HighlightStyle, Hsla, Image, ImageFormat, ImageSource, InspectorElementId,
-    InteractiveElement as _, IntoElement, IsZero as _, LayoutId, ObjectFit, Overflow,
-    ParentElement, Pixels, Point, Refineable as _, Rems, ScrollHandle, SharedString, SharedUri,
-    StatefulInteractiveElement, StyleRefinement, Styled, StyledImage as _, TextStyleRefinement,
-    WhiteSpace, Window, div, img, prelude::FluentBuilder as _, px, relative, rems,
+    InteractiveElement as _, IntoElement, IsZero as _, LayoutId, Overflow, ParentElement, Pixels,
+    Point, Refineable as _, Rems, ScrollHandle, SharedString, SharedUri,
+    StatefulInteractiveElement, StyleRefinement, Styled, TextStyleRefinement, WhiteSpace, Window,
+    div, img, prelude::FluentBuilder as _, px, relative, rems,
 };
 use markdown::mdast;
 
@@ -29,7 +29,6 @@ use crate::{
         inline_flow::{InlineFlow, InlineFlowItem, slice_ranges},
         range_highlight::{RangeHighlightFrame, RevealAt, RevealRequest},
         stream_fade::{StreamFadeFrame, TextLeafKey},
-        text_view::handle_link_click,
     },
     theme::ActiveTheme as _,
 };
@@ -2791,6 +2790,7 @@ pub(crate) struct NodeContext {
     pub(crate) code_block_highlighter: Option<Arc<CodeBlockHighlighterFn>>,
     pub(crate) table_actions: Option<Arc<TableActionsFn>>,
     pub(crate) image_source: Option<Arc<super::text_view::ImageSourceFn>>,
+    pub(crate) block_index: Option<usize>,
     pub(crate) link_click_handler: Option<Arc<LinkClickHandlerFn>>,
     pub(crate) image_click_handler: Option<Arc<ImageClickHandlerFn>>,
     pub(crate) task_toggle_handler: Option<Arc<TaskToggleHandlerFn>>,
@@ -2816,7 +2816,7 @@ impl NodeContext {
 
     fn image_source(&self, image: &ImageNode) -> ImageSource {
         match &self.image_source {
-            Some(resolve) => resolve(&image.url),
+            Some(resolve) => resolve(&image.url, self.block_index),
             None => image.source(),
         }
     }
@@ -2996,7 +2996,6 @@ impl Paragraph {
         _window: &mut Window,
         cx: &mut App,
     ) -> AnyElement {
-        let children = &self.children;
         let fades = node_cx.stream_fades(fade_key);
         let backgrounds = node_cx.range_backgrounds(fade_key);
 
@@ -3011,191 +3010,54 @@ impl Paragraph {
             .into_any_element();
         }
 
-        let has_image = children.iter().any(|child| child.image.is_some());
-        // Text alone is one `Inline`, which needs no box of its own, and its
-        // text, highlights and links are cached across frames.
-        if !has_image {
-            let (text, highlights, mut links) = self.plain_render(node_cx, cx);
-            // An editor leaf is laid out even when empty, so the editor gets
-            // a line box for the caret.
-            if text.is_empty() && self.leaf_key().is_none() {
-                return div().into_any_element();
-            }
-            for (_, link_mark) in &mut links {
-                if let Some(identifier) = link_mark.identifier.as_ref()
-                    && let Some(mark) = node_cx.link_refs.get(identifier)
-                {
-                    *link_mark = mark.clone();
-                }
-            }
-            let highlights = fade_highlights(highlights, &slice_fades(fades, 0, text.len()));
-            let backgrounds = slice_backgrounds(backgrounds, 0, text.len());
-            let reveal = node_cx.reveal_at(fade_key, 0, text.len());
-            if let Ok(mut state) = self.state.lock() {
-                state.set_text(text);
-            }
-            return Inline::new(
-                self.state.clone(),
-                links,
-                highlights,
-                node_cx.link_click_handler.clone(),
-            )
-            .range_backgrounds(backgrounds)
-            .reading_leaf(fade_key, 0)
-            .reveal(reveal)
-            .into_any_element();
-        }
-
-        let mut child_nodes: Vec<AnyElement> = vec![];
-
-        let mut text = String::new();
-        let mut highlights: Vec<(Range<usize>, InlineHighlight)> = vec![];
-        let mut links: Vec<(Range<usize>, LinkMark)> = vec![];
-        let mut offset = 0;
-        // Where `text` starts in the paragraph's whole rendered text, which
-        // is the byte space the fade ranges use.
-        let mut consumed = 0;
-
-        for (ix, inline_node) in children.iter().enumerate() {
-            let text_len = inline_node.text.len();
-            text.push_str(&inline_node.text);
-
-            if let Some(image) = &inline_node.image {
-                if text.len() > 0 {
-                    if let Ok(mut state) = inline_node.state.lock() {
-                        state.set_text(text.clone().into());
-                    }
-                    child_nodes.push(
-                        Inline::new(
-                            inline_node.state.clone(),
-                            links.clone(),
-                            fade_highlights(
-                                highlights.clone(),
-                                &slice_fades(fades, consumed, consumed + text.len()),
-                            ),
-                            node_cx.link_click_handler.clone(),
-                        )
-                        .range_backgrounds(slice_backgrounds(
-                            backgrounds,
-                            consumed,
-                            consumed + text.len(),
-                        ))
-                        .reading_leaf(fade_key, consumed)
-                        .reveal(node_cx.reveal_at(fade_key, consumed, consumed + text.len()))
-                        .into_any_element(),
-                    );
-                }
-                let link_click_handler = node_cx.link_click_handler.clone();
-                let image_click_handler = node_cx.image_click_handler.clone();
-                let mut element = img(node_cx.image_source(image))
-                    .id(ix)
-                    .object_fit(ObjectFit::Contain)
-                    .max_w(relative(1.))
-                    .when_some(image.width, |this, width| this.w(width));
-                if let Some(image_click_handler) = image_click_handler {
-                    let url: SharedString = image.url.as_ref().into();
-                    element = element.cursor_pointer().on_click(move |event, window, cx| {
-                        crate::TextSelection::end(window, cx);
-                        cx.stop_propagation();
-                        image_click_handler(&url, &event, window, cx);
-                    });
-                } else if let Some(link) = image.link.clone() {
-                    let aux_link = link.clone();
-                    let aux_link_click_handler = link_click_handler.clone();
-                    element = element
-                        .cursor_pointer()
-                        .on_click(move |event, window, cx| {
-                            crate::TextSelection::end(window, cx);
-                            cx.stop_propagation();
-                            handle_link_click(
-                                &link_click_handler,
-                                link.url.clone(),
-                                event.clone(),
-                                window,
-                                cx,
-                            );
-                        })
-                        .on_aux_click(move |event, window, cx| {
-                            crate::TextSelection::end(window, cx);
-                            cx.stop_propagation();
-                            handle_link_click(
-                                &aux_link_click_handler,
-                                aux_link.url.clone(),
-                                event.clone(),
-                                window,
-                                cx,
-                            );
-                        });
-                }
-                child_nodes.push(element.into_any_element());
-
-                consumed += text.len();
-                text.clear();
-                links.clear();
-                highlights.clear();
-                offset = 0;
-            } else {
-                let mut node_highlights = vec![];
-                for (range, style) in &inline_node.marks {
-                    let inner_range = (offset + range.start)..(offset + range.end);
-                    let mut highlight = mark_highlight(style, node_cx, cx);
-
-                    if let Some(mut link_mark) = style.link.clone() {
-                        highlight.style.color = Some(node_cx.style.link());
-                        highlight.style.underline = Some(link_underline(&node_cx.style));
-
-                        // convert link references, replace link
-                        if let Some(identifier) = link_mark.identifier.as_ref() {
-                            if let Some(mark) = node_cx.link_refs.get(identifier) {
-                                link_mark = mark.clone();
-                            }
-                        }
-
-                        links.push((inner_range.clone(), link_mark));
-                    }
-
-                    node_highlights.push((inner_range, highlight));
-                }
-
-                append_node_highlights(&mut highlights, node_highlights);
-                offset += text_len;
-            }
-        }
-
-        // Add the last text node
-        if text.len() > 0 {
-            let text_end = consumed + text.len();
-            let highlights = fade_highlights(highlights, &slice_fades(fades, consumed, text_end));
-            if let Ok(mut state) = self.state.lock() {
-                state.set_text(text.into());
-            }
-            child_nodes.push(
-                Inline::new(
-                    self.state.clone(),
-                    links,
-                    highlights,
-                    node_cx.link_click_handler.clone(),
+        if self.children.iter().any(|child| child.image.is_some()) {
+            return div()
+                .id(self.element_id(fade_key))
+                .children(
+                    self.inline_flow_items(fade_key, fades, backgrounds, node_cx, cx)
+                        .into_iter()
+                        .enumerate()
+                        .map(|(index, item)| {
+                            InlineFlow::new(
+                                ("paragraph-image", index),
+                                vec![item],
+                                node_cx.link_click_handler.clone(),
+                                node_cx.image_click_handler.clone(),
+                            )
+                            .centered()
+                        }),
                 )
-                .range_backgrounds(slice_backgrounds(backgrounds, consumed, text_end))
-                .reading_leaf(fade_key, consumed)
-                .reveal(node_cx.reveal_at(fade_key, consumed, text_end))
-                .into_any_element(),
-            );
+                .into_any_element();
         }
 
-        // Text alone is one `Inline`, which needs no box of its own. Images
-        // keep an identified box: an image's element state is its animation,
-        // and the box scopes that state per paragraph.
-        if !has_image {
-            return child_nodes
-                .pop()
-                .unwrap_or_else(|| div().into_any_element());
+        // An empty editor leaf still needs a line for its caret.
+        let (text, highlights, mut links) = self.plain_render(node_cx, cx);
+        if text.is_empty() && self.leaf_key().is_none() {
+            return div().into_any_element();
         }
-
-        div()
-            .id(self.element_id(fade_key))
-            .children(child_nodes)
-            .into_any_element()
+        for (_, link_mark) in &mut links {
+            if let Some(identifier) = link_mark.identifier.as_ref()
+                && let Some(mark) = node_cx.link_refs.get(identifier)
+            {
+                *link_mark = mark.clone();
+            }
+        }
+        let highlights = fade_highlights(highlights, &slice_fades(fades, 0, text.len()));
+        let backgrounds = slice_backgrounds(backgrounds, 0, text.len());
+        let reveal = node_cx.reveal_at(fade_key, 0, text.len());
+        if let Ok(mut state) = self.state.lock() {
+            state.set_text(text);
+        }
+        Inline::new(
+            self.state.clone(),
+            links,
+            highlights,
+            node_cx.link_click_handler.clone(),
+        )
+        .range_backgrounds(backgrounds)
+        .reading_leaf(fade_key, 0)
+        .reveal(reveal)
+        .into_any_element()
     }
 
     /// The element id of this paragraph when it needs one: an inline flow,
@@ -3339,7 +3201,7 @@ impl Paragraph {
                     source: node_cx.image_source(image),
                     url: image.url.as_ref().into(),
                     link: image.link.clone(),
-                    title: image.title(),
+                    alt: image.alt.clone().unwrap_or_else(|| image.title().into()),
                     width: image.width,
                     height: image.height,
                 });

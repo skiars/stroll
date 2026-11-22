@@ -1,12 +1,16 @@
 use rust_i18n::t;
 
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use anyhow::{Context, Result, ensure};
 use gpui::{
     App, Asset, DevicePixels, Image, ImageFormat, IntoElement, ObjectFit, ParentElement as _,
-    RenderImage, SharedString, Size, Styled, StyledImage as _, SvgSize, Window, canvas, div, img,
-    px, size,
+    RenderImage, SharedString, Size, Styled, StyledImage as _, SvgSize, WeakEntity, Window, canvas,
+    div, img, px, size,
 };
 use gpui_component::{
     ActiveTheme, ThemeMode, h_flex,
@@ -26,6 +30,8 @@ use merman::{
 use ratex_layout::{LayoutOptions, layout, to_display_list};
 use ratex_svg::{SvgColorSyntax, SvgOptions, render_to_svg_with_color_syntax};
 use ratex_types::{color::Color, math_style::MathStyle};
+
+use crate::docs::DocReader;
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub enum GraphicKind {
@@ -113,40 +119,132 @@ impl Picture {
     }
 }
 
-type ThemedPictures = [Result<Picture, SharedString>; 2];
+#[derive(Clone)]
+enum GraphicState {
+    Pending,
+    Ready(Result<Picture, SharedString>),
+    LimitReached,
+}
+
+#[derive(Clone, Hash, PartialEq, Eq)]
+struct GraphicRequest {
+    kind: GraphicKind,
+    source: SharedString,
+    dark: bool,
+}
 
 #[derive(Default)]
-pub struct Graphics(HashMap<GraphicKind, HashMap<String, ThemedPictures>>);
+struct GeneratedGraphics {
+    images: HashMap<GraphicRequest, GraphicState>,
+    pending: usize,
+    reader: Option<WeakEntity<DocReader>>,
+}
+
+#[derive(Default)]
+pub struct Graphics {
+    sources: HashMap<GraphicKind, HashMap<String, Vec<usize>>>,
+    generated: Mutex<GeneratedGraphics>,
+}
 
 impl Graphics {
-    pub fn prepare(&mut self, kind: GraphicKind, source: &str) {
-        // Bound work per document and deduplicate repeated formulas.
-        if self.0.values().map(HashMap::len).sum::<usize>() >= 128 {
+    pub fn prepare(&mut self, kind: GraphicKind, source: &str, offset: usize) {
+        let has_capacity = self.sources.values().map(HashMap::len).sum::<usize>() < 128;
+        let sources = self.sources.entry(kind).or_default();
+        if let Some(offsets) = sources.get_mut(source) {
+            offsets.push(offset);
+        } else if has_capacity {
+            sources.insert(source.to_owned(), vec![offset]);
+        }
+    }
+
+    pub(crate) fn observe(&self, reader: WeakEntity<DocReader>) {
+        self.generated.lock().unwrap().reader = Some(reader);
+    }
+
+    fn state(&self, request: &GraphicRequest) -> GraphicState {
+        if !self
+            .sources
+            .get(&request.kind)
+            .is_some_and(|sources| sources.contains_key(request.source.as_ref()))
+        {
+            return GraphicState::LimitReached;
+        }
+        self.generated
+            .lock()
+            .unwrap()
+            .images
+            .get(request)
+            .cloned()
+            .unwrap_or(GraphicState::Pending)
+    }
+
+    fn request(self: &Arc<Self>, request: &GraphicRequest, cx: &mut App) {
+        let mut generated = self.generated.lock().unwrap();
+        if generated.pending >= 2 || generated.images.contains_key(request) {
             return;
         }
-        self.0
-            .entry(kind)
-            .or_default()
-            .entry(source.to_owned())
-            .or_insert_with(|| {
-                [false, true].map(|dark| {
-                    let picture = match kind {
-                        GraphicKind::Diagram => diagram(source, dark),
-                        _ => formula(source, dark, kind == GraphicKind::InlineMath),
+        generated
+            .images
+            .insert(request.clone(), GraphicState::Pending);
+        generated.pending += 1;
+        drop(generated);
+
+        let graphics = Arc::downgrade(self);
+        let request = request.clone();
+        cx.spawn(async move |cx| {
+            let work = request.clone();
+            let picture = cx
+                .background_executor()
+                .spawn(async move {
+                    let picture = match work.kind {
+                        GraphicKind::Diagram => diagram(&work.source, work.dark),
+                        _ => formula(
+                            &work.source,
+                            work.dark,
+                            work.kind == GraphicKind::InlineMath,
+                        ),
                     };
                     picture.map_err(|error| format!("{error:#}").into())
                 })
-            });
+                .await;
+            if let Some(graphics) = graphics.upgrade() {
+                let offsets = &graphics.sources[&request.kind][request.source.as_ref()];
+                let reader = {
+                    let mut generated = graphics.generated.lock().unwrap();
+                    generated
+                        .images
+                        .insert(request, GraphicState::Ready(picture));
+                    generated.pending -= 1;
+                    generated.reader.clone()
+                };
+                if let Some(reader) = reader {
+                    cx.update(|cx| {
+                        _ = reader
+                            .update(cx, |reader, cx| reader.refresh_graphic_layout(offsets, cx));
+                    });
+                }
+            }
+        })
+        .detach();
     }
 
-    fn get(
-        &self,
-        kind: GraphicKind,
-        source: &str,
-        cx: &App,
-    ) -> Option<&Result<Picture, SharedString>> {
-        let theme = usize::from(cx.theme().mode == ThemeMode::Dark);
-        self.0.get(&kind)?.get(source).map(|images| &images[theme])
+    fn placeholder(
+        self: &Arc<Self>,
+        request: GraphicRequest,
+        width: f32,
+        height: f32,
+    ) -> impl IntoElement + use<> {
+        let graphics = self.clone();
+        canvas(
+            |_, _, _| (),
+            move |bounds, (), window, cx| {
+                if !bounds.intersect(&window.content_mask().bounds).is_empty() {
+                    graphics.request(&request, cx);
+                }
+            },
+        )
+        .w(px(width))
+        .h(px(height))
     }
 }
 
@@ -173,6 +271,16 @@ struct GraphicPlugin {
     graphics: Arc<Graphics>,
 }
 
+impl GraphicPlugin {
+    fn request(&self, node: &MarkdownNode, cx: &App) -> GraphicRequest {
+        GraphicRequest {
+            kind: self.kind,
+            source: node.as_text().to_owned().into(),
+            dark: cx.theme().mode == ThemeMode::Dark,
+        }
+    }
+}
+
 impl MarkdownPlugin for GraphicPlugin {
     fn is_block(&self) -> bool {
         self.kind != GraphicKind::InlineMath
@@ -194,8 +302,13 @@ impl MarkdownPlugin for GraphicPlugin {
     fn render(&self, node: &MarkdownNode, window: &mut Window, cx: &mut App) -> impl IntoElement {
         let source = node.as_text();
         let theme = cx.theme();
-        let inner = match self.graphics.get(self.kind, source, cx) {
-            Some(Ok(picture)) if self.kind == GraphicKind::DisplayMath => {
+        let request = self.request(node, cx);
+        let inner = match self.graphics.state(&request) {
+            GraphicState::Pending => self
+                .graphics
+                .placeholder(request, 48., 24.)
+                .into_any_element(),
+            GraphicState::Ready(Ok(picture)) if self.kind == GraphicKind::DisplayMath => {
                 let font_size = window.text_style().font_size.to_pixels(window.rem_size());
                 let scale = f32::from(font_size) / MATH_FONT_SIZE;
                 div()
@@ -216,7 +329,7 @@ impl MarkdownPlugin for GraphicPlugin {
                     )
                     .into_any_element()
             }
-            Some(Ok(picture)) => div()
+            GraphicState::Ready(Ok(picture)) => div()
                 .w_full()
                 .min_w_0()
                 .h(px(picture.height + 8.))
@@ -236,10 +349,10 @@ impl MarkdownPlugin for GraphicPlugin {
                 )
                 .into_any_element(),
             result => {
-                let error = result
-                    .and_then(|result| result.as_ref().err())
-                    .cloned()
-                    .unwrap_or_else(|| t!("docs.graphics_limit").into());
+                let error = match result {
+                    GraphicState::Ready(Err(error)) => error,
+                    _ => t!("docs.graphics_limit").into(),
+                };
                 div()
                     .w_full()
                     .text_sm()
@@ -282,16 +395,22 @@ impl MarkdownPlugin for GraphicPlugin {
         _: &mut Window,
         cx: &mut App,
     ) -> Option<InlineElement> {
-        let picture = self
-            .graphics
-            .get(self.kind, node.as_text(), cx)?
-            .as_ref()
-            .ok()?;
-        let scale = f32::from(context.font_size()) / MATH_FONT_SIZE;
-        Some(
-            InlineElement::new(picture.math_element(scale))
-                .with_baseline(px(picture.baseline * scale)),
-        )
+        let request = self.request(node, cx);
+        let font_size = f32::from(context.font_size());
+        match self.graphics.state(&request) {
+            GraphicState::Pending => Some(
+                InlineElement::new(self.graphics.placeholder(request, font_size, font_size))
+                    .with_baseline(px(font_size * 0.8)),
+            ),
+            GraphicState::Ready(Ok(picture)) => {
+                let scale = font_size / MATH_FONT_SIZE;
+                Some(
+                    InlineElement::new(picture.math_element(scale))
+                        .with_baseline(px(picture.baseline * scale)),
+                )
+            }
+            GraphicState::LimitReached | GraphicState::Ready(Err(_)) => None,
+        }
     }
 }
 

@@ -537,3 +537,132 @@ fn first_markdown_parse_uses_initial_extensions(cx: &mut gpui::TestAppContext) {
         assert_eq!(state.source_offset_for_block(2), None);
     });
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn document_images_use_intrinsic_size_unless_html_sets_dimensions() -> anyhow::Result<()> {
+    use std::sync::Arc;
+
+    use gpui::{
+        AppContext as _, Context, HeadlessAppContext, ParentElement as _, Render, RenderImage,
+        SharedString, Styled as _, Window, div, px, size,
+    };
+    use gpui_component::text::TextView;
+    use gpui_wgpu::WgpuHeadlessRenderer;
+    use image::{Frame, Rgba, RgbaImage};
+
+    struct Reader {
+        markdown: SharedString,
+        width: f32,
+        image: Arc<RenderImage>,
+    }
+
+    impl Render for Reader {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl gpui::IntoElement {
+            let image = self.image.clone();
+            div().w(px(self.width)).child(
+                TextView::markdown("image-sizing", self.markdown.clone())
+                    .w_full()
+                    .image_source(move |_| image.clone().into()),
+            )
+        }
+    }
+
+    let mut app = HeadlessAppContext::with_platform(
+        gpui_platform::current_platform(true).text_system(),
+        Arc::new(gpui_kit_assets::AllAssets),
+        || Ok(Some(Box::new(WgpuHeadlessRenderer::new()?))),
+    );
+    app.update(gpui_component::init);
+    let handle = app.open_window(size(px(420.), px(240.)), |_, cx| {
+        cx.new(|_| Reader {
+            markdown: SharedString::default(),
+            width: 420.,
+            image: Arc::new(RenderImage::new([Frame::new(RgbaImage::from_pixel(
+                100,
+                50,
+                Rgba([0, 0, 255, 255]),
+            ))])),
+        })
+    })?;
+
+    for (markdown, width, scale, expected) in [
+        ("![sample](image.png)", 420., 1., (100, 50)),
+        // Keep the text and layout width fixed while changing the display scale.
+        ("![sample](image.png)", 420., 2., (100, 50)),
+        ("Text ![sample](image.png)", 420., 1.5, (100, 50)),
+        ("[![sample](image.png)](page.md)", 420., 1., (100, 50)),
+        ("<img src=\"image.png\">", 420., 2., (100, 50)),
+        ("<img src=\"image.png\" width=\"80\">", 420., 2., (160, 80)),
+        (
+            "<img src=\"image.png\" width=\"300\">",
+            420.,
+            1.,
+            (300, 150),
+        ),
+        ("<img src=\"image.png\" height=\"80\">", 420., 1., (160, 80)),
+        (
+            "<img src=\"image.png\" width=\"300\" height=\"120\">",
+            420.,
+            1.,
+            (240, 120),
+        ),
+        (
+            "<img src=\"image.png\" style=\"width: 300px\">",
+            240.,
+            1.,
+            (240, 120),
+        ),
+        (
+            "<img src=\"image.png\" width=\"50%\">",
+            420.,
+            1.,
+            (210, 105),
+        ),
+        ("![sample](image.png)", 80., 1., (80, 40)),
+        ("![sample](image.png)", 40., 2., (80, 40)),
+    ] {
+        app.update_window(handle.into(), |root, window, cx| {
+            window.set_scale_factor(scale);
+            root.downcast::<Reader>().unwrap().update(cx, |reader, cx| {
+                reader.markdown = markdown.into();
+                reader.width = width;
+                cx.notify();
+            });
+        })?;
+        for _ in 0..3 {
+            app.run_until_parked();
+            app.update_window(handle.into(), |_, window, cx| window.draw(cx).clear(cx))?;
+        }
+        let screenshot = app.capture_screenshot(handle.into())?;
+        let (min_x, min_y, max_x, max_y) = screenshot
+            .enumerate_pixels()
+            .filter(|(_, _, pixel)| u16::from(pixel[0]) > u16::from(pixel[1].max(pixel[2])) + 32)
+            .fold(
+                (u32::MAX, u32::MAX, 0, 0),
+                |(min_x, min_y, max_x, max_y), (x, y, _)| {
+                    (min_x.min(x), min_y.min(y), max_x.max(x), max_y.max(y))
+                },
+            );
+        assert!(min_x <= max_x, "image was painted for {markdown}");
+        let actual = (max_x - min_x + 1, max_y - min_y + 1);
+        assert!(
+            actual.0.abs_diff(expected.0) <= 2 && actual.1.abs_diff(expected.1) <= 2,
+            "{markdown} at {scale}×: painted {actual:?}, expected {expected:?}",
+        );
+        let image_center = (min_x + max_x + 1) as f32 / 2.;
+        let column_center = width * scale / 2.;
+        if markdown.starts_with("Text ") {
+            assert!(
+                image_center < column_center,
+                "inline image follows its text"
+            );
+        } else {
+            assert!(
+                (image_center - column_center).abs() <= 2.,
+                "{markdown} at {scale}×: image center {image_center}, expected {column_center}",
+            );
+        }
+    }
+    Ok(())
+}

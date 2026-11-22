@@ -559,21 +559,18 @@ fn standalone_embedded_images_open_the_original_in_the_preview() -> Result<()> {
             visual.run_until_parked();
             visual.update(|window, cx| window.draw(cx).clear(cx));
         }
-        visual.simulate_click(point(px(54.), px(60.)), Default::default());
+        visual.simulate_click(point(px(265.), px(60.)), Default::default());
         visual.update(|_, cx| {
             let preview = workspace
                 .read(cx)
                 .image_preview
                 .as_ref()
                 .expect("click should open the image preview");
-            let ImageSource::Image(original) = &preview.image else {
-                panic!("expected the original embedded image");
+            let ImageSource::Render(original) = &preview.image else {
+                panic!("expected the loaded embedded image");
             };
-            assert_eq!(original.format(), gpui::ImageFormat::Png);
-            assert_eq!(
-                image::load_from_memory(original.bytes()).unwrap().width(),
-                192
-            );
+            assert_eq!(original.size(0).width, gpui::DevicePixels(192));
+            assert_eq!(original.size(0).height, gpui::DevicePixels(128));
         });
         visual.simulate_keystrokes("escape");
         visual.update(|window, cx| {

@@ -283,6 +283,10 @@ impl ParsedDocument {
                 move |ix, window, cx| {
                     let is_last = ix + 1 == blocks.len();
                     let (is_first, prev) = flow_position(&blocks, ix);
+                    let node_cx = NodeContext {
+                        block_index: Some(ix),
+                        ..node_cx.clone()
+                    };
                     let row = blocks[ix]
                         .render_block(
                             NodeRenderOptions {

@@ -108,6 +108,14 @@ impl TextView {
         self.inner = self.inner.image_source(resolver);
         self
     }
+    /// Resolves an image with the index of its containing scrollable block, if any.
+    pub fn image_source_with_block<F>(mut self, resolver: F) -> Self
+    where
+        F: Fn(&gpui::SharedUri, Option<usize>) -> gpui::ImageSource + Send + Sync + 'static,
+    {
+        self.inner = self.inner.image_source_with_block(resolver);
+        self
+    }
     /// Sets the style, folded onto the one derived from the active theme.
     pub fn style(mut self, style: TextViewStyle) -> Self {
         self.text_style = Some(style);
