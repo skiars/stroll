@@ -2644,7 +2644,7 @@ impl CodeBlock {
                     .child(lang)
             });
 
-        let block = div()
+        let mut block = div()
             .w_full()
             .min_w_0()
             .px_4()
@@ -2727,6 +2727,36 @@ impl CodeBlock {
                                 .mode(crate::ScrollbarMode::Always),
                         ),
                 )
+                .children(actions)
+                .children(lang_label)
+                .into_any_element()
+        } else if matches!(style.code_block().overflow.x, Some(Overflow::Scroll)) {
+            let scroll_id = block_element_id("codeblock-scroll", self.span, options.ix);
+            let scroll_handle = window
+                .use_keyed_state(scroll_id.clone(), cx, |_, _| ScrollHandle::default())
+                .read(cx)
+                .clone();
+            let frame = StyleRefinement {
+                corner_radii: block.style().corner_radii.clone(),
+                ..Default::default()
+            };
+            block.style().overflow.x = None;
+            div()
+                .id(id)
+                .w_full()
+                .min_w_0()
+                .relative()
+                .child(horizontal_scroll_area(
+                    scroll_id,
+                    &scroll_handle,
+                    &frame,
+                    block
+                        .w_auto()
+                        .min_w_full()
+                        .flex()
+                        .flex_col()
+                        .whitespace_nowrap(),
+                ))
                 .children(actions)
                 .children(lang_label)
                 .into_any_element()

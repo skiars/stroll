@@ -1,14 +1,15 @@
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
+use std::time::Duration;
 
 use instant::Instant;
 
 use gpui::{
     Along as _, App, Axis, BorderStyle, Bounds, ContentMask, Edges, Element, ElementId,
     GlobalElementId, Hitbox, Hsla, InteractiveElement as _, IntoElement, IsZero as _, LayoutId,
-    OngoingScroll, PaintQuad, ParentElement as _, Point, Position, ScrollEvent,
-    ScrollHandle, SmoothScroll, StatefulInteractiveElement as _, Style, StyleRefinement,
-    Styled as _, Window, div, px, relative,
+    OngoingScroll, PaintQuad, ParentElement as _, Point, Position, ScrollEvent, ScrollHandle,
+    SmoothScroll, StatefulInteractiveElement as _, Style, StyleRefinement, Styled, TouchPhase,
+    Window, div, px, relative,
 };
 use gpui::{Corners, Pixels};
 
@@ -75,7 +76,7 @@ fn caller_id() -> ElementId {
     ElementId::CodeLocation(*std::panic::Location::caller())
 }
 
-/// A horizontal scroll viewport that only consumes horizontal wheel deltas.
+/// A horizontal document viewport with an overlay scrollbar.
 ///
 /// GPUI's native `overflow_x_scroll` maps vertical wheel input onto horizontal
 /// scrolling when there is no vertical overflow. This wrapper keeps the visual
@@ -85,7 +86,7 @@ pub(crate) fn horizontal_scroll_area(
     id: impl Into<ElementId>,
     scroll_handle: &ScrollHandle,
     style: &StyleRefinement,
-    child: impl IntoElement,
+    child: impl IntoElement + Styled,
 ) -> impl IntoElement {
     let id = id.into();
 
@@ -116,11 +117,19 @@ pub(crate) fn horizontal_scroll_area(
                 .w_full()
                 .refine_style(style)
                 .overflow_hidden()
+                .flex()
                 .track_scroll(scroll_handle)
-                .child(child),
+                .child(child.flex_none()),
         )
-        .child(ScrollableMask::new(Axis::Horizontal, scroll_handle).id(id))
+        .child(ScrollableMask::horizontal_content(scroll_handle).id(id.clone()))
         .child(frame)
+        .child(
+            div().absolute().inset_0().child(
+                crate::Scrollbar::horizontal(scroll_handle)
+                    .id((id, "scrollbar"))
+                    .mode(crate::ScrollbarMode::Always),
+            ),
+        )
 }
 
 /// Keeps a rounded scroll viewport's corners clean at every scroll offset.
@@ -332,6 +341,51 @@ fn corner_notch_path(
     builder.build().ok()
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WheelHandling {
+    AlongAxis,
+    MapVerticalToHorizontal,
+    HorizontalContent,
+}
+
+#[derive(Default)]
+struct ContentScrollGesture {
+    axis: Option<Axis>,
+    has_start: bool,
+    last_packet: Option<Instant>,
+}
+
+impl ContentScrollGesture {
+    fn axis(&mut self, delta: Point<Pixels>, phase: TouchPhase, now: Instant) -> Option<Axis> {
+        // Some platform events only report Moved. In that case a pause
+        // separates gestures. Explicit phases keep the same axis through pauses.
+        if phase == TouchPhase::Started
+            || !self.has_start
+                && self
+                    .last_packet
+                    .is_some_and(|last| now - last >= Duration::from_millis(100))
+        {
+            *self = Self {
+                has_start: phase == TouchPhase::Started,
+                ..Self::default()
+            };
+        }
+        if self.axis.is_none() && !delta.is_zero() {
+            self.axis = Some(if delta.x.abs() > delta.y.abs() {
+                Axis::Horizontal
+            } else {
+                Axis::Vertical
+            });
+        }
+        let axis = self.axis;
+        self.last_packet = Some(now);
+        if matches!(phase, TouchPhase::Ended | TouchPhase::Cancelled) {
+            *self = Self::default();
+        }
+        axis
+    }
+}
+
 /// Make a scrollable mask element to cover the parent view with the mouse wheel event listening.
 ///
 /// When the mouse wheel is scrolled, will move the `scroll_handle` scrolling with the `axis` direction.
@@ -360,9 +414,7 @@ pub struct ScrollableMask<H: ScrollbarHandle + Clone = ScrollHandle> {
     axis: Axis,
     id: ElementId,
     scroll_handle: H,
-    /// Only turn a plain wheel's vertical lines into horizontal scrolling,
-    /// leaving every other event to the scroller below.
-    vertical_wheel: bool,
+    wheel_handling: WheelHandling,
     debug: Option<Hsla>,
 }
 
@@ -374,7 +426,7 @@ impl<H: ScrollbarHandle + Clone> ScrollableMask<H> {
             scroll_handle: scroll_handle.clone(),
             axis,
             id: caller_id(),
-            vertical_wheel: false,
+            wheel_handling: WheelHandling::AlongAxis,
             debug: None,
         }
     }
@@ -391,7 +443,17 @@ impl<H: ScrollbarHandle + Clone> ScrollableMask<H> {
     #[track_caller]
     pub fn vertical_wheel(scroll_handle: &H) -> Self {
         Self {
-            vertical_wheel: true,
+            wheel_handling: WheelHandling::MapVerticalToHorizontal,
+            ..Self::new(Axis::Horizontal, scroll_handle)
+        }
+    }
+
+    /// Scroll inline document content horizontally with a horizontal gesture or
+    /// Shift-wheel. Leave ordinary vertical input to the document viewport.
+    #[track_caller]
+    pub fn horizontal_content(scroll_handle: &H) -> Self {
+        Self {
+            wheel_handling: WheelHandling::HorizontalContent,
             ..Self::new(Axis::Horizontal, scroll_handle)
         }
     }
@@ -486,16 +548,23 @@ impl<H: ScrollbarHandle + Clone> Element for ScrollableMask<H> {
     ) {
         let axis = self.axis;
         let is_horizontal = axis.is_horizontal();
-        let vertical_wheel = self.vertical_wheel;
+        let vertical_wheel = self.wheel_handling == WheelHandling::MapVerticalToHorizontal;
+        let horizontal_content = self.wheel_handling == WheelHandling::HorizontalContent;
+        let content_gesture = global_id.filter(|_| horizontal_content).map(|id| {
+            window.with_element_state::<Rc<RefCell<ContentScrollGesture>>, _>(id, |state, _| {
+                let state = state.unwrap_or_default();
+                (state.clone(), state)
+            })
+        });
         let bounds = hitbox.bounds;
         let ongoing_scroll = global_id
+            .filter(|_| !horizontal_content && !vertical_wheel)
             .map(|global_id| {
                 window.with_element_state::<Rc<RefCell<OngoingScroll>>, _>(global_id, |state, _| {
                     let state = state.unwrap_or_default();
                     (state.clone(), state)
                 })
-            })
-            .unwrap_or_default();
+            });
         let smooth_scroll = global_id.filter(|_| cx.smooth_scrolling()).map(|id| {
             window.with_element_state(id, |state: Option<SmoothScroll>, _| {
                 let state = state.unwrap_or_default();
@@ -538,6 +607,39 @@ impl<H: ScrollbarHandle + Clone> Element for ScrollableMask<H> {
 
                     let mut offset = scroll_handle.offset();
                     let mut delta = event.delta.content_delta();
+                    if let Some(gesture) = &content_gesture {
+                        if scroll_handle.content_size().width
+                            <= scroll_handle.viewport_bounds().size.width
+                            || !delta.x.as_f32().is_finite()
+                            || !delta.y.as_f32().is_finite()
+                        {
+                            return;
+                        }
+                        let horizontal = if event.is_wheel() {
+                            // Some backends already supply the Shift-wheel delta on X.
+                            if event.shift && delta.x.is_zero() {
+                                delta.x = delta.y;
+                            }
+                            !delta.x.is_zero() && (event.shift || delta.x.abs() > delta.y.abs())
+                        } else {
+                            gesture.borrow_mut().axis(
+                                delta,
+                                event.touch_phase,
+                                cx.background_executor().now(),
+                            ) == Some(Axis::Horizontal)
+                        };
+                        if !horizontal {
+                            return;
+                        }
+                        // Even a packet at the horizontal boundary belongs to
+                        // this gesture. Its vertical component must not move
+                        // the page.
+                        cx.stop_propagation();
+                        if delta.x.is_zero() {
+                            return;
+                        }
+                        delta.y = px(0.);
+                    }
                     let animate_wheel = smooth_scroll.is_some() && cx.smooth_scrolling();
 
                     let mut animate = |axis: Axis, distance: Pixels| {
@@ -628,7 +730,9 @@ impl<H: ScrollbarHandle + Clone> Element for ScrollableMask<H> {
                     // Lock the gesture to the axis it started on, so a diagonal
                     // trackpad swipe cannot flip which mask consumes it from one
                     // event to the next. Line deltas carry no touch phase.
-                    if !event.is_wheel() {
+                    if !event.is_wheel()
+                        && let Some(ongoing_scroll) = &ongoing_scroll
+                    {
                         ongoing_scroll
                             .borrow_mut()
                             .lock_axis(&mut delta, event.touch_phase);
@@ -687,18 +791,18 @@ impl<H: ScrollbarHandle + Clone> Element for ScrollableMask<H> {
                             - scroll_handle.viewport_bounds().size.width)
                             .max(px(0.));
                         let current = offset.x.clamp(-axis_max, px(0.));
-                        record_horizontal_scroll(
-                            (offset.x + delta.x).clamp(-axis_max, px(0.)) - current,
-                        );
+                        // The generic mask still lets the div clamp its raw
+                        // offset at prepaint. Document content clamps here.
+                        let next = if horizontal_content {
+                            current
+                        } else {
+                            offset.x
+                        } + delta.x;
+                        let clamped = next.clamp(-axis_max, px(0.));
+                        record_horizontal_scroll(clamped - current);
+                        offset.x = if horizontal_content { clamped } else { next };
                     }
 
-                    offset.x += delta.x;
-
-                    // NOTE: `set_offset` does not clamp (clamping happens in
-                    // the div's prepaint), so any non-zero horizontal-dominant
-                    // delta passes this guard — even at the scroll edge the
-                    // event is consumed rather than turned into a parent
-                    // scroll.
                     if offset != scroll_handle.offset() {
                         scroll_handle.set_offset(offset);
                         cx.notify(view_id);
@@ -1157,37 +1261,17 @@ mod tests {
         });
         assert!(last_horizontal_scroll_claim().is_none());
 
-        // The overscroll only lasts until the next prepaint clamps it, and
-        // `simulate_event` draws after each event, so dispatch these steps
-        // within one update.
-        cx.update(|window, cx| {
-            let mut dispatch = |delta_x: f32| {
-                window.dispatch_event(
-                    gpui::PlatformInput::Scroll(ScrollEvent {
-                        position: point(px(10.), px(10.)),
-                        delta: ScrollDelta::Pixels(point(px(delta_x), px(0.))),
-                        ..Default::default()
-                    }),
-                    cx,
-                );
-            };
-
-            // Reversing an overscroll without re-entering the range does not
-            // move content.
-            scroll_handle.set_offset(point(px(40.), px(0.)));
-            dispatch(-10.);
-            assert!(last_horizontal_scroll_claim().is_none());
-            assert_eq!(scroll_handle.offset().x, px(30.));
-
-            // Only the part of a step that re-enters the range counts as movement.
-            dispatch(-40.);
+        cx.simulate_event(ScrollEvent {
+            position: point(px(10.), px(10.)),
+            delta: ScrollDelta::Pixels(point(px(-250.), px(0.))),
+            ..Default::default()
         });
         let claim = last_horizontal_scroll_claim().expect("a moving step claims");
-        assert_eq!(claim.delta_x(), px(-10.));
-        assert_eq!(scroll_handle.offset().x, px(-10.));
+        assert_eq!(claim.delta_x(), px(-200.));
+        assert_eq!(scroll_handle.offset().x, px(-200.));
 
         // Ignored input keeps the last meaningful claim intact.
-        for delta in [point(px(0.), px(-40.)), point(px(-0.25), px(0.))] {
+        for delta in [point(px(0.), px(-40.)), point(px(0.25), px(0.))] {
             cx.simulate_event(ScrollEvent {
                 position: point(px(10.), px(10.)),
                 delta: ScrollDelta::Pixels(delta),
@@ -1227,9 +1311,8 @@ mod tests {
         });
         assert_eq!(scroll_handle.offset().x, px(-40.));
 
-        // Same gesture, now leaning vertical but under the unlock ratio: the
-        // lock holds and the horizontal offset keeps moving. Comparing this
-        // event alone would zero `delta.x` and stall the scroller at -40.
+        // The same gesture can lean vertical without switching targets.
+        // Comparing only this packet would stall the scroller at -40.
         cx.simulate_event(ScrollEvent {
             position: point(px(10.), px(10.)),
             delta: ScrollDelta::Pixels(point(px(-10.), px(-15.))),
@@ -1239,7 +1322,7 @@ mod tests {
     }
 
     #[gpui::test]
-    fn horizontal_mask_releases_axis_lock_on_a_strong_turn(cx: &mut TestAppContext) {
+    fn horizontal_content_keeps_its_axis_during_a_strong_turn(cx: &mut TestAppContext) {
         let scroll_handle = ScrollHandle::new();
         let cx = setup_horizontal_area_test(cx, &scroll_handle);
 
@@ -1250,14 +1333,13 @@ mod tests {
         });
         assert_eq!(scroll_handle.offset().x, px(-40.));
 
-        // Past the unlock ratio the gesture is no longer horizontal, so the
-        // event stops driving this scroller.
+        // A strong turn is still part of the same gesture.
         cx.simulate_event(ScrollEvent {
             position: point(px(10.), px(10.)),
             delta: ScrollDelta::Pixels(point(px(-10.), px(-25.))),
             ..Default::default()
         });
-        assert_eq!(scroll_handle.offset().x, px(-40.));
+        assert_eq!(scroll_handle.offset().x, px(-50.));
     }
 
     /// Reproduces the DataTable case: a vertically scrollable element

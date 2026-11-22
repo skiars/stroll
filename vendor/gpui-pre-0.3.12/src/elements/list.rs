@@ -173,6 +173,9 @@ impl List {
         };
         let animate = self.state.0.borrow().last_layout_bounds.is_some()
             && !matches!(request, NavigationRequest::Reveal { animate: false, .. });
+        if !matches!(request, NavigationRequest::Distance(_)) {
+            scroll.cancel_navigation();
+        }
         let state = Rc::downgrade(&self.state.0);
         let view = window.current_view();
         scroll.navigate(

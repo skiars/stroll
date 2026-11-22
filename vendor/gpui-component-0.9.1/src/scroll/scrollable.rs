@@ -75,8 +75,8 @@ pub trait ScrollableElement: InteractiveElement + Styled + ParentElement + Eleme
         Scrollable::new(self, ScrollbarAxis::Vertical)
     }
 
-    /// Makes a content reader horizontally scrollable with a persistent
-    /// standard-width scrollbar.
+    /// Makes inline document content scroll horizontally with a horizontal
+    /// gesture or Shift-wheel, with a persistent standard-width scrollbar.
     #[track_caller]
     fn overflow_x_content_scrollbar(self) -> Scrollable<Self> {
         let mut scrollable = Scrollable::new(self, ScrollbarAxis::Horizontal);
@@ -236,6 +236,7 @@ where
             .track_scroll(&scroll_handle)
             .map(|this| match self.axis {
                 ScrollbarAxis::Vertical => this.flex_col().overflow_y_scroll(),
+                ScrollbarAxis::Horizontal if self.persistent => this.flex_row().overflow_hidden(),
                 ScrollbarAxis::Horizontal => this.flex_row().overflow_x_scroll(),
                 ScrollbarAxis::Both => this.overflow_scroll(),
             })
@@ -272,7 +273,11 @@ where
             // A plain mouse wheel has only a vertical axis, which the locked
             // horizontal area above would ignore.
             .when(self.axis == ScrollbarAxis::Horizontal, |this| {
-                this.child(ScrollableMask::vertical_wheel(&scroll_handle))
+                this.child(if self.persistent {
+                    ScrollableMask::horizontal_content(&scroll_handle)
+                } else {
+                    ScrollableMask::vertical_wheel(&scroll_handle)
+                })
             })
             .child(render_scrollbar(scrollbar.id(scrollbar_id), window, cx))
     }

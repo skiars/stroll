@@ -56,6 +56,16 @@ pub(crate) enum ScrollPadding {
     SurroundingLines,
 }
 
+impl ScrollPadding {
+    fn for_direction(direction: Option<MoveDirection>) -> Self {
+        if direction.is_some() {
+            Self::SurroundingLines
+        } else {
+            Self::Minimal
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 pub(super) enum ProjectedScroll {
     Line {
@@ -3279,12 +3289,12 @@ impl<M: InputModeKind> InputBaseState<M> {
         direction: Option<MoveDirection>,
         cx: &mut Context<Self>,
     ) {
-        let padding = if direction.is_some() {
-            ScrollPadding::SurroundingLines
-        } else {
-            ScrollPadding::Minimal
-        };
-        self.scroll_to_with_padding(offset, direction, padding, cx);
+        self.scroll_to_with_padding(
+            offset,
+            direction,
+            ScrollPadding::for_direction(direction),
+            cx,
+        );
     }
 
     /// Reveal an offset with independently chosen direction restriction and padding.
@@ -3296,8 +3306,40 @@ impl<M: InputModeKind> InputBaseState<M> {
         padding: ScrollPadding,
         cx: &mut Context<Self>,
     ) {
-        let retargeting = self.is_scroll_navigating() && cx.smooth_scrolling() && !cx.reduce_motion();
-        self.cancel_scroll_navigation();
+        self.queue_scroll_to(offset, direction, padding, false, cx);
+    }
+
+    pub(super) fn scroll_for_keyboard_navigation(
+        &mut self,
+        direction: Option<MoveDirection>,
+        cx: &mut Context<Self>,
+    ) {
+        self.queue_scroll_to(
+            self.cursor(),
+            direction,
+            ScrollPadding::for_direction(direction),
+            direction.is_some(),
+            cx,
+        );
+        self.animate_pending_scroll();
+    }
+
+    fn queue_scroll_to(
+        &mut self,
+        offset: usize,
+        direction: Option<MoveDirection>,
+        padding: ScrollPadding,
+        continue_navigation: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let retargeting =
+            self.is_scroll_navigating() && cx.smooth_scrolling() && !cx.reduce_motion();
+        if continue_navigation && self.is_code_editor() && retargeting {
+            self.deferred_scroll_offset = None;
+            self.pending_projected_scroll = None;
+        } else {
+            self.cancel_scroll_navigation();
+        }
         let Some(last_layout) = self.last_layout.as_ref() else {
             return;
         };

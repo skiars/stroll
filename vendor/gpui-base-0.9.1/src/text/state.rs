@@ -144,6 +144,7 @@ pub struct TextViewState {
     pub(super) selectable: bool,
     pub(super) selection_format: SelectionFormat,
     pub(super) scrollable: bool,
+    scrollable_content_width: Option<(Pixels, gpui::AbsoluteLength)>,
     pub(super) max_lines: Option<usize>,
     /// Line spans reported by `Inline` during prepaint (collected only while
     /// [`Self::max_lines`] is set); cleared by `TextView` at each frame start.
@@ -264,6 +265,7 @@ impl TextViewState {
             selectable: false,
             selection_format: SelectionFormat::default(),
             scrollable: false,
+            scrollable_content_width: None,
             max_lines: None,
             line_spans: Arc::default(),
             clamped: false,
@@ -347,6 +349,17 @@ impl TextViewState {
     /// Set whether the text view scrolls internally, default false.
     pub fn scrollable(mut self, scrollable: bool) -> Self {
         self.scrollable = scrollable;
+        self
+    }
+
+    /// Centers scrollable rows within a maximum width, including padding on
+    /// each side. The viewport and its scrollbar still use the full width.
+    pub fn scrollable_content_width(
+        mut self,
+        max_width: Pixels,
+        side_padding: impl Into<gpui::AbsoluteLength>,
+    ) -> Self {
+        self.scrollable_content_width = Some((max_width, side_padding.into()));
         self
     }
 
@@ -1391,6 +1404,7 @@ impl Render for TextViewState {
                     } else {
                         None
                     },
+                    self.scrollable_content_width,
                     &node_cx,
                     window,
                     cx,

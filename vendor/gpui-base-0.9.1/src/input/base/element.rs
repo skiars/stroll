@@ -1325,11 +1325,12 @@ impl<M: InputModeKind> TextElement<M> {
         };
         let projected = state.pending_projected_scroll;
         let caret = state.cursor();
+        let caret_affinity = state.cursor_line_end_affinity;
         let revision = state.document_revision;
         let caret_top = move |state: &InputBaseState<M>, height| {
             let row = state
                 .display_map
-                .offset_to_display_row(caret, state.cursor_line_end_affinity);
+                .offset_to_display_row(caret, caret_affinity);
             state.display_map.display_row_top(row, height)
         };
         let inset = target.y + caret_top(state, line_height);
@@ -1350,10 +1351,11 @@ impl<M: InputModeKind> TextElement<M> {
             target.x,
             clamp_y(state, target.y, line_height, viewport_height),
         );
+        let scroll = state.scroll_handle.smooth_scroll();
         if current == target {
+            scroll.cancel_navigation();
             return;
         }
-        let scroll = state.scroll_handle.smooth_scroll();
         self.state.update(cx, |state, _| {
             state.deferred_scroll_offset = None;
             state.overscroll.reset();
@@ -1368,7 +1370,13 @@ impl<M: InputModeKind> TextElement<M> {
             move |last, next, _, cx| {
                 editor
                     .update(cx, |state, cx| {
-                        if state.document_revision != revision || state.cursor() != caret {
+                        // The frame callback runs before prepaint can install the
+                        // queued keyboard target. Sample this curve through the
+                        // handoff so the new target can inherit its velocity.
+                        if state.document_revision != revision
+                            || (state.cursor() != caret
+                                && (projected.is_some() || !state.pending_scroll_navigation))
+                        {
                             return None;
                         }
                         let current = state.scroll_offset();

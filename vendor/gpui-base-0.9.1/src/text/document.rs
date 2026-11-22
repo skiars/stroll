@@ -1,5 +1,6 @@
 use gpui::{
-    App, IntoElement, ListState, ParentElement as _, SharedString, Styled as _, Window, div,
+    AbsoluteLength, App, IntoElement, ListState, ParentElement as _, Pixels, SharedString,
+    Styled as _, Window, div,
 };
 
 use std::{
@@ -240,6 +241,7 @@ impl ParsedDocument {
     pub(super) fn render_root(
         &self,
         list_state: Option<ListState>,
+        content_width: Option<(Pixels, AbsoluteLength)>,
         node_cx: &NodeContext,
         window: &mut Window,
         cx: &mut App,
@@ -281,7 +283,7 @@ impl ParsedDocument {
                 move |ix, window, cx| {
                     let is_last = ix + 1 == blocks.len();
                     let (is_first, prev) = flow_position(&blocks, ix);
-                    blocks[ix]
+                    let row = blocks[ix]
                         .render_block(
                             NodeRenderOptions {
                                 ix,
@@ -294,7 +296,16 @@ impl ParsedDocument {
                             window,
                             cx,
                         )
-                        .into_any_element()
+                        .into_any_element();
+                    match content_width {
+                        Some((width, padding)) => div()
+                            .w_full()
+                            .flex()
+                            .justify_center()
+                            .child(div().w_full().min_w_0().max_w(width).px(padding).child(row))
+                            .into_any_element(),
+                        None => row,
+                    }
                 }
             })
             .size_full(),

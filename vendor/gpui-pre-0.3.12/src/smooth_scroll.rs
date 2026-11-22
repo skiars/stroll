@@ -9,11 +9,14 @@ use scheduler::Instant;
 
 use crate::{App, Pixels, Point, Window, point, px};
 
+#[path = "scroll_navigation.rs"]
+mod navigation;
+use navigation::NavigationAxis;
+
 const HALF_LIFE: Duration = Duration::from_millis(24);
 // A stalled UI frame should not spend the entire scroll distance at once.
 const MAX_FRAME_STEP: Duration = Duration::from_millis(25);
 const SETTLE_DISTANCE: f32 = 0.5;
-const NAVIGATION_DURATION: Duration = Duration::from_millis(140);
 
 type ApplyScroll =
     dyn FnMut(Point<Pixels>, Point<Pixels>, &mut Window, &mut App) -> Option<Point<Pixels>>;
@@ -62,8 +65,8 @@ struct ScrollAnimation {
 
 struct Navigation {
     running: Rc<Cell<bool>>,
-    start: Point<Pixels>,
-    elapsed: Duration,
+    x: NavigationAxis,
+    y: NavigationAxis,
 }
 
 impl SmoothScroll {
@@ -101,13 +104,31 @@ impl SmoothScroll {
         ) -> Option<Point<Pixels>>
         + 'static,
     ) -> bool {
-        self.cancel_navigation();
         let id = Rc::as_ptr(&self.0) as usize;
+        let animate = cx.smooth_scrolling() && !cx.reduce_motion() && viewport_height > px(0.);
+        if animate
+            && current != target
+            && let Some(active) = window.smooth_scroll.active.get_mut(&id)
+            && let Some(navigation) = active.navigation.as_mut()
+            && navigation.running.get()
+            && (active.last.x - current.x).abs() <= px(SETTLE_DISTANCE)
+            && (active.last.y - current.y).abs() <= px(SETTLE_DISTANCE)
+        {
+            navigation.x.retarget(current.x.as_f32(), target.x.as_f32());
+            navigation.y.retarget(current.y.as_f32(), target.y.as_f32());
+            active.target = target;
+            // Refresh the receiver even at the same target: the caret or the
+            // list anchor can change while the viewport is still arriving.
+            active.apply = Box::new(apply);
+            return true;
+        }
+
+        self.cancel_navigation();
         window.smooth_scroll.active.remove(&id);
         if current == target {
             return false;
         }
-        if !cx.smooth_scrolling() || cx.reduce_motion() || viewport_height <= px(0.) {
+        if !animate {
             apply(current, target, window, cx);
             return false;
         }
@@ -133,8 +154,8 @@ impl SmoothScroll {
                 sampled_at: cx.background_executor().now(),
                 navigation: Some(Navigation {
                     running,
-                    start,
-                    elapsed: Duration::ZERO,
+                    x: NavigationAxis::new(start.x.as_f32(), target.x.as_f32()),
+                    y: NavigationAxis::new(start.y.as_f32(), target.y.as_f32()),
                 }),
                 apply: Box::new(apply),
             },
@@ -255,18 +276,18 @@ fn tick(window: &mut Window, cx: &mut App) {
             if !navigation.running.get() {
                 continue;
             }
-            navigation.elapsed += elapsed;
-            let finished = navigation.elapsed >= NAVIGATION_DURATION
-                || !cx.smooth_scrolling()
-                || cx.reduce_motion();
-            let remaining_time =
-                1. - navigation.elapsed.as_secs_f32() / NAVIGATION_DURATION.as_secs_f32();
-            let next = if finished {
-                animation.target
+            if !cx.smooth_scrolling() || cx.reduce_motion() {
+                (animation.target, true)
             } else {
-                animation.target - (animation.target - navigation.start) * remaining_time.powi(3)
-            };
-            (next, finished)
+                let next = point(
+                    px(navigation.x.advance(elapsed)),
+                    px(navigation.y.advance(elapsed)),
+                );
+                (
+                    next,
+                    navigation.x.is_finished() && navigation.y.is_finished(),
+                )
+            }
         } else {
             let remaining = animation.target - animation.last;
             let finished = remaining.x.as_f32().abs().max(remaining.y.as_f32().abs())

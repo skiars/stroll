@@ -603,6 +603,7 @@ impl DocReader {
                 cx,
             )
             .scrollable(true)
+            .scrollable_content_width(px(860.), rems(1.25))
             .track_viewport_line()
         });
         text.read(cx).list_state().set_pixel_aligned_scroll(true);
@@ -1127,6 +1128,14 @@ impl Render for DocReader {
         };
         let mut table = StyleRefinement::default().rounded(px(9.));
         table.overflow.x = Some(Overflow::Scroll);
+        let mut code_block = StyleRefinement::default()
+            .rounded(px(9.))
+            .border_0()
+            .p(px(12.))
+            .line_height(relative(1.5))
+            .font_family(code_font.clone())
+            .text_size(px(self.typography.code_block_font_size as f32));
+        code_block.overflow.x = Some(Overflow::Scroll);
         let style = TextViewStyle {
             heading_base_font_size: px(self.typography.body_font_size as f32),
             highlight_theme: theme.highlight_theme.clone(),
@@ -1150,15 +1159,7 @@ impl Render for DocReader {
         // Tables keep only their row rules: a transparent cell border color
         // leaves the column dividers painted by the row slack invisible.
         .table_cell(StyleRefinement::default().border_color(theme.transparent))
-        .code_block(
-            StyleRefinement::default()
-                .rounded(px(9.))
-                .border_0()
-                .p(px(12.))
-                .line_height(relative(1.5))
-                .font_family(code_font.clone())
-                .text_size(px(self.typography.code_block_font_size as f32)),
-        );
+        .code_block(code_block);
         let code_languages = self
             .workspace
             .upgrade()
@@ -1180,8 +1181,6 @@ impl Render for DocReader {
             .h_full()
             .min_h_0()
             .w_full()
-            .max_w(px(860.))
-            .px_5()
             .markdown_extensions(self.document.extensions.clone())
             .image_source({
                 let resolve_image = resolve_image.clone();
@@ -1262,7 +1261,6 @@ impl Render for DocReader {
             .h_full()
             .min_w_0()
             .min_h_0()
-            .max_w(px(860.))
             .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, window, cx| {
                 let text = this.text.read(cx);
                 if event.keystroke.modifiers.modified() || !text.focus_handle().is_focused(window) {
@@ -1343,14 +1341,7 @@ impl Render for DocReader {
                         cx.notify();
                     }))
                     .items_start()
-                    .child(
-                        h_flex()
-                            .flex_1()
-                            .min_w_0()
-                            .h_full()
-                            .justify_center()
-                            .child(body),
-                    )
+                    .child(body)
                     .when(show_outline, |el| el.child(self.outline(cx, colors))),
             )
     }
@@ -1441,6 +1432,307 @@ mod tests {
             &doc.source[doc.headings[1].source.clone()],
             "## 中文 & Code"
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    fn draw_scroll_test_frame(visual: &mut VisualTestContext) {
+        for _ in 0..4 {
+            visual.run_until_parked();
+            visual.update(|window, cx| {
+                window.simulate_next_frame(cx);
+                window.draw(cx).clear(cx);
+            });
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn document_scroll_thumb(
+        visual: &mut VisualTestContext,
+        axis: Axis,
+        viewport: Bounds<Pixels>,
+    ) -> Option<Bounds<Pixels>> {
+        visual.update(|window, _| {
+            let scale = window.scale_factor();
+            window
+                .painted_quads()
+                .into_iter()
+                .map(|quad| {
+                    let to_pixels = |value: ScaledPixels| px(value.as_f32() / scale);
+                    Bounds::new(
+                        point(to_pixels(quad.bounds.left()), to_pixels(quad.bounds.top())),
+                        size(
+                            to_pixels(quad.bounds.size.width),
+                            to_pixels(quad.bounds.size.height),
+                        ),
+                    )
+                })
+                .find(|bounds| match axis {
+                    Axis::Horizontal => {
+                        (px(5.9)..=px(8.1)).contains(&bounds.size.height)
+                            && bounds.size.width >= px(18.)
+                    }
+                    Axis::Vertical => {
+                        (bounds.size.width - px(6.)).abs() < px(0.1)
+                            && bounds.size.height >= px(18.)
+                            && (viewport.right() - bounds.right()).abs() < px(16.)
+                    }
+                })
+        })
+    }
+
+    #[cfg(target_os = "linux")]
+    #[gpui::test]
+    fn markdown_reader_scrolls_from_both_margins_and_paints_the_thumb_at_the_pane_edge(
+        cx: &mut TestAppContext,
+    ) {
+        let source = (0..40)
+            .map(|index| format!("## Section {index}\n\n{}", "Short paragraph.\n\n".repeat(5)))
+            .collect::<String>();
+        let (reader, visual) = cx.add_window_view(|window, cx| {
+            gpui_component::init(cx);
+            cx.set_reduce_motion(true);
+            cx.set_smooth_scrolling(false);
+            let mut reader = DocReader::new(
+                PathBuf::new(),
+                PathBuf::from("README.md"),
+                PreparedDocument::new(source).unwrap(),
+                None,
+                WeakEntity::new_invalid(),
+                window,
+                cx,
+            );
+            reader.set_outline_layout(px(220.), Some(true), false);
+            reader
+        });
+        visual.simulate_resize(size(px(1500.), px(540.)));
+        draw_scroll_test_frame(visual);
+
+        let (list, outline) = visual.update(|_, cx| {
+            let reader = reader.read(cx);
+            (
+                reader.text.read(cx).list_state().clone(),
+                reader.outline_scroll.clone(),
+            )
+        });
+        let viewport = list.viewport_bounds();
+        assert!(viewport.size.width > px(1100.), "{viewport:?}");
+        assert!(outline.bounds().left() - viewport.right() < px(16.));
+        let thumb = document_scroll_thumb(visual, Axis::Vertical, viewport)
+            .expect("the thumb is on the right edge of the reading pane");
+
+        let y = viewport.center().y;
+        for x in [viewport.left() + px(36.), viewport.right() - px(36.)] {
+            let before = list.scroll_px_offset_for_scrollbar().y;
+            visual.simulate_event(ScrollEvent {
+                position: point(x, y),
+                delta: ScrollDelta::Lines(point(0., -2.)),
+                ..Default::default()
+            });
+            draw_scroll_test_frame(visual);
+            assert_eq!(list.scroll_px_offset_for_scrollbar().y, before - px(60.));
+        }
+
+        let moved_thumb = document_scroll_thumb(visual, Axis::Vertical, viewport).unwrap();
+        assert!(moved_thumb.top() > thumb.top());
+        let before = list.scroll_px_offset_for_scrollbar().y;
+        visual.simulate_mouse_move(moved_thumb.center(), None, Modifiers::default());
+        visual.simulate_mouse_down(
+            moved_thumb.center(),
+            MouseButton::Left,
+            Modifiers::default(),
+        );
+        let drag_to = moved_thumb.center() + point(px(0.), px(50.));
+        visual.simulate_mouse_move(drag_to, MouseButton::Left, Modifiers::default());
+        visual.simulate_mouse_up(drag_to, MouseButton::Left, Modifiers::default());
+        draw_scroll_test_frame(visual);
+        assert!(list.scroll_px_offset_for_scrollbar().y < before);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[gpui::test]
+    fn markdown_wide_blocks_route_vertical_input_to_the_reader_and_scroll_horizontally(
+        cx: &mut TestAppContext,
+    ) {
+        let diagram = include_str!("../tests/fixtures/mermaid-layout.md")
+            .split_once("## Wide horizontal chain\n\n")
+            .unwrap()
+            .1
+            .split_once("\n\n## ")
+            .unwrap()
+            .0;
+        let formula = format!("$$\n{}z\n$$", "x+".repeat(110));
+        let table = format!(
+            "|{}|\n|{}|\n|{}|",
+            " Column header |".repeat(27).trim_end_matches('|'),
+            "---|".repeat(27).trim_end_matches('|'),
+            " entry |".repeat(27).trim_end_matches('|'),
+        );
+        let code = format!("```text\n{}\n```", "0123456789".repeat(40));
+        for (kind, block) in [
+            ("Mermaid", diagram),
+            ("formula", formula.as_str()),
+            ("table", table.as_str()),
+            ("code", code.as_str()),
+        ] {
+            let preceding = "Before the block.\n\n".repeat(3);
+            let source = format!(
+                "{preceding}{block}\n\n{}",
+                "Short paragraph.\n\n".repeat(100)
+            );
+            let (reader, visual) = cx.add_window_view(|window, cx| {
+                gpui_component::init(cx);
+                cx.set_reduce_motion(true);
+                cx.set_smooth_scrolling(false);
+                DocReader::new(
+                    PathBuf::new(),
+                    PathBuf::from("README.md"),
+                    PreparedDocument::new(source).unwrap(),
+                    None,
+                    WeakEntity::new_invalid(),
+                    window,
+                    cx,
+                )
+            });
+            visual.simulate_resize(size(px(1400.), px(540.)));
+            draw_scroll_test_frame(visual);
+            let list = visual.update(|_, cx| reader.read(cx).text.read(cx).list_state().clone());
+            let viewport = list.viewport_bounds();
+            let position = list.bounds_for_item(3).unwrap().center();
+            let page_y = || list.scroll_px_offset_for_scrollbar().y;
+            let thumb = |visual: &mut VisualTestContext| {
+                document_scroll_thumb(visual, Axis::Horizontal, viewport).unwrap_or_else(|| {
+                    panic!(
+                        "{kind}: missing horizontal thumb at page offset {:?}",
+                        page_y()
+                    )
+                })
+            };
+            let send = |visual: &mut VisualTestContext, source, phase, delta, shift| {
+                visual.simulate_event(ScrollEvent {
+                    position,
+                    delta,
+                    source,
+                    touch_phase: phase,
+                    modifiers: Modifiers {
+                        shift,
+                        ..Default::default()
+                    },
+                });
+                draw_scroll_test_frame(visual);
+            };
+
+            let touchpad = |visual: &mut VisualTestContext, phase, x, y| {
+                send(
+                    visual,
+                    ScrollSource::Touchpad,
+                    phase,
+                    ScrollDelta::Pixels(point(px(x), px(y))),
+                    false,
+                );
+            };
+            let shift_wheel = |visual: &mut VisualTestContext, x, y| {
+                send(
+                    visual,
+                    ScrollSource::Pointer,
+                    TouchPhase::Moved,
+                    ScrollDelta::Lines(point(x, y)),
+                    true,
+                );
+            };
+
+            let start = thumb(visual);
+            touchpad(visual, TouchPhase::Started, -62., -19.);
+            let horizontal = thumb(visual);
+            assert!(
+                horizontal.left() > start.left(),
+                "{kind}: touchpad horizontal"
+            );
+            touchpad(visual, TouchPhase::Moved, -16., -80.);
+            assert_eq!(page_y(), px(0.), "{kind}: keep the initial horizontal axis");
+            assert!(
+                thumb(visual).left() > horizontal.left(),
+                "{kind}: horizontal continuation"
+            );
+            touchpad(visual, TouchPhase::Ended, 0., 0.);
+
+            let before = thumb(visual);
+            shift_wheel(visual, 0., -5.);
+            assert!(
+                thumb(visual).left() > before.left(),
+                "{kind}: Shift-wheel on Y"
+            );
+            let before = thumb(visual);
+            shift_wheel(visual, 5., 0.);
+            assert!(
+                thumb(visual).left() < before.left(),
+                "{kind}: native Shift-wheel on X"
+            );
+            assert_eq!(page_y(), px(0.), "{kind}: Shift-wheel only moves the block");
+
+            let drag_from = thumb(visual).center();
+            visual.simulate_mouse_move(drag_from, None, Modifiers::default());
+            visual.simulate_mouse_down(drag_from, MouseButton::Left, Modifiers::default());
+            let drag_to = point(drag_from.x + px(40.), drag_from.y);
+            visual.simulate_mouse_move(drag_to, MouseButton::Left, Modifiers::default());
+            visual.simulate_mouse_up(drag_to, MouseButton::Left, Modifiers::default());
+            draw_scroll_test_frame(visual);
+            assert!(
+                thumb(visual).center().x > drag_from.x,
+                "{kind}: horizontal thumb drag"
+            );
+            assert_eq!(page_y(), px(0.), "{kind}: thumb drag only moves the block");
+
+            shift_wheel(visual, 0., -1000.);
+            let block_x = thumb(visual).left();
+            touchpad(visual, TouchPhase::Started, -80., -19.);
+            touchpad(visual, TouchPhase::Moved, 0., -60.);
+            touchpad(visual, TouchPhase::Ended, 0., 0.);
+            assert_eq!(
+                page_y(),
+                px(0.),
+                "{kind}: horizontal boundary never moves the page"
+            );
+            assert_eq!(
+                thumb(visual).left(),
+                block_x,
+                "{kind}: horizontal boundary stays clamped"
+            );
+
+            for (source, phase, delta, distance) in [
+                (
+                    ScrollSource::Pointer,
+                    TouchPhase::Moved,
+                    ScrollDelta::Lines(point(0., -1.)),
+                    px(30.),
+                ),
+                (
+                    ScrollSource::PreciseWheel,
+                    TouchPhase::Moved,
+                    ScrollDelta::Pixels(point(px(0.), px(-17.))),
+                    px(17.),
+                ),
+                (
+                    ScrollSource::Touchpad,
+                    TouchPhase::Started,
+                    ScrollDelta::Pixels(point(px(-6.), px(-24.))),
+                    px(24.),
+                ),
+            ] {
+                list.set_offset_from_scrollbar(point(px(0.), px(0.)));
+                draw_scroll_test_frame(visual);
+                send(visual, source, phase, delta, false);
+                assert_eq!(
+                    page_y(),
+                    -distance,
+                    "{kind}: vertical {source:?} belongs to the page"
+                );
+                assert_eq!(
+                    thumb(visual).left(),
+                    block_x,
+                    "{kind}: vertical input never moves the block"
+                );
+            }
+        }
     }
 
     #[cfg(target_os = "linux")]

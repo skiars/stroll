@@ -236,8 +236,7 @@ impl<M: InputModeKind> InputBaseState<M> {
         self.selections.merge_overlapping();
 
         self.cursor_line_end_affinity = active_affinity;
-        self.scroll_to(self.cursor(), direction, cx);
-        self.animate_pending_scroll();
+        self.scroll_for_keyboard_navigation(direction, cx);
         self.pause_blink_cursor(cx);
         M::hide_context_menu(self, cx);
         M::clear_inline_completion(self, cx);
