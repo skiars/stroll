@@ -1247,6 +1247,11 @@ impl Render for DocReader {
             }
         })
         .table(table)
+        .table_head(
+            StyleRefinement::default()
+                .bg(colors.hover)
+                .text_color(colors.ink),
+        )
         // Tables keep only their row rules: a transparent cell border color
         // leaves the column dividers painted by the row slack invisible.
         .table_cell(StyleRefinement::default().border_color(theme.transparent))
