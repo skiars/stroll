@@ -302,14 +302,17 @@ fn diff_file_headers_render_theme_lighting_before_and_after_pinning() -> Result<
             panel.diff.read(cx).editor_viewport_position()
         })
     };
-    let assert_lighting = |image: &RgbaImage, header: Bounds<ScaledPixels>, mode| {
+    let assert_lighting = |image: &RgbaImage, header: Bounds<ScaledPixels>, mode, phase: &str| {
         let x = |fraction| (header.left().0 + header.size.width.0 * fraction) as u32;
         let y = header.top().0 as u32;
         let face = image.get_pixel(x(0.20), y + 4).0;
         let other_end = image.get_pixel(x(0.97), y + 4).0;
         let shadow = image.get_pixel(x(0.83), y + 33).0;
         let below = image.get_pixel(x(0.83), y + 46).0;
-        assert!(shadow[0] < below[0], "{mode:?}: {shadow:?} vs {below:?}");
+        assert!(
+            shadow[0] < below[0],
+            "{mode:?} {phase} at {header:?}: {shadow:?} vs {below:?}"
+        );
         if mode == ThemeMode::Light {
             let warmth = |pixel: [u8; 4]| i16::from(pixel[0]) - i16::from(pixel[2]);
             assert_eq!(other_end, [255; 4]);
@@ -360,7 +363,7 @@ fn diff_file_headers_render_theme_lighting_before_and_after_pinning() -> Result<
         visible.sort_by(|a, b| a.top().0.total_cmp(&b.top().0));
         assert_eq!(visible.len(), 2, "{mode:?}: {visible:?}");
         let in_flow = cx.capture_screenshot(window)?;
-        assert_lighting(&in_flow, visible[1], mode);
+        assert_lighting(&in_flow, visible[1], mode, "in flow");
         if mode.is_dark() {
             // Sample over the neutral hunk header before scrolling it out of view.
             let x = (visible[1].left().0 + visible[1].size.width.0 * 0.20) as u32;
@@ -386,6 +389,15 @@ fn diff_file_headers_render_theme_lighting_before_and_after_pinning() -> Result<
                     .to_platform_input(),
                     cx,
                 );
+                // Keep the hunk toolbar out of the lighting samples after scrolling.
+                window.dispatch_event(
+                    MouseMoveEvent {
+                        position: point(px(aligned.left().0 + 100.), px(0.)),
+                        ..Default::default()
+                    }
+                    .to_platform_input(),
+                    cx,
+                );
             })?;
             settle(cx)
         };
@@ -402,7 +414,7 @@ fn diff_file_headers_render_theme_lighting_before_and_after_pinning() -> Result<
         let pinned = headers(&mut cx, mode)?.pop().unwrap();
         assert_eq!(pinned, aligned);
         let pinned_image = cx.capture_screenshot(window)?;
-        assert_lighting(&pinned_image, pinned, mode);
+        assert_lighting(&pinned_image, pinned, mode, "pinned");
         let x = pinned.left().0 as u32;
         let y = pinned.top().0 as u32;
         for dy in [4, 16, 28] {
