@@ -34,7 +34,7 @@ use crate::{
 
 use crate::repository::{
     DirectoryEntry, DirectoryListing, Location, RecentRepository, Repository, Store, Worktree,
-    directory_name, project_name,
+    directory_name, project_name, ssh_project_name,
 };
 
 use super::{
@@ -310,6 +310,10 @@ impl RepositoryUi {
         }
         paths::display(&path)
     }
+
+    fn repository_path_label(&self, root: &Path, common_dir: &Path, home: Option<&Path>) -> String {
+        ssh_repository_path_label(root, common_dir, home).unwrap_or_else(|| self.path_label(root))
+    }
 }
 
 impl Workspace {
@@ -569,12 +573,7 @@ impl Workspace {
             let supports_browse = session
                 .call::<u32>(Request::Hello(crate::remote::BROWSE_VERSION))
                 .is_ok_and(|version| version == crate::remote::BROWSE_VERSION);
-            let directory = supports_browse.then(|| {
-                session.call::<DirectoryListing>(Request::Browse {
-                    path: query,
-                    base: None,
-                })
-            });
+            let directory = supports_browse.then(|| session.browse_directory(query, None));
             Ok::<_, anyhow::Error>((session, directory))
         });
         ui.remote.task = cx.spawn_in(window, async move |this, cx| {
@@ -673,10 +672,7 @@ impl Workspace {
         ui.directory_error = None;
         ui.tab = PickerTab::Browse;
         let query = cx.background_spawn(async move {
-            session.call::<DirectoryListing>(Request::Browse {
-                path: path.display().to_string(),
-                base,
-            })
+            session.browse_directory(path.display().to_string(), base)
         });
         ui.directory_task = cx.spawn_in(window, async move |this, cx| {
             let result = query.await;
@@ -1408,6 +1404,11 @@ impl Workspace {
         let recents: Vec<_> = self.quick_recents().collect();
         let path = paths::display(&repo.root);
         let remote = repo.ssh.is_some();
+        let path_label = ui.repository_path_label(
+            &repo.root,
+            &repo.common_dir,
+            repo.ssh.as_ref().and_then(SshSession::home),
+        );
         let opening = ui.opening.is_some();
         let mut handles = ui.menu_rows.iter();
         let worktrees: Vec<_> = ui
@@ -1530,7 +1531,7 @@ impl Workspace {
                     .child(
                         path_line(colors, cx)
                             .truncate()
-                            .child(ui.path_label(&repo.root))
+                            .child(path_label)
                             .managed_tooltip(move |_, cx| {
                                 cx.new(|_| Tooltip::new(path.clone())).into()
                             }),
@@ -2107,11 +2108,16 @@ impl Workspace {
             .is_some_and(|repo| repo.root == item.root);
         let root = item.root.clone();
         let missing = show_missing && ui.unavailable.contains(&root);
-        let online = self.repository_is_online(&root);
+        let ssh = self.online_repository_ssh(&root);
+        let online = ssh.is_some();
         let detail = path_line(colors, cx)
             .debug_selector(|| "recent-repository-path".into())
             .truncate()
-            .child(ui.path_label(&root));
+            .child(ui.repository_path_label(
+                &root,
+                &item.common_dir,
+                ssh.and_then(SshSession::home),
+            ));
         picker_row(
             format!("recent-repository:{}", root.display()),
             IconName::FolderGit2,
@@ -2142,13 +2148,13 @@ impl Workspace {
         }))
     }
 
-    fn repository_is_online(&self, root: &Path) -> bool {
+    fn online_repository_ssh(&self, root: &Path) -> Option<&SshSession> {
         self.repository
             .iter()
             .chain(&self.recent_ssh_repositories)
             .find(|repo| repo.root == root)
             .and_then(|repo| repo.ssh.as_ref())
-            .is_some_and(|ssh| ssh.failure().is_none())
+            .filter(|ssh| ssh.failure().is_none())
     }
 
     fn repository_directory(
@@ -2456,6 +2462,61 @@ fn feedback(message: impl Into<SharedString>, error: bool, colors: Palette) -> S
         .text_size(px(12.))
         .text_color(if error { colors.warning } else { colors.muted })
         .child(message.into())
+}
+
+fn ssh_repository_path_label(
+    root: &Path,
+    common_dir: &Path,
+    home: Option<&Path>,
+) -> Option<String> {
+    let target = SshTarget::parse(root).ok()??;
+    let project = ssh_project_name(&target, common_dir);
+    let path = target.path.to_str()?;
+    let path = match path.rsplit_once('/') {
+        Some((_, name)) if name == project => &path[..path.len() - name.len()],
+        _ => path,
+    };
+    if let Some(home) = home.and_then(Path::to_str) {
+        if path == home {
+            return Some("~".into());
+        }
+        let home = home.trim_end_matches('/');
+        if let Some(relative) = path.strip_prefix(home).filter(|path| path.starts_with('/')) {
+            return Some(format!("~{relative}"));
+        }
+    }
+    Some(path.to_owned())
+}
+
+#[cfg(test)]
+#[::core::prelude::v1::test]
+fn ssh_repository_path_label_omits_only_redundant_components() {
+    let root = Path::new("ssh://remote-laptop/home/gwl/Documents/code/silken-hollow");
+    let common_dir = Path::new("ssh://remote-laptop/home/gwl/Documents/code/silken-hollow/.git");
+    assert_eq!(
+        ssh_repository_path_label(root, common_dir, None).as_deref(),
+        Some("/home/gwl/Documents/code/")
+    );
+    let home = Some(Path::new("/home/gwl"));
+    assert_eq!(
+        ssh_repository_path_label(root, common_dir, home).as_deref(),
+        Some("~/Documents/code/")
+    );
+    let other_home = Some(Path::new("/home/gw"));
+    assert_eq!(
+        ssh_repository_path_label(root, common_dir, other_home).as_deref(),
+        Some("/home/gwl/Documents/code/")
+    );
+    let main_git_dir = Path::new("ssh://remote-laptop/home/gwl/Documents/code/main-checkout/.git");
+    assert_eq!(
+        ssh_repository_path_label(root, main_git_dir, home).as_deref(),
+        Some("~/Documents/code/silken-hollow")
+    );
+    let repo = Path::new("ssh://remote-laptop/repo");
+    assert_eq!(
+        ssh_repository_path_label(repo, &repo.join(".git"), None).as_deref(),
+        Some("/")
+    );
 }
 
 fn path_line(colors: Palette, cx: &App) -> Stateful<Div> {

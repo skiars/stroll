@@ -254,13 +254,7 @@ impl RecentRepository {
 #[cfg(any(feature = "desktop", test))]
 pub(crate) fn project_name(root: &Path, common_dir: &Path) -> String {
     if let Ok(Some(target)) = crate::remote::SshTarget::parse(root) {
-        let unnamed = t!("repository.unnamed");
-        let project = common_dir
-            .to_str()
-            .and_then(|path| path.strip_suffix("/.git"))
-            .and_then(|path| path.rsplit('/').next())
-            .or_else(|| target.path.file_name().and_then(|name| name.to_str()))
-            .unwrap_or(&unnamed);
+        let project = ssh_project_name(&target, common_dir);
         return format!("{project} · {}", target.authority());
     }
     let project = if common_dir.file_name().is_some_and(|name| name == ".git") {
@@ -269,6 +263,16 @@ pub(crate) fn project_name(root: &Path, common_dir: &Path) -> String {
         root
     };
     directory_name(project)
+}
+
+#[cfg(any(feature = "desktop", test))]
+pub(crate) fn ssh_project_name(target: &crate::remote::SshTarget, common_dir: &Path) -> String {
+    common_dir
+        .to_str()
+        .and_then(|path| path.strip_suffix("/.git"))
+        .and_then(|path| path.rsplit('/').next())
+        .or_else(|| target.path.file_name().and_then(|name| name.to_str()))
+        .map_or_else(|| t!("repository.unnamed").into_owned(), str::to_owned)
 }
 
 #[derive(Deserialize, Serialize)]

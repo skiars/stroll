@@ -57,6 +57,8 @@ pub(crate) struct SshSession(Arc<Connection>);
 
 struct Connection {
     target: SshTarget,
+    #[cfg(feature = "desktop")]
+    home: std::sync::OnceLock<std::path::PathBuf>,
     child: Mutex<Child>,
     writer: mpsc::SyncSender<Call>,
     pending: Pending,
@@ -346,6 +348,26 @@ impl SshSession {
     }
 
     #[cfg(feature = "desktop")]
+    pub(crate) fn home(&self) -> Option<&std::path::Path> {
+        self.0.home.get().map(std::path::PathBuf::as_path)
+    }
+
+    #[cfg(feature = "desktop")]
+    pub(crate) fn browse_directory(
+        &self,
+        path: String,
+        base: Option<String>,
+    ) -> Result<crate::repository::DirectoryListing> {
+        let browsing_home = path == "~";
+        let directory: crate::repository::DirectoryListing =
+            self.call(Request::Browse { path, base })?;
+        if browsing_home {
+            _ = self.0.home.set(directory.path.clone());
+        }
+        Ok(directory)
+    }
+
+    #[cfg(feature = "desktop")]
     pub(crate) fn try_terminal_call(
         &self,
         request: Request,
@@ -375,6 +397,8 @@ impl Connection {
         let failure = Arc::new(Mutex::new(None));
         let connection = Arc::new(Connection {
             target,
+            #[cfg(feature = "desktop")]
+            home: Default::default(),
             child: Mutex::new(child),
             writer,
             pending: pending.clone(),

@@ -11,7 +11,7 @@ pub(crate) use edit_history::SavedEditHistory;
 
 pub(crate) use selection::{DirectoryEntry, DirectoryListing, directory_name, repository_root};
 #[cfg(feature = "desktop")]
-pub(crate) use selection::{RecentRepository, Worktree, project_name};
+pub(crate) use selection::{RecentRepository, Worktree, project_name, ssh_project_name};
 #[cfg(feature = "desktop")]
 pub(crate) use worktree_state::WorktreeState;
 

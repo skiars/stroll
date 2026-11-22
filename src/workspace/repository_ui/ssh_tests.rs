@@ -136,7 +136,12 @@ fn ssh_switch_reuses_connection_refreshes_view_and_reconnects() -> anyhow::Resul
             .success()
     );
     let deadline = Instant::now() + Duration::from_secs(5);
-    while visual.update(|_, cx| workspace.read(cx).repository_is_online(&ssh_root)) {
+    while visual.update(|_, cx| {
+        workspace
+            .read(cx)
+            .online_repository_ssh(&ssh_root)
+            .is_some()
+    }) {
         anyhow::ensure!(Instant::now() < deadline, "SSH disconnect was not observed");
         std::thread::sleep(Duration::from_millis(10));
     }
