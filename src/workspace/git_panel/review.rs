@@ -5,7 +5,7 @@ use rust_i18n::t;
 
 use super::*;
 use crate::workspace::{
-    SourcePosition, WorkspaceView, baseline_shift,
+    FindInDocument, SourcePosition, WorkspaceView, baseline_shift,
     editor_git::{HunkDirection, HunkNavigationAnchor, hunk_toolbar},
     file_name_font_size,
     image_preview::{ImageHoverSource, decode_preview, hover_image_source},
@@ -3036,6 +3036,12 @@ impl GitPanel {
         } = layout;
         let review = self.review.as_ref();
         let has_changes = review.is_some_and(|review| !review.detail.files.is_empty());
+        let can_scroll_to_top = self.snapshot.is_none()
+            && review.is_some_and(|review| {
+                matches!(review.detail.comparison, Comparison::Commit { .. })
+                    || !self.diff.read(cx).files().is_empty()
+            })
+            && self.editor.is_scrolled_from_top();
 
         h_flex()
             .id("git-toolbar")
@@ -3090,6 +3096,18 @@ impl GitPanel {
                     )
                 })
                 .child(
+                    icon_button(
+                        "git-diff-back-to-top",
+                        IconName::ArrowUp,
+                        t!("git.back_to_top"),
+                    )
+                    .debug_selector(|| "git-diff-back-to-top".into())
+                    .disabled(!can_scroll_to_top)
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        super::editor::ReviewEditor::scroll_to_top(this, cx);
+                    })),
+                )
+                .child(
                     icon_control(
                         "git-diff-single-file",
                         IconName::FileDiff,
@@ -3098,15 +3116,6 @@ impl GitPanel {
                     )
                     .debug_selector(|| "git-diff-single-file".into())
                     .on_click(cx.listener(|this, _, _, cx| this.toggle_single_file(cx))),
-                )
-                .child(
-                    icon_control(
-                        "git-diff-search",
-                        IconName::Search,
-                        t!("git.search_diff"),
-                        false,
-                    )
-                    .on_click(cx.listener(|this, _, window, cx| this.find(window, cx))),
                 )
                 .child(self.reading_menu(cx))
             })
@@ -3141,6 +3150,7 @@ impl GitPanel {
             let whitespace_view = view.clone();
             let split_view = view.clone();
             let wrap_view = view.clone();
+            let search_view = view.clone();
             let previous = view.clone();
             let next = view.clone();
             menu.item(
@@ -3169,6 +3179,18 @@ impl GitPanel {
                     }),
             )
             .separator()
+            .item(
+                PopupMenuItem::new(t!("git.search_diff"))
+                    .icon(IconName::Search)
+                    .action(Box::new(FindInDocument))
+                    .on_click(move |_, window, _| {
+                        // Let the menu restore focus so find can pick the active diff column.
+                        let search_view = search_view.clone();
+                        window.on_next_frame(move |window, cx| {
+                            _ = search_view.update(cx, |this, cx| this.find(window, cx));
+                        });
+                    }),
+            )
             .item(
                 PopupMenuItem::new(t!("git.previous_hunk")).on_click(move |_, _, cx| {
                     _ = previous.update(cx, |this, cx| {

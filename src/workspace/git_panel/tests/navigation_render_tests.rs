@@ -17,13 +17,13 @@ fn settle(visual: &mut VisualTestContext) {
 }
 
 #[::core::prelude::v1::test]
-fn single_file_mode_switches_the_diff_and_keeps_wrap_in_the_reading_menu() {
+fn diff_toolbar_navigates_in_unified_split_and_single_file_modes() {
     let fixture = tempfile::tempdir().unwrap();
     let root = fixture.path().join("repo");
     fs::create_dir(&root).unwrap();
     git(&root, &["init", "-qb", "main"]);
-    fs::write(root.join("first.txt"), "first change\n").unwrap();
-    fs::write(root.join("second.txt"), "second change\n").unwrap();
+    fs::write(root.join("first.txt"), "first change\n".repeat(120)).unwrap();
+    fs::write(root.join("second.txt"), "second change\n".repeat(120)).unwrap();
 
     let mut app = TestAppContext::build_with_text_system(
         TestDispatcher::new(0),
@@ -60,6 +60,7 @@ fn single_file_mode_switches_the_diff_and_keeps_wrap_in_the_reading_menu() {
         panel.update(cx, |panel, cx| {
             panel.set_history_visible(false, cx);
             panel.set_tree_visible(true, cx);
+            panel.split = false;
             panel.select_worktree(window, cx);
         });
         panel
@@ -83,10 +84,55 @@ fn single_file_mode_switches_the_diff_and_keeps_wrap_in_the_reading_menu() {
                 .collect::<Vec<_>>()
         })
     };
+    let scroll_down = |visual: &mut VisualTestContext| {
+        let viewport = visual.debug_bounds("git-diff-editor").unwrap();
+        visual.simulate_event(ScrollEvent {
+            position: point(viewport.left() + px(90.), viewport.center().y),
+            delta: ScrollDelta::Pixels(point(px(0.), px(-950.))),
+            modifiers: Modifiers::default(),
+            touch_phase: TouchPhase::Moved,
+            source: ScrollSource::Pointer,
+        });
+        settle(visual);
+    };
+    let back_to_top = |visual: &mut VisualTestContext, split: bool| {
+        let offsets = |visual: &mut VisualTestContext| {
+            visual.update(|window, cx| {
+                let editor = &panel.read(cx).editor;
+                (
+                    editor.original_state().read(cx).scroll_offset().y,
+                    editor.focused_column(window, cx).read(cx).scroll_offset().y,
+                )
+            })
+        };
+        scroll_down(visual);
+        let (left, right) = offsets(visual);
+        assert!(right < px(0.));
+        if split {
+            assert_eq!(left, right);
+        }
+        click(visual, "git-diff-back-to-top");
+        let (left, right) = offsets(visual);
+        assert_eq!(right, px(0.));
+        if split {
+            assert_eq!(left, px(0.));
+        }
+        let viewport = visual.debug_bounds("git-diff-editor").unwrap();
+        let summary = visual.debug_bounds("git-review-summary").unwrap();
+        assert!((summary.top() - viewport.top()).abs() < px(1.));
+    };
+
+    let back_button = visual.debug_bounds("git-diff-back-to-top").unwrap();
+    let single_file_button = visual.debug_bounds("git-diff-single-file").unwrap();
+    assert!(back_button.right() <= single_file_button.left());
+
     assert_eq!(paths(visual), ["first.txt", "second.txt"]);
+    back_to_top(visual, false);
     click(visual, "git-diff-single-file");
     assert_eq!(paths(visual), ["first.txt"]);
     click(visual, "git-tree-row:file:second.txt");
+    assert_eq!(paths(visual), ["second.txt"]);
+    back_to_top(visual, false);
     assert_eq!(paths(visual), ["second.txt"]);
     click(visual, "git-tree-row:file:first.txt");
     assert_eq!(paths(visual), ["first.txt"]);
@@ -101,6 +147,25 @@ fn single_file_mode_switches_the_diff_and_keeps_wrap_in_the_reading_menu() {
 
     click(visual, "git-diff-single-file");
     assert_eq!(paths(visual), ["first.txt", "second.txt"]);
+
+    click(visual, "git-reading-options");
+    visual.simulate_keystrokes("down down enter");
+    settle(visual);
+    assert!(visual.update(|_, cx| panel.read(cx).split));
+    back_to_top(visual, true);
+
+    let left = visual.update(|window, cx| {
+        let left = panel.read(cx).editor.original_state().clone();
+        left.update(cx, |editor, cx| editor.focus(window, cx));
+        left
+    });
+    settle(visual);
+    click(visual, "git-reading-options");
+    visual.simulate_keystrokes("down down down down enter");
+    settle(visual);
+    assert!(visual.update(|window, cx| {
+        gpui_component::input::Editor::search_has_focus(&left, window, cx)
+    }));
 }
 
 #[::core::prelude::v1::test]

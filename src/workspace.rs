@@ -4040,7 +4040,7 @@ impl Workspace {
                 nav_item(
                     "nav-git",
                     "Git",
-                    t!("git.history"),
+                    t!("git.history_nav"),
                     self.view == WorkspaceView::Git,
                     window,
                     cx,

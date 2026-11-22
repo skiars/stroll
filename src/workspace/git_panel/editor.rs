@@ -943,6 +943,7 @@ pub(super) struct ReviewEditor {
     navigation_source: Option<DiffLinePosition>,
     pub(super) navigating_file: Option<String>,
     pub(super) image_hover: ImageHoverDismiss,
+    scroll_to_top: bool,
     restore_viewport: bool,
     tail_rows: Rc<Cell<Option<usize>>>,
     wrap_rows: Rc<RefCell<Rc<Vec<usize>>>>,
@@ -1013,6 +1014,7 @@ impl ReviewEditor {
             navigation_source: None,
             navigating_file: None,
             image_hover: ImageHoverDismiss::default(),
+            scroll_to_top: false,
             restore_viewport: false,
             tail_rows: Rc::default(),
             wrap_rows: Rc::default(),
@@ -1317,6 +1319,19 @@ impl ReviewEditor {
         self.modified
             .editor
             .update(cx, |editor, cx| editor.focus(window, cx));
+    }
+
+    pub(super) fn is_scrolled_from_top(&self) -> bool {
+        self.last_scroll.get().1 < px(0.)
+    }
+
+    pub(super) fn scroll_to_top(panel: &mut GitPanel, cx: &mut Context<GitPanel>) {
+        panel.pending_file_reveal = None;
+        panel.pending_hunk_navigation = None;
+        panel.pending_position = None;
+        panel.pending_review_anchor = None;
+        panel.editor.scroll_to_top = true;
+        cx.notify();
     }
 
     fn scroll_to_rows(
@@ -1726,6 +1741,22 @@ impl ReviewEditor {
                 editor.set_soft_wrap(panel.wrap, window, cx)
             });
         }
+        if std::mem::take(&mut panel.editor.scroll_to_top) {
+            panel.editor.navigation_row = target;
+            panel.editor.navigation_source = None;
+            panel.editor.navigating_file = None;
+            panel.editor.revealed_hunk.set(None);
+            panel.editor.restore_viewport = false;
+            panel
+                .diff
+                .update(cx, |diff, _| diff.clear_projected_navigation());
+            for column in [&panel.editor.original, &panel.editor.modified] {
+                column.editor.update(cx, |editor, cx| {
+                    editor.set_scroll_offset(point(editor.scroll_offset().x, px(0.)), cx);
+                });
+            }
+            return;
+        }
         if panel.editor.row_revision == Some(revision)
             && let Some(jump) = panel
                 .pending_hunk_navigation
@@ -1870,6 +1901,7 @@ impl ReviewEditor {
             super::review::is_all_worktree_changes(&review.detail.comparison)
         });
         let split = self.split;
+        let review_pane = panel.review_pane.entity_id();
         let last_scroll = self.last_scroll.clone();
         let scroll_from_left = self.scroll_from_left.clone();
         let viewport = self.viewport.clone();
@@ -1976,6 +2008,9 @@ impl ReviewEditor {
                     }
                 }
                 last_scroll.set((a, b));
+                if (b < px(0.)) != (old_b < px(0.)) {
+                    window.defer(cx, move |_, cx| App::notify(cx, review_pane));
+                }
                 let right_state = right.read(cx);
                 let visible = right_state.visible_row_range().unwrap_or(0..2);
                 let top = right_state.projected_top_line();
