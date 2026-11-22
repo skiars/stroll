@@ -42,6 +42,7 @@ use gpui_kit_assets::IconName;
 use crate::{
     config::{DiffLayout, Git as GitSettings},
     git::{self, Changes, Commit, Comparison, History, Mode, Side},
+    repository::Repository,
     session::{
         DiffPosition, GitSelection as Selection, GitSession, HistoryPosition, WorktreeSession,
     },
@@ -264,6 +265,7 @@ struct PaneLayout {
 
 pub(super) struct GitPanel {
     root: PathBuf,
+    repository: Arc<Repository>,
     backend: git::Backend,
     workspace: WeakEntity<Workspace>,
     focus: FocusHandle,
@@ -363,8 +365,7 @@ pub(super) struct GitPanel {
 
 impl GitPanel {
     pub(super) fn new(
-        root: PathBuf,
-        backend: git::Backend,
+        repository: Arc<Repository>,
         workspace: WeakEntity<Workspace>,
         config: GitSettings,
         session: &WorktreeSession,
@@ -516,8 +517,9 @@ impl GitPanel {
             ListState::new(0, ListAlignment::Top, px(0.)).with_width_independent_heights();
         history_scroll.set_pixel_aligned_scroll(true);
         let mut panel = Self {
-            root,
-            backend,
+            root: repository.root.clone(),
+            backend: repository.git_backend(),
+            repository,
             workspace,
             focus: cx.focus_handle(),
             branches,

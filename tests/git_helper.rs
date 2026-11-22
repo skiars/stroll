@@ -750,3 +750,65 @@ fn helper_supplies_staged_ai_context_and_validates_hover_paths() {
             .is_some()
     );
 }
+
+#[test]
+fn image_diff_versions_agree_with_disk_and_git_objects() {
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+
+    let repo = fixture();
+    let root = repo.path();
+    let image = root.join("picture.ppm");
+    let bytes = |pixel| [b"P6\n1 1\n255\n".as_slice(), &[pixel, 0, 0]].concat();
+    std::fs::write(&image, bytes(1)).unwrap();
+    git(root, &["add", "picture.ppm"]);
+    git(root, &["commit", "-qm", "Add picture"]);
+    std::fs::write(&image, bytes(2)).unwrap();
+
+    let mut helper = Helper::start();
+    assert_eq!(helper.ok(json!({ "Hello": 23 })), 23);
+    helper.ok(json!({ "OpenWorkspace": root }));
+    let detail = helper.ok(json!({ "ReviewFiles": comparison() }));
+    let base = &detail["base"];
+    let request = |side, version: &Value| json!({ "ImageDiffResource": [comparison(), base, "picture.ppm", side, version] });
+    let stored = helper.ok(request("Old", &Value::Null));
+    let oid = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["rev-parse", "HEAD:picture.ppm"])
+        .output()
+        .unwrap();
+    assert!(oid.status.success());
+    assert_eq!(
+        stored["Version"]["Blob"],
+        String::from_utf8_lossy(&oid.stdout).trim()
+    );
+    assert_eq!(
+        helper.ok(request("Old", &stored["Version"]))["Content"],
+        STANDARD.encode(bytes(1))
+    );
+
+    let changed = helper.ok(request("New", &Value::Null));
+    let disk = &changed["Version"];
+    let check = |version: &Value| {
+        json!({ "ReadResource": {
+            "path": "picture.ppm", "asset": true, "version": version["Worktree"]
+        } })
+    };
+    assert_eq!(helper.ok(check(disk)), "Unchanged");
+    assert_eq!(
+        helper.ok(request("New", disk))["Content"],
+        STANDARD.encode(bytes(2))
+    );
+    std::fs::write(&image, bytes(3)).unwrap();
+    assert!(helper.call(request("New", disk)).get("Err").is_some());
+    let latest = helper.ok(request("New", &Value::Null));
+    assert_ne!(latest["Version"], *disk);
+    assert_eq!(
+        helper.ok(request("New", &latest["Version"]))["Content"],
+        STANDARD.encode(bytes(3))
+    );
+    assert_eq!(
+        helper.ok(json!({ "ImageDiffSide": [comparison(), base, "picture.ppm", "New"] })),
+        STANDARD.encode(bytes(3))
+    );
+}

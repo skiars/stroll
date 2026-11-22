@@ -1,7 +1,7 @@
 use std::{borrow::Cow, cell::Cell, time::Instant};
 
 use super::*;
-use crate::image_viewer;
+use crate::{image_viewer, resource_cache::ResourceCache};
 
 const ZOOM_STOPS: [f32; 12] = [0.25, 0.5, 0.75, 1., 1.25, 1.5, 1.75, 2., 2.5, 3., 3.5, 4.];
 const SCROLL_STEP: Pixels = px(48.);
@@ -186,8 +186,9 @@ impl Workspace {
         let source = path.clone();
         let renderer = cx.svg_renderer();
         let load = cx.background_spawn(async move {
-            let image =
-                Image::from_bytes(format, image_bytes(&repo, &source)?).to_image_data(renderer)?;
+            let cache = ResourceCache::for_desktop();
+            let bytes = repo.read_workspace_image(&source, true, cache.as_ref())?;
+            let image = Image::from_bytes(format, bytes).to_image_data(renderer)?;
             let dimensions = image.size(0);
             anyhow::ensure!(
                 dimensions.width.0 > 0 && dimensions.height.0 > 0,
@@ -596,22 +597,6 @@ fn sampling_label(sampling: ImageSampling) -> Cow<'static, str> {
     match sampling {
         ImageSampling::Linear => t!("image.sampling_linear"),
         ImageSampling::Nearest => t!("image.sampling_nearest"),
-    }
-}
-
-fn image_bytes(repo: &Repository, path: &Path) -> Result<Vec<u8>> {
-    if path.is_absolute() {
-        let target = path.canonicalize()?;
-        anyhow::ensure!(
-            target.is_file() && target.components().all(|part| part.as_os_str() != ".git"),
-            t!("storage.local_regular_file")
-        );
-        return Ok(fs::read(target)?);
-    }
-    if repo.ssh.is_some() {
-        repo.bytes(path, true)
-    } else {
-        Ok(fs::read(repo.resolve(path)?)?)
     }
 }
 

@@ -73,6 +73,7 @@ fn image_diff_candidate(file: &git::ChangedFile) -> bool {
 
 fn diff_images(
     backend: &git::Backend,
+    repository: &Arc<Repository>,
     detail: &Arc<Changes>,
     ix: usize,
     renderer: SvgRenderer,
@@ -81,6 +82,7 @@ fn diff_images(
     if !backend.supports_image_diff() {
         return [DiffImage::UnsupportedHelper, DiffImage::UnsupportedHelper];
     }
+    let cache = crate::resource_cache::ResourceCache::for_desktop();
     let file = &detail.files[ix];
     [Side::Old, Side::New].map(|side| {
         let mode = match side {
@@ -102,7 +104,7 @@ fn diff_images(
                 DiffSide::Modified
             },
         );
-        match backend.image_diff_side(detail, file, side) {
+        match backend.image_diff_side(repository, detail, file, side, cache.as_ref()) {
             Ok(Some(bytes)) => match decode_preview(
                 path,
                 &bytes.0,
@@ -112,10 +114,18 @@ fn diff_images(
             ) {
                 Ok(image) => {
                     let backend = backend.clone();
+                    let repository = repository.clone();
                     let detail = detail.clone();
+                    let cache = cache.clone();
                     let hover = ImageHoverSource::new(path.to_owned(), move || {
                         backend
-                            .image_diff_side(&detail, &detail.files[ix], side)?
+                            .image_diff_side(
+                                &repository,
+                                &detail,
+                                &detail.files[ix],
+                                side,
+                                cache.as_ref(),
+                            )?
                             .map(|bytes| bytes.0)
                             .context(t!("git.missing_snapshot"))
                     });
@@ -1729,13 +1739,14 @@ impl GitPanel {
         let detail = review.detail.clone();
         let source = detail.clone();
         let backend = self.backend.clone();
+        let repository = self.repository.clone();
         let renderer = cx.svg_renderer();
         let scale = window.scale_factor();
         // Thumbnail I/O and decoding must not hold up publication of text patches.
         let load = cx
             .background_executor()
             .spawn_with_priority(Priority::Low, async move {
-                diff_images(&backend, &source, ix, renderer, scale)
+                diff_images(&backend, &repository, &source, ix, renderer, scale)
             });
         let task = cx.spawn_in(window, async move |this, cx| {
             let images = load.await;

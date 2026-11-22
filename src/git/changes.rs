@@ -13,6 +13,10 @@ use anyhow::{Context, Result, bail, ensure};
 use gpui_component::diff::{DiffFile, DiffParseOptions};
 
 use super::{Commit, RepoState, capture, command, head, object_id, read, text};
+use crate::{
+    remote::Bytes,
+    repository::{MAX_ASSET_BYTES, files::EntryVersion, resolve_file, resources::ResourceFile},
+};
 
 const PATCH_LIMIT: usize = 4 * 1024 * 1024;
 const SNAPSHOT_LIMIT: usize = 4 * 1024 * 1024;
@@ -645,13 +649,12 @@ pub(super) fn read_blob(root: &Path, spec: &str, limit: usize) -> Result<Option<
     )?))
 }
 
-fn read_side(
-    state: &RepoState,
-    detail: &Changes,
-    file: &ChangedFile,
-    side: Side,
-    limit: usize,
-) -> Result<Option<(Vec<u8>, bool)>> {
+enum FileSide<'a> {
+    Blob(String),
+    Worktree(&'a str),
+}
+
+fn file_side<'a>(detail: &Changes, file: &'a ChangedFile, side: Side) -> FileSide<'a> {
     let path = match side {
         Side::Old => file.old_path.as_deref().unwrap_or(&file.path),
         Side::New => &file.path,
@@ -673,10 +676,135 @@ fn read_side(
             },
             Side::Old,
         ) => format!(":{path}"),
-        (_, Side::New) => return state.read_disk(path, limit),
+        (_, Side::New) => return FileSide::Worktree(path),
         (_, Side::Old) => format!("{}:{path}", detail.base),
     };
-    state.blob(&spec, limit)
+    FileSide::Blob(spec)
+}
+
+fn read_side(
+    state: &RepoState,
+    detail: &Changes,
+    file: &ChangedFile,
+    side: Side,
+    limit: usize,
+) -> Result<Option<(Vec<u8>, bool)>> {
+    match file_side(detail, file, side) {
+        FileSide::Blob(spec) => state.blob(&spec, limit),
+        FileSide::Worktree(path) => state.read_disk(path, limit),
+    }
+}
+
+#[derive(Clone, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub(crate) enum ImageDiffVersion {
+    Blob(String),
+    Worktree(EntryVersion),
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+pub(crate) enum ImageDiffResource {
+    Version(ImageDiffVersion),
+    Content(Bytes),
+    Uncached,
+}
+
+pub(crate) fn image_diff_resource(
+    state: &RepoState,
+    detail: &Changes,
+    file: &ChangedFile,
+    side: Side,
+    expected: Option<&ImageDiffVersion>,
+) -> Result<Option<ImageDiffResource>> {
+    if file.submodule() || file.conflict() {
+        return Ok(None);
+    }
+    let changed = || t!("workspace.tree_entry_changed").into_owned();
+    match file_side(detail, file, side) {
+        FileSide::Blob(spec) => {
+            // Replacement refs can change the bytes returned for an otherwise immutable OID.
+            let replace_base =
+                std::env::var_os("GIT_REPLACE_REF_BASE").unwrap_or_else(|| "refs/replace".into());
+            let replacements = command(
+                state.root(),
+                [
+                    std::ffi::OsStr::new("for-each-ref"),
+                    "--count=1".as_ref(),
+                    replace_base.as_os_str(),
+                ],
+            )
+            .output()?;
+            if !replacements.status.success() || !replacements.stdout.is_empty() {
+                return Ok(Some(ImageDiffResource::Uncached));
+            }
+            let resolved = command(
+                state.root(),
+                [
+                    "rev-parse",
+                    "--verify",
+                    "--quiet",
+                    "--end-of-options",
+                    &spec,
+                ],
+            )
+            .output()?;
+            let oid = std::str::from_utf8(&resolved.stdout)?.trim();
+            if !resolved.status.success() || !object_id(oid) {
+                return Ok(None);
+            }
+            let version = ImageDiffVersion::Blob(oid.to_owned());
+            let Some(expected) = expected else {
+                return Ok(Some(ImageDiffResource::Version(version)));
+            };
+            ensure!(expected == &version, changed());
+            // Use the exact object even if a replacement ref appears during this read.
+            let Some((bytes, truncated)) =
+                read_blob_exact(state.root(), oid, MAX_ASSET_BYTES as usize)?
+            else {
+                return Ok(None);
+            };
+            ensure!(!truncated, t!("storage.image_limit"));
+            Ok(Some(ImageDiffResource::Content(Bytes(bytes))))
+        }
+        FileSide::Worktree(path) => {
+            let target = match resolve_file(state.root(), Path::new(path)) {
+                Ok(target) => target,
+                Err(error)
+                    if error
+                        .downcast_ref::<std::io::Error>()
+                        .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+                {
+                    return Ok(None);
+                }
+                Err(error) => return Err(error),
+            };
+            let resource = ResourceFile::open(&target, true)?;
+            let Some(version) = resource.version().cloned().map(ImageDiffVersion::Worktree) else {
+                return Ok(Some(ImageDiffResource::Uncached));
+            };
+            let Some(expected) = expected else {
+                return Ok(Some(ImageDiffResource::Version(version)));
+            };
+            ensure!(expected == &version, changed());
+            let (bytes, read_version) = resource.read()?;
+            ensure!(
+                read_version.map(ImageDiffVersion::Worktree).as_ref() == Some(expected),
+                changed()
+            );
+            Ok(Some(ImageDiffResource::Content(Bytes(bytes))))
+        }
+    }
+}
+
+fn read_blob_exact(root: &Path, oid: &str, limit: usize) -> Result<Option<(Vec<u8>, bool)>> {
+    let kind = command(root, ["--no-replace-objects", "cat-file", "-t", oid]).output()?;
+    if !kind.status.success() || kind.stdout != b"blob\n" {
+        return Ok(None);
+    }
+    Ok(Some(capture(
+        command(root, ["--no-replace-objects", "cat-file", "blob", oid]),
+        limit,
+        false,
+    )?))
 }
 
 pub(crate) fn image_diff_side(
@@ -684,15 +812,16 @@ pub(crate) fn image_diff_side(
     detail: &Changes,
     file: &ChangedFile,
     side: Side,
-) -> Result<Option<crate::remote::Bytes>> {
+) -> Result<Option<Bytes>> {
     if file.submodule() || file.conflict() {
         return Ok(None);
     }
-    let Some((bytes, truncated)) = read_side(state, detail, file, side, 16 * 1024 * 1024)? else {
+    let Some((bytes, truncated)) = read_side(state, detail, file, side, MAX_ASSET_BYTES as usize)?
+    else {
         return Ok(None);
     };
     ensure!(!truncated, t!("storage.image_limit"));
-    Ok(Some(crate::remote::Bytes(bytes)))
+    Ok(Some(Bytes(bytes)))
 }
 
 pub(crate) fn snapshot(

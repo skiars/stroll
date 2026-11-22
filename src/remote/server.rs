@@ -157,6 +157,7 @@ impl Server {
                             | super::WORKSPACE_TRANSFER_VERSION
                             | super::WORKTREE_LSP_VERSION
                             | super::IMAGE_DIFF_VERSION
+                            | super::IMAGE_DIFF_RESOURCE_VERSION
                     ),
                     "SSH workspace protocol version mismatch. Update the remote helper."
                 );
@@ -364,8 +365,17 @@ impl Server {
                     .context("Changes are out of date. Refresh the workspace.")?;
                 git::snapshot(state, &detail, file, side)
             })?),
-            Request::ImageDiffSide(comparison, base, path, side) => {
-                value(session.call(|state| {
+            request @ (Request::ImageDiffSide(..) | Request::ImageDiffResource(..)) => {
+                let (comparison, base, path, side, expected) = match request {
+                    Request::ImageDiffSide(comparison, base, path, side) => {
+                        (comparison, base, path, side, None)
+                    }
+                    Request::ImageDiffResource(comparison, base, path, side, expected) => {
+                        (comparison, base, path, side, Some(expected))
+                    }
+                    _ => unreachable!(),
+                };
+                session.call(|state| {
                     let detail = self.patch_files(state, comparison)?;
                     ensure!(
                         detail.base == base,
@@ -376,8 +386,17 @@ impl Server {
                         .iter()
                         .find(|file| file.path == path)
                         .context("Changes are out of date. Refresh the workspace.")?;
-                    git::image_diff_side(state, &detail, file, side)
-                })?)
+                    match expected {
+                        Some(expected) => value(git::image_diff_resource(
+                            state,
+                            &detail,
+                            file,
+                            side,
+                            expected.as_ref(),
+                        )?),
+                        None => value(git::image_diff_side(state, &detail, file, side)?),
+                    }
+                })
             }
             Request::Stage(expected, paths, staged) => {
                 let _guard = self.mutations.lock().unwrap();

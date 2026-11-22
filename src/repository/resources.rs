@@ -135,7 +135,7 @@ impl Repository {
     }
 }
 
-struct ResourceFile {
+pub(crate) struct ResourceFile {
     file: File,
     asset: bool,
     size: u64,
@@ -143,7 +143,7 @@ struct ResourceFile {
 }
 
 impl ResourceFile {
-    fn open(path: &Path, asset: bool) -> Result<Self> {
+    pub(crate) fn open(path: &Path, asset: bool) -> Result<Self> {
         let file = File::open(path)?;
         let metadata = file.metadata()?;
         ensure!(metadata.is_file(), t!("storage.regular_file"));
@@ -159,7 +159,11 @@ impl ResourceFile {
         })
     }
 
-    fn read(self) -> Result<(Vec<u8>, Option<EntryVersion>)> {
+    pub(crate) fn version(&self) -> Option<&EntryVersion> {
+        self.version.as_ref()
+    }
+
+    pub(crate) fn read(self) -> Result<(Vec<u8>, Option<EntryVersion>)> {
         let mut bytes = Vec::new();
         (&self.file)
             .take(limit(self.asset) + 1)
@@ -193,17 +197,21 @@ fn check_size(bytes: u64, asset: bool) -> Result<()> {
 }
 
 #[cfg(feature = "desktop")]
-pub(crate) use desktop::{RemoteResources, read_local_resource};
+pub(crate) use desktop::{RemoteResources, local_resource_key, read_local_resource};
 
 #[cfg(feature = "desktop")]
 mod desktop {
     use super::*;
     use crate::{
         remote::{Request, SshSession},
-        repository::read_remote_bytes,
+        repository::{canonical_local_file, read_remote_bytes},
         resource_cache::{ResourceCache, SourceKey},
     };
     use std::path::PathBuf;
+
+    pub(crate) fn local_resource_key(path: &Path) -> SourceKey {
+        SourceKey::new("local", &[path.as_os_str().as_encoded_bytes()])
+    }
 
     pub(crate) fn read_local_resource(
         path: &Path,
@@ -211,7 +219,7 @@ mod desktop {
         cache: Option<&ResourceCache>,
     ) -> Result<Vec<u8>> {
         let file = ResourceFile::open(path, asset)?;
-        let key = SourceKey::new("local", &[path.as_os_str().as_encoded_bytes()]);
+        let key = local_resource_key(path);
         if let Some(cache) = cache
             && let Some(entry) = cache.source::<EntryVersion>(key)
             && file.version.as_ref() == Some(&entry.version)
@@ -235,6 +243,29 @@ mod desktop {
     }
 
     impl Repository {
+        pub(crate) fn read_workspace_image(
+            &self,
+            path: &Path,
+            allow_large_local: bool,
+            cache: Option<&ResourceCache>,
+        ) -> Result<Vec<u8>> {
+            let target = if path.is_absolute() {
+                canonical_local_file(path)?
+            } else if let Some(remote) = self.remote_resources() {
+                // A foreground preview can use one conditional request for the complete image.
+                let _priority = remote.ssh.prioritize_resources();
+                return remote.read_whole(path, true, cache);
+            } else if allow_large_local {
+                self.resolve(path)?
+            } else {
+                resolve_asset(&self.root, path)?
+            };
+            if allow_large_local && target.metadata()?.len() > MAX_ASSET_BYTES {
+                return Ok(std::fs::read(target)?);
+            }
+            read_local_resource(&target, true, cache)
+        }
+
         pub(crate) fn remote_resources(&self) -> Option<RemoteResources> {
             Some(RemoteResources {
                 ssh: self.ssh.clone()?,
@@ -246,7 +277,7 @@ mod desktop {
     }
 
     impl RemoteResources {
-        fn source_key(&self, path: &RepoPath, asset: bool) -> SourceKey {
+        pub(crate) fn source_key(&self, path: &RepoPath, asset: bool) -> SourceKey {
             SourceKey::new(
                 "ssh",
                 &[&self.scope, path.as_str().as_bytes(), &[asset.into()]],
@@ -476,7 +507,10 @@ mod desktop {
     fn ssh_resource_reuses_disk_content_across_connections() -> Result<()> {
         use std::{fs, path::PathBuf, process::Command};
 
-        use crate::remote::SshTarget;
+        use crate::{
+            git::{ChangedFile, Changes, Comparison, Mode, Side},
+            remote::SshTarget,
+        };
 
         let fixture = tempfile::tempdir()?;
         let worktree = fixture.path();
@@ -487,13 +521,18 @@ mod desktop {
         let assets = [PathBuf::from("one.svg"), PathBuf::from("two.svg")];
         let large = Path::new("large.png");
         let large_bytes = vec![42; RESOURCE_CHUNK_BYTES * 2 + 7];
+        let preview = Path::new("preview.png");
+        let preview_bytes = vec![5; 1024 * 1024];
+        let new_preview = vec![6; preview_bytes.len()];
+        fs::write(worktree.join(preview), &preview_bytes)?;
+        fs::write(worktree.join("object"), &large_bytes)?;
         fs::write(worktree.join(path), original)?;
         fs::write(worktree.join(large), &large_bytes)?;
         for asset in &assets {
             fs::write(worktree.join(asset), original)?;
         }
 
-        let connect = |chunks: bool| -> Result<RemoteResources> {
+        let connect_repository = |chunks: bool| -> Result<Repository> {
             let mut helper = Command::new("python3");
             helper
                 .arg("-u")
@@ -537,6 +576,25 @@ while header := input.read(4):
             event = "missing"
         with (root / "reads").open("a") as log:
             log.write(event + "\n")
+    elif "ImageDiffResource" in request:
+        _, _, name, side, expected = request["ImageDiffResource"]
+        if side == "Old":
+            path = root / "object"
+            version = {"Blob": "1" * 40}
+            event = "blob"
+        else:
+            path = root / name
+            version = {"Worktree": str(path.stat().st_ctime_ns)}
+            event = "worktree"
+        if expected is None:
+            reply = {"Ok": {"Version": version}}
+            event += "-version"
+        else:
+            assert expected == version
+            reply = {"Ok": {"Content": base64.b64encode(path.read_bytes()).decode()}}
+            event += "-contents"
+        with (root / "reads").open("a") as log:
+            log.write(event + "\n")
     elif "ReadResourceChunk" in request:
         read = request["ReadResourceChunk"]
         path = root / read["path"]
@@ -575,9 +633,10 @@ while header := input.read(4):
                 },
                 helper,
             )?;
-            Ok(Repository::open_ssh(session, PathBuf::from(worktree))?
-                .remote_resources()
-                .unwrap())
+            Repository::open_ssh(session, PathBuf::from(worktree))
+        };
+        let connect = |chunks| {
+            Ok::<_, anyhow::Error>(connect_repository(chunks)?.remote_resources().unwrap())
         };
 
         let cache = ResourceCache::new(directory.clone());
@@ -625,6 +684,75 @@ while header := input.read(4):
             format!(
                 "0\n0\n{RESOURCE_CHUNK_BYTES}\n{}\n",
                 RESOURCE_CHUNK_BYTES * 2
+            )
+        );
+
+        let reads = worktree.join("reads");
+        fs::write(&reads, "")?;
+        let repo = connect_repository(true)?;
+        assert_eq!(
+            repo.read_workspace_image(preview, true, Some(&cache))?,
+            preview_bytes
+        );
+        drop(repo);
+
+        let repo = connect_repository(true)?;
+        // Reopening the image tab and hovering over the file tree share the versioned entry.
+        assert_eq!(
+            repo.read_workspace_image(preview, true, Some(&cache))?,
+            preview_bytes
+        );
+        assert_eq!(
+            repo.read_workspace_image(preview, false, Some(&cache))?,
+            preview_bytes
+        );
+        let backend = repo.git_backend();
+        let detail = Changes {
+            comparison: Comparison::Worktree {
+                mode: Mode::All,
+                base: None,
+            },
+            base: "0".repeat(40),
+            files: Vec::new(),
+            status: None,
+        };
+        let file = ChangedFile {
+            path: preview.to_str().unwrap().into(),
+            old_path: None,
+            code: 'M',
+            old_mode: "100644".into(),
+            new_mode: "100644".into(),
+            counts: None,
+            binary: true,
+            worktree: None,
+        };
+        let image = |file: &ChangedFile, side| -> Result<Vec<u8>> {
+            Ok(backend
+                .image_diff_side(&repo, &detail, file, side, Some(&cache))?
+                .context("Expected image")?
+                .0)
+        };
+        assert_eq!(image(&file, Side::New)?, preview_bytes);
+        assert_eq!(image(&file, Side::Old)?, large_bytes);
+        assert_eq!(image(&file, Side::Old)?, large_bytes);
+        let renamed = ChangedFile {
+            path: "renamed.png".into(),
+            ..file.clone()
+        };
+        assert_eq!(image(&renamed, Side::Old)?, large_bytes);
+
+        fs::write(worktree.join(preview), &new_preview)?;
+        assert_eq!(image(&file, Side::New)?, new_preview);
+        assert_eq!(
+            repo.read_workspace_image(preview, false, Some(&cache))?,
+            new_preview
+        );
+        assert_eq!(
+            fs::read_to_string(reads)?,
+            concat!(
+                "contents\nunchanged\nunchanged\nworktree-version\n",
+                "blob-version\nblob-contents\nblob-version\nblob-version\n",
+                "worktree-version\nworktree-contents\nunchanged\n"
             )
         );
         Ok(())

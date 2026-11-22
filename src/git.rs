@@ -452,19 +452,89 @@ impl Backend {
 
     pub fn image_diff_side(
         &self,
+        repo: &crate::repository::Repository,
         detail: &Changes,
         file: &ChangedFile,
         side: Side,
+        cache: Option<&crate::resource_cache::ResourceCache>,
     ) -> Result<Option<crate::remote::Bytes>> {
-        self.call(
-            crate::remote::Request::ImageDiffSide(
-                detail.comparison.clone(),
-                detail.base.clone(),
-                file.path.clone(),
-                side,
-            ),
-            |state| image_diff_side(state, detail, file, side),
-        )
+        use crate::{
+            remote::{RepoPath, Request},
+            repository::{MAX_ASSET_BYTES, files::EntryVersion, resources::local_resource_key},
+            resource_cache::SourceKey,
+        };
+
+        let read_uncached = || {
+            self.call(
+                Request::ImageDiffSide(
+                    detail.comparison.clone(),
+                    detail.base.clone(),
+                    file.path.clone(),
+                    side,
+                ),
+                |state| image_diff_side(state, detail, file, side),
+            )
+        };
+        let Some(cache) = cache.filter(|_| {
+            self.ssh
+                .as_ref()
+                .is_none_or(|ssh| ssh.supports_image_diff_resource())
+        }) else {
+            return read_uncached();
+        };
+        let resource = |expected: Option<ImageDiffVersion>| {
+            self.call(
+                Request::ImageDiffResource(
+                    detail.comparison.clone(),
+                    detail.base.clone(),
+                    file.path.clone(),
+                    side,
+                    expected.clone(),
+                ),
+                |state| image_diff_resource(state, detail, file, side, expected.as_ref()),
+            )
+        };
+
+        let version = match resource(None)? {
+            Some(ImageDiffResource::Version(version)) => version,
+            Some(ImageDiffResource::Uncached) => return read_uncached(),
+            None => return Ok(None),
+            _ => anyhow::bail!("Expected a Git image version"),
+        };
+        let (key, hash) = match &version {
+            ImageDiffVersion::Blob(oid) => {
+                let key = SourceKey::new("git-blob", &[repo.storage_key(), oid.as_bytes()]);
+                (key, cache.source::<()>(key).map(|entry| entry.hash))
+            }
+            ImageDiffVersion::Worktree(version) => {
+                let path = Path::new(&file.path);
+                let key = if let Some(remote) = repo.remote_resources() {
+                    remote.source_key(&RepoPath::from_local(path)?, true)
+                } else {
+                    local_resource_key(&repo.resolve(path)?)
+                };
+                let hash = cache
+                    .source::<EntryVersion>(key)
+                    .filter(|entry| &entry.version == version)
+                    .map(|entry| entry.hash);
+                (key, hash)
+            }
+        };
+        if let Some(bytes) = hash.and_then(|hash| cache.read_content(&hash, MAX_ASSET_BYTES)) {
+            return Ok(Some(crate::remote::Bytes(bytes)));
+        }
+        match resource(Some(version.clone()))? {
+            Some(ImageDiffResource::Content(bytes)) => {
+                let _ = match version {
+                    ImageDiffVersion::Blob(_) => cache.store(key, &(), &bytes.0),
+                    ImageDiffVersion::Worktree(version) => cache.store(key, &version, &bytes.0),
+                };
+                Ok(Some(bytes))
+            }
+            Some(ImageDiffResource::Uncached) => read_uncached(),
+            None => Ok(None),
+            _ => anyhow::bail!("Expected Git image contents"),
+        }
     }
 
     pub fn stage(&self, expected: &WorktreeStatus, paths: &[String], staged: bool) -> Result<()> {

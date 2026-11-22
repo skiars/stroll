@@ -2075,14 +2075,12 @@ impl Workspace {
                 panel.update(cx, |panel, cx| panel.refresh_worktree(window, cx));
             }
         } else {
-            let root = repo.root.clone();
-            let backend = repo.git_backend();
+            let repo = repo.clone();
             let workspace = cx.weak_entity();
             let config = self.config.current().git;
             let inlay_hints = self.config.current().editor.inlay_hints;
             self.git = Some(cx.new(|cx| {
-                let mut panel =
-                    GitPanel::new(root, backend, workspace, config, &self.session, window, cx);
+                let mut panel = GitPanel::new(repo, workspace, config, &self.session, window, cx);
                 panel.set_inlay_hints_enabled(inlay_hints, window, cx);
                 panel
             }));
@@ -4347,7 +4345,10 @@ impl Workspace {
                     image_preview::hover_image(
                         element,
                         None,
-                        move || repo.bytes(&path, true),
+                        move || {
+                            let cache = crate::resource_cache::ResourceCache::for_desktop();
+                            repo.read_workspace_image(&path, false, cache.as_ref())
+                        },
                         entry.path.clone(),
                     )
                 } else {
