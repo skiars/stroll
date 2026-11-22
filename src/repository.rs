@@ -2,6 +2,7 @@ use rust_i18n::t;
 
 mod edit_history;
 pub(crate) mod files;
+pub(crate) mod resources;
 mod selection;
 #[cfg(feature = "desktop")]
 mod worktree_state;
@@ -52,6 +53,10 @@ pub(crate) const MAX_ASSET_BYTES: u64 = 16 * 1024 * 1024;
 pub struct Repository {
     pub(crate) ssh: Option<SshSession>,
     remote_identity: Option<String>,
+    #[cfg(feature = "desktop")]
+    remote_resource_read: bool,
+    #[cfg(feature = "desktop")]
+    remote_resource_chunks: bool,
     #[cfg(feature = "desktop")]
     pub(crate) worktree_state: Option<WorktreeState>,
     #[cfg(feature = "desktop")]
@@ -115,6 +120,10 @@ impl Repository {
             ssh: Some(ssh),
             remote_identity,
             #[cfg(feature = "desktop")]
+            remote_resource_read: info.resource_read,
+            #[cfg(feature = "desktop")]
+            remote_resource_chunks: info.resource_chunks,
+            #[cfg(feature = "desktop")]
             worktree_state: None,
             #[cfg(feature = "desktop")]
             local_storage_key: None,
@@ -141,6 +150,10 @@ impl Repository {
         Ok(Self {
             ssh: None,
             remote_identity: None,
+            #[cfg(feature = "desktop")]
+            remote_resource_read: false,
+            #[cfg(feature = "desktop")]
+            remote_resource_chunks: false,
             #[cfg(feature = "desktop")]
             worktree_state: None,
             #[cfg(feature = "desktop")]
@@ -437,13 +450,6 @@ pub(crate) fn read_remote_bytes(ssh: &SshSession, path: &Path, asset: bool) -> R
         .0)
 }
 
-/// Reads a Markdown file from the local filesystem without requiring it to be
-/// part of the open repository. Callers decide how the path is resolved.
-#[cfg(feature = "desktop")]
-pub(crate) fn read_markdown_file(path: &Path) -> Result<String> {
-    decode_markdown(read_bytes(path)?)
-}
-
 pub(crate) fn decode_markdown(bytes: Vec<u8>) -> Result<String> {
     let text = std::str::from_utf8(bytes.strip_prefix(b"\xef\xbb\xbf").unwrap_or(&bytes))
         .context(t!("storage.text_only"))?;
@@ -454,6 +460,10 @@ pub(crate) fn decode_markdown(bytes: Vec<u8>) -> Result<String> {
 #[derive(Serialize, Deserialize)]
 pub(crate) struct RepositoryInfo {
     pub identity: String,
+    #[serde(default)]
+    pub resource_read: bool,
+    #[serde(default)]
+    pub resource_chunks: bool,
     pub root: PathBuf,
     pub common_dir: PathBuf,
     pub name: String,
@@ -481,6 +491,8 @@ impl From<Repository> for RepositoryInfo {
         );
         Self {
             identity,
+            resource_read: true,
+            resource_chunks: true,
             root: repo.root,
             common_dir: repo.common_dir,
             name: repo.name,
@@ -784,7 +796,7 @@ fn write_resolved(
     Ok(true)
 }
 
-fn read_asset(root: &Path, path: &Path) -> Result<Vec<u8>> {
+fn resolve_asset(root: &Path, path: &Path) -> Result<PathBuf> {
     ensure!(
         path.components()
             .all(|part| matches!(part, Component::Normal(name) if name != ".git")),
@@ -799,6 +811,11 @@ fn read_asset(root: &Path, path: &Path) -> Result<Vec<u8>> {
                 .all(|part| part.as_os_str() != ".git"),
         t!("storage.image_outside_repo")
     );
+    Ok(target)
+}
+
+fn read_asset(root: &Path, path: &Path) -> Result<Vec<u8>> {
+    let target = resolve_asset(root, path)?;
     let limit = MAX_ASSET_BYTES;
     let mut bytes = Vec::new();
     File::open(target)?

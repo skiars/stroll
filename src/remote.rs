@@ -212,6 +212,18 @@ pub(crate) enum Request {
     Exists(RepoPath),
     Openable(Vec<Option<String>>),
     Read(RepoPath, bool),
+    ReadResource {
+        path: RepoPath,
+        asset: bool,
+        version: Option<crate::repository::files::EntryVersion>,
+    },
+    ReadResourceChunk {
+        path: RepoPath,
+        asset: bool,
+        offset: u64,
+        version: Option<crate::repository::files::EntryVersion>,
+    },
+    CheckResources(Vec<crate::repository::resources::ResourceCheck>),
     Locator(crate::locator::TextQuery),
     LocatorPaths,
     Save {

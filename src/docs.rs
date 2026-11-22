@@ -31,8 +31,11 @@ use url::Url;
 use crate::{
     doc_graphics::{self, GraphicKind, Graphics},
     paths,
-    remote::SshSession,
-    repository::{Entry, Repository},
+    repository::{
+        Entry, Repository, decode_markdown,
+        resources::{RemoteResources, read_local_resource},
+    },
+    resource_cache::ResourceCache,
     session::{DocumentLinePosition, DocumentLocation, DocumentPosition},
     workspace::{
         Palette, PaneDrag, Workspace, compact_icon_button, icon, icon_button, pane_scrollbar,
@@ -171,7 +174,7 @@ pub struct PreparedDocument {
     headings: Vec<Heading>,
     extensions: MarkdownExtensions,
     graphics: Arc<Graphics>,
-    ssh: Option<SshSession>,
+    remote: Option<RemoteResources>,
 }
 
 impl PreparedDocument {
@@ -213,7 +216,7 @@ impl PreparedDocument {
             headings,
             extensions: doc_graphics::extensions(graphics.clone()).plugin(TaskTable(task_cells)),
             graphics,
-            ssh: None,
+            remote: None,
         })
     }
 }
@@ -632,12 +635,17 @@ impl DocReader {
     }
 
     pub(crate) fn release_online_images(&mut self, cx: &mut Context<Self>) {
+        self.pause_ssh_images(true, cx);
         self.text
             .update(cx, |text, _| text.cancel_scroll_navigation());
         self.displayed_images = online_images::DisplayedImages::new(cx);
         self.image_subscription = cx.observe(&self.displayed_images, Self::refresh_image_layout);
         self.image_thumbnails = ImageThumbnails::new(cx);
         cx.notify();
+    }
+
+    pub(crate) fn pause_ssh_images(&self, pause: bool, cx: &App) {
+        self.displayed_images.read(cx).pause_ssh(pause);
     }
 
     fn refresh_image_layout(
@@ -1121,7 +1129,7 @@ impl Render for DocReader {
         let images = online_images::DocumentImages {
             root: self.root.clone(),
             document: self.path.clone(),
-            ssh: self.document.ssh.clone(),
+            remote: self.document.remote.clone(),
             allow_embedded: self.standalone,
             display: self.displayed_images.clone(),
         };
@@ -1347,15 +1355,19 @@ fn copy_button(code: SharedString) -> Button {
 }
 
 pub(crate) fn load_local(path: &Path) -> Result<PreparedDocument> {
-    crate::repository::read_markdown_file(path).and_then(PreparedDocument::new)
+    let bytes = read_local_resource(path, false, ResourceCache::for_desktop().as_ref())?;
+    PreparedDocument::new(decode_markdown(bytes)?)
 }
 
 pub fn load(repo: &Repository, path: &Path) -> Result<PreparedDocument> {
     anyhow::ensure!(is_markdown(path), t!("docs.select_markdown"));
-    let remote = !path.is_absolute() && repo.ssh.is_some();
+    let remote = (!path.is_absolute())
+        .then(|| repo.remote_resources())
+        .flatten();
+    let cache = ResourceCache::for_desktop();
     let read = || {
-        if remote {
-            repo.read_markdown(path)
+        if let Some(remote) = &remote {
+            remote.read(path, false, cache.as_ref())
         } else {
             let target = if path.is_absolute() {
                 path.to_owned()
@@ -1364,15 +1376,14 @@ pub fn load(repo: &Repository, path: &Path) -> Result<PreparedDocument> {
             };
             let target = target.canonicalize()?;
             anyhow::ensure!(target.is_file(), t!("storage.regular_file"));
-            crate::repository::read_markdown_file(&target)
+            read_local_resource(&target, false, cache.as_ref())
         }
     };
-    let source =
-        read().with_context(|| t!("docs.read_failed", path = paths::display(path)).into_owned())?;
+    let source = read()
+        .and_then(decode_markdown)
+        .with_context(|| t!("docs.read_failed", path = paths::display(path)).into_owned())?;
     let mut document = PreparedDocument::new(source)?;
-    if remote {
-        document.ssh = repo.ssh.clone();
-    }
+    document.remote = remote;
     Ok(document)
 }
 
@@ -1422,7 +1433,7 @@ mod tests {
             time::{Duration, Instant},
         };
 
-        use crate::remote::SshTarget;
+        use crate::remote::{SshSession, SshTarget};
 
         let fixture = tempfile::tempdir().unwrap();
         let root = fixture.path();

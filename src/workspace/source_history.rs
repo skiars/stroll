@@ -240,7 +240,7 @@ impl Workspace {
                 || (self.view == WorkspaceView::Docs && location.document.is_some()))
         {
             self.cancel_file_open();
-            self.cancel_document_navigation();
+            self.cancel_document_navigation(cx);
             cx.notify();
             return;
         }
@@ -273,7 +273,7 @@ impl Workspace {
             self.open_history_document(path, index, document, window, cx);
         } else {
             if self.view == WorkspaceView::Docs {
-                self.cancel_document_navigation();
+                self.cancel_document_navigation(cx);
                 self.switch_view(WorkspaceView::Editor, window, cx);
             }
             if self.view == WorkspaceView::Editor {
@@ -309,7 +309,7 @@ impl Workspace {
             }
             WorkspaceView::Editor => {
                 self.capture_active_file_position(cx);
-                self.cancel_document_navigation();
+                self.cancel_document_navigation(cx);
                 let previous = self.tabs.deselect();
                 if self.view == view {
                     self.finish_tab_selection(previous.as_deref(), window, cx);

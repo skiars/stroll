@@ -91,6 +91,41 @@ struct Connection {
     #[cfg(feature = "desktop")]
     lsp_edits: AtomicBool,
     failure: Arc<Mutex<Option<String>>>,
+    #[cfg(feature = "desktop")]
+    resource_schedule: ResourceSchedule,
+}
+
+#[cfg(feature = "desktop")]
+#[derive(Default)]
+struct ResourceSchedule {
+    state: Mutex<ResourceScheduleState>,
+    available: std::sync::Condvar,
+}
+
+#[cfg(feature = "desktop")]
+#[derive(Default)]
+struct ResourceScheduleState {
+    foreground: usize,
+    image_chunk_in_flight: bool,
+}
+
+#[cfg(feature = "desktop")]
+pub(crate) struct ResourcePermit<'a> {
+    schedule: &'a ResourceSchedule,
+    foreground: bool,
+}
+
+#[cfg(feature = "desktop")]
+impl Drop for ResourcePermit<'_> {
+    fn drop(&mut self) {
+        let mut state = self.schedule.state.lock().unwrap();
+        if self.foreground {
+            state.foreground -= 1;
+        } else {
+            state.image_chunk_in_flight = false;
+        }
+        self.schedule.available.notify_all();
+    }
 }
 
 impl Drop for Connection {
@@ -150,6 +185,39 @@ impl SshSession {
     #[cfg(feature = "desktop")]
     pub(crate) fn connection_id(&self) -> usize {
         Arc::as_ptr(&self.0) as usize
+    }
+
+    #[cfg(feature = "desktop")]
+    pub(crate) fn prioritize_resources(&self) -> ResourcePermit<'_> {
+        let schedule = &self.0.resource_schedule;
+        schedule.state.lock().unwrap().foreground += 1;
+        ResourcePermit {
+            schedule,
+            foreground: true,
+        }
+    }
+
+    #[cfg(feature = "desktop")]
+    pub(crate) fn image_chunk<T: DeserializeOwned>(
+        &self,
+        request: Request,
+        wanted: &impl Fn() -> bool,
+    ) -> Result<Option<T>> {
+        let schedule = &self.0.resource_schedule;
+        let mut state = schedule.state.lock().unwrap();
+        while wanted() && (state.foreground != 0 || state.image_chunk_in_flight) {
+            state = schedule.available.wait(state).unwrap();
+        }
+        if !wanted() {
+            return Ok(None);
+        }
+        state.image_chunk_in_flight = true;
+        drop(state);
+        let _permit = ResourcePermit {
+            schedule,
+            foreground: false,
+        };
+        self.call(request).map(Some)
     }
 
     #[cfg(feature = "desktop")]
@@ -331,6 +399,8 @@ impl Connection {
             #[cfg(feature = "desktop")]
             locator: AtomicBool::new(false),
             failure: failure.clone(),
+            #[cfg(feature = "desktop")]
+            resource_schedule: Default::default(),
         });
         let diagnostics = Arc::new(Mutex::new(Vec::new()));
         let tail = diagnostics.clone();

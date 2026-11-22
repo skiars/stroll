@@ -98,6 +98,7 @@ impl Workspace {
         };
         self.session_revision += 1;
         if active {
+            self.pause_document_images(true, cx);
             self.doc = None;
             self.doc_task = Task::ready(());
             self.doc_loading = None;

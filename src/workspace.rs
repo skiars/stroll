@@ -1504,6 +1504,7 @@ impl Workspace {
         self.repository_ui.reset_worktrees();
         self.doc_task = Task::ready(());
         self.doc_loading = None;
+        self.pause_document_images(false, cx);
         self.doc_error = None;
         self.open_documents_list = false;
         self.reset_workspace_tree(cx);
@@ -2012,7 +2013,7 @@ impl Workspace {
         }
         self.queue_drafts(window, cx);
         self.capture_session(cx);
-        self.cancel_document_navigation();
+        self.cancel_document_navigation(cx);
         self.cancel_file_open();
         self.tree_scroll = UniformListScrollHandle::new();
         if view != WorkspaceView::Docs
@@ -2157,7 +2158,13 @@ impl Workspace {
         );
     }
 
-    fn cancel_document_navigation(&mut self) {
+    fn pause_document_images(&self, pause: bool, cx: &App) {
+        if let Some(doc) = &self.doc {
+            doc.read(cx).pause_ssh_images(pause, cx);
+        }
+    }
+
+    fn cancel_document_navigation(&mut self, cx: &mut Context<Self>) {
         if self
             .doc_loading
             .as_ref()
@@ -2165,6 +2172,8 @@ impl Workspace {
         {
             self.doc_loading = None;
             self.doc_task = Task::ready(());
+            self.pause_document_images(false, cx);
+            cx.notify();
         }
     }
 
@@ -2237,6 +2246,8 @@ impl Workspace {
                 if navigation.is_some() && self.doc_loading.is_some() {
                     self.doc_loading = None;
                     self.doc_task = Task::ready(());
+                    self.pause_document_images(false, cx);
+                    cx.notify();
                 }
                 let previous_error = self.doc_error.take();
                 let animate = self.view == WorkspaceView::Docs;
@@ -2270,6 +2281,7 @@ impl Workspace {
         let store = self.store.clone();
         self.capture_document_position(cx);
         let saved_position = self.session.documents.get(&path).copied();
+        self.pause_document_images(true, cx);
         if navigation.is_none() {
             self.session.select_document(&path);
             self.session_revision += 1;
@@ -2313,6 +2325,7 @@ impl Workspace {
                                 this.doc_error = Some(
                                     t!("docs.fragment_missing", fragment = fragment).into_owned(),
                                 );
+                                this.pause_document_images(false, cx);
                                 cx.notify();
                                 return;
                             }
@@ -2367,6 +2380,7 @@ impl Workspace {
                         this.rebuild_tree();
                     }
                     Err(error) => {
+                        this.pause_document_images(false, cx);
                         if let Some(DocumentNavigation::Replay { index, .. }) = navigation
                             && error.chain().any(|cause| {
                                 cause.downcast_ref::<std::io::Error>().is_some_and(|error| {
@@ -2520,7 +2534,7 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         if !matches!(request, FileOpen::Startup | FileOpen::Restore { .. }) {
-            self.cancel_document_navigation();
+            self.cancel_document_navigation(cx);
         }
         if !matches!(request, FileOpen::Startup | FileOpen::Restore { .. })
             && self.terminal_maximized()

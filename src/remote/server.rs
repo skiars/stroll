@@ -304,6 +304,20 @@ impl Server {
             Request::Locator(query) => value(crate::locator::search_text(&repo, &query, || false)?),
             Request::ReadForSync(path) => value(repo.bytes_if_present(path.as_path())?.map(Bytes)),
             Request::Read(path, asset) => value(Bytes(repo.bytes(path.as_path(), asset)?)),
+            Request::ReadResource {
+                path,
+                asset,
+                version,
+            } => value(repo.read_resource(path.as_path(), asset, version.as_ref())?),
+            Request::ReadResourceChunk {
+                path,
+                asset,
+                offset,
+                version,
+            } => {
+                value(repo.read_resource_chunk(path.as_path(), asset, offset, version.as_ref())?)
+            }
+            Request::CheckResources(checks) => value(repo.check_resources(checks)?),
             Request::Save {
                 path,
                 baseline,

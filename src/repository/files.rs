@@ -43,24 +43,31 @@ fn entry_kind(path: &Path) -> Result<(fs::Metadata, EntryVersion)> {
         kind.is_file() || kind.is_dir() || kind.is_symlink(),
         t!("workspace.tree_unsupported")
     );
-    #[cfg(unix)]
-    let identity = {
-        use std::os::unix::fs::MetadataExt;
-        (
-            metadata.dev(),
-            metadata.ino(),
-            metadata.ctime(),
-            metadata.ctime_nsec(),
-        )
-    };
-    #[cfg(not(unix))]
-    let identity = metadata.created().ok();
-    let version = EntryVersion(format!(
-        "{identity:?}/{kind:?}/{:?}/{}",
-        metadata.modified().ok(),
-        metadata.len()
-    ));
+    let version = EntryVersion::from_metadata(&metadata);
     Ok((metadata, version))
+}
+
+impl EntryVersion {
+    pub(super) fn from_metadata(metadata: &fs::Metadata) -> Self {
+        #[cfg(unix)]
+        let identity = {
+            use std::os::unix::fs::MetadataExt;
+            (
+                metadata.dev(),
+                metadata.ino(),
+                metadata.ctime(),
+                metadata.ctime_nsec(),
+            )
+        };
+        #[cfg(not(unix))]
+        let identity = metadata.created().ok();
+        let kind = metadata.file_type();
+        Self(format!(
+            "{identity:?}/{kind:?}/{:?}/{}",
+            metadata.modified().ok(),
+            metadata.len()
+        ))
+    }
 }
 
 /// Compare against the filesystem host's clock, including the Unix change

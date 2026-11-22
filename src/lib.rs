@@ -24,6 +24,8 @@ mod process;
 mod pty;
 pub mod remote;
 pub mod repository;
+#[cfg(feature = "desktop")]
+mod resource_cache;
 mod session;
 #[cfg(feature = "desktop")]
 mod symbols;

@@ -1,16 +1,19 @@
 use std::{
     cell::RefCell,
     collections::{HashMap, HashSet},
-    fs::{self, File, FileTimes, OpenOptions},
-    io::{Cursor, Read as _, Write as _},
+    io::Cursor,
     net::IpAddr,
-    path::{Path, PathBuf},
+    path::PathBuf,
     rc::Rc,
-    sync::Arc,
-    time::{Duration, Instant, SystemTime},
+    sync::{
+        Arc, Mutex, Weak,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context as _, Result, ensure};
+use futures_channel::oneshot;
 use gpui::{
     App, AppContext as _, Entity, EntityId, Global, Image, ImageAssetLoader, ImageCacheError,
     ImageSource, RenderImage, SharedString, SvgRenderer, WeakEntity, Window,
@@ -19,11 +22,10 @@ use gpui_component::text::data_url_image;
 use image::{
     DynamicImage, Frame, ImageDecoder, ImageFormat, ImageReader, Limits, imageops::FilterType,
 };
-use sha2::{Digest, Sha256};
 use ureq::{
     Agent, Body, Error,
     config::Config,
-    http::{Response, Uri, header},
+    http::{Response, StatusCode, Uri, header},
     unversioned::{
         resolver::{DefaultResolver, ResolvedSocketAddrs, Resolver},
         transport::{DefaultConnector, NextTimeout},
@@ -33,8 +35,14 @@ use url::Url;
 
 use crate::{
     image_viewer,
-    remote::SshSession,
-    repository::{MAX_ASSET_BYTES, read_remote_bytes},
+    repository::{
+        canonical_local_file,
+        resources::{RemoteResources, read_local_resource},
+    },
+    resource_cache::{
+        ResourceCache, SourceKey,
+        http::{self, HttpVersion},
+    },
 };
 
 use super::{Destination, destination};
@@ -42,8 +50,6 @@ use super::{Destination, destination};
 const MAX_DOWNLOAD_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_PIXELS: u64 = 24_000_000;
 const MAX_RENDER_DIMENSION: u32 = 1720;
-const MAX_CACHE_BYTES: u64 = 128 * 1024 * 1024;
-const MAX_CACHE_ENTRIES: usize = 256;
 const MAX_CONCURRENT_DOWNLOADS: usize = 4;
 const MAX_CONCURRENT_FILE_LOADS: usize = 4;
 const MAX_CONCURRENT_SSH_LOADS: usize = 2;
@@ -52,6 +58,7 @@ const MAX_DOCUMENT_SSH_BYTES: usize = 32 * 1024 * 1024;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const RETRY_DELAY: Duration = Duration::from_secs(30);
 const MAX_REDIRECTS: usize = 5;
+const IMAGE_ACCEPT: &str = "image/*";
 
 type LoadedImage = std::result::Result<Arc<RenderImage>, ImageCacheError>;
 
@@ -67,7 +74,7 @@ enum ImageRequest {
 pub(super) struct DocumentImages {
     pub root: PathBuf,
     pub document: PathBuf,
-    pub ssh: Option<SshSession>,
+    pub remote: Option<RemoteResources>,
     pub allow_embedded: bool,
     pub display: Entity<DisplayedImages>,
 }
@@ -77,7 +84,7 @@ impl DocumentImages {
         let request = self.request(uri, false)?;
         Some(request_source(
             request,
-            self.ssh.clone(),
+            self.remote.clone(),
             self.display.clone(),
             block,
             false,
@@ -96,7 +103,7 @@ impl DocumentImages {
         };
         Some(request_source(
             request,
-            self.ssh.clone(),
+            self.remote.clone(),
             display,
             None,
             true,
@@ -115,10 +122,10 @@ impl DocumentImages {
             let Destination::Local { path, .. } = destination(&self.document, uri)? else {
                 return None;
             };
-            if let Some(ssh) = &self.ssh {
+            if let Some(remote) = &self.remote {
                 image_viewer::format(&path)?;
                 ImageRequest::Remote {
-                    connection: ssh.connection_id(),
+                    connection: remote.ssh.connection_id(),
                     path,
                 }
             } else {
@@ -144,18 +151,26 @@ fn image_url(uri: &str) -> Option<Url> {
 
 fn request_source(
     request: ImageRequest,
-    ssh: Option<SshSession>,
+    remote: Option<RemoteResources>,
     display: Entity<DisplayedImages>,
     block: Option<usize>,
     preview: bool,
 ) -> ImageSource {
     if preview {
         ImageSource::Custom(Arc::new(move |window, cx| {
-            use_image(&request, ssh.as_ref(), &display, None, true, window, cx)
+            use_image(&request, remote.as_ref(), &display, None, true, window, cx)
         }))
     } else {
         ImageSource::deferred(move |visible, window, cx| {
-            use_image(&request, ssh.as_ref(), &display, block, visible, window, cx)
+            use_image(
+                &request,
+                remote.as_ref(),
+                &display,
+                block,
+                visible,
+                window,
+                cx,
+            )
         })
     }
 }
@@ -169,12 +184,14 @@ pub(super) struct DisplayedImages {
     changed: HashSet<usize>,
     ssh_images: usize,
     ssh_bytes: usize,
+    ssh_paused: Arc<AtomicBool>,
 }
 
 impl DisplayedImages {
     pub(super) fn new(cx: &mut App) -> Entity<Self> {
         cx.new(|cx| {
             cx.on_release(|images: &mut Self, cx| {
+                images.pause_ssh(true);
                 let images = std::mem::take(&mut images.results);
                 cx.defer(move |cx| {
                     for (result, _) in images.into_values() {
@@ -189,6 +206,9 @@ impl DisplayedImages {
             .detach();
             Self::default()
         })
+    }
+    pub(super) fn pause_ssh(&self, paused: bool) {
+        self.ssh_paused.store(paused, Ordering::Release);
     }
     fn can_load_ssh_image(&self) -> bool {
         self.ssh_images < MAX_DOCUMENT_SSH_IMAGES && self.ssh_bytes < MAX_DOCUMENT_SSH_BYTES
@@ -215,7 +235,7 @@ fn ssh_budget_error() -> ImageCacheError {
 
 struct OnlineImages {
     pending: Rc<RefCell<PendingImages>>,
-    directory: Option<PathBuf>,
+    cache: Option<ResourceCache>,
     agent: Agent,
 }
 
@@ -227,7 +247,7 @@ impl Default for OnlineImages {
         let config = Agent::config_builder().proxy(None).max_redirects(0).build();
         Self {
             pending: Rc::default(),
-            directory: dirs::cache_dir().map(|path| path.join("stroll").join("online-images")),
+            cache: ResourceCache::for_desktop(),
             agent: Agent::with_parts(config, DefaultConnector::new(), PublicResolver::default()),
         }
     }
@@ -235,13 +255,78 @@ impl Default for OnlineImages {
 
 #[derive(Default)]
 struct PendingImages {
-    loads: HashMap<ImageRequest, HashMap<EntityId, WeakEntity<DisplayedImages>>>,
+    loads: HashMap<ImageRequest, PendingImage>,
     waiting_views: HashSet<EntityId>,
+    ssh_checks: HashMap<usize, Vec<(PathBuf, oneshot::Sender<CachedImageCheck>)>>,
+}
+
+type ImageInterest = Arc<Mutex<HashMap<EntityId, Weak<AtomicBool>>>>;
+
+#[derive(Default)]
+struct PendingImage {
+    views: HashMap<EntityId, WeakEntity<DisplayedImages>>,
+    interest: ImageInterest,
+}
+
+impl PendingImage {
+    fn add_view(
+        &mut self,
+        view: EntityId,
+        display: &Entity<DisplayedImages>,
+        paused: &Arc<AtomicBool>,
+    ) {
+        self.views.insert(view, display.downgrade());
+        self.interest
+            .lock()
+            .unwrap()
+            .insert(view, Arc::downgrade(paused));
+    }
+}
+
+type CachedImageCheck = Option<Result<Vec<u8>>>;
+
+fn queue_ssh_check(
+    pending: &Rc<RefCell<PendingImages>>,
+    path: PathBuf,
+    remote: RemoteResources,
+    cache: ResourceCache,
+    cx: &mut App,
+) -> oneshot::Receiver<CachedImageCheck> {
+    let connection = remote.ssh.connection_id();
+    let (send, result) = oneshot::channel();
+    let schedule = {
+        let mut pending = pending.borrow_mut();
+        let checks = pending.ssh_checks.entry(connection).or_default();
+        checks.push((path, send));
+        checks.len() == 1
+    };
+    if schedule {
+        let pending = Rc::clone(pending);
+        // Collect visible image requests from this draw without waiting for a timer.
+        cx.defer(move |cx| {
+            let (paths, replies): (Vec<_>, Vec<_>) = pending
+                .borrow_mut()
+                .ssh_checks
+                .remove(&connection)
+                .unwrap_or_default()
+                .into_iter()
+                .unzip();
+            cx.spawn(async move |_| {
+                let results =
+                    blocking::unblock(move || remote.check_cached_assets(&paths, &cache)).await;
+                for (reply, result) in replies.into_iter().zip(results) {
+                    let _ = reply.send(result);
+                }
+            })
+            .detach();
+        });
+    }
+    result
 }
 
 fn use_image(
     request: &ImageRequest,
-    ssh: Option<&SshSession>,
+    remote: Option<&RemoteResources>,
     display: &Entity<DisplayedImages>,
     block: Option<usize>,
     visible: bool,
@@ -255,8 +340,13 @@ fn use_image(
         return Some(result.clone());
     }
 
-    if matches!(request, ImageRequest::Remote { .. }) && !displayed.can_load_ssh_image() {
-        return Some(Err(ssh_budget_error()));
+    if matches!(request, ImageRequest::Remote { .. }) {
+        if displayed.ssh_paused.load(Ordering::Acquire) {
+            return None;
+        }
+        if !displayed.can_load_ssh_image() {
+            return Some(Err(ssh_budget_error()));
+        }
     }
     if let Some(block) = block {
         displayed
@@ -270,6 +360,7 @@ fn use_image(
     if !visible {
         return None;
     }
+    let paused = displayed.ssh_paused.clone();
     if !cx.has_global::<OnlineImages>() {
         cx.set_global(OnlineImages::default());
     }
@@ -277,8 +368,8 @@ fn use_image(
     let pending = Rc::clone(&online.pending);
     let view = window.current_view();
     let mut state = pending.borrow_mut();
-    if let Some(views) = state.loads.get_mut(request) {
-        views.insert(view, display.downgrade());
+    if let Some(load) = state.loads.get_mut(request) {
+        load.add_view(view, display, &paused);
         return None;
     }
 
@@ -287,63 +378,94 @@ fn use_image(
         state.waiting_views.insert(view);
         return None;
     }
-    state.loads.insert(
-        request.clone(),
-        HashMap::from([(view, display.downgrade())]),
-    );
+    let mut load = PendingImage::default();
+    load.add_view(view, display, &paused);
+    let interest = load.interest.clone();
+    state.loads.insert(request.clone(), load);
     drop(state);
 
-    let directory = online.directory.clone();
+    let cache = online.cache.clone();
     let agent = online.agent.clone();
     let svg = cx.svg_renderer();
-    let ssh = ssh.cloned();
+    let remote = remote.cloned();
+    let ssh_check =
+        match (request, &remote, &cache) {
+            (ImageRequest::Remote { path, .. }, Some(remote), Some(cache)) => Some(
+                queue_ssh_check(&pending, path.clone(), remote.clone(), cache.clone(), cx),
+            ),
+            _ => None,
+        };
     let request = request.clone();
     let load = request.clone();
     cx.spawn(async move |cx| {
         let fetched = if let ImageRequest::Embedded(uri) = load {
-            cx.background_executor()
-                .spawn(async move {
-                    let image = data_url_image(&uri)
-                        .context("Invalid embedded image")?
-                        .to_image_data(svg)?;
-                    Ok((image, None))
-                })
-                .await
+            Some(
+                cx.background_executor()
+                    .spawn(async move {
+                        let image = data_url_image(&uri)
+                            .context("Invalid embedded image")?
+                            .to_image_data(svg)?;
+                        Ok((image, None))
+                    })
+                    .await,
+            )
         } else {
-            blocking::unblock(move || -> Result<_, ImageCacheError> {
+            let checked = match ssh_check {
+                Some(check) => check.await.ok().flatten(),
+                None => None,
+            };
+            blocking::unblock(move || -> Result<Option<_>, ImageCacheError> {
                 let mut ssh_bytes = None;
                 let image = match load {
                     ImageRequest::Online { url, original } => {
-                        load_image(&url, directory.as_deref(), &agent, &svg, original)?
+                        load_image(&url, cache.as_ref(), &agent, &svg, original)?
                     }
                     ImageRequest::Local(path) => {
-                        let bytes = read_local_image(&path)?;
+                        let path = canonical_local_file(&path)?;
+                        let bytes = read_local_resource(&path, true, cache.as_ref())?;
                         ImageAssetLoader::decode(&bytes, &svg)?
                     }
                     ImageRequest::Remote { path, .. } => {
                         let format =
                             image_viewer::format(&path).context("Unsupported image format")?;
-                        let ssh = ssh.as_ref().context("Missing SSH image session")?;
-                        let bytes = read_remote_bytes(ssh, &path, true)?;
+                        let remote = remote.as_ref().context("Missing SSH image session")?;
+                        let wanted = || {
+                            interest.lock().unwrap().values().any(|flag| {
+                                flag.upgrade()
+                                    .is_some_and(|paused| !paused.load(Ordering::Acquire))
+                            })
+                        };
+                        if !wanted() {
+                            return Ok(None);
+                        }
+                        let bytes = match checked {
+                            Some(bytes) => Some(bytes?),
+                            None => remote.read_while(&path, true, cache.as_ref(), &wanted)?,
+                        };
+                        let Some(bytes) = bytes else { return Ok(None) };
                         ssh_bytes = Some(bytes.len());
                         Image::from_bytes(format, bytes).to_image_data(svg)?
                     }
                     ImageRequest::Embedded(_) => unreachable!(),
                 };
-                Ok((image, ssh_bytes))
+                Ok(Some((image, ssh_bytes)))
             })
             .await
+            .transpose()
         };
         cx.update(|cx| {
             let mut pending = pending.borrow_mut();
             let views = pending
                 .loads
                 .remove(&request)
-                .expect("Expected an in-flight image request");
+                .expect("Expected an in-flight image request")
+                .views;
             let now = Instant::now();
             let mut displayed = false;
             for (view, display) in views {
-                if let Some(display) = display.upgrade() {
+                if let Some(display) = display.upgrade()
+                    && let Some(fetched) = &fetched
+                {
                     displayed = true;
                     display.update(cx, |images, cx| {
                         if images
@@ -368,7 +490,7 @@ fn use_image(
                     cx.notify(view);
                 }
             }
-            if !displayed && let Ok((image, _)) = fetched {
+            if !displayed && let Some(Ok((image, _))) = fetched {
                 cx.drop_image(image, None);
             }
             for view in pending.waiting_views.drain() {
@@ -400,128 +522,43 @@ fn has_capacity<'a>(
     }
 }
 
-fn read_local_image(path: &Path) -> Result<Vec<u8>> {
-    let path = path.canonicalize()?;
-    ensure!(
-        path.is_file() && path.components().all(|part| part.as_os_str() != ".git"),
-        "Invalid local image path",
-    );
-    let file = File::open(path)?;
-    ensure!(
-        file.metadata()?.len() <= MAX_ASSET_BYTES,
-        "Local image is too large"
-    );
-    let mut bytes = Vec::new();
-    file.take(MAX_ASSET_BYTES + 1).read_to_end(&mut bytes)?;
-    ensure!(
-        bytes.len() as u64 <= MAX_ASSET_BYTES,
-        "Local image is too large"
-    );
-    Ok(bytes)
-}
-
 fn load_image(
     url: &Url,
-    directory: Option<&Path>,
+    cache: Option<&ResourceCache>,
     agent: &Agent,
     svg: &SvgRenderer,
     original: bool,
 ) -> Result<Arc<RenderImage>> {
-    let name = format!(
-        "{}.image",
-        hex::encode(Sha256::digest(url.as_str().as_bytes()))
-    );
-    if let Some(directory) = directory
-        && let Ok(image) = read_cached_image(directory, &name, svg, original)
-    {
-        return Ok(image);
-    }
-    let (bytes, cacheable) = download(url.clone(), agent, MAX_DOWNLOAD_BYTES)?;
-    let image = decode(&bytes, svg, original)?;
-    if cacheable && let Some(directory) = directory {
-        let _ = store_cached_image(directory, &name, &bytes);
+    let downloaded = download(url.clone(), agent, MAX_DOWNLOAD_BYTES, cache)?;
+    let image = decode(&downloaded.bytes, svg, original)?;
+    if let (Some(cache), Some((key, version))) = (cache, downloaded.index) {
+        let _ = cache.store(key, &version, &downloaded.bytes);
     }
     Ok(image)
 }
 
-fn read_cached_image(
-    directory: &Path,
-    name: &str,
-    svg: &SvgRenderer,
-    original: bool,
-) -> Result<Arc<RenderImage>> {
-    let path = directory.join(name);
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(&path)
-        .or_else(|_| File::open(path))?;
-    let mut bytes = Vec::new();
-    (&file)
-        .take(MAX_DOWNLOAD_BYTES + 1)
-        .read_to_end(&mut bytes)?;
-    ensure!(
-        bytes.len() as u64 <= MAX_DOWNLOAD_BYTES,
-        "cached image is too large"
-    );
-    let image = decode(&bytes, svg, original)?;
-    let _ = file.set_times(FileTimes::new().set_modified(SystemTime::now()));
-    Ok(image)
+struct DownloadedImage {
+    bytes: Vec<u8>,
+    index: Option<(SourceKey, HttpVersion)>,
 }
 
-fn store_cached_image(directory: &Path, name: &str, bytes: &[u8]) -> Result<()> {
-    fs::create_dir_all(directory)?;
-    // Serialize publication and eviction across application instances.
-    let lock = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(directory.join("cache.lock"))?;
-    lock.lock()?;
-    let mut file = tempfile::NamedTempFile::new_in(directory)?;
-    file.write_all(bytes)?;
-    file.persist(directory.join(name))?;
-    prune_cache(directory)
+fn image_key(url: &Url) -> SourceKey {
+    SourceKey::new(
+        "http",
+        &[
+            url.as_str().as_bytes(),
+            IMAGE_ACCEPT.as_bytes(),
+            http::ACCEPT_ENCODING.as_bytes(),
+        ],
+    )
 }
 
-fn prune_cache(directory: &Path) -> Result<()> {
-    let mut files = Vec::new();
-    let mut bytes = 0;
-    for entry in fs::read_dir(directory)? {
-        let entry = entry?;
-        let path = entry.path();
-        if path
-            .extension()
-            .is_some_and(|extension| extension == "image")
-            && path
-                .file_stem()
-                .and_then(|stem| stem.to_str())
-                .is_some_and(|stem| {
-                    stem.len() == 64 && stem.bytes().all(|byte| byte.is_ascii_hexdigit())
-                })
-            && entry.file_type()?.is_file()
-        {
-            let metadata = entry.metadata()?;
-            bytes += metadata.len();
-            files.push((metadata.modified()?, metadata.len(), path));
-        }
-    }
-    files.sort_unstable();
-    let mut count = files.len();
-    for (_, size, path) in files {
-        if count <= MAX_CACHE_ENTRIES && bytes <= MAX_CACHE_BYTES {
-            break;
-        }
-        fs::remove_file(path)?;
-        count -= 1;
-        bytes -= size;
-    }
-    Ok(())
-}
-
-fn download(mut url: Url, agent: &Agent, max_bytes: u64) -> Result<(Vec<u8>, bool)> {
-    let mut cacheable = true;
+fn download(
+    mut url: Url,
+    agent: &Agent,
+    max_bytes: u64,
+    mut cache: Option<&ResourceCache>,
+) -> Result<DownloadedImage> {
     let started = Instant::now();
     for hop in 0..=MAX_REDIRECTS {
         ensure!(
@@ -531,36 +568,82 @@ fn download(mut url: Url, agent: &Agent, max_bytes: u64) -> Result<(Vec<u8>, boo
                 && url.password().is_none(),
             "invalid online image URL"
         );
-        let remaining = REQUEST_TIMEOUT
-            .checked_sub(started.elapsed())
-            .context("online image request timed out")?;
-        let response = agent
-            .get(url.as_str())
-            .header(header::ACCEPT, "image/*")
-            .config()
-            .timeout_global(Some(remaining))
-            .build()
-            .call()?;
+        let key = image_key(&url);
+        let mut cached = cache.and_then(|cache| cache.source::<HttpVersion>(key));
+        if let (Some(cache), Some(entry)) = (cache, &cached)
+            && entry.version.fresh()
+        {
+            if let Some(bytes) = cache.read_content(&entry.hash, max_bytes) {
+                return Ok(DownloadedImage { bytes, index: None });
+            }
+            cached = None;
+        }
 
-        cacheable &= !response
-            .headers()
-            .get_all(header::CACHE_CONTROL)
-            .iter()
-            .filter_map(|value| value.to_str().ok())
-            .flat_map(|value| value.split(','))
-            .any(|directive| {
-                matches!(
-                    directive.trim().to_ascii_lowercase().as_str(),
-                    "no-store" | "no-cache"
-                )
-            });
+        let response = loop {
+            let remaining = REQUEST_TIMEOUT
+                .checked_sub(started.elapsed())
+                .context("online image request timed out")?;
+            let mut request = agent
+                .get(url.as_str())
+                .header(header::ACCEPT, IMAGE_ACCEPT)
+                .header(header::ACCEPT_ENCODING, http::ACCEPT_ENCODING);
+            if let Some(entry) = &cached {
+                let version = &entry.version;
+                if let Some(etag) = &version.etag {
+                    request = request.header(header::IF_NONE_MATCH, etag.as_str());
+                } else if let Some(modified) = &version.last_modified {
+                    request = request.header(header::IF_MODIFIED_SINCE, modified.as_str());
+                }
+            }
+            let request_started = Instant::now();
+            let response = request
+                .config()
+                .timeout_global(Some(remaining))
+                .build()
+                .call()?;
+            if response.status() != StatusCode::NOT_MODIFIED {
+                break (response, request_started.elapsed());
+            }
+
+            let (Some(cache), Some(entry)) = (cache, cached.take()) else {
+                anyhow::bail!("Unexpected HTTP not-modified response");
+            };
+            ensure!(
+                entry.version.can_validate(),
+                "Unexpected HTTP not-modified response"
+            );
+            let version = HttpVersion::from_headers(
+                response.headers(),
+                Some(&entry.version),
+                request_started.elapsed(),
+            );
+            if version.is_none() {
+                cache.forget(key);
+            }
+            if let Some(bytes) = cache.read_content(&entry.hash, max_bytes) {
+                return Ok(DownloadedImage {
+                    bytes,
+                    index: version.map(|version| (key, version)),
+                });
+            }
+            // The content may have been evicted while the request was in flight.
+        };
+        let (response, request_time) = response;
+
         if matches!(response.status().as_u16(), 301 | 302 | 303 | 307 | 308) {
             ensure!(hop < MAX_REDIRECTS, "too many online image redirects");
+            if let Some(previous_cache) = cache {
+                previous_cache.forget(key);
+                if http::no_store(response.headers()) {
+                    cache = None;
+                }
+            }
             let location = response
                 .headers()
                 .get(header::LOCATION)
-                .context("missing redirect location")?;
-            let next = url.join(location.to_str()?)?;
+                .context("missing redirect location")?
+                .to_str()?;
+            let next = url.join(location)?;
             ensure!(
                 url.scheme() != "https" || next.scheme() == "https",
                 "insecure image redirect"
@@ -570,7 +653,19 @@ fn download(mut url: Url, agent: &Agent, max_bytes: u64) -> Result<(Vec<u8>, boo
             continue;
         }
 
-        return Ok((read_body(response, max_bytes)?, cacheable));
+        let index = cache.and_then(|cache| {
+            let version = (response.status() == StatusCode::OK)
+                .then(|| HttpVersion::from_headers(response.headers(), None, request_time))
+                .flatten();
+            if version.is_none() {
+                cache.forget(key);
+            }
+            version.map(|version| (key, version))
+        });
+        return Ok(DownloadedImage {
+            bytes: read_body(response, max_bytes)?,
+            index,
+        });
     }
     unreachable!("the redirect limit is checked before following a redirect");
 }
@@ -699,7 +794,10 @@ mod tests {
     use super::*;
     use gpui::{Context, Render, TestApp, img};
     use image::{Rgba, RgbaImage};
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::{
+        fs,
+        sync::atomic::{AtomicUsize, Ordering},
+    };
     use ureq::{SendBody, http::Request, middleware::MiddlewareNext};
 
     #[test]
@@ -783,16 +881,25 @@ mod tests {
             .into();
         let redirect = Url::parse("http://example.com/redirect")?;
         assert_eq!(
-            download(redirect.clone(), &agent, 4)?,
-            (vec![1, 2, 3, 4], true)
+            download(redirect.clone(), &agent, 4, None)?.bytes,
+            vec![1, 2, 3, 4]
         );
-        assert!(download(redirect, &agent, 3).is_err());
-        assert!(download(Url::parse("https://example.com/downgrade")?, &agent, 4).is_err());
+        assert!(download(redirect, &agent, 3, None).is_err());
+        assert!(
+            download(
+                Url::parse("https://example.com/downgrade")?,
+                &agent,
+                4,
+                None
+            )
+            .is_err()
+        );
         assert!(
             download(
                 Url::parse("https://user:pass@example.com/image")?,
                 &agent,
-                4
+                4,
+                None,
             )
             .is_err()
         );
@@ -822,74 +929,85 @@ mod tests {
     }
 
     #[test]
-    fn disk_cache_evicts_oldest_files() -> Result<()> {
+    fn https_cache_revalidates_and_shares_contents_with_local_files() -> Result<()> {
         let directory = tempfile::tempdir()?;
-        let old = directory.path().join(format!("{:064x}.image", 0));
-        fs::write(&old, b"old image")?;
-        OpenOptions::new()
-            .write(true)
-            .open(&old)?
-            .set_times(FileTimes::new().set_modified(SystemTime::UNIX_EPOCH))?;
-        for index in 1..MAX_CACHE_ENTRIES {
-            fs::write(
-                directory.path().join(format!("{index:064x}.image")),
-                b"image",
-            )?;
-        }
-        store_cached_image(
-            directory.path(),
-            &format!("{MAX_CACHE_ENTRIES:064x}.image"),
-            b"new image",
-        )?;
-        assert!(!old.exists());
-        assert_eq!(
-            fs::read_dir(directory.path())?.count(),
-            MAX_CACHE_ENTRIES + 1
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn disk_cache_reads_after_reopening_and_replaces_invalid_files() -> Result<()> {
-        let directory = tempfile::tempdir()?;
+        let cache = ResourceCache::new(directory.path().to_owned());
         let calls = Arc::new(AtomicUsize::new(0));
         let request_count = calls.clone();
         let agent: Agent = Agent::config_builder()
             .middleware(move |req: Request<SendBody>, _: MiddlewareNext| {
                 request_count.fetch_add(1, Ordering::Relaxed);
-                let mut response = Response::new(Body::builder().data(test_svg()));
-                if req.uri().path() == "/private" {
-                    response
-                        .headers_mut()
-                        .insert(header::CACHE_CONTROL, "private, no-store".parse().unwrap());
-                }
-                Ok(response)
+                let mut response =
+                    Response::builder().header(header::VARY, "Accept, Accept-Encoding");
+                let bytes = match req.uri().path() {
+                    "/private" => {
+                        response = response.header(header::CACHE_CONTROL, "private, no-store");
+                        test_svg()
+                    }
+                    "/vary" => {
+                        response = response
+                            .header(header::VARY, "*")
+                            .header(header::CACHE_CONTROL, "max-age=600");
+                        test_svg()
+                    }
+                    "/image" if req.headers().contains_key(header::IF_NONE_MATCH) => {
+                        assert_eq!(req.headers()[header::IF_NONE_MATCH], "\"svg\"");
+                        response = response
+                            .status(304)
+                            .header(header::CACHE_CONTROL, "max-age=600");
+                        Vec::new()
+                    }
+                    "/image" => {
+                        response = response
+                            .header(header::ETAG, "\"svg\"")
+                            .header(header::CACHE_CONTROL, "max-age=600")
+                            .header(header::AGE, "600");
+                        test_svg()
+                    }
+                    _ => panic!("unexpected request"),
+                };
+                Ok(response.body(Body::builder().data(bytes)).unwrap())
             })
             .build()
             .into();
         let url = Url::parse("https://example.com/image")?;
         let svg = SvgRenderer::new(Arc::new(()));
-        let first = load_image(&url, Some(directory.path()), &agent, &svg, false)?;
-        let image_id = first.id;
-        drop(first);
-        let second = load_image(&url, Some(directory.path()), &agent, &svg, false)?;
-        assert_ne!(second.id, image_id);
-        assert_eq!(second.as_bytes(0).unwrap().len(), 8 * 4 * 4);
-        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        let local = directory.path().join("diagram.svg");
+        fs::write(&local, test_svg())?;
+        assert_eq!(read_local_resource(&local, true, Some(&cache))?, test_svg());
 
-        let cached = directory.path().join(format!(
-            "{}.image",
-            hex::encode(Sha256::digest(url.as_str()))
-        ));
-        fs::write(&cached, b"corrupt contents")?;
-        load_image(&url, Some(directory.path()), &agent, &svg, false)?;
-        assert_eq!(fs::read(&cached)?, test_svg());
-        let private = Url::parse("https://example.com/private")?;
-        for _ in 0..2 {
-            load_image(&private, Some(directory.path()), &agent, &svg, false)?;
+        let first = load_image(&url, Some(&cache), &agent, &svg, false)?;
+        let reopened = ResourceCache::new(directory.path().to_owned());
+        let second = load_image(&url, Some(&reopened), &agent, &svg, false)?;
+        assert_ne!(first.id, second.id);
+        assert_eq!(second.as_bytes(0).unwrap().len(), 8 * 4 * 4);
+        load_image(&url, Some(&reopened), &agent, &svg, false)?;
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+        assert_eq!(cache.count_contents(), 1);
+
+        let cached = reopened.source::<HttpVersion>(image_key(&url)).unwrap();
+        reopened.corrupt_content(&cached.hash)?;
+        load_image(&url, Some(&reopened), &agent, &svg, false)?;
+        assert_eq!(calls.load(Ordering::Relaxed), 3);
+        assert_eq!(
+            reopened
+                .read_content(&cached.hash, MAX_DOWNLOAD_BYTES)
+                .unwrap(),
+            test_svg()
+        );
+
+        for path in ["private", "vary"] {
+            let alternate = url.join(path)?;
+            for _ in 0..2 {
+                load_image(&alternate, Some(&reopened), &agent, &svg, false)?;
+            }
+            assert!(
+                reopened
+                    .source::<HttpVersion>(image_key(&alternate))
+                    .is_none()
+            );
         }
-        assert_eq!(calls.load(Ordering::Relaxed), 4);
-        assert_eq!(fs::read_dir(directory.path())?.count(), 2);
+        assert_eq!(calls.load(Ordering::Relaxed), 7);
         Ok(())
     }
 
@@ -927,7 +1045,7 @@ mod tests {
         let (first_display, second_display) = app.update(|cx| {
             cx.set_global(OnlineImages {
                 pending: Rc::default(),
-                directory: Some(directory.path().to_owned()),
+                cache: Some(ResourceCache::new(directory.path().to_owned())),
                 agent,
             });
             (DisplayedImages::new(cx), DisplayedImages::new(cx))
