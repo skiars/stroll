@@ -21,6 +21,8 @@ mod style;
 mod text_view;
 mod utils;
 
+#[doc(hidden)]
+pub use format::html::html_ids;
 use gpui::{App, ElementId, IntoElement, RenderOnce, SharedString, Window};
 pub use inline_element::*;
 pub use markdown_ext::*;

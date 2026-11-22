@@ -172,6 +172,7 @@ struct Heading {
 pub struct PreparedDocument {
     source: SharedString,
     headings: Vec<Heading>,
+    html_anchors: HashMap<SharedString, usize>,
     extensions: MarkdownExtensions,
     graphics: Arc<Graphics>,
     remote: Option<RemoteResources>,
@@ -179,7 +180,8 @@ pub struct PreparedDocument {
 
 impl PreparedDocument {
     pub(crate) fn has_fragment(&self, fragment: &str) -> bool {
-        heading_index(&self.headings, fragment).is_some()
+        self.html_anchors.contains_key(fragment)
+            || heading_index(&self.headings, fragment).is_some()
     }
 
     pub(crate) fn title(&self) -> Option<&str> {
@@ -211,9 +213,11 @@ impl PreparedDocument {
             }
         });
         let graphics = Arc::new(graphics);
+        let html_anchors = html_anchors(&ast, &source);
         Ok(Self {
             source: source.into(),
             headings,
+            html_anchors,
             extensions: doc_graphics::extensions(graphics.clone()).plugin(TaskTable(task_cells)),
             graphics,
             remote: None,
@@ -273,8 +277,44 @@ fn heading_index(headings: &[Heading], fragment: &str) -> Option<usize> {
         })
 }
 
-pub(crate) fn heading_source_offset(source: &str, fragment: &str) -> Option<usize> {
-    let headings = headings(&parse_markdown(source).ok()?);
+fn html_anchors(ast: &Node, source: &str) -> HashMap<SharedString, usize> {
+    let mut anchors = HashMap::new();
+    visit(ast, &mut |node| {
+        if let Node::Html(html) = node
+            && let Some(position) = &html.position
+        {
+            let ids = gpui_base::text::html_ids(&html.value);
+            if ids.is_empty() {
+                return;
+            }
+            let raw = &source[position.start.offset..position.end.offset];
+            let mut starts = vec![position.start.offset];
+            starts.extend(
+                raw.match_indices(['\n', '\r'])
+                    .filter_map(|(offset, ending)| {
+                        let next = offset + 1;
+                        (ending != "\r" || !raw[next..].starts_with('\n'))
+                            .then_some(position.start.offset + next)
+                    }),
+            );
+            for (id, line) in ids {
+                let offset = starts
+                    .get(line - 1)
+                    .copied()
+                    .unwrap_or(position.start.offset);
+                anchors.entry(id).or_insert(offset);
+            }
+        }
+    });
+    anchors
+}
+
+pub(crate) fn fragment_source_offset(source: &str, fragment: &str) -> Option<usize> {
+    let ast = parse_markdown(source).ok()?;
+    if let Some(&offset) = html_anchors(&ast, source).get(fragment) {
+        return Some(offset);
+    }
+    let headings = headings(&ast);
     Some(headings[heading_index(&headings, fragment)?].source.start)
 }
 
@@ -449,6 +489,11 @@ pub(crate) fn line_fragment(fragment: &str) -> Option<u32> {
         .map(|line| line.saturating_sub(1))
 }
 
+enum DocumentFragment {
+    Heading(usize),
+    HtmlId(String),
+}
+
 pub struct DocReader {
     typography: crate::config::Docs,
     root: PathBuf,
@@ -468,8 +513,8 @@ pub struct DocReader {
     outline_scroll: ScrollHandle,
     selected_heading: Option<usize>,
     body_position: Option<ListOffset>,
-    heading_jump_block: Option<usize>,
-    pending_heading: Option<(usize, bool)>,
+    fragment_jump_block: Option<usize>,
+    pending_fragment: Option<(DocumentFragment, bool)>,
     pending_source_location: Option<(Range<usize>, bool)>,
     history_fragment: Option<String>,
     pending_position: Option<DocumentPosition>,
@@ -588,7 +633,7 @@ impl DocReader {
         let text_subscription = cx.observe(&text, |this: &mut Self, _, cx| this.reveal_pending(cx));
         let search_subscription = cx.observe(&search, |this: &mut Self, search, cx| {
             if search.read(cx).has_matches() {
-                this.heading_jump_block = None;
+                this.fragment_jump_block = None;
             }
             cx.notify();
         });
@@ -614,8 +659,8 @@ impl DocReader {
             outline_scroll: ScrollHandle::new(),
             selected_heading: None,
             body_position: None,
-            heading_jump_block: None,
-            pending_heading: None,
+            fragment_jump_block: None,
+            pending_fragment: None,
             pending_source_location: None,
             history_fragment: None,
             pending_position: None,
@@ -667,7 +712,7 @@ impl DocReader {
         let text = self.text.read(cx);
         let top = text.list_state().logical_scroll_top();
         let position = if blocks.contains(&top.item_ix)
-            && self.heading_jump_block.is_none()
+            && self.fragment_jump_block.is_none()
             && !text.has_pending_reveal()
         {
             self.session_position(cx)
@@ -685,7 +730,7 @@ impl DocReader {
     pub(crate) fn history_location(&self, cx: &App) -> DocumentLocation {
         DocumentLocation {
             position: self.pending_position.or_else(|| {
-                if self.heading_jump_block.is_some() {
+                if self.fragment_jump_block.is_some() {
                     None
                 } else {
                     self.session_position(cx)
@@ -703,7 +748,7 @@ impl DocReader {
     ) {
         self.pending_source_location = None;
         if let Some(position) = location.position {
-            self.pending_heading = None;
+            self.pending_fragment = None;
             self.history_fragment = location.fragment;
             self.restore_position(Some(position));
             self.navigate_saved_position = animate;
@@ -712,7 +757,7 @@ impl DocReader {
             .as_deref()
             .is_some_and(|fragment| self.jump_to_fragment_with_motion(fragment, animate, cx))
         {
-            self.pending_heading = None;
+            self.pending_fragment = None;
             self.history_fragment = None;
             self.restore_position(Some(DocumentPosition {
                 source_offset: None,
@@ -727,7 +772,7 @@ impl DocReader {
 
     pub(crate) fn session_position(&self, cx: &App) -> Option<DocumentPosition> {
         if self.pending_position.is_some()
-            || self.pending_heading.is_some()
+            || self.pending_fragment.is_some()
             || self.pending_source_location.is_some()
         {
             return None;
@@ -753,7 +798,7 @@ impl DocReader {
 
     pub(crate) fn restore_position(&mut self, position: Option<DocumentPosition>) {
         if position.is_some() {
-            self.heading_jump_block = None;
+            self.fragment_jump_block = None;
         }
         self.pending_position = position;
         self.restoring_line = false;
@@ -824,7 +869,7 @@ impl DocReader {
         cx: &mut Context<Self>,
     ) {
         if self.typography != typography {
-            if self.heading_jump_block.is_none()
+            if self.fragment_jump_block.is_none()
                 && let Some(position) = self.session_position(cx)
             {
                 self.restore_position(Some(position));
@@ -883,8 +928,8 @@ impl DocReader {
         };
         let source = to_source_offset(range.start)..to_source_offset(range.end);
         self.restore_position(None);
-        self.heading_jump_block = None;
-        self.pending_heading = None;
+        self.fragment_jump_block = None;
+        self.pending_fragment = None;
         self.pending_source_location = Some((source, animate));
         self.reveal_pending(cx);
     }
@@ -928,26 +973,42 @@ impl DocReader {
         animate: bool,
         cx: &mut Context<Self>,
     ) -> bool {
-        let Some(index) = heading_index(&self.document.headings, fragment) else {
-            return false;
-        };
-        self.jump_to_heading(index, animate, cx);
-        true
+        if self.document.html_anchors.contains_key(fragment) {
+            self.start_fragment_jump(DocumentFragment::HtmlId(fragment.to_owned()), animate, cx);
+            true
+        } else if let Some(index) = heading_index(&self.document.headings, fragment) {
+            self.jump_to_heading(index, animate, cx);
+            true
+        } else {
+            false
+        }
     }
 
     fn jump_to_heading(&mut self, index: usize, animate: bool, cx: &mut Context<Self>) {
-        self.restore_position(None);
-        self.heading_jump_block = None;
-        self.pending_source_location = None;
         self.select_heading(index);
-        self.history_fragment = Some(self.document.headings[index].slug.clone());
-        self.pending_heading = Some((index, animate));
+        self.start_fragment_jump(DocumentFragment::Heading(index), animate, cx);
+    }
+
+    fn start_fragment_jump(
+        &mut self,
+        fragment: DocumentFragment,
+        animate: bool,
+        cx: &mut Context<Self>,
+    ) {
+        self.restore_position(None);
+        self.fragment_jump_block = None;
+        self.pending_source_location = None;
+        self.history_fragment = Some(match &fragment {
+            DocumentFragment::Heading(index) => self.document.headings[*index].slug.clone(),
+            DocumentFragment::HtmlId(id) => id.clone(),
+        });
+        self.pending_fragment = Some((fragment, animate));
         self.reveal_pending(cx);
         cx.notify();
     }
 
     fn reveal_pending(&mut self, cx: &mut Context<Self>) {
-        if self.pending_heading.is_none() && self.pending_source_location.is_none() {
+        if self.pending_fragment.is_none() && self.pending_source_location.is_none() {
             return;
         }
         let text = self.text.read(cx);
@@ -955,19 +1016,54 @@ impl DocReader {
         if rendered.source() != self.document.source.as_ref() {
             return;
         }
-        let Some((index, animate)) = self.pending_heading.take() else {
+        let Some((fragment, animate)) = self.pending_fragment.take() else {
             if let Some((source, animate)) = self.pending_source_location.take() {
                 self.reveal_source_range(source, animate, cx);
             }
             return;
         };
-        if let Some(range) = rendered.range_for_source(self.document.headings[index].source.clone())
-        {
-            self.heading_jump_block =
-                text.block_for_source_offset(self.document.headings[index].source.start);
-            self.text.update(cx, |text, cx| {
-                _ = text.scroll_to_range(range.start..range.start, Some(px(12.)), animate, cx);
-            });
+        match fragment {
+            DocumentFragment::Heading(index) => {
+                let source = self.document.headings[index].source.clone();
+                if let Some(range) = rendered.range_for_source(source.clone()) {
+                    self.fragment_jump_block = text.block_for_source_offset(source.start);
+                    self.text.update(cx, |text, cx| {
+                        _ = text.scroll_to_range(
+                            range.start..range.start,
+                            Some(px(12.)),
+                            animate,
+                            cx,
+                        );
+                    });
+                }
+            }
+            DocumentFragment::HtmlId(id) => {
+                let source = self.document.html_anchors[id.as_str()];
+                let heading = self
+                    .document
+                    .headings
+                    .partition_point(|heading| heading.source.start <= source)
+                    .saturating_sub(1);
+                let block = self.text.update(cx, |text, cx| {
+                    text.scroll_to_html_id(&id, px(12.), animate, cx)
+                        .or_else(|| {
+                            let block = text.block_for_source_offset(source)?;
+                            text.scroll_to_block(
+                                ListOffset {
+                                    item_ix: block,
+                                    offset_in_item: px(0.),
+                                },
+                                animate,
+                            );
+                            cx.notify();
+                            Some(block)
+                        })
+                });
+                if !self.document.headings.is_empty() {
+                    self.select_heading(heading);
+                    self.fragment_jump_block = block;
+                }
+            }
         }
     }
 
@@ -977,7 +1073,7 @@ impl DocReader {
     }
 
     fn sync_outline(&mut self, cx: &mut Context<Self>) {
-        if self.pending_heading.is_some() || self.pending_position.is_some() {
+        if self.pending_fragment.is_some() || self.pending_position.is_some() {
             return;
         }
         let text = self.text.read(cx);
@@ -989,7 +1085,7 @@ impl DocReader {
         let previous = self.body_position.replace(top);
         // An explicit reveal can place a heading anywhere within the visible page.
         // Keep the clicked heading until the reader moves away from that position.
-        if let Some(target) = self.heading_jump_block.take() {
+        if let Some(target) = self.fragment_jump_block.take() {
             if list
                 .bounds_for_item(target)
                 .is_some_and(|bounds| list.viewport_bounds().intersects(&bounds))
@@ -997,7 +1093,7 @@ impl DocReader {
                 return;
             }
             if text.has_pending_reveal() {
-                self.heading_jump_block = Some(target);
+                self.fragment_jump_block = Some(target);
                 return;
             }
         }
@@ -1283,7 +1379,7 @@ impl Render for DocReader {
                         |_, _, _| (),
                         move |_, _, window, cx| {
                             let report = reader.read_with(cx, |reader, cx| {
-                                reader.heading_jump_block.is_some()
+                                reader.fragment_jump_block.is_some()
                                     || reader.body_position
                                         != Some(
                                             reader.text.read(cx).list_state().logical_scroll_top(),
@@ -1402,6 +1498,67 @@ mod tests {
             &doc.source[doc.headings[1].source.clone()],
             "## 中文 & Code"
         );
+    }
+
+    #[test]
+    fn finds_explicit_html_ids_with_exact_case_and_decoded_attributes() {
+        let source = "# Title\n\n<span ID='Part&amp;One'>Label</span>\n\n<!-- <p id='comment'> -->\n\n```html\n<img id='example'>\n```";
+        let document = PreparedDocument::new(source.into()).unwrap();
+        assert!(document.has_fragment("Part&One"));
+        assert!(document.has_fragment("title"));
+        let table = "<table>\n<tr><td id='cell'>Target</td></tr>\n</table>";
+        assert_eq!(fragment_source_offset(table, "cell"), table.find("<tr>"));
+        for missing in ["part&one", "comment", "example"] {
+            assert!(!document.has_fragment(missing));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[gpui::test]
+    fn markdown_html_cell_jump_uses_the_target_row_within_the_table(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        let rows = (0..40)
+            .map(|index| format!("<tr><td id='Row-{index}'>Item {index}</td></tr>"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let source = format!(
+            "[Jump](#Row-20)\n\n<table><tbody>\n{rows}\n</tbody></table>\n\n{}",
+            "Following paragraph.\n\n".repeat(25),
+        );
+        let (reader, visual) = cx.add_window_view(|window, cx| {
+            DocReader::new(
+                PathBuf::new(),
+                "README.md".into(),
+                PreparedDocument::new(source).unwrap(),
+                None,
+                WeakEntity::new_invalid(),
+                window,
+                cx,
+            )
+        });
+        visual.simulate_resize(size(px(850.), px(430.)));
+        draw_scroll_test_frame(visual);
+        let reveal = |visual: &mut VisualTestContext, id: &str| {
+            visual.update(|_, cx| {
+                reader.update(cx, |reader, cx| {
+                    assert!(reader.jump_to_fragment_with_motion(id, false, cx));
+                });
+            });
+            draw_scroll_test_frame(visual);
+            visual.update(|_, cx| {
+                let reader = reader.read(cx);
+                let text = reader.text.read(cx);
+                assert!(!text.has_pending_reveal());
+                assert_eq!(reader.history_fragment.as_deref(), Some(id));
+                let list = text.list_state();
+                let table = list.bounds_for_item(1).unwrap();
+                table.top() - list.viewport_bounds().top()
+            })
+        };
+        let first = reveal(visual, "Row-0");
+        let middle = reveal(visual, "Row-20");
+        assert!(first.abs() < px(30.));
+        assert!(middle < first - px(450.));
     }
 
     #[cfg(target_os = "linux")]

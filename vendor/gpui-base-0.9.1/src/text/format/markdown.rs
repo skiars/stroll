@@ -128,7 +128,7 @@ fn shift_positions(node: &mut Node, origin: &Point) {
 
 enum InlineGroup<'a> {
     Node(&'a Node),
-    Marked(TextMark, &'a [Node]),
+    Marked(TextMark, &'a Node, &'a [Node]),
 }
 
 /// CommonMark hands each raw inline tag over as its own `Html` node, so
@@ -144,7 +144,11 @@ fn inline_groups(children: &[Node]) -> Vec<InlineGroup<'_>> {
             && let Some(mark) = inline_html_mark(&name, attrs)
             && let Some(close) = matching_close_tag(children, ix, &name)
         {
-            groups.push(InlineGroup::Marked(mark, &children[ix + 1..close]));
+            groups.push(InlineGroup::Marked(
+                mark,
+                &children[ix],
+                &children[ix + 1..close],
+            ));
             ix = close + 1;
             continue;
         }
@@ -260,7 +264,8 @@ fn parse_inline_children(
             InlineGroup::Node(child) => {
                 text.push_str(&parse_paragraph(source, paragraph, child, cx));
             }
-            InlineGroup::Marked(mark, nodes) => {
+            InlineGroup::Marked(mark, opening, nodes) => {
+                add_inline_html_anchors(paragraph, opening);
                 text.push_str(&merge_children_with_mark(
                     source, paragraph, nodes, mark, cx,
                 ));
@@ -355,11 +360,13 @@ fn merge_children_with_mark(
         let mut child_paragraph = Paragraph::default();
         let child_text = match group {
             InlineGroup::Node(child) => parse_paragraph(source, &mut child_paragraph, child, cx),
-            InlineGroup::Marked(child_mark, nodes) => {
+            InlineGroup::Marked(child_mark, opening, nodes) => {
+                add_inline_html_anchors(&mut child_paragraph, opening);
                 merge_children_with_mark(source, &mut child_paragraph, nodes, child_mark, cx)
             }
         };
         text.push_str(&child_text);
+        paragraph.append_html_anchors(child_paragraph.html_anchors, merged_text.len());
 
         for mut node in child_paragraph.children {
             if node.custom.is_some() {
@@ -730,9 +737,7 @@ fn append_inline_html_blocks(paragraph: &mut Paragraph, blocks: Vec<BlockNode>) 
             }
             BlockNode::Paragraph(html_paragraph) => {
                 text.push_str(&html_paragraph.text());
-                for child in html_paragraph.children {
-                    paragraph.push(child);
-                }
+                paragraph.merge(html_paragraph);
             }
             BlockNode::Break { .. } => {
                 text.push('\n');
@@ -743,6 +748,14 @@ fn append_inline_html_blocks(paragraph: &mut Paragraph, blocks: Vec<BlockNode>) 
     }
 
     Some(text)
+}
+
+fn add_inline_html_anchors(paragraph: &mut Paragraph, node: &Node) {
+    if let Node::Html(html) = node {
+        for (id, _) in super::html::html_ids(&html.value) {
+            paragraph.add_html_anchor(id);
+        }
+    }
 }
 
 fn parse_paragraph(

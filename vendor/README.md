@@ -384,3 +384,12 @@ dialogs in a Wayland window after changes to paint order or focus handling.
   handoff coverage. Run `cargo test --release --locked -p gpui-pre-macos --lib events::scroll_tests`
   on macOS for native phase classification. The `scroll_probe` example logs
   native input classifications and frame CPU timings for manual verification.
+
+- Markdown fragment navigation can reveal visible elements with an explicit HTML
+  `id`, including cells within a table. HTML tables retain their row groups
+  and header cells. Headerless HTML tables use body row styling throughout.
+  The reader, source history, and `documents` tests cover these paths and
+  the existing GFM header styling.
+
+- Completed Markdown task items inherit the body text color. The `documents`
+  integration test compares the painted text colors of both task states.

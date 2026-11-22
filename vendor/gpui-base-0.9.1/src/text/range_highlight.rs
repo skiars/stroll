@@ -28,7 +28,7 @@ use std::{
 #[cfg(target_family = "wasm")]
 use web_time::Instant;
 
-use gpui::{Bounds, EntityId, Hsla, Pixels, SharedString};
+use gpui::{Bounds, EntityId, Hsla, Pixels, SharedString, Window, px};
 
 use super::{
     document::ParsedDocument,
@@ -1545,6 +1545,11 @@ enum RevealTarget {
     Line { key: TextLeafKey, offset: usize },
     /// A whole top-level block, for text that belongs to no leaf.
     Block { ix: usize },
+    HtmlAnchor {
+        ix: usize,
+        paragraph: usize,
+        offset: usize,
+    },
 }
 
 /// How long a reveal keeps trying. One that has not been carried out by
@@ -1603,14 +1608,44 @@ impl PendingReveal {
         now: Instant,
         top_inset: Option<Pixels>,
     ) -> Option<Self> {
-        Some(Self {
-            target: text.index().locate(range)?,
-            requested_at: now,
+        Some(Self::for_target(
+            text.index().locate(range)?,
+            now,
+            top_inset,
+        ))
+    }
+
+    pub(super) fn html_anchor(
+        document: &ParsedDocument,
+        id: &str,
+        now: Instant,
+        inset: Pixels,
+    ) -> Option<Self> {
+        let (ix, (paragraph, offset)) = document
+            .blocks
+            .iter()
+            .enumerate()
+            .find_map(|(ix, block)| block.html_anchor(id).map(|target| (ix, target)))?;
+        Some(Self::for_target(
+            RevealTarget::HtmlAnchor {
+                ix,
+                paragraph,
+                offset,
+            },
+            now,
+            Some(inset),
+        ))
+    }
+
+    fn for_target(target: RevealTarget, requested_at: Instant, top_inset: Option<Pixels>) -> Self {
+        Self {
+            target,
+            requested_at,
             top_inset,
             report: Arc::default(),
             attempts: 0,
             scroll: None,
-        })
+        }
     }
 
     pub(super) fn is_expired(&self, now: Instant) -> bool {
@@ -1631,7 +1666,9 @@ impl PendingReveal {
                     .span()
                     .is_some_and(|span| span.start <= key.block_start())
             }),
-            RevealTarget::Block { ix } => (ix < document.blocks.len()).then_some(ix),
+            RevealTarget::Block { ix } | RevealTarget::HtmlAnchor { ix, .. } => {
+                (ix < document.blocks.len()).then_some(ix)
+            }
         }
     }
 
@@ -1646,12 +1683,11 @@ impl PendingReveal {
         if let Ok(mut report) = self.report.lock() {
             *report = None;
         }
-        let RevealTarget::Line { key, offset } = self.target else {
+        if self.is_block() {
             return None;
-        };
+        }
         Some(RevealRequest {
-            key,
-            offset,
+            target: self.target,
             top_inset: self.top_inset,
             report: self.report.clone(),
         })
@@ -1688,8 +1724,7 @@ impl PendingReveal {
 /// that lays that text out.
 #[derive(Clone, Debug)]
 pub(crate) struct RevealRequest {
-    key: TextLeafKey,
-    offset: usize,
+    target: RevealTarget,
     top_inset: Option<Pixels>,
     report: Arc<Mutex<Option<RevealReport>>>,
 }
@@ -1703,15 +1738,36 @@ impl RevealRequest {
         start: usize,
         end: usize,
     ) -> Option<RevealAt> {
-        if key != Some(self.key) {
+        let RevealTarget::Line {
+            key: target,
+            offset,
+        } = self.target
+        else {
             return None;
-        }
+        };
+        (key == Some(target))
+            .then(|| self.at_offset(offset))?
+            .rebase(start, end)
+    }
+
+    pub(crate) fn html_anchor(&self, paragraph: usize) -> Option<RevealAt> {
+        let RevealTarget::HtmlAnchor {
+            paragraph: target,
+            offset,
+            ..
+        } = self.target
+        else {
+            return None;
+        };
+        (paragraph == target).then(|| self.at_offset(offset))
+    }
+
+    fn at_offset(&self, offset: usize) -> RevealAt {
         RevealAt {
-            offset: self.offset,
+            offset,
             top_inset: self.top_inset,
             report: self.report.clone(),
         }
-        .rebase(start, end)
     }
 }
 
@@ -1726,6 +1782,22 @@ pub(crate) struct RevealAt {
 impl RevealAt {
     pub(crate) fn offset(&self) -> usize {
         self.offset
+    }
+
+    pub(super) fn with_offset(mut self, offset: usize) -> Self {
+        self.offset = offset;
+        self
+    }
+
+    pub(super) fn request_anchor(&self, mut bounds: Bounds<Pixels>, window: &mut Window) {
+        let visible = window.content_mask().bounds.dilate(px(0.5));
+        bounds.size.height = px(1.);
+        bounds.size.width = bounds.size.width.max(px(1.));
+        window.request_autoscroll_to_top(bounds, self.top_inset.unwrap_or_default());
+        self.report(
+            bounds,
+            bounds.top() < visible.bottom() && bounds.bottom() > visible.top(),
+        );
     }
 
     /// The reveal in the text between `start` and `end`, rebased to `start`,

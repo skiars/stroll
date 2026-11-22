@@ -81,7 +81,7 @@ fn source_history_replays_files_jumps_and_worktree_positions() -> Result<()> {
     )?;
     fs::write(
         root.join(guide),
-        "# Guide\n\n## Target\n\nSee [source](alpha.txt#L42).\n",
+        "# Guide\n\n<table><tr><td id='Entry'>Target</td></tr></table>\n\n<span id='Details'>Details</span>\n\nSee [source](alpha.txt#L42).\n",
     )?;
     git(&["add", "."])?;
     git(&[
@@ -466,9 +466,13 @@ fn source_history_replays_files_jumps_and_worktree_positions() -> Result<()> {
     visual.simulate_click(end.center(), Modifiers::none());
     wait_for(visual, |cx| reading(cx, readme, Some("end")))?;
     navigate(visual, |workspace, window, cx| {
-        workspace.follow_document_link(Path::new("README.md"), "guide.md#target", window, cx);
+        workspace.follow_document_link(Path::new("README.md"), "guide.md#Entry", window, cx);
     });
-    wait_for(visual, |cx| reading(cx, guide, Some("target")))?;
+    wait_for(visual, |cx| reading(cx, guide, Some("Entry")))?;
+    navigate(visual, |workspace, window, cx| {
+        workspace.follow_document_link(Path::new("guide.md"), "#Details", window, cx);
+    });
+    wait_for(visual, |cx| reading(cx, guide, Some("Details")))?;
     navigate(visual, |workspace, window, cx| {
         workspace.follow_document_link(Path::new("guide.md"), "beta.txt#L42", window, cx);
     });
@@ -483,7 +487,8 @@ fn source_history_replays_files_jumps_and_worktree_positions() -> Result<()> {
             })
     })?;
     for (path, fragment) in [
-        (guide, Some("target")),
+        (guide, Some("Details")),
+        (guide, Some("Entry")),
         (readme, Some("end")),
         (readme, None),
     ] {

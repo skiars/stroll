@@ -813,6 +813,26 @@ impl TextViewState {
         self.reveal_range_with_inset(range, top_inset, Some(animate), cx)
     }
 
+    /// Scroll to an explicit `id` on an HTML element rendered in Markdown.
+    #[doc(hidden)]
+    pub fn scroll_to_html_id(
+        &mut self,
+        id: &str,
+        inset: Pixels,
+        animate: bool,
+        cx: &mut Context<Self>,
+    ) -> Option<usize> {
+        let document = &self.parsed_content.document;
+        let mut reveal =
+            PendingReveal::html_anchor(document, id, cx.background_executor().now(), inset)?;
+        let block = reveal.block_ix(document)?;
+        reveal.scroll = Some(animate);
+        self.list_state.cancel_navigation();
+        self.pending_reveal = Some(reveal);
+        cx.notify();
+        Some(block)
+    }
+
     /// Stop queued or in-progress navigation at the current reading position.
     pub fn cancel_scroll_navigation(&mut self) {
         if self

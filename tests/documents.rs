@@ -4,6 +4,40 @@ use stroll::docs::{Destination, destination};
 
 #[cfg(target_os = "linux")]
 #[gpui::test]
+fn markdown_checklist_items_keep_the_body_text_color(cx: &mut gpui::TestAppContext) {
+    use gpui::{AppContext as _, Context, Entity, Render, Window};
+    use gpui_component::text::{TextView, TextViewState};
+
+    struct Checklist(Entity<TextViewState>);
+    impl Render for Checklist {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl gpui::IntoElement {
+            TextView::new(&self.0)
+        }
+    }
+
+    cx.update(gpui_component::init);
+    let (_, visual) = cx.add_window_view(|_, cx| {
+        let state = cx.new(|cx| {
+            TextViewState::markdown("<u>Body</u>\n\n- [ ] <u>Open</u>\n- [x] <u>Done</u>", cx)
+        });
+        Checklist(state)
+    });
+    visual.run_until_parked();
+    visual.update(|window, cx| {
+        window.draw(cx).clear(cx);
+        // Underlines without an explicit color follow the color of the glyphs.
+        let mut lines = window.painted_underlines();
+        lines.sort_by(|a, b| a.bounds.top().0.total_cmp(&b.bounds.top().0));
+        let [body, open, done] = lines.as_slice() else {
+            panic!("expected three underlined text runs");
+        };
+        assert_eq!(open.color, body.color);
+        assert_eq!(done.color, body.color);
+    });
+}
+
+#[cfg(target_os = "linux")]
+#[gpui::test]
 fn markdown_link_preview_waits_for_pointer_rest_and_stays_in_the_window(
     cx: &mut gpui::TestAppContext,
 ) {
@@ -222,6 +256,85 @@ fn clipped_image_does_not_enter_the_atlas_until_visible() -> anyhow::Result<()> 
     })?;
     assert!(atlas.contains(&key));
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[gpui::test]
+fn html_table_headers_follow_the_markup_and_gfm_keeps_its_header(cx: &mut gpui::TestAppContext) {
+    use std::sync::{Arc, Mutex};
+
+    use gpui::{
+        AppContext as _, Background, Context, Empty, Entity, ParentElement as _, Render,
+        StyleRefinement, Styled as _, Window, div, px, rgb, size,
+    };
+    use gpui_component::text::{TableData, TextView, TextViewState, TextViewStyle};
+
+    const HEADER_FILL: u32 = 0x11aa77;
+    const SOURCE: &str =
+        "<table><tbody><tr><td><strong>Card title</strong></td><td>Image B</td></tr>
+<tr><td>Image C</td><td>Image D</td></tr></tbody></table>
+
+<table><thead><tr><th>Column</th><th></th></tr></thead>
+<tbody><tr><th scope='row'>Row</th><td>Value</td></tr></tbody></table>
+
+| First | Second |
+| --- | --- |
+| One | Two |
+";
+
+    struct Tables {
+        state: Entity<TextViewState>,
+        data: Arc<Mutex<Vec<TableData>>>,
+    }
+    impl Render for Tables {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl gpui::IntoElement {
+            let data = self.data.clone();
+            div().size_full().child(
+                TextView::new(&self.state)
+                    .style(
+                        TextViewStyle::default()
+                            .table_head(StyleRefinement::default().bg(rgb(HEADER_FILL))),
+                    )
+                    .table_actions(move |table, _, _| {
+                        data.lock().unwrap().push(table.clone());
+                        Empty
+                    }),
+            )
+        }
+    }
+
+    cx.update(gpui_component::init);
+    let data = Arc::new(Mutex::new(Vec::new()));
+    let (_, visual) = cx.add_window_view(|_, cx| Tables {
+        state: cx.new(|cx| TextViewState::markdown(SOURCE, cx)),
+        data: data.clone(),
+    });
+    visual.simulate_resize(size(px(750.), px(550.)));
+    visual.run_until_parked();
+    data.lock().unwrap().clear();
+    visual.update(|window, cx| {
+        window.draw(cx).clear(cx);
+        let header: Background = rgb(HEADER_FILL).into();
+        assert_eq!(
+            window
+                .painted_quads()
+                .iter()
+                .filter(|quad| quad.background == header)
+                .count(),
+            2,
+            "Only the HTML head and GFM header rows get the header fill"
+        );
+    });
+    let tables = data.lock().unwrap();
+    assert_eq!(tables.len(), 3);
+    assert!(tables[0].headers.is_empty());
+    assert_eq!(tables[0].rows[0], ["Card title", "Image B"]);
+    assert!(tables[0].markdown.starts_with("<table><tbody><tr><td>"));
+    assert_eq!(tables[1].headers, ["Column", ""]);
+    assert_eq!(tables[1].rows, [vec!["Row", "Value"]]);
+    assert!(tables[1].markdown.contains("<tbody><tr><th>"));
+    assert_eq!(tables[2].headers, ["First", "Second"]);
+    assert_eq!(tables[2].rows, [vec!["One", "Two"]]);
 }
 
 #[test]

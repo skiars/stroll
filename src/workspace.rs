@@ -2741,7 +2741,7 @@ impl Workspace {
                     }
                 },
                 SourcePosition::MarkdownFragment(fragment) => {
-                    let offset = docs::heading_source_offset(&text.to_string(), &fragment);
+                    let offset = docs::fragment_source_offset(&text.to_string(), &fragment);
                     if offset.is_none() {
                         toast::info(window, cx, t!("docs.fragment_missing", fragment = fragment));
                     }

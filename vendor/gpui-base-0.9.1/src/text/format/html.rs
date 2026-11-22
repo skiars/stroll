@@ -6,13 +6,19 @@ use std::sync::Arc;
 
 use gpui::{DefiniteLength, Hsla, SharedString, px, relative};
 use html5ever::tendril::TendrilSink;
-use html5ever::{LocalName, ParseOpts, local_name, parse_document};
+use html5ever::{
+    LocalName, ParseOpts, local_name, parse_document,
+    tokenizer::{
+        BufferQueue, StartTag, Token, TokenSink, TokenSinkResult, Tokenizer, TokenizerResult,
+    },
+    tree_builder::TreeBuilder,
+};
 use markup5ever_rcdom::{Node, NodeData, RcDom};
 
 use crate::text::document::ParsedDocument;
 use crate::text::node::{
-    self, BlockNode, ImageNode, InlineNode, LinkMark, NodeContext, Paragraph, Table, TableRow,
-    TextMark,
+    self, BlockNode, HtmlTableRow, HtmlTableSection, ImageNode, InlineNode, LinkMark, NodeContext,
+    Paragraph, Table, TableRow, TextMark,
 };
 
 const BLOCK_ELEMENTS: [&str; 35] = [
@@ -94,18 +100,7 @@ impl HtmlParagraph {
 
 /// Parse HTML into AST Node.
 pub(crate) fn parse(source: &str, cx: &mut NodeContext) -> Result<ParsedDocument, SharedString> {
-    let opts = ParseOpts {
-        ..Default::default()
-    };
-
-    let bytes = cleanup_html(&source);
-    let mut cursor = std::io::Cursor::new(bytes);
-    // Ref
-    // https://github.com/servo/html5ever/blob/main/rcdom/examples/print-rcdom.rs
-    let dom = parse_document(RcDom::default(), opts)
-        .from_utf8()
-        .read_from(&mut cursor)
-        .map_err(|e| SharedString::from(format!("{:?}", e)))?;
+    let dom = parse_dom(&cleanup_html(source))?;
 
     let mut paragraph = HtmlParagraph::default();
     // NOTE: The outer paragraph is not used.
@@ -117,6 +112,89 @@ pub(crate) fn parse(source: &str, cx: &mut NodeContext) -> Result<ParsedDocument
         source: source.to_string().into(),
         blocks: Arc::new(vec![node]),
     })
+}
+
+fn parse_dom(source: &[u8]) -> Result<RcDom, SharedString> {
+    parse_document(RcDom::default(), ParseOpts::default())
+        .from_utf8()
+        .read_from(&mut std::io::Cursor::new(source))
+        .map_err(|error| SharedString::from(format!("{error:?}")))
+}
+
+/// Explicit element IDs and the one-based lines of their opening tags.
+pub fn html_ids(source: &str) -> Vec<(SharedString, usize)> {
+    if !source
+        .as_bytes()
+        .windows(2)
+        .any(|pair| pair.eq_ignore_ascii_case(b"id"))
+    {
+        return Vec::new();
+    }
+
+    struct IdCollector {
+        tree: TreeBuilder<Rc<Node>, RcDom>,
+        ids: Vec<(SharedString, usize)>,
+    }
+
+    impl TokenSink for IdCollector {
+        type Handle = Rc<Node>;
+
+        fn process_token(&mut self, token: Token, line: u64) -> TokenSinkResult<Self::Handle> {
+            if let Token::TagToken(tag) = &token
+                && tag.kind == StartTag
+                && supports_anchor(&tag.name)
+                && let Some(id) = tag
+                    .attrs
+                    .iter()
+                    .find(|attr| attr.name.local == local_name!("id"))
+                && !id.value.is_empty()
+            {
+                self.ids.push((SharedString::new(&id.value), line as usize));
+            }
+            self.tree.process_token(token, line)
+        }
+
+        fn end(&mut self) {
+            self.tree.end();
+        }
+
+        fn adjusted_current_node_present_but_not_in_html_namespace(&self) -> bool {
+            self.tree
+                .adjusted_current_node_present_but_not_in_html_namespace()
+        }
+    }
+
+    let mut tokenizer = Tokenizer::new(
+        IdCollector {
+            tree: TreeBuilder::new(RcDom::default(), Default::default()),
+            ids: Vec::new(),
+        },
+        Default::default(),
+    );
+    let mut input = BufferQueue::default();
+    input.push_back(source.into());
+    while let TokenizerResult::Script(_) = tokenizer.feed(&mut input) {}
+    tokenizer.end();
+    tokenizer.sink.ids
+}
+
+fn supports_anchor(name: &LocalName) -> bool {
+    !matches!(
+        *name,
+        local_name!("style") | local_name!("script") | local_name!("head")
+    )
+}
+
+fn element_id(node: &Node) -> Option<SharedString> {
+    let NodeData::Element { name, attrs, .. } = &node.data else {
+        return None;
+    };
+    if !supports_anchor(&name.local) {
+        return None;
+    }
+    attr_value(attrs, local_name!("id"))
+        .filter(|id| !id.is_empty())
+        .map(Into::into)
 }
 
 fn cleanup_html(source: &str) -> Vec<u8> {
@@ -251,29 +329,44 @@ fn attr_width_height(
     (width, height)
 }
 
-fn parse_table_row(table: &mut Table, node: &Rc<Node>) {
-    let mut row = TableRow::default();
-    let mut count = 0;
-    for child in node.children.borrow().iter() {
-        match child.data {
-            NodeData::Element {
-                ref name,
-                ref attrs,
-                ..
-            } if name.local == local_name!("td") || name.local == local_name!("th") => {
-                if child.children.borrow().is_empty() {
-                    continue;
-                }
+fn parse_table_row(
+    table: &mut Table,
+    node: &Rc<Node>,
+    section: HtmlTableSection,
+    section_id: &mut Option<SharedString>,
+) {
+    let NodeData::Element { name, .. } = &node.data else {
+        return;
+    };
+    if name.local != local_name!("tr") {
+        return;
+    }
 
-                count += 1;
-                parse_table_cell(&mut row, child, attrs);
-            }
-            _ => {}
+    let mut row = TableRow::default();
+    let mut headers = Vec::new();
+    for child in node.children.borrow().iter() {
+        if let NodeData::Element { name, attrs, .. } = &child.data
+            && matches!(name.local, local_name!("td") | local_name!("th"))
+        {
+            parse_table_cell(&mut row, child, attrs);
+            headers.push(name.local == local_name!("th"));
         }
     }
 
-    if count > 0 {
+    if let Some(first) = row.children.first_mut() {
+        first.children.html_anchors.extend(
+            section_id
+                .take()
+                .into_iter()
+                .chain(element_id(node))
+                .map(|id| (id, 0)),
+        );
         table.children.push(row);
+        table
+            .html_rows
+            .as_mut()
+            .unwrap()
+            .push(HtmlTableRow { section, headers });
     }
 }
 
@@ -283,6 +376,10 @@ fn parse_table_cell(
     attrs: &RefCell<Vec<html5ever::Attribute>>,
 ) {
     let mut paragraph = HtmlParagraph::default();
+    paragraph
+        .content
+        .html_anchors
+        .extend(element_id(node).map(|id| (id, 0)));
     for child in node.children.borrow().iter() {
         parse_cell_content(&mut paragraph, child);
     }
@@ -306,10 +403,14 @@ fn parse_cell_content(paragraph: &mut HtmlParagraph, node: &Rc<Node>) {
             ) =>
         {
             let mut block = HtmlParagraph::default();
+            block
+                .content
+                .html_anchors
+                .extend(element_id(node).map(|id| (id, 0)));
             for child in node.children.borrow().iter() {
                 parse_cell_content(&mut block, child);
             }
-            if block.content.is_empty() {
+            if block.content.is_empty() && block.content.html_anchors.is_empty() {
                 return;
             }
 
@@ -355,6 +456,10 @@ fn trim_text(text: &str) -> String {
 }
 
 fn parse_paragraph(paragraph: &mut HtmlParagraph, node: &Rc<Node>) {
+    if let Some(id) = element_id(node) {
+        paragraph.content.add_html_anchor(id);
+    }
+
     fn push_merged(
         paragraph: &mut HtmlParagraph,
         text: String,
@@ -391,10 +496,12 @@ fn parse_paragraph(paragraph: &mut HtmlParagraph, node: &Rc<Node>) {
         for child in node.children.borrow().iter() {
             let mut child_paragraph = HtmlParagraph::default();
             parse_paragraph(&mut child_paragraph, &child);
-
             if !child_paragraph.content.is_empty() {
                 ends_with_break = Some(child_paragraph.ends_with_break);
             }
+            paragraph
+                .content
+                .append_html_anchors(child_paragraph.content.html_anchors, merged_text.len());
             for node in child_paragraph.content.children {
                 let offset = merged_text.len();
                 merged_text.push_str(&node.text);
@@ -508,6 +615,40 @@ fn parse_paragraph(paragraph: &mut HtmlParagraph, node: &Rc<Node>) {
 }
 
 fn parse_node(
+    node: &Rc<Node>,
+    paragraph: &mut HtmlParagraph,
+    cx: &mut NodeContext,
+) -> Option<BlockNode> {
+    let id = element_id(node);
+    let mut block = parse_node_content(node, paragraph, cx);
+    if let Some(id) = id {
+        if let Some(block) = &mut block {
+            if !block.prepend_html_anchor(id.clone()) {
+                let anchor = Paragraph {
+                    html_anchors: vec![(id, 0)],
+                    ..Default::default()
+                };
+                *block = BlockNode::Root {
+                    children: vec![
+                        BlockNode::Paragraph(anchor),
+                        std::mem::replace(block, BlockNode::Unknown),
+                    ],
+                    span: None,
+                };
+            }
+        } else if !paragraph
+            .content
+            .html_anchors
+            .iter()
+            .any(|(anchor, _)| *anchor == id)
+        {
+            paragraph.content.add_html_anchor(id);
+        }
+    }
+    block
+}
+
+fn parse_node_content(
     node: &Rc<Node>,
     paragraph: &mut HtmlParagraph,
     cx: &mut NodeContext,
@@ -658,20 +799,26 @@ fn parse_node(
                 let mut children = vec![];
                 consume_paragraph(&mut children, paragraph);
 
-                let mut table = Table::default();
+                let mut table = Table {
+                    html_rows: Some(Vec::new()),
+                    ..Default::default()
+                };
                 for child in node.children.borrow().iter() {
-                    match child.data {
-                        NodeData::Element { ref name, .. }
-                            if name.local == local_name!("tbody")
-                                || name.local == local_name!("thead") =>
-                        {
-                            for sub_child in child.children.borrow().iter() {
-                                parse_table_row(&mut table, &sub_child);
-                            }
-                        }
+                    let NodeData::Element { name, .. } = &child.data else {
+                        continue;
+                    };
+                    let section = match name.local {
+                        local_name!("thead") => HtmlTableSection::Head,
+                        local_name!("tbody") => HtmlTableSection::Body,
+                        local_name!("tfoot") => HtmlTableSection::Foot,
                         _ => {
-                            parse_table_row(&mut table, &child);
+                            parse_table_row(&mut table, child, HtmlTableSection::Body, &mut None);
+                            continue;
                         }
+                    };
+                    let mut section_id = element_id(child);
+                    for row in child.children.borrow().iter() {
+                        parse_table_row(&mut table, row, section, &mut section_id);
                     }
                 }
                 consume_paragraph(&mut children, paragraph);
@@ -765,7 +912,7 @@ fn consume_children_nodes(
 }
 
 fn consume_paragraph(children: &mut Vec<BlockNode>, paragraph: &mut HtmlParagraph) {
-    if paragraph.content.is_empty() {
+    if paragraph.content.is_empty() && paragraph.content.html_anchors.is_empty() {
         return;
     }
 

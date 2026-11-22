@@ -203,7 +203,7 @@ fn custom_block_selection(
 
 /// A table cell, laid out as its content. Text painted inside it knows its
 /// cell, so a drag that starts in the cell selects only in that cell.
-struct TableCellElement(AnyElement);
+struct TableCellElement(AnyElement, Option<ScrollHandle>);
 
 impl IntoElement for TableCellElement {
     type Element = Self;
@@ -244,6 +244,19 @@ impl Element for TableCellElement {
         window: &mut Window,
         cx: &mut App,
     ) {
+        if let Some(scroll) = &self.1 {
+            let viewport = scroll.bounds();
+            let width = bounds.size.width.min(viewport.size.width);
+            let delta = bounds.left().clamp(viewport.left(), viewport.right() - width) - bounds.left();
+            let mut offset = scroll.offset();
+            let x = (offset.x + delta).clamp(-scroll.max_offset().x, px(0.));
+            if (offset.x - x).abs() >= px(0.5) {
+                offset.x = x;
+                scroll.set_offset(offset);
+                window.defer(cx, |window, _| window.refresh());
+            }
+        }
+
         // Prepaint runs for the whole window before any text paints, so the
         // cell that holds the anchor is known to all text, in every view.
         if let Some(view) = GlobalState::global(cx).text_view_state() {
@@ -451,6 +464,68 @@ enum BlockTextKind {
 }
 
 impl BlockNode {
+    pub(super) fn html_anchor(&self, id: &str) -> Option<(usize, usize)> {
+        let find = |paragraph: &Paragraph| {
+            let (_, offset) = paragraph
+                .html_anchors
+                .iter()
+                .find(|(anchor, _)| anchor.as_ref() == id)?;
+            Some((paragraph.render_identity(), *offset))
+        };
+        match self {
+            Self::Paragraph(paragraph)
+            | Self::Heading {
+                children: paragraph,
+                ..
+            } => find(paragraph),
+            Self::Table(table) => table
+                .children
+                .iter()
+                .flat_map(|row| &row.children)
+                .find_map(|cell| find(&cell.children)),
+            Self::Root { children, .. }
+            | Self::Blockquote { children, .. }
+            | Self::Surface { children, .. }
+            | Self::List { children, .. }
+            | Self::ListItem { children, .. } => {
+                children.iter().find_map(|block| block.html_anchor(id))
+            }
+            _ => None,
+        }
+    }
+
+    pub(super) fn prepend_html_anchor(&mut self, id: SharedString) -> bool {
+        let paragraph = match self {
+            Self::Paragraph(paragraph)
+            | Self::Heading {
+                children: paragraph,
+                ..
+            } => paragraph,
+            Self::Table(table) => {
+                let Some(cell) = table
+                    .children
+                    .iter_mut()
+                    .find_map(|row| row.children.first_mut())
+                else {
+                    return false;
+                };
+                &mut cell.children
+            }
+            Self::Root { children, .. }
+            | Self::Blockquote { children, .. }
+            | Self::Surface { children, .. }
+            | Self::List { children, .. }
+            | Self::ListItem { children, .. } => {
+                return children
+                    .iter_mut()
+                    .any(|block| block.prepend_html_anchor(id.clone()));
+            }
+            _ => return false,
+        };
+        paragraph.html_anchors.insert(0, (id, 0));
+        true
+    }
+
     pub(super) fn is_list_item(&self) -> bool {
         matches!(self, Self::ListItem { .. })
     }
@@ -1397,6 +1472,9 @@ fn table_selected_source(table: &Table) -> String {
         _ => {}
     }
 
+    if let Some(rows) = &table.html_rows {
+        return table.to_html(rows, cell_source);
+    }
     let mut lines: Vec<String> = Vec::new();
     for (row_ix, row) in table.children.iter().enumerate() {
         let cells: Vec<String> = row
@@ -1616,6 +1694,7 @@ impl InlineNode {
 pub struct Paragraph {
     pub(super) span: Option<Span>,
     pub(super) children: Vec<InlineNode>,
+    pub(super) html_anchors: Vec<(SharedString, usize)>,
     /// The link references in this paragraph, used for reference links.
     ///
     /// The key is the identifier, the value is the url.
@@ -1673,6 +1752,7 @@ impl PartialEq for Paragraph {
     fn eq(&self, other: &Self) -> bool {
         self.span == other.span
             && self.children == other.children
+            && self.html_anchors == other.html_anchors
             && self.link_refs == other.link_refs
     }
 }
@@ -1682,6 +1762,7 @@ impl Paragraph {
         Self {
             span: None,
             children: vec![InlineNode::new(&text)],
+            html_anchors: Vec::new(),
             link_refs: HashMap::new(),
             state: Arc::new(Mutex::new(InlineState::default())),
             render_cache: ParagraphRenderCache::default(),
@@ -2044,10 +2125,34 @@ pub struct Table {
     pub(crate) children: Vec<TableRow>,
     pub(crate) column_aligns: Vec<ColumnumnAlign>,
     pub(crate) span: Option<Span>,
+    pub(crate) html_rows: Option<Vec<HtmlTableRow>>,
     /// The [`TableData`] handed to the `table_actions` hook, kept between
     /// frames; see [`Table::cached_table_data`].
     pub(crate) table_data_cache: TableDataCache,
     pub(crate) column_widths_cache: TableColumnWidthsCache,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HtmlTableSection {
+    Head,
+    Body,
+    Foot,
+}
+
+impl HtmlTableSection {
+    fn tag(self) -> &'static str {
+        match self {
+            Self::Head => "thead",
+            Self::Body => "tbody",
+            Self::Foot => "tfoot",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct HtmlTableRow {
+    pub section: HtmlTableSection,
+    pub headers: Vec<bool>,
 }
 
 /// Derived state, invisible to `Debug` and equality.
@@ -2152,12 +2257,12 @@ impl TableTextStyles {
         }
     }
 
-    fn row(&self, row_ix: usize) -> &gpui::TextStyle {
-        if row_ix == 0 { &self.head } else { &self.body }
+    fn cell(&self, header: bool) -> &gpui::TextStyle {
+        if header { &self.head } else { &self.body }
     }
 
-    fn row_refinement(&self, row_ix: usize) -> &TextStyleRefinement {
-        if row_ix == 0 {
+    fn cell_refinement(&self, header: bool) -> &TextStyleRefinement {
+        if header {
             &self.head_refinement
         } else {
             &self.body_refinement
@@ -2169,12 +2274,12 @@ impl TableTextStyles {
 /// [`crate::text::TextView::table_actions`] hook.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct TableData {
-    /// First table row (header cells) as plain text.
+    /// The first header row as plain text, when present.
     pub headers: Vec<String>,
-    /// Rows after the header as plain text cells. May be ragged while
+    /// The remaining rows as plain text cells. May be ragged while
     /// a table is still streaming in.
     pub rows: Vec<Vec<String>>,
-    /// The table serialized back to GFM pipe-table Markdown, alignments kept.
+    /// The table serialized as a GFM pipe table or raw HTML in Markdown.
     pub markdown: String,
     /// Byte range of the table in the Markdown source, for callers that need
     /// to map the table back to the document.
@@ -2222,6 +2327,50 @@ impl Table {
         self.column_aligns.get(index).copied().unwrap_or_default()
     }
 
+    fn is_header_row(&self, row: usize) -> bool {
+        self.html_rows
+            .as_ref()
+            .map_or(row == 0, |rows| rows[row].section == HtmlTableSection::Head)
+    }
+
+    fn is_header_cell(&self, row: usize, cell: usize) -> bool {
+        self.html_rows
+            .as_ref()
+            .and_then(|rows| rows[row].headers.get(cell).copied())
+            .unwrap_or(false)
+    }
+
+    fn to_html(
+        &self,
+        html_rows: &[HtmlTableRow],
+        cell_source: impl Fn(&TableCell) -> String,
+    ) -> String {
+        use std::fmt::Write as _;
+
+        let mut output = String::from("<table>");
+        let mut section: Option<HtmlTableSection> = None;
+        for (row, html_row) in self.children.iter().zip(html_rows) {
+            if section != Some(html_row.section) {
+                if let Some(previous) = section.replace(html_row.section) {
+                    let _ = write!(output, "</{}>", previous.tag());
+                }
+                let _ = write!(output, "<{}>", html_row.section.tag());
+            }
+            output.push_str("<tr>");
+            for (cell, is_header) in row.children.iter().zip(&html_row.headers) {
+                let tag = if *is_header { "th" } else { "td" };
+                let content = markdown::to_html(cell_source(cell).trim()).replace('\n', " ");
+                let _ = write!(output, "<{tag}>{content}</{tag}>");
+            }
+            output.push_str("</tr>");
+        }
+        if let Some(section) = section {
+            let _ = write!(output, "</{}>", section.tag());
+        }
+        output.push_str("</table>");
+        output
+    }
+
     /// Serialize the table back to GFM pipe-table Markdown (`| a | b |`),
     /// preserving column alignments. Cell newlines collapse to spaces and
     /// `|` is escaped so rows stay intact.
@@ -2229,6 +2378,9 @@ impl Table {
     /// Mirrors [`table_selected_source`], which does the same for the selected
     /// cells only.
     pub(crate) fn to_markdown(&self) -> String {
+        if let Some(rows) = &self.html_rows {
+            return self.to_html(rows, |cell| cell.children.to_markdown());
+        }
         let mut lines: Vec<String> = Vec::with_capacity(self.children.len() + 1);
 
         for (row_ix, row) in self.children.iter().enumerate() {
@@ -2275,9 +2427,18 @@ impl Table {
                 .collect::<Vec<_>>()
         };
 
+        let header = (0..self.children.len()).find(|&index| self.is_header_row(index));
         TableData {
-            headers: self.children.first().map(row_text).unwrap_or_default(),
-            rows: self.children.iter().skip(1).map(row_text).collect(),
+            headers: header
+                .map(|index| row_text(&self.children[index]))
+                .unwrap_or_default(),
+            rows: self
+                .children
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| Some(*index) != header)
+                .map(|(_, row)| row_text(row))
+                .collect(),
             markdown: self.to_markdown(),
             span: self.span.map(|span| span.start..span.end),
         }
@@ -2342,6 +2503,7 @@ impl Paragraph {
             Paragraph {
                 span: None,
                 children: vec![],
+                html_anchors: Vec::new(),
                 link_refs: Default::default(),
                 state: Arc::new(Mutex::new(InlineState::default())),
                 render_cache: ParagraphRenderCache::default(),
@@ -2410,7 +2572,24 @@ impl Paragraph {
             .sum::<usize>()
     }
 
+    pub(crate) fn add_html_anchor(&mut self, id: SharedString) {
+        self.html_anchors.push((id, self.text_len()));
+    }
+
+    pub(crate) fn append_html_anchors(
+        &mut self,
+        anchors: Vec<(SharedString, usize)>,
+        pending_text: usize,
+    ) {
+        if !anchors.is_empty() {
+            let start = self.text_len() + pending_text;
+            self.html_anchors
+                .extend(anchors.into_iter().map(|(id, offset)| (id, start + offset)));
+        }
+    }
+
     pub(crate) fn merge(&mut self, other: Self) {
+        self.append_html_anchors(other.html_anchors, 0);
         self.children.extend(other.children);
         self.invalidate_render_cache();
     }
@@ -2986,10 +3165,58 @@ impl Paragraph {
         highlights
     }
 
+    fn render_identity(&self) -> usize {
+        Arc::as_ptr(&self.state) as usize
+    }
+
+    fn anchor_reveal(&self, node_cx: &NodeContext) -> Option<RevealAt> {
+        node_cx.reveal.as_ref()?.html_anchor(self.render_identity())
+    }
+
+    fn text_reveal(
+        &self,
+        node_cx: &NodeContext,
+        key: Option<TextLeafKey>,
+        start: usize,
+        end: usize,
+    ) -> Option<RevealAt> {
+        node_cx.reveal_at(key, start, end).or_else(|| {
+            let reveal = self.anchor_reveal(node_cx)?;
+            if reveal.offset() == 0 {
+                return None;
+            }
+            let offset = reveal.offset().min(self.text_len().saturating_sub(1));
+            reveal.with_offset(offset).rebase(start, end)
+        })
+    }
+
+    fn render(
+        &self,
+        fade_key: Option<TextLeafKey>,
+        node_cx: &NodeContext,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> AnyElement {
+        let content = self.render_content(fade_key, node_cx, window, cx);
+        if let Some(reveal) = self.anchor_reveal(node_cx)
+            && (reveal.offset() == 0 || self.text_len() == 0)
+        {
+            return div()
+                .child(content)
+                .on_children_prepainted(move |children, window, _| {
+                    if let Some(bounds) = children.first().copied() {
+                        reveal.request_anchor(bounds, window);
+                    }
+                })
+                .into_any_element();
+        }
+        content
+    }
+
     /// `fade_key` names this paragraph's text for the streamed fade-in and
     /// for range highlights; the owning block supplies it because a heading
     /// or table cell paragraph carries no span of its own.
-    fn render(
+    fn render_content(
         &self,
         fade_key: Option<TextLeafKey>,
         node_cx: &NodeContext,
@@ -3044,7 +3271,7 @@ impl Paragraph {
         }
         let highlights = fade_highlights(highlights, &slice_fades(fades, 0, text.len()));
         let backgrounds = slice_backgrounds(backgrounds, 0, text.len());
-        let reveal = node_cx.reveal_at(fade_key, 0, text.len());
+        let reveal = self.text_reveal(node_cx, fade_key, 0, text.len());
         if let Ok(mut state) = self.state.lock() {
             state.set_text(text);
         }
@@ -3125,7 +3352,8 @@ impl Paragraph {
                     let item_fades = slice_fades(fades, consumed, consumed + text.len());
                     let item_backgrounds =
                         slice_backgrounds(backgrounds, consumed, consumed + text.len());
-                    let item_reveal = node_cx.reveal_at(leaf_key, consumed, consumed + text.len());
+                    let item_reveal =
+                        self.text_reveal(node_cx, leaf_key, consumed, consumed + text.len());
                     let reading_leaf = leaf_key.map(|key| (key, consumed));
                     consumed += text.len();
                     items.push(InlineFlowItem::Text {
@@ -3192,7 +3420,12 @@ impl Paragraph {
                             consumed,
                             consumed + text.len(),
                         ),
-                        reveal: node_cx.reveal_at(leaf_key, consumed, consumed + text.len()),
+                        reveal: self.text_reveal(
+                            node_cx,
+                            leaf_key,
+                            consumed,
+                            consumed + text.len(),
+                        ),
                         reading_leaf: leaf_key.map(|key| (key, consumed)),
                     });
                 }
@@ -3247,7 +3480,7 @@ impl Paragraph {
                 &slice_fades(fades, consumed, consumed + text.len()),
             );
             let backgrounds = slice_backgrounds(backgrounds, consumed, consumed + text.len());
-            let reveal = node_cx.reveal_at(leaf_key, consumed, consumed + text.len());
+            let reveal = self.text_reveal(node_cx, leaf_key, consumed, consumed + text.len());
             items.push(InlineFlowItem::Text {
                 state: self.state.clone(),
                 text: text.into(),
@@ -3468,7 +3701,8 @@ fn measure_table_columns(
     for &(row_ix, ix) in &measured.custom_cells {
         let cell = &table.children[row_ix].children[ix];
         let items = cell.children.inline_flow_items(None, &[], &[], node_cx, cx);
-        let style = text_styles.row_refinement(row_ix).clone();
+        let header = table.is_header_row(row_ix) || table.is_header_cell(row_ix, ix);
+        let style = text_styles.cell_refinement(header).clone();
         let width = window.with_text_style(Some(style), |window| {
             super::inline_flow::intrinsic_width(&items, window, cx)
         });
@@ -3495,9 +3729,10 @@ fn measure_table_text_columns(
     let mut col_w = vec![CELL_MIN_PX; col_count];
     let mut custom_cells = Vec::new();
     for (row_ix, row) in table.children.iter().enumerate() {
-        let text_style = text_styles.row(row_ix);
-        let font_size = text_style.font_size.to_pixels(window.rem_size());
+        let header_row = table.is_header_row(row_ix);
         for (ix, cell) in row.children.iter().enumerate() {
+            let text_style = text_styles.cell(header_row || table.is_header_cell(row_ix, ix));
+            let font_size = text_style.font_size.to_pixels(window.rem_size());
             let Some(slot) = col_w.get_mut(ix) else {
                 continue;
             };
@@ -3847,10 +4082,6 @@ impl BlockNode {
                     .flex_auto()
                     .min_w_0()
                     .overflow_hidden()
-                    // A done task steps back so the open ones stand out.
-                    .when(checked == Some(true), |this| {
-                        this.text_color(style.muted_foreground())
-                    })
                     .child(content),
             )
     }
@@ -4106,7 +4337,17 @@ impl BlockNode {
             })
             .collect();
 
-        let rows = Self::render_table_rows(table, &columns, node_cx, window, cx);
+        let scroll_handle = scroll.then(|| {
+            window
+                .use_keyed_state(
+                    block_element_id("table-scroll", table.span, options.ix),
+                    cx,
+                    |_, _| ScrollHandle::default(),
+                )
+                .read(cx)
+                .clone()
+        });
+        let rows = Self::render_table_rows(table, &columns, scroll_handle.as_ref(), node_cx, window, cx);
         let frame = StyleRefinement::default()
             .text_size(text_size)
             .bg(style
@@ -4115,15 +4356,7 @@ impl BlockNode {
             .border_1()
             .border_color(style.border())
             .refine_style(style.table());
-        let body = if scroll {
-            let scroll_handle = window
-                .use_keyed_state(
-                    block_element_id("table-scroll", table.span, options.ix),
-                    cx,
-                    |_, _| ScrollHandle::default(),
-                )
-                .read(cx)
-                .clone();
+        let body = if let Some(scroll_handle) = scroll_handle {
             let min_total_w = columns
                 .iter()
                 .map(|column| column.min + column.divider)
@@ -4222,6 +4455,7 @@ impl BlockNode {
     fn render_table_rows(
         table: &Table,
         columns: &[TableColumn],
+        scroll: Option<&ScrollHandle>,
         node_cx: &NodeContext,
         window: &mut Window,
         cx: &mut App,
@@ -4257,11 +4491,14 @@ impl BlockNode {
         let mut rows = Vec::with_capacity(row_count);
         let mut cell_ordinal = 0;
         for (row_ix, row) in table.children.iter().enumerate() {
+            let header_row = table.is_header_row(row_ix);
             let mut cells = Vec::with_capacity(col_count * 2);
             for (ix, column) in columns.iter().enumerate() {
                 let is_last_col = ix + 1 == col_count;
                 let align = table.column_align(ix);
-                let content = row.children.get(ix).map(|cell| {
+                let header_cell = !header_row && table.is_header_cell(row_ix, ix);
+                let cell = row.children.get(ix);
+                let content = cell.map(|cell| {
                     let fade_key = table
                         .span
                         .map(|span| TextLeafKey::table_cell(span.start, cell_ordinal));
@@ -4278,6 +4515,9 @@ impl BlockNode {
                 if lead > 0. {
                     cells.push(slack(lead).into_any_element());
                 }
+                let reveal_scroll = scroll
+                    .filter(|_| cell.is_some_and(|cell| cell.children.anchor_reveal(node_cx).is_some()))
+                    .cloned();
                 cells.push(
                     TableCellElement(
                         div()
@@ -4299,9 +4539,18 @@ impl BlockNode {
                             })
                             .px_3()
                             .py(px(7.))
+                            .when(header_cell, |this| {
+                                this.text_color(style.foreground())
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .refine_style(&StyleRefinement {
+                                        text: style.table_head().text.clone(),
+                                        ..Default::default()
+                                    })
+                            })
                             .refine_style(&style.table_cell())
                             .children(content)
                             .into_any_element(),
+                        reveal_scroll,
                     )
                     .into_any_element(),
                 );
@@ -4323,15 +4572,14 @@ impl BlockNode {
                     .border_color(style.border())
                     .flex()
                     .flex_row()
-                    // The first row is the header, as everywhere else that
-                    // reads a table (`table_data`, `to_markdown`). The
-                    // refinement comes last so it can override the defaults.
                     .when(row_ix == 0, |this| {
+                        this.when_some(top_left, |this, radius| this.rounded_tl(radius))
+                            .when_some(top_right, |this, radius| this.rounded_tr(radius))
+                    })
+                    .when(header_row, |this| {
                         this.bg(style.code_background())
                             .text_color(style.foreground())
                             .font_weight(FontWeight::SEMIBOLD)
-                            .when_some(top_left, |this, radius| this.rounded_tl(radius))
-                            .when_some(top_right, |this, radius| this.rounded_tr(radius))
                             .refine_style(&style.table_head())
                     })
                     .when(row_ix + 1 == row_count, |this| {
@@ -4340,7 +4588,7 @@ impl BlockNode {
                     })
                     // Body rows only: the header keeps its own fill.
                     .when_some(
-                        style.table_row_hover().filter(|_| row_ix > 0),
+                        style.table_row_hover().filter(|_| !header_row),
                         |this, color| this.hover(|this| this.bg(color)),
                     )
                     .children(cells)
@@ -4383,15 +4631,19 @@ impl BlockNode {
                     )
                 }))
                 .into_any_element(),
-            BlockNode::Paragraph(paragraph) => gapped(
-                paragraph.render(
+            BlockNode::Paragraph(paragraph) => {
+                let content = paragraph.render(
                     paragraph.span.map(|span| TextLeafKey::block(span.start)),
                     node_cx,
                     window,
                     cx,
-                ),
-                mb,
-            ),
+                );
+                if paragraph.is_empty() && !paragraph.html_anchors.is_empty() {
+                    content
+                } else {
+                    gapped(content, mb)
+                }
+            }
             BlockNode::Heading {
                 level,
                 children,
@@ -5612,6 +5864,7 @@ mod tests {
             }],
             column_aligns: vec![],
             span: None,
+            html_rows: None,
             table_data_cache: TableDataCache::default(),
             column_widths_cache: TableColumnWidthsCache::default(),
         };
@@ -5669,6 +5922,7 @@ mod tests {
             }],
             column_aligns: vec![],
             span: None,
+            html_rows: None,
             table_data_cache: TableDataCache::default(),
             column_widths_cache: TableColumnWidthsCache::default(),
         };
@@ -5812,6 +6066,7 @@ mod tests {
         let paragraph = Paragraph {
             span: None,
             children,
+            html_anchors: Vec::new(),
             link_refs: HashMap::new(),
             state: Arc::new(Mutex::new(InlineState::default())),
             render_cache: ParagraphRenderCache::default(),
@@ -6264,6 +6519,7 @@ mod tests {
             ],
             column_aligns: vec![ColumnumnAlign::Left, ColumnumnAlign::Right],
             span: None,
+            html_rows: None,
             table_data_cache: TableDataCache::default(),
             column_widths_cache: TableColumnWidthsCache::default(),
         };
@@ -6313,6 +6569,7 @@ mod tests {
                 .collect(),
             column_aligns,
             span: None,
+            html_rows: None,
             table_data_cache: TableDataCache::default(),
             column_widths_cache: TableColumnWidthsCache::default(),
         }
@@ -6477,6 +6734,7 @@ mod tests {
         Paragraph {
             span: None,
             children: vec![InlineNode::image(image)],
+            html_anchors: Vec::new(),
             link_refs: HashMap::new(),
             state: Arc::new(Mutex::new(InlineState::default())),
             render_cache: ParagraphRenderCache::default(),
