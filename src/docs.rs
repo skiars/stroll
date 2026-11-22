@@ -559,10 +559,7 @@ impl DocReader {
         self.standalone = standalone;
     }
 
-    pub(crate) fn refresh_language(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.search.update(cx, |search, cx| {
-            search.set_placeholder(t!("docs.find"), window, cx);
-        });
+    pub(crate) fn refresh_language(&mut self, _: &mut Window, cx: &mut Context<Self>) {
         cx.notify();
     }
 
@@ -588,9 +585,6 @@ impl DocReader {
         text.read(cx).list_state().set_pixel_aligned_scroll(true);
         text.read(cx).list_state().set_scroll_past_end(true);
         let search = DocumentFind::for_document(text.clone(), window, cx);
-        search.update(cx, |search, cx| {
-            search.set_placeholder(t!("docs.find"), window, cx)
-        });
         let text_subscription = cx.observe(&text, |this: &mut Self, _, cx| this.reveal_pending(cx));
         let search_subscription = cx.observe(&search, |this: &mut Self, search, cx| {
             if search.read(cx).has_matches() {

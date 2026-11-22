@@ -6,6 +6,43 @@ use std::{ops::Range, rc::Rc};
 
 use super::{InputBaseState, Replace, Search, movement::MoveDirection, state::ScrollPadding};
 
+/// Options shared by the Find controls and the application's pattern compiler.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SearchOptions {
+    pub whole_word: bool,
+    pub regex: bool,
+}
+
+type Scan = dyn Fn(&str, Option<&Range<usize>>) -> Result<Vec<Range<usize>>, String>;
+type Expand = dyn Fn(&str, &[Range<usize>], &str) -> Result<Vec<String>, String>;
+
+/// A compiled pattern and its replacement expander.
+#[derive(Clone)]
+pub struct CompiledSearch {
+    scan: Rc<Scan>,
+    expand: Rc<Expand>,
+}
+
+impl CompiledSearch {
+    pub fn new(
+        scan: impl Fn(&str, Option<&Range<usize>>) -> Result<Vec<Range<usize>>, String> + 'static,
+        expand: impl Fn(&str, &[Range<usize>], &str) -> Result<Vec<String>, String> + 'static,
+    ) -> Self {
+        Self {
+            scan: Rc::new(scan),
+            expand: Rc::new(expand),
+        }
+    }
+}
+
+impl std::fmt::Debug for CompiledSearch {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("CompiledSearch")
+    }
+}
+
+pub type SearchCompiler = fn(&str, bool, SearchOptions) -> Result<CompiledSearch, String>;
+
 type MatchRanges = Rc<dyn Fn(&str) -> Vec<Range<usize>>>;
 
 #[derive(Clone)]
@@ -24,6 +61,10 @@ pub struct SearchMatcher {
     pub query: Option<AhoCorasick>,
     unicode_query: Option<regex::Regex>,
     pattern: Option<SearchPattern>,
+    advanced: Option<CompiledSearch>,
+    compile_error: Option<String>,
+    scan_error: Option<String>,
+    scope: Option<Range<usize>>,
     matched_ranges: Rc<Vec<Range<usize>>>,
     current_match_ix: usize,
     replacing: bool,
@@ -41,6 +82,10 @@ pub struct SearchSession {
     pub replace_mode: bool,
     pub case_insensitive: bool,
     pub query: String,
+    pub options: SearchOptions,
+    pub in_selection: bool,
+    selection_scope: Option<Range<usize>>,
+    replacement_failure: Option<(String, String)>,
     pub replacement: String,
     pub anchor_offset: Option<usize>,
     pub matcher: SearchMatcher,
@@ -57,6 +102,10 @@ impl Default for SearchSession {
             replace_mode: false,
             case_insensitive: true,
             query: String::new(),
+            options: SearchOptions::default(),
+            in_selection: false,
+            selection_scope: None,
+            replacement_failure: None,
             replacement: String::new(),
             anchor_offset: None,
             matcher: SearchMatcher::new(),
@@ -90,6 +139,14 @@ impl SearchSession {
         self.active
     }
 
+    /// The last failed replacement for this template and search snapshot.
+    pub fn replacement_failure(&self, replacement: &str) -> Option<&str> {
+        self.replacement_failure
+            .as_ref()
+            .filter(|(template, _)| template == replacement)
+            .map(|(_, error)| error.as_str())
+    }
+
     pub(crate) fn update_query(&mut self, query: impl Into<String>, case_insensitive: bool) {
         let query = query.into();
         if self.query == query && self.case_insensitive == case_insensitive {
@@ -119,7 +176,16 @@ impl<M: InputModeKind> InputBaseState<M> {
         self.search_activation_revision = self.search_activation_revision.wrapping_add(1);
         self.search_session
             .open(replace_mode, self.is_replaceable());
-        let selected = self.selected_text().to_string();
+        let selected = if self.has_advanced_find() {
+            if let Some(selection) = self.explicit_search_selection() {
+                self.search_session.selection_scope = Some(selection.clone());
+                self.text.slice(selection).to_string()
+            } else {
+                String::new()
+            }
+        } else {
+            self.selected_text().to_string()
+        };
         let query = if selected.is_empty() {
             self.search_session.query.clone()
         } else {
@@ -136,8 +202,8 @@ impl<M: InputModeKind> InputBaseState<M> {
             None
         };
         let case_insensitive = self.search_session.case_insensitive;
-        self.search_session.update_query(query, case_insensitive);
-        self.search_session.matcher.update(&self.text);
+        self.update_find_query(query, case_insensitive, self.search_session.options);
+        self.sync_search_matcher();
         if query_changed && let Some(anchor) = self.search_session.anchor_offset {
             self.search_session.matcher.update_cursor_by_offset(anchor);
         }
@@ -196,9 +262,80 @@ impl<M: InputModeKind> InputBaseState<M> {
         case_insensitive: bool,
         cx: &mut Context<Self>,
     ) {
+        self.set_find_query(query, case_insensitive, self.search_session.options, cx);
+    }
+
+    /// Opt in to advanced source Find with the application's query semantics.
+    pub fn set_search_compiler(&mut self, compiler: SearchCompiler) {
+        self.search_compiler = Some(compiler);
+    }
+
+    pub fn has_advanced_find(&self) -> bool {
+        self.search_compiler.is_some()
+    }
+
+    pub fn explicit_search_selection(&self) -> Option<Range<usize>> {
+        let range = self.selected_range();
+        (!range.is_empty()
+            && self.selection_endpoints().nth(1).is_none()
+            && self.find_generated_selection.as_ref() != Some(&range))
+        .then_some(range)
+    }
+
+    pub fn is_selecting_text(&self) -> bool {
+        self.selecting
+    }
+
+    pub fn can_find_in_selection(&self) -> bool {
+        self.explicit_search_selection().is_some() || self.search_session.selection_scope.is_some()
+    }
+
+    pub fn set_find_in_selection(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        if enabled && let Some(selection) = self.explicit_search_selection() {
+            self.search_session.selection_scope = Some(selection);
+        }
+        self.search_session.in_selection = enabled;
+        self.search_session.replacement_failure = None;
+        self.sync_search_matcher();
+        cx.notify();
+    }
+
+    pub(super) fn adjust_search_scope(&mut self, replaced: &Range<usize>, inserted: usize) {
+        let Some(scope) = self.search_session.selection_scope.as_mut() else {
+            return;
+        };
+        if replaced.start > scope.end || (!replaced.is_empty() && replaced.start == scope.end) {
+            return;
+        }
+        if inserted == 0 && replaced.start <= scope.start && replaced.end >= scope.end {
+            self.search_session.selection_scope = None;
+            return;
+        }
+        let map = |offset: usize, end: bool| {
+            if offset < replaced.start || (offset == replaced.start && !end) {
+                offset
+            } else if offset >= replaced.end {
+                offset - replaced.len() + inserted
+            } else if end {
+                replaced.start + inserted
+            } else {
+                replaced.start
+            }
+        };
+        *scope = map(scope.start, false)..map(scope.end, true);
+    }
+
+    pub fn set_find_query(
+        &mut self,
+        query: impl Into<String>,
+        case_insensitive: bool,
+        options: SearchOptions,
+        cx: &mut Context<Self>,
+    ) {
         let query = query.into();
         let query_changed = query != self.search_session.query
-            || case_insensitive != self.search_session.case_insensitive;
+            || case_insensitive != self.search_session.case_insensitive
+            || options != self.search_session.options;
         self.search_session.anchor_offset = if query_changed {
             self.last_layout
                 .as_ref()
@@ -207,12 +344,36 @@ impl<M: InputModeKind> InputBaseState<M> {
             None
         };
         self.search_session.activate();
-        self.search_session.update_query(query, case_insensitive);
-        self.search_session.matcher.update(&self.text);
+        self.update_find_query(query, case_insensitive, options);
+        self.sync_search_matcher();
         if query_changed && let Some(anchor) = self.search_session.anchor_offset {
             self.search_session.matcher.update_cursor_by_offset(anchor);
         }
         cx.notify();
+    }
+
+    fn update_find_query(&mut self, query: String, case_insensitive: bool, options: SearchOptions) {
+        let session = &mut self.search_session;
+        if let Some(compiler) = self.search_compiler {
+            if session.query == query
+                && session.case_insensitive == case_insensitive
+                && session.options == options
+            {
+                return;
+            }
+            session.replacement_failure = None;
+            session.query = query;
+            session.case_insensitive = case_insensitive;
+            session.options = options;
+            let compiled = if session.query.is_empty() {
+                Ok(None)
+            } else {
+                compiler(&session.query, case_insensitive, options).map(Some)
+            };
+            session.matcher.update_compiled(&self.text, compiled);
+        } else {
+            session.update_query(query, case_insensitive);
+        }
     }
 
     /// Seed Find with a caller-provided pattern. The next change to the query
@@ -225,6 +386,8 @@ impl<M: InputModeKind> InputBaseState<M> {
         cx: &mut Context<Self>,
     ) {
         self.set_search_query(query, case_insensitive, cx);
+        self.search_session.matcher.advanced = None;
+        self.search_session.matcher.compile_error = None;
         self.search_session.matcher.pattern = Some(SearchPattern(Rc::new(matches)));
         self.search_session.matcher.update_matches();
         if let Some(anchor) = self.search_session.anchor_offset {
@@ -292,6 +455,7 @@ impl<M: InputModeKind> InputBaseState<M> {
         cx: &mut Context<Self>,
     ) {
         self.set_selected_range_with_direction(range.clone(), reversed, cx);
+        self.find_generated_selection = Some(self.selected_range());
         // Match order does not describe viewport direction after a manual
         // scroll. Always allow search navigation to reveal the active match.
         self.scroll_to_with_padding(self.cursor(), None, ScrollPadding::SurroundingLines, cx);
@@ -321,8 +485,16 @@ impl<M: InputModeKind> InputBaseState<M> {
         if !self.can_edit_ranges(std::slice::from_ref(&range), cx) {
             return false;
         }
+        let Some(mut replacements) =
+            self.expand_search_replacements(std::slice::from_ref(&range), replacement, cx)
+        else {
+            return false;
+        };
+        let Some(replacement) = replacements.pop() else {
+            return false;
+        };
         let range_utf16 = self.range_to_utf16(&range);
-        self.replace_text_in_range_silent(Some(range_utf16), replacement, window, cx);
+        self.replace_text_in_range_silent(Some(range_utf16), &replacement, window, cx);
         self.sync_search_matcher();
         // Start after the inserted text, even if that text still matches.
         let end = self.cursor();
@@ -352,14 +524,18 @@ impl<M: InputModeKind> InputBaseState<M> {
             return 0;
         }
         self.sync_search_matcher();
-        let edits = self
+        let ranges: Vec<_> = self
             .search_session
             .matcher
             .matched_ranges()
             .iter()
             .filter(|range| self.can_edit_ranges(std::slice::from_ref(range), cx))
-            .map(|range| (range.clone(), replacement.to_owned()))
-            .collect::<Vec<_>>();
+            .cloned()
+            .collect();
+        let Some(replacements) = self.expand_search_replacements(&ranges, replacement, cx) else {
+            return 0;
+        };
+        let edits: Vec<_> = ranges.into_iter().zip(replacements).collect();
         if edits.is_empty() {
             return 0;
         }
@@ -370,6 +546,24 @@ impl<M: InputModeKind> InputBaseState<M> {
         count
     }
 
+    fn expand_search_replacements(
+        &mut self,
+        ranges: &[Range<usize>],
+        replacement: &str,
+        cx: &mut Context<Self>,
+    ) -> Option<Vec<String>> {
+        let session = &mut self.search_session;
+        session.replacement_failure = None;
+        match session.matcher.replacements(ranges, replacement) {
+            Ok(replacements) => Some(replacements),
+            Err(error) => {
+                session.replacement_failure = Some((replacement.to_owned(), error));
+                cx.notify();
+                None
+            }
+        }
+    }
+
     /// Keep the matches in step with an edit. A closed search skips the scan:
     /// it copies and searches the whole document, and nothing reads the
     /// matches until the search is resumed or navigated, which sync first.
@@ -377,12 +571,19 @@ impl<M: InputModeKind> InputBaseState<M> {
         if !self.search_session.is_active() {
             return;
         }
+        self.search_session.replacement_failure = None;
         self.sync_search_matcher();
     }
 
     /// Recompute the matches if the text changed since the last scan.
     fn sync_search_matcher(&mut self) {
-        self.search_session.matcher.update(&self.text);
+        let session = &mut self.search_session;
+        let scope = if session.in_selection {
+            Some(session.selection_scope.clone().unwrap_or(0..0))
+        } else {
+            None
+        };
+        session.matcher.update_scoped(&self.text, scope);
     }
 
     /// An input that is not `searchable` leaves the shortcut to its
@@ -422,6 +623,10 @@ impl SearchMatcher {
             query: None,
             unicode_query: None,
             pattern: None,
+            advanced: None,
+            compile_error: None,
+            scan_error: None,
+            scope: None,
             matched_ranges: Rc::new(Vec::new()),
             current_match_ix: 0,
             replacing: false,
@@ -430,16 +635,23 @@ impl SearchMatcher {
 
     /// Update the source text and recompute matches.
     pub fn update(&mut self, text: &Rope) {
-        if self.text.eq(text) {
+        self.update_scoped(text, None);
+    }
+
+    fn update_scoped(&mut self, text: &Rope, scope: Option<Range<usize>>) {
+        if self.text.eq(text) && self.scope == scope {
             self.replacing = false;
             return;
         }
         self.text = text.clone();
+        self.scope = scope;
         self.update_matches();
     }
 
     pub fn update_query(&mut self, query: &str, case_insensitive: bool) {
         self.pattern = None;
+        self.advanced = None;
+        self.compile_error = None;
         self.unicode_query = if !query.is_empty() && case_insensitive {
             regex::RegexBuilder::new(&regex::escape(query))
                 .case_insensitive(true)
@@ -457,6 +669,45 @@ impl SearchMatcher {
                 .expect("failed to build input search query")
         });
         self.update_matches();
+    }
+
+    fn update_compiled(&mut self, text: &Rope, compiled: Result<Option<CompiledSearch>, String>) {
+        self.text = text.clone();
+        self.pattern = None;
+        self.query = None;
+        self.unicode_query = None;
+        (self.advanced, self.compile_error) = match compiled {
+            Ok(pattern) => (pattern, None),
+            Err(error) => (None, Some(error)),
+        };
+        self.update_matches();
+    }
+
+    pub fn error(&self) -> Option<&str> {
+        self.compile_error.as_deref().or(self.scan_error.as_deref())
+    }
+
+    pub fn replacement_error(&self, replacement: &str) -> Option<String> {
+        self.replacements(&[], replacement).err()
+    }
+
+    fn replacements(
+        &self,
+        ranges: &[Range<usize>],
+        replacement: &str,
+    ) -> Result<Vec<String>, String> {
+        if let Some(error) = self.error() {
+            return Err(error.to_owned());
+        }
+        if let Some(pattern) = &self.advanced {
+            let text = if ranges.is_empty() {
+                String::new()
+            } else {
+                self.text.to_string()
+            };
+            return (pattern.expand)(&text, ranges, replacement);
+        }
+        Ok(vec![replacement.to_owned(); ranges.len()])
     }
 
     /// Update the rendered text and the literal query in a single scan.
@@ -530,7 +781,15 @@ impl SearchMatcher {
 
     fn update_matches(&mut self) {
         let mut ranges = Vec::new();
-        if let Some(pattern) = &self.pattern {
+        self.scan_error = None;
+        if let Some(pattern) = &self.advanced {
+            if !self.scope.as_ref().is_some_and(Range::is_empty) {
+                match (pattern.scan)(&self.text.to_string(), self.scope.as_ref()) {
+                    Ok(matches) => ranges = matches,
+                    Err(error) => self.scan_error = Some(error),
+                }
+            }
+        } else if let Some(pattern) = &self.pattern {
             ranges = (pattern.0)(&self.text.to_string());
         } else if let Some(query) = &self.unicode_query {
             let text = self.text.to_string();

@@ -532,6 +532,9 @@ pub struct InputBaseState<M: InputModeKind> {
     /// pointer position at the press.
     pub(super) pressed_token: Option<(usize, u64, Point<Pixels>)>,
     pub(super) search_session: super::SearchSession,
+    pub(super) search_compiler: Option<super::SearchCompiler>,
+    pub(super) find_generated_selection: Option<Range<usize>>,
+    find_field: bool,
     /// Advances every time search is explicitly invoked. See
     /// [`InputBaseState::search_activation_revision`].
     pub(super) search_activation_revision: u64,
@@ -919,7 +922,7 @@ impl<M: InputModeKind> InputBaseState<M> {
     /// thumb inside every text field, which is a control the field does not
     /// have.
     pub(crate) fn shows_scrollbar(&self) -> bool {
-        self.is_multi_line()
+        self.is_multi_line() && !self.find_field
     }
 
     pub fn is_multi_line(&self) -> bool {
@@ -1057,6 +1060,9 @@ impl<M: InputModeKind> InputBaseState<M> {
             text: "".into(),
             display_map: DisplayMap::new(text_style.font(), window.rem_size(), None),
             search_session: super::SearchSession::default(),
+            search_compiler: None,
+            find_generated_selection: None,
+            find_field: false,
             search_activation_revision: 0,
             presented_search_activation_revision: Cell::new(0),
             searchable: false,
@@ -1582,6 +1588,13 @@ impl<M: InputModeKind> InputBaseState<M> {
 
     pub fn set_clean_on_escape(&mut self, clean: bool) {
         self.clean_on_escape = clean;
+    }
+
+    /// In a multiline Find field, reserve Enter and Shift+Enter for navigation.
+    #[doc(hidden)]
+    pub fn find_field(mut self) -> Self {
+        self.find_field = true;
+        self
     }
 
     /// Set true to treat `Enter` as a submit action in multi-line mode,
@@ -2593,7 +2606,12 @@ impl<M: InputModeKind> InputBaseState<M> {
         // (without Shift) is treated as submit: propagate the action and emit
         // PressEnter without inserting a newline. `Shift+Enter` still inserts
         // a newline.
-        let insert_newline = self.is_multi_line() && (!self.submit_on_enter || action.shift);
+        let insert_newline = self.is_multi_line()
+            && if self.find_field {
+                action.secondary
+            } else {
+                !self.submit_on_enter || action.shift
+            };
 
         if insert_newline {
             if !self.selections.is_single() {
@@ -3091,6 +3109,9 @@ impl<M: InputModeKind> InputBaseState<M> {
         }
         if self.active_selection().is_empty() {
             self.active_selection_mut().reversed = false;
+        }
+        if self.selecting && self.search_compiler.is_some() {
+            cx.notify();
         }
         self.end_mouse_selection();
     }
@@ -3906,6 +3927,7 @@ impl<M: InputModeKind> InputBaseState<M> {
     /// Sets the active selection to the given range, keeping its `reversed`
     /// and `column_anchor` state untouched.
     pub(super) fn set_selection(&mut self, start: usize, end: usize) {
+        self.find_generated_selection = None;
         let range = self.normalize_token_range(start..end);
         let (start, end) = (range.start, range.end);
         let active = self.active_selection_mut();
@@ -3916,6 +3938,7 @@ impl<M: InputModeKind> InputBaseState<M> {
     /// Collapses the active selection to a cursor at the given offset,
     /// clearing `reversed`.
     pub(super) fn set_cursor_to(&mut self, offset: usize) {
+        self.find_generated_selection = None;
         let offset = self.token_boundary(offset, Bias::Right);
         let active = self.active_selection_mut();
         active.start = offset;
@@ -4768,6 +4791,7 @@ impl<M: InputModeKind> InputBaseState<M> {
         self.undo_manager.break_transaction_coalescing();
         M::clear_inline_completion(self, cx);
 
+        self.find_generated_selection = None;
         let mut active_affinity = false;
         let new_selections: Vec<CursorSelection> = self
             .selections
@@ -4942,6 +4966,9 @@ impl<M: InputModeKind> InputBaseState<M> {
             cursor.start(cx);
         });
         cx.emit(InputEvent::Focus);
+        if self.search_compiler.is_some() {
+            cx.notify();
+        }
     }
 
     fn on_blur(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -5384,6 +5411,8 @@ impl<M: InputModeKind> InputBaseState<M> {
         for (range, new_text) in &sorted {
             let old_text = self.text.clone();
             self.mode.adjust_auto_closed_pair(range, new_text.len());
+            self.adjust_search_scope(range, new_text.len());
+            self.find_generated_selection = None;
             self.text.replace(range.clone(), new_text);
 
             M::adjust_annotations(self, range, new_text.len());
@@ -6251,7 +6280,7 @@ impl<M: InputModeKind> Render for InputBaseState<M> {
                     .on_action(window.listener_for(&entity, InputBaseState::cut))
                     .on_action(window.listener_for(&entity, InputBaseState::undo))
                     .on_action(window.listener_for(&entity, InputBaseState::redo))
-                    .when(self.is_multi_line(), |this| {
+                    .when(self.is_multi_line() && !self.find_field, |this| {
                         this.on_action(window.listener_for(&entity, InputBaseState::indent_inline))
                             .on_action(window.listener_for(&entity, InputBaseState::outdent_inline))
                             .on_action(window.listener_for(&entity, InputBaseState::indent_block))

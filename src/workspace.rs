@@ -11,6 +11,7 @@ mod file_drop;
 mod file_icons;
 mod file_tabs;
 mod file_tree;
+mod find;
 mod folder_icons;
 mod git_history;
 mod git_panel;
@@ -25,6 +26,7 @@ mod markdown_editing;
 mod markdown_links;
 mod repo_sync;
 mod repository_ui;
+mod selection_highlight;
 mod session;
 mod settings;
 mod source_history;
@@ -677,6 +679,7 @@ struct OpenFile {
     _lsp_refresh: Task<()>,
     inlay_hints: inlay_hints::InlayHints,
     caret_hints: caret_hints::CaretHints,
+    selection_highlight: selection_highlight::SelectionHighlight,
     dirty: bool,
     pending_draft: bool,
     unconfirmed_save: Option<Rope>,
@@ -1073,6 +1076,7 @@ impl Workspace {
         workspace.start_session_writer(cx);
         workspace.observe_window_geometry(window, cx);
         cx.observe_window_activation(window, |this, window, cx| {
+            this.refresh_active_selection_highlight(window, cx);
             if window.is_window_active() && !this.repository_watch_active {
                 this.rescan_workspace(window, cx);
             }
@@ -3071,9 +3075,11 @@ impl Workspace {
                 session::restore_file_selection(editor, position, cx);
             }
             editor.ensure_highlighter_factory(source_highlighter_factory(syntax));
+            editor.set_search_compiler(find::compile);
             editor.prepare_language(window, cx);
         });
         let caret_hints = editor.update(cx, |editor, cx| caret_hints::CaretHints::new(editor, cx));
+        let selection_highlight = editor.update(cx, selection_highlight::SelectionHighlight::new);
         let git = editor_git::EditorGit::new(&editor, cx);
         let inlay_hints = inlay_hints::InlayHints::new(&editor, cx);
         inlay_hints.set_enabled(self.config.current().editor.inlay_hints, cx);
@@ -3126,6 +3132,7 @@ impl Workspace {
                 _lsp_refresh: Task::ready(()),
                 inlay_hints,
                 caret_hints,
+                selection_highlight,
                 dirty,
                 pending_draft: false,
                 unconfirmed_save: None,

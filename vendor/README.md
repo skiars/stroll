@@ -46,7 +46,11 @@ dialogs in a Wayland window after changes to paint order or focus handling.
   passthrough, and drag callbacks anchored at the initial press. These options
   let consumers customize a splitter through the existing appearance hook.
   The resize handle tests cover default behavior and opt-in geometry and input.
-- The shared editor search and replace fields use the default input height.
+- The shared Find panel uses the default text field height and UI font-sized
+  action icons. Replace adds one aligned row. Multiline input scrolls inside
+  the fixed-height field, and narrow views move the match icons into a popover.
+  The baseline-aligned case and whole-word SVGs render 2 px larger than the
+  UI font size to keep their letterforms readable.
 - The editor, Git diff, and Markdown reader mount the same Find panel.
   All three targets use Unicode case-insensitive literal matching. The Markdown
   reader counts and navigates every match in rendered text, and the text view
@@ -62,6 +66,11 @@ dialogs in a Wayland window after changes to paint order or focus handling.
   actions.
 - Source Find shortcuts navigate relative to the editor selection and reuse a
   retained query without moving focus into the Find panel.
+- The source editor opts into advanced Find through a pattern compiler shared
+  with Locator. The shared Find panel retains match options and a tracked
+  selection scope, and uses multiline query and replacement fields for opted-in
+  editors. Run `cargo test --release --locked --lib workspace::find::tests` for
+  keyboard, replacement, and selection scope coverage.
 - Escape in the editor dismisses its built-in Find session after transient
   editor overlays. An explicit Find action requests focus once. Remounting a
   retained Find session restores its query without moving focus from the editor.
@@ -360,7 +369,8 @@ dialogs in a Wayland window after changes to paint order or focus handling.
   image-only paragraphs and inline images share intrinsic sizing, explicit
   HTML dimensions, fitted paragraph width, and alternate text on failure.
   Images without explicit dimensions use at most one device pixel per raster
-  pixel, including on high-DPI displays.
+  pixel, including on high-DPI displays. Image-only paragraphs center each
+  image horizontally within the available column width.
   Run `cargo test --release --locked --test documents` for reader layout and
   rendering coverage.
 

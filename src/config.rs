@@ -237,6 +237,7 @@ pub(crate) struct Editor {
     pub line_numbers: bool,
     pub soft_wrap: bool,
     pub inlay_hints: bool,
+    pub selection_highlight: bool,
 }
 
 impl Default for Editor {
@@ -248,6 +249,7 @@ impl Default for Editor {
             line_numbers: true,
             soft_wrap: true,
             inlay_hints: false,
+            selection_highlight: true,
         }
     }
 }

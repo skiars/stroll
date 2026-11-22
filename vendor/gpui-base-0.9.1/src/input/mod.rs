@@ -134,6 +134,6 @@ pub use native::set_text_content_type;
 pub use native::{NativeMenu, NativeMenuItem};
 pub use rope_ext::{InputEdit, Point, RopeExt, RopeLines};
 pub use ropey::Rope;
-pub use search::{SearchMatcher, SearchSession};
+pub use search::{CompiledSearch, SearchCompiler, SearchMatcher, SearchOptions, SearchSession};
 pub use state::*;
 pub use textarea::{Textarea, TextareaState};

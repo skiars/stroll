@@ -2166,40 +2166,20 @@ impl Workspace {
         let Some(file) = self.active_file().map(|file| file.editor.clone()) else {
             return;
         };
-        let pattern = if !query.query.is_empty() && (query.regex || query.whole_word) {
-            match query.pattern() {
-                Ok(pattern) => Some(pattern),
-                Err(error) => {
-                    self.locator.error = Some(error.to_string());
-                    self.notify_locator(cx);
-                    return;
-                }
-            }
-        } else {
-            None
-        };
         self.close_locator(false, window, cx);
         file.update(cx, |editor, cx| {
             editor.focus(window, cx);
             editor.open_search(false, cx);
-            if let Some(pattern) = pattern {
-                editor.set_search_pattern(
-                    query.query,
-                    !query.case_sensitive,
-                    move |text| {
-                        pattern
-                            .find_iter(text)
-                            .map_while(|hit| hit.ok())
-                            .filter(|hit| hit.start() != hit.end())
-                            .take(5000)
-                            .map(|hit| hit.range())
-                            .collect()
-                    },
-                    cx,
-                );
-            } else {
-                editor.set_search_query(query.query, !query.case_sensitive, cx);
-            }
+            editor.set_find_in_selection(false, cx);
+            editor.set_find_query(
+                query.query,
+                !query.case_sensitive,
+                gpui_base::input::SearchOptions {
+                    whole_word: query.whole_word,
+                    regex: query.regex,
+                },
+                cx,
+            );
         });
     }
 }

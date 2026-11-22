@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24"
+     fill="none" stroke="currentColor" stroke-width="2"
+     stroke-linecap="round" stroke-linejoin="round">
+  <title>Match case</title>
+  <!-- Rounded letterforms with a common y=16.5 baseline. -->
+  <path d="M2 16.5 6.04 5.21c.15-.43.76-.43.91 0L11 16.5M3.47 12.5h6.06"/>
+  <path d="M22 8.35v8.15m0-4.08c0 2.38-1.53 4.08-3.67 4.08s-3.58-1.7-3.58-4.08 1.44-4.07 3.58-4.07S22 10.04 22 12.42Z"/>
+</svg>

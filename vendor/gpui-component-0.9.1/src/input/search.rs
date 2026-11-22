@@ -4,23 +4,28 @@ use rust_i18n::t;
 use std::ops::Range;
 
 use gpui::{
-    App, AppContext as _, Context, Empty, Entity, FocusHandle, Focusable, Half,
-    InteractiveElement as _, IntoElement, KeyBinding, ParentElement as _, Pixels, Render, Styled,
-    Subscription, WeakEntity, Window, actions, div, prelude::FluentBuilder as _, px,
+    App, AppContext as _, Context, Empty, Entity, FocusHandle, Focusable, Half, Hsla,
+    InteractiveElement as _, IntoElement, KeyBinding, ParentElement as _, Pixels, Render,
+    SharedString, StatefulInteractiveElement as _, Styled, Subscription, WeakEntity, Window,
+    actions, div, prelude::FluentBuilder as _, px, rems,
 };
 
 use crate::{
-    ActiveTheme, Disableable, ElementExt, IconName, Selectable, Sizable,
+    ActiveTheme, Disableable, ElementExt, Icon, Selectable, Sizable,
     button::{Button, ButtonVariants},
     h_flex,
     input::{
         Enter, Escape, IndentInline, Input, InputBaseState, InputEvent, InputState, OutdentInline,
-        Replace,
+        Replace, TextareaState,
     },
     label::Label,
+    popover::Popover,
     text::{RangeHighlight, TextViewState},
+    tooltip::Tooltip,
     v_flex,
 };
+
+use gpui_kit_assets::IconName;
 
 const CONTEXT: &'static str = "SearchPanel";
 const DOCUMENT_HIGHLIGHT_LIMIT: usize = 5000;
@@ -40,6 +45,13 @@ pub trait SearchTarget: Sized + 'static {
     fn step_match(&mut self, previous: bool, session: &mut SearchSession, cx: &mut Context<Self>);
     fn close_search(&mut self, cx: &mut Context<Self>);
     fn focus_search_target(&mut self, window: &mut Window, cx: &mut Context<Self>);
+    fn has_advanced_find(&self) -> bool {
+        false
+    }
+    fn can_find_in_selection(&self) -> bool {
+        false
+    }
+    fn set_find_in_selection(&mut self, _: bool, _: &mut Context<Self>) {}
     fn can_replace(&self) -> bool {
         false
     }
@@ -49,7 +61,7 @@ pub trait SearchTarget: Sized + 'static {
 
 impl<M: InputModeKind> SearchTarget for InputBaseState<M> {
     fn update_query(&mut self, query: &str, session: &mut SearchSession, cx: &mut Context<Self>) {
-        self.set_search_query(query, session.case_insensitive, cx);
+        self.set_find_query(query, session.case_insensitive, session.options, cx);
         *session = self.search_session().clone();
     }
 
@@ -68,6 +80,18 @@ impl<M: InputModeKind> SearchTarget for InputBaseState<M> {
 
     fn focus_search_target(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.focus(window, cx);
+    }
+
+    fn has_advanced_find(&self) -> bool {
+        InputBaseState::has_advanced_find(self)
+    }
+
+    fn can_find_in_selection(&self) -> bool {
+        InputBaseState::can_find_in_selection(self)
+    }
+
+    fn set_find_in_selection(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        InputBaseState::set_find_in_selection(self, enabled, cx);
     }
 
     fn can_replace(&self) -> bool {
@@ -177,13 +201,105 @@ fn prev_scroll_direction(
     }
 }
 
+enum SearchField {
+    Single(Entity<InputState>),
+    Multi(Entity<TextareaState>),
+}
+
+impl SearchField {
+    fn new(advanced: bool, placeholder: &str, window: &mut Window, cx: &mut App) -> Self {
+        if advanced {
+            Self::Multi(cx.new(|cx| {
+                TextareaState::new(window, cx)
+                    .placeholder(placeholder.to_owned())
+                    .find_field()
+            }))
+        } else {
+            Self::Single(
+                cx.new(|cx| InputState::new(window, cx).placeholder(placeholder.to_owned())),
+            )
+        }
+    }
+
+    fn input(&self) -> Input {
+        match self {
+            Self::Single(field) => Input::new(field),
+            Self::Multi(field) => Input::from_state(field.clone()),
+        }
+    }
+
+    fn value(&self, cx: &App) -> gpui::SharedString {
+        match self {
+            Self::Single(field) => field.read(cx).value(),
+            Self::Multi(field) => field.read(cx).value(),
+        }
+    }
+
+    fn focus_handle(&self, cx: &App) -> FocusHandle {
+        match self {
+            Self::Single(field) => field.read(cx).focus_handle(cx),
+            Self::Multi(field) => field.read(cx).focus_handle(cx),
+        }
+    }
+
+    fn select_query(&self, query: &str, window: &mut Window, cx: &mut App) {
+        fn select<M: InputModeKind>(
+            field: &Entity<InputBaseState<M>>,
+            query: Option<&str>,
+            window: &mut Window,
+            cx: &mut App,
+        ) {
+            field.update(cx, |field, cx| {
+                if let Some(query) = query {
+                    field.set_value(query, window, cx);
+                }
+                field.select_all(window, cx);
+            });
+        }
+        match self {
+            Self::Single(field) => select(field, (!query.is_empty()).then_some(query), window, cx),
+            Self::Multi(field) => select(field, Some(query), window, cx),
+        }
+    }
+
+    fn subscribe<T: SearchTarget>(
+        &self,
+        query: bool,
+        cx: &mut Context<SearchPanel<T>>,
+    ) -> Subscription {
+        fn changed<T: SearchTarget>(
+            panel: &mut SearchPanel<T>,
+            query: bool,
+            event: &InputEvent,
+            cx: &mut Context<SearchPanel<T>>,
+        ) {
+            if matches!(event, InputEvent::Change) {
+                if query {
+                    panel.update_search_query(None, cx);
+                } else {
+                    cx.notify();
+                }
+            }
+        }
+        match self {
+            Self::Single(field) => cx.subscribe(field, move |panel, _, event, cx| {
+                changed(panel, query, event, cx)
+            }),
+            Self::Multi(field) => cx.subscribe(field, move |panel, _, event, cx| {
+                changed(panel, query, event, cx)
+            }),
+        }
+    }
+}
+
 #[doc(hidden)]
 pub struct SearchPanel<T: SearchTarget> {
     target: WeakEntity<T>,
-    search_input: Entity<InputState>,
-    replace_input: Entity<InputState>,
+    search_input: SearchField,
+    replace_input: SearchField,
+    advanced: bool,
     session: gpui_base::input::SearchSession,
-    input_width: Pixels,
+    panel_width: Option<Pixels>,
 
     _subscriptions: Vec<Subscription>,
 }
@@ -199,40 +315,37 @@ impl<T: SearchTarget> SearchPanel<T> {
 
     /// The query the panel's search input currently holds.
     pub(super) fn query(&self, cx: &App) -> gpui::SharedString {
-        self.search_input.read(cx).value()
+        self.search_input.value(cx)
     }
 
     /// The panel's search input, so a test can assert what re-invoking search
     /// does to its value and selection.
     #[cfg(test)]
     pub(super) fn search_input(&self) -> &Entity<InputState> {
-        &self.search_input
+        match &self.search_input {
+            SearchField::Single(field) => field,
+            SearchField::Multi(_) => unreachable!("test uses a single-line target"),
+        }
     }
 
     pub(crate) fn new(target: Entity<T>, window: &mut Window, cx: &mut App) -> Entity<Self> {
-        let search_input = cx.new(|cx| InputState::new(window, cx));
-        let replace_input = cx.new(|cx| InputState::new(window, cx));
+        let advanced = target.read(cx).has_advanced_find();
+        let search_input = SearchField::new(advanced, "Find…", window, cx);
+        let replace_input = SearchField::new(advanced, "Replace…", window, cx);
 
         cx.new(|cx| {
-            let _subscriptions =
-                vec![
-                    cx.subscribe(&search_input, |this: &mut Self, _, ev: &InputEvent, cx| {
-                        // Handle search input changes
-                        match ev {
-                            InputEvent::Change => {
-                                this.update_search_query(None, cx);
-                            }
-                            _ => {}
-                        }
-                    }),
-                ];
+            let _subscriptions = vec![
+                search_input.subscribe(true, cx),
+                replace_input.subscribe(false, cx),
+            ];
 
             Self {
                 target: target.downgrade(),
                 search_input,
                 replace_input,
+                advanced,
                 session: gpui_base::input::SearchSession::default(),
-                input_width: Pixels::ZERO,
+                panel_width: None,
                 _subscriptions,
             }
         })
@@ -250,16 +363,11 @@ impl<T: SearchTarget> SearchPanel<T> {
         self.session.open = true;
         self.session.replace_mode = replace_mode;
         if focus {
-            self.search_input
-                .update(cx, |input, cx| input.focus(window, cx));
+            self.search_input.focus_handle(cx).focus(window, cx);
         }
 
-        self.search_input.update(cx, |this, cx| {
-            if selected_text.len() > 0 {
-                this.set_value(selected_text.to_string(), window, cx);
-            }
-            this.select_all(window, cx);
-        });
+        self.search_input
+            .select_query(&selected_text.to_string(), window, cx);
 
         // The `set_value` does not emit `InputEvent::Change`, so update the query
         // here to match the value of the search input.
@@ -275,7 +383,7 @@ impl<T: SearchTarget> SearchPanel<T> {
         visible_range_offset: Option<Range<usize>>,
         cx: &mut Context<Self>,
     ) {
-        let query = self.search_input.read(cx).value();
+        let query = self.search_input.value(cx);
         _ = self.target.update(cx, |target, cx| {
             target.update_query(&query, &mut self.session, cx);
         });
@@ -318,11 +426,7 @@ impl<T: SearchTarget> SearchPanel<T> {
             self.step(true, cx);
         } else if !action.secondary
             && self.session.replace_mode
-            && self
-                .replace_input
-                .read(cx)
-                .focus_handle(cx)
-                .is_focused(window)
+            && self.replace_input.focus_handle(cx).is_focused(window)
         {
             self.replace_next(window, cx);
         } else {
@@ -353,16 +457,19 @@ impl<T: SearchTarget> SearchPanel<T> {
     /// There are only 2 inputs, so the forward and the backward are the same.
     fn cycle_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !self.session.replace_mode || !self.replaceable(cx) {
+            cx.propagate();
             return;
         }
 
-        let search_focus_handle = self.search_input.read(cx).focus_handle(cx);
-        let focus_handle = if search_focus_handle.is_focused(window) {
-            self.replace_input.read(cx).focus_handle(cx)
+        let search = self.search_input.focus_handle(cx);
+        let replace = self.replace_input.focus_handle(cx);
+        if search.is_focused(window) {
+            replace.focus(window, cx);
+        } else if replace.is_focused(window) {
+            search.focus(window, cx);
         } else {
-            search_focus_handle
-        };
-        focus_handle.focus(window, cx);
+            cx.propagate();
+        }
     }
 
     fn on_action_replace(&mut self, _: &Replace, window: &mut Window, cx: &mut Context<Self>) {
@@ -381,9 +488,9 @@ impl<T: SearchTarget> SearchPanel<T> {
             .target
             .update(cx, |target, cx| target.set_replace_mode(replace_mode, cx));
         let focus_handle = if self.session.replace_mode {
-            self.replace_input.read(cx).focus_handle(cx)
+            self.replace_input.focus_handle(cx)
         } else {
-            self.search_input.read(cx).focus_handle(cx)
+            self.search_input.focus_handle(cx)
         };
         focus_handle.focus(window, cx);
         cx.notify();
@@ -403,7 +510,7 @@ impl<T: SearchTarget> SearchPanel<T> {
             return;
         }
 
-        let replacement = self.replace_input.read(cx).value();
+        let replacement = self.replace_input.value(cx);
         _ = self.target.update(cx, |target, cx| {
             target.replace_match(&replacement, false, window, cx)
         });
@@ -416,7 +523,7 @@ impl<T: SearchTarget> SearchPanel<T> {
             return;
         }
 
-        let replacement = self.replace_input.read(cx).value();
+        let replacement = self.replace_input.value(cx);
         _ = self.target.update(cx, |target, cx| {
             target.replace_match(&replacement, true, window, cx)
         });
@@ -442,8 +549,9 @@ impl DocumentFind {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.search_input
-            .update(cx, |input, cx| input.set_placeholder(label, window, cx));
+        if let SearchField::Single(input) = &self.search_input {
+            input.update(cx, |input, cx| input.set_placeholder(label, window, cx));
+        }
     }
 
     pub fn has_matches(&self) -> bool {
@@ -475,12 +583,10 @@ impl DocumentFind {
 impl<T: SearchTarget> SearchPanel<T> {
     pub(super) fn has_focus(&self, window: &Window, cx: &App) -> bool {
         self.search_input
-            .read(cx)
             .focus_handle(cx)
             .contains_focused(window, cx)
             || self
                 .replace_input
-                .read(cx)
                 .focus_handle(cx)
                 .contains_focused(window, cx)
     }
@@ -488,24 +594,212 @@ impl<T: SearchTarget> SearchPanel<T> {
 
 impl<T: SearchTarget> Focusable for SearchPanel<T> {
     fn focus_handle(&self, cx: &App) -> FocusHandle {
-        self.search_input.read(cx).focus_handle(cx)
+        self.search_input.focus_handle(cx)
+    }
+}
+
+fn find_button(
+    id: &'static str,
+    icon: impl Into<Icon>,
+    label: impl Into<SharedString>,
+    size: Pixels,
+    icon_size: Pixels,
+) -> Button {
+    let label = label.into();
+    Button::new(id)
+        .rounded(px(4.))
+        .with_size(size)
+        .ghost()
+        .compact()
+        .icon(Icon::new(icon))
+        .icon_size(icon_size)
+        .accessibility_label(label.clone())
+        .tooltip(label)
+}
+
+fn find_field(
+    input: Input,
+    id: &'static str,
+    label: impl Into<SharedString>,
+    error: Option<String>,
+    danger: Hsla,
+) -> impl IntoElement {
+    let label = label.into();
+    let accessible_name = match &error {
+        Some(error) => format!("{label}. {error}").into(),
+        None => label,
+    };
+    let invalid = error.is_some();
+    div()
+        .id(id)
+        .debug_selector(move || id.into())
+        .flex_1()
+        .min_w_0()
+        .h(rems(2.))
+        .when_some(error, |field, error| {
+            field.tooltip(move |window, cx| Tooltip::new(error.clone()).build(window, cx))
+        })
+        .child(
+            input
+                .compact_field()
+                .aria_label(accessible_name)
+                .focus_bordered(!invalid)
+                .w_full()
+                .shadow_none()
+                .when(invalid, |input| input.border_color(danger)),
+        )
+}
+
+impl<T: SearchTarget> SearchPanel<T> {
+    fn match_options(
+        &self,
+        entity: WeakEntity<Self>,
+        size: Pixels,
+        icon_size: Pixels,
+    ) -> [Button; 3] {
+        let case_panel = entity.clone();
+        let word_panel = entity.clone();
+        let letter_icon_size = icon_size + px(2.);
+        [
+            find_button(
+                "find-case",
+                Icon::default().data(include_bytes!("icons/find-match-case.svg")),
+                t!("Input.Find match case"),
+                size,
+                letter_icon_size,
+            )
+            .selected(!self.session.case_insensitive)
+            .toggled(!self.session.case_insensitive)
+            .on_click(move |_, _, cx| {
+                _ = case_panel.update(cx, |panel, cx| {
+                    panel.session.case_insensitive = !panel.session.case_insensitive;
+                    panel.update_search_query(None, cx);
+                });
+            }),
+            find_button(
+                "find-whole-word",
+                Icon::default().data(include_bytes!("icons/find-whole-word.svg")),
+                t!("Input.Find whole word"),
+                size,
+                letter_icon_size,
+            )
+            .selected(self.session.options.whole_word)
+            .toggled(self.session.options.whole_word)
+            .on_click(move |_, _, cx| {
+                _ = word_panel.update(cx, |panel, cx| {
+                    panel.session.options.whole_word = !panel.session.options.whole_word;
+                    panel.update_search_query(None, cx);
+                });
+            }),
+            find_button(
+                "find-regex",
+                IconName::Regex,
+                t!("Input.Find regex"),
+                size,
+                icon_size,
+            )
+            .selected(self.session.options.regex)
+            .toggled(self.session.options.regex)
+            .on_click(move |_, _, cx| {
+                _ = entity.update(cx, |panel, cx| {
+                    panel.session.options.regex = !panel.session.options.regex;
+                    panel.update_search_query(None, cx);
+                });
+            }),
+        ]
     }
 }
 
 impl<T: SearchTarget> Render for SearchPanel<T> {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if !self.session.open {
             return Empty.into_any_element();
         }
 
-        let has_matches = !self.session.matcher.is_empty();
         let allow_replace = self.replaceable(cx);
-        if !allow_replace {
-            self.session.replace_mode = false;
-        }
+        let replace_open = allow_replace && self.session.replace_mode;
+        self.session.replace_mode = replace_open;
+        let scope_available = self
+            .target
+            .read_with(cx, |target, _| target.can_find_in_selection())
+            .unwrap_or(false);
+        let scope_missing = self.session.in_selection && !scope_available;
+        let matcher = &self.session.matcher;
+        let has_matches = !matcher.is_empty();
+        let search_error = matcher.error().map(str::to_owned);
+        let replacement_error = if replace_open && has_matches {
+            matcher.replacement_error(&self.replace_input.value(cx))
+        } else {
+            None
+        };
+        let can_replace = has_matches && search_error.is_none() && replacement_error.is_none();
+        let replacement_error = replacement_error.or_else(|| {
+            self.session
+                .replacement_failure(&self.replace_input.value(cx))
+                .map(str::to_owned)
+        });
+
+        let icon_size = cx.theme().control_font_size;
+        let button_size = (window.rem_size() * 2. - px(4.)).max(icon_size + px(2.));
+        let gap = px(3.);
+        let side_padding = px(8.);
+        let count_chars = matcher.len().to_string().len() * 2 + 1;
+        let count_width = icon_size * (count_chars as f32 * 0.62).max(3.3);
+        let leading_buttons = u8::from(allow_replace) + u8::from(self.advanced);
+        let before_navigation = count_width + (button_size + gap) * f32::from(leading_buttons);
+        let expanded_width =
+            before_navigation + (button_size + gap) * 6. + side_padding * 2. + icon_size * 5.;
+        let narrow = self.advanced && self.panel_width.is_some_and(|width| width < expanded_width);
+        let danger = cx.theme().danger;
+        let progress_color = if search_error.is_some() {
+            danger
+        } else {
+            cx.theme().muted_foreground
+        };
+        let entity = cx.weak_entity();
+        let options = if narrow {
+            let active = !self.session.case_insensitive
+                || self.session.options.whole_word
+                || self.session.options.regex;
+            let popover = Popover::new("find-options-popup")
+                .trigger(
+                    find_button(
+                        "find-options",
+                        IconName::Ellipsis,
+                        t!("Input.Find options"),
+                        button_size,
+                        icon_size,
+                    )
+                    .selected(active),
+                )
+                .content(move |_, _, cx| {
+                    let buttons = entity
+                        .read_with(cx, |panel, _| {
+                            panel.match_options(entity.clone(), button_size, icon_size)
+                        })
+                        .ok();
+                    h_flex()
+                        .id("find-options-actions")
+                        .debug_selector(|| "find-options-actions".into())
+                        .gap(gap)
+                        .children(buttons.into_iter().flatten())
+                });
+            div()
+                .debug_selector(|| "find-options-trigger".into())
+                .child(popover)
+                .into_any_element()
+        } else {
+            let options = self.match_options(entity, button_size, icon_size);
+            let count = if self.advanced { 3 } else { 1 };
+            h_flex()
+                .gap(px(2.))
+                .children(options.into_iter().take(count))
+                .into_any_element()
+        };
 
         v_flex()
             .id("search-panel")
+            .debug_selector(|| "find-bar".into())
             .occlude()
             .track_focus(&self.focus_handle(cx))
             .key_context(CONTEXT)
@@ -514,12 +808,22 @@ impl<T: SearchTarget> Render for SearchPanel<T> {
             .on_action(cx.listener(Self::on_action_tab))
             .on_action(cx.listener(Self::on_action_tab_prev))
             .on_action(cx.listener(Self::on_action_replace))
+            .on_prepaint({
+                let entity = cx.weak_entity();
+                move |bounds, _, cx| {
+                    _ = entity.update(cx, |panel, cx| {
+                        if panel.panel_width != Some(bounds.size.width) {
+                            panel.panel_width = Some(bounds.size.width);
+                            cx.notify();
+                        }
+                    });
+                }
+            })
             .font_family(cx.theme().font_family.clone())
-            .items_center()
-            .py_2()
-            .px_3()
+            .py(px(8.))
+            .px(side_padding)
             .w_full()
-            .gap_1()
+            .gap(px(4.))
             .bg(cx.theme().tokens.popover)
             .border_b_1()
             .rounded(cx.theme().radius.half())
@@ -527,131 +831,141 @@ impl<T: SearchTarget> Render for SearchPanel<T> {
             .child(
                 h_flex()
                     .w_full()
-                    .gap_2()
-                    .child(
-                        div()
-                            .flex()
-                            .flex_1()
-                            .gap_1()
-                            .child(
-                                Input::new(&self.search_input)
-                                    .aria_label(t!("ComboBox.search_placeholder"))
-                                    .focus_bordered(false)
-                                    .suffix(
-                                        Button::new("case-insensitive")
-                                            .rounded(px(5.))
-                                            .selected(!self.session.case_insensitive)
-                                            .toggled(!self.session.case_insensitive)
-                                            .xsmall()
-                                            .compact()
-                                            .ghost()
-                                            .icon(IconName::CaseSensitive)
-                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                this.session.case_insensitive =
-                                                    !this.session.case_insensitive;
-                                                this.update_search_query(None, cx);
-                                                cx.notify();
-                                            })),
-                                    )
-                                    .w_full()
-                                    .shadow_none(),
+                    .min_w_0()
+                    .gap(gap)
+                    .child(find_field(
+                        self.search_input.input().suffix(options),
+                        "find-query-field",
+                        t!("Input.Find"),
+                        search_error,
+                        danger,
+                    ))
+                    .when(allow_replace, |row| {
+                        row.child(
+                            find_button(
+                                "replace-mode",
+                                IconName::PanelTopOpen,
+                                t!("Input.Find toggle replace"),
+                                button_size,
+                                icon_size,
                             )
-                            .on_prepaint({
-                                let view = cx.entity();
-                                move |bounds, _, cx| {
-                                    view.update(cx, |r, _| r.input_width = bounds.size.width)
-                                }
-                            }),
-                    )
-                    .when(allow_replace, |this| {
-                        this.child(
-                            Button::new("replace-mode")
-                                .rounded(px(5.))
-                                .xsmall()
-                                .ghost()
-                                .icon(IconName::Replace)
-                                .selected(self.session.replace_mode)
-                                .toggled(self.session.replace_mode)
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.toggle_replace_mode(window, cx);
-                                })),
+                            .selected(replace_open)
+                            .toggled(replace_open)
+                            .on_click(cx.listener(
+                                |this, _, window, cx| this.toggle_replace_mode(window, cx),
+                            )),
+                        )
+                    })
+                    .when(self.advanced, |row| {
+                        let scope_label = if scope_missing {
+                            t!("Input.Find selection missing")
+                        } else {
+                            t!("Input.Find selection description")
+                        };
+                        row.child(
+                            find_button(
+                                "find-in-selection",
+                                IconName::ScanText,
+                                scope_label,
+                                button_size,
+                                icon_size,
+                            )
+                            .selected(self.session.in_selection)
+                            .toggled(self.session.in_selection)
+                            .disabled(!scope_available && !self.session.in_selection)
+                            .when(scope_missing, |button| button.text_color(danger))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                let enabled = !this.session.in_selection;
+                                _ = this.target.update(cx, |target, cx| {
+                                    target.set_find_in_selection(enabled, cx)
+                                });
+                                this.session.in_selection = enabled;
+                                cx.notify();
+                            })),
                         )
                     })
                     .child(
-                        Button::new("prev")
-                            .rounded(px(5.))
-                            .xsmall()
-                            .ghost()
-                            .icon(IconName::ChevronLeft)
-                            .disabled(!has_matches)
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.step(true, cx);
-                            })),
+                        Label::new(matcher.label())
+                            .w(count_width)
+                            .text_size(icon_size)
+                            .text_center()
+                            .text_color(progress_color)
+                            .flex_shrink_0(),
                     )
                     .child(
-                        Button::new("next")
-                            .rounded(px(5.))
-                            .xsmall()
-                            .ghost()
-                            .icon(IconName::ChevronRight)
-                            .disabled(!has_matches)
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.step(false, cx);
-                            })),
+                        find_button(
+                            "prev",
+                            IconName::ChevronUp,
+                            t!("Input.Find previous match"),
+                            button_size,
+                            icon_size,
+                        )
+                        .disabled(!has_matches)
+                        .on_click(cx.listener(|this, _, _, cx| this.step(true, cx))),
                     )
                     .child(
-                        Label::new(self.session.matcher.label())
-                            .when(!has_matches, |this| {
-                                this.text_color(cx.theme().muted_foreground)
-                            })
-                            .text_left()
-                            .min_w_16(),
+                        find_button(
+                            "next",
+                            IconName::ChevronDown,
+                            t!("Input.Find next match"),
+                            button_size,
+                            icon_size,
+                        )
+                        .disabled(!has_matches)
+                        .on_click(cx.listener(|this, _, _, cx| this.step(false, cx))),
                     )
-                    .child(div().w_7())
                     .child(
-                        Button::new("close")
-                            .rounded(px(5.))
-                            .xsmall()
-                            .ghost()
-                            .icon(IconName::Close)
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.on_action_escape(&Escape, window, cx);
-                            })),
+                        find_button(
+                            "close",
+                            IconName::Close,
+                            t!("Input.Find close"),
+                            button_size,
+                            icon_size,
+                        )
+                        .on_click(cx.listener(|this, _, window, cx| this.hide(window, cx))),
                     ),
             )
-            .when(self.session.replace_mode && allow_replace, |this| {
-                this.child(
+            .when(replace_open, |panel| {
+                panel.child(
                     h_flex()
                         .w_full()
-                        .gap_2()
+                        .min_w_0()
+                        .gap(gap)
+                        .child(find_field(
+                            self.replace_input.input(),
+                            "find-replacement-field",
+                            t!("Input.Replace"),
+                            replacement_error,
+                            danger,
+                        ))
+                        .child(div().w(before_navigation).flex_shrink_0())
                         .child(
-                            Input::new(&self.replace_input)
-                                .focus_bordered(false)
-                                .w(self.input_width)
-                                .shadow_none(),
+                            find_button(
+                                "replace-one",
+                                IconName::Replace,
+                                t!("Input.Find replace current"),
+                                button_size,
+                                icon_size,
+                            )
+                            .disabled(!can_replace)
+                            .on_click(
+                                cx.listener(|this, _, window, cx| this.replace_next(window, cx)),
+                            ),
                         )
                         .child(
-                            Button::new("replace-one")
-                                .rounded(px(5.))
-                                .small()
-                                .secondary()
-                                .label(t!("Input.Replace"))
-                                .disabled(!has_matches)
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.replace_next(window, cx);
-                                })),
+                            find_button(
+                                "replace-all",
+                                IconName::ReplaceAll,
+                                t!("Input.Replace All"),
+                                button_size,
+                                icon_size,
+                            )
+                            .disabled(!can_replace)
+                            .on_click(
+                                cx.listener(|this, _, window, cx| this.replace_all(window, cx)),
+                            ),
                         )
-                        .child(
-                            Button::new("replace-all")
-                                .rounded(px(5.))
-                                .small()
-                                .secondary()
-                                .label(t!("Input.Replace All"))
-                                .disabled(!has_matches)
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.replace_all(window, cx);
-                                })),
-                        ),
+                        .child(div().w(button_size).flex_shrink_0()),
                 )
             })
             .into_any_element()

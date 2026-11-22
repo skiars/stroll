@@ -619,6 +619,9 @@ impl Workspace {
             }
             cx.refresh_windows();
         }
+        if previous.editor.selection_highlight != config.editor.selection_highlight {
+            self.refresh_active_selection_highlight(window, cx);
+        }
         cx.notify();
     }
 }
@@ -1152,6 +1155,13 @@ impl SettingsPage {
                 self.switch(default.editor.inlay_hints, |c| &mut c.editor.inlay_hints),
             )
             .description(t!("settings.inlay_hints_description").into_owned()),
+            setting_item(
+                t!("settings.selection_highlight"),
+                self.switch(default.editor.selection_highlight, |c| {
+                    &mut c.editor.selection_highlight
+                }),
+            )
+            .description(t!("settings.selection_highlight_description").into_owned()),
         ]);
         let git = SettingGroup::new().items([
             setting_item(

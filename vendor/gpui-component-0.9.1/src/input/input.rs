@@ -148,6 +148,7 @@ pub struct Input {
     prefix: Option<AnyElement>,
     suffix: Option<AnyElement>,
     height: Option<DefiniteLength>,
+    compact_field: bool,
     appearance: bool,
     preview: bool,
     external_search_panel: bool,
@@ -259,6 +260,7 @@ impl Input {
             prefix: None,
             suffix: None,
             height: None,
+            compact_field: false,
             appearance: true,
             preview: false,
             external_search_panel: false,
@@ -310,6 +312,12 @@ impl Input {
 
     pub fn suffix(mut self, suffix: impl IntoElement) -> Self {
         self.suffix = Some(suffix.into_any_element());
+        self
+    }
+
+    /// Use the standard text-field frame around a scrollable text surface.
+    pub(super) fn compact_field(mut self) -> Self {
+        self.compact_field = true;
         self
     }
 
@@ -544,14 +552,18 @@ impl Input {
     fn render_editor(
         input_state: TextInputState,
         search_panel: Option<AnyElement>,
-        _: &Window,
+        compact: bool,
     ) -> impl IntoElement {
-        v_flex().size_full().children(search_panel).child(
-            div()
-                .relative()
-                .flex_1()
-                .child(input_state.into_any_element()),
-        )
+        v_flex()
+            .size_full()
+            .when(compact, |view| view.flex_1().min_w_0().overflow_hidden())
+            .children(search_panel)
+            .child(
+                div()
+                    .relative()
+                    .flex_1()
+                    .child(input_state.into_any_element()),
+            )
     }
 }
 
@@ -636,7 +648,7 @@ impl RenderOnce for Input {
             cx,
         );
         state.set_editor_paddings(
-            if state.presentation(cx).is_multi_line() {
+            if state.presentation(cx).is_multi_line() && !self.compact_field {
                 Edges {
                     top: self.size.input_py(),
                     right: self.size.input_px(),
@@ -738,6 +750,7 @@ impl RenderOnce for Input {
         let content_type = self.content_type;
         let disabled = self.disabled;
         let is_multi_line = presentation.is_multi_line();
+        let standard_frame = !is_multi_line || self.compact_field;
         // Without a content type, a masked input is a password field to screen
         // readers, so they announce it as one.
         let accessibility_role = accessibility_role(
@@ -842,14 +855,16 @@ impl RenderOnce for Input {
             .flex()
             .size_full()
             .line_height(LINE_HEIGHT)
-            .when(!is_multi_line, |this| {
+            .when(standard_frame, |this| {
                 this.input_px(self.size).py(self.size.control_padding_y())
             })
             .input_h(self.size)
             .input_text_size(self.size)
-            .when(!is_multi_line, |this| this.text_size(cx.theme().control_font_size))
+            .when(standard_frame, |this| {
+                this.text_size(cx.theme().control_font_size)
+            })
             .items_center()
-            .when(is_multi_line, |this| this.h_auto())
+            .when(!standard_frame, |this| this.h_auto())
             .when_some(self.height, |this, height| this.h(height))
             .when(self.appearance, |this| {
                 this.bg(bg)
@@ -876,14 +891,19 @@ impl RenderOnce for Input {
                     (!self.external_search_panel)
                         .then_some(overlays.search)
                         .flatten(),
-                    window,
+                    self.compact_field,
                 ))
             })
             .when(!presentation.is_multi_line(), |this| {
                 this.child(state.clone().into_any_element())
             })
             .when(has_suffix, |this| {
-                this.pr(self.size.input_px()).child(
+                this.pr(if self.compact_field {
+                    px(2.)
+                } else {
+                    self.size.input_px()
+                })
+                .child(
                     h_flex()
                         .id("suffix")
                         .gap(gap_x)

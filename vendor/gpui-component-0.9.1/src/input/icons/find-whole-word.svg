@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24"
+     fill="none" stroke="currentColor" stroke-width="2"
+     stroke-linecap="round" stroke-linejoin="round">
+  <title>Match whole word</title>
+  <!-- Rounded letterforms with a common y=16.5 baseline. -->
+  <path d="M10.3 8.35v8.15m0-4.08c0 2.38-1.53 4.08-3.67 4.08s-3.58-1.7-3.58-4.08 1.44-4.07 3.58-4.07 3.67 1.69 3.67 4.07Z"/>
+  <path d="M13.7 5.2v11.3m0-4.08c0-2.38 1.53-4.07 3.67-4.07s3.58 1.69 3.58 4.07-1.44 4.08-3.58 4.08-3.67-1.7-3.67-4.08Z"/>
+  <path d="M1.6 18.75v1.85q0 1.1 1.1 1.1h18.6q1.1 0 1.1-1.1v-1.85" stroke-width="1.85"/>
+</svg>

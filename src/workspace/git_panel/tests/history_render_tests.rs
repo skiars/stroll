@@ -824,27 +824,23 @@ fn compares_outside_the_selected_branch_from_both_toolbar_entries() -> Result<()
     draw(visual);
     let narrow_history = history_state(visual);
     let toolbar = visual.debug_bounds("git-toolbar").unwrap();
-    let closed_quads = visual.update(|window, _| window.painted_quads());
     visual.update(|window, cx| panel.update(cx, |panel, cx| panel.find(window, cx)));
     draw(visual);
+    let field = visual
+        .debug_bounds("find-query-field")
+        .expect("editor search field");
+    assert!(field.top() >= toolbar.bottom());
+    assert!(field.left() >= toolbar.left() && field.right() <= toolbar.right());
     visual.update(|window, cx| {
         let scale = window.scale_factor();
-        let toolbar = toolbar.scale(scale);
-        let field = window
-            .painted_quads()
-            .into_iter()
-            .find(|quad| {
-                quad.border_color == cx.theme().input
-                    && quad.border_widths.top.0 > 0.
-                    && quad.bounds.top() >= toolbar.bottom()
-                    && quad.bounds.left() >= toolbar.left()
-                    && quad.bounds.right() <= toolbar.right()
-                    && !closed_quads
-                        .iter()
-                        .any(|closed| closed.bounds == quad.bounds)
-            })
-            .expect("editor search border");
-        assert!((field.bounds.size.height.0 - 28. * scale).abs() <= 1.);
+        assert_eq!(field.size.height, window.rem_size() * 2.);
+        let field = field.scale(scale);
+        assert!(window.painted_quads().into_iter().any(|quad| {
+            (quad.border_color == cx.theme().input || quad.border_color == cx.theme().ring)
+                && quad.border_widths.top.0 > 0.
+                && (quad.bounds.top() - field.top()).0.abs() <= 1.
+                && (quad.bounds.size.height - field.size.height).0.abs() <= 1.
+        }));
     });
     visual.simulate_keystrokes("escape");
     draw(visual);
