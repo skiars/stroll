@@ -788,6 +788,10 @@ impl DocReader {
         cx.notify();
     }
 
+    pub(crate) fn focus_content(&self, window: &mut Window, cx: &mut App) {
+        self.text.read(cx).focus_handle().clone().focus(window, cx);
+    }
+
     pub(crate) fn session_position(&self, cx: &App) -> Option<DocumentPosition> {
         if self.pending_position.is_some()
             || self.pending_fragment.is_some()
@@ -1472,9 +1476,11 @@ impl Render for DocReader {
 }
 
 fn copy_button(code: SharedString) -> Button {
-    compact_icon_button("copy-code", IconName::Copy, t!("docs.copy_code")).on_click(
-        move |_, _, cx| cx.write_to_clipboard(ClipboardItem::new_string(code.to_string())),
-    )
+    compact_icon_button("copy-code", IconName::Copy, t!("docs.copy_code"))
+        .debug_selector(|| "docs-copy-code".into())
+        .on_click(move |_, _, cx| {
+            cx.write_to_clipboard(ClipboardItem::new_string(code.to_string()));
+        })
 }
 
 pub(crate) fn load_local(path: &Path) -> Result<PreparedDocument> {

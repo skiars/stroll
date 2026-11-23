@@ -111,6 +111,10 @@ actions!(
     ]
 );
 
+#[derive(Action, Clone, Copy, PartialEq)]
+#[action(namespace = workspace, no_json, no_register)]
+pub struct SwitchWorkspaceView(pub WorkspaceView);
+
 #[derive(Clone)]
 pub(crate) struct PaneDrag {
     pub(crate) edge: HandleEdge,
@@ -942,6 +946,7 @@ impl Workspace {
             if let Err(error) = this.flush_session(cx) {
                 eprintln!("{error:#}");
             }
+            this.flush_inactive_terminal_sessions(cx);
             this.shutdown_terminals(cx);
             async {}
         })
@@ -1786,7 +1791,9 @@ impl Workspace {
         if !self.session.worktree_lsp_trusted {
             *repo.worktree_lsp.write().unwrap() = Arc::default();
         }
+        self.terminal_view_changed();
         self.repository = Some(Arc::new(repo));
+        self.restore_terminals(window, cx);
         self.watch_connection(window, cx);
         self.rebuild_tree();
         match self.view {
@@ -1959,6 +1966,25 @@ impl Workspace {
         self.switch_view_to(view, None, window, cx);
     }
 
+    fn switch_view_shortcut(
+        &mut self,
+        action: &SwitchWorkspaceView,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.repository.is_none()
+            || self.repository_overlay_open()
+            || window.has_active_dialog(cx)
+            || self.terminal_focused(window, cx)
+        {
+            return;
+        }
+        match action.0 {
+            WorkspaceView::Git => self.switch_view(WorkspaceView::Git, window, cx),
+            view => self.switch_view_from_topbar(view, window, cx),
+        }
+    }
+
     fn switch_view_from_topbar(
         &mut self,
         view: WorkspaceView,
@@ -2030,6 +2056,7 @@ impl Workspace {
             doc.update(cx, |doc, cx| doc.release_online_images(cx));
         }
         self.finish_tree_edit(window, cx);
+        self.terminal_view_changed();
         self.view = view;
         self.git_watch = Task::ready(());
         self.lsp_panel_open = false;
@@ -3377,6 +3404,7 @@ impl Workspace {
         }
         match self.flush_drafts(cx).and_then(|()| self.flush_session(cx)) {
             Ok(()) => {
+                self.flush_inactive_terminal_sessions(cx);
                 self.shutdown_terminals(cx);
                 true
             }
@@ -4568,7 +4596,7 @@ impl Workspace {
     fn content(&self, window: &Window, cx: &Context<Self>, colors: Palette) -> Stateful<Div> {
         let editor_background =
             code_theme::surface(self.config.current().appearance.code_theme, cx.theme().mode);
-        let maximum = ((window.viewport_size().height - px(68.)) * 0.65).max(px(100.));
+        let maximum = terminal::maximum_height(window);
         let mut terminal = self.terminal_panel(maximum, colors, cx);
         let maximized = self.terminal_maximized();
         let mut main = v_flex().relative().flex_1().min_w_0().min_h_0().h_full();
@@ -4735,6 +4763,7 @@ impl Workspace {
             } else {
                 main.children(terminal)
             },
+            "workspace-editor-column",
             maximum,
             cx,
         )
@@ -4970,7 +4999,7 @@ impl Workspace {
                         row.child(self.sidebar(tree_width.min(tree_limit), window, cx, colors))
                     })
                     .child(if docs {
-                        self.file_drop_area(self.docs_content(window, cx, colors), cx, colors)
+                        self.file_drop_area(self.docs_column(window, cx, colors), cx, colors)
                             .into_any_element()
                     } else {
                         self.file_drop_area(self.content(window, cx, colors), cx, colors)
@@ -5065,6 +5094,22 @@ impl Workspace {
                     },
                 ),
             )
+    }
+
+    fn docs_column(&self, window: &Window, cx: &Context<Self>, colors: Palette) -> Stateful<Div> {
+        let maximum = terminal::maximum_height(window);
+        let column = v_flex()
+            .relative()
+            .flex_1()
+            .min_w_0()
+            .min_h_0()
+            .h_full()
+            .child(
+                self.docs_content(window, cx, colors)
+                    .when(self.terminal_maximized(), |content| content.invisible()),
+            )
+            .children(self.terminal_panel(maximum, colors, cx));
+        self.terminal_column(column, "workspace-docs-column", maximum, cx)
     }
 
     fn docs_content(&self, window: &Window, cx: &Context<Self>, colors: Palette) -> Stateful<Div> {
@@ -5178,6 +5223,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::save))
             .on_action(cx.listener(Self::toggle_wrap))
             .on_action(cx.listener(Self::toggle_terminal_shortcut))
+            .on_action(cx.listener(Self::switch_view_shortcut))
             .when(self.view == WorkspaceView::Git && !switching, |view| {
                 view.key_context("Reader")
             })

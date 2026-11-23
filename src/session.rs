@@ -33,9 +33,32 @@ pub(crate) struct WorktreeSession {
     pub git: Option<GitSession>,
     pub panels: PanelPreferences,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub terminal: Option<TerminalSession>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub commit_draft: Option<String>,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub worktree_lsp_trusted: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub(crate) struct TerminalSession {
+    pub open: bool,
+    // None marks a snapshot from when both views shared one visibility flag.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub docs_open: Option<bool>,
+    pub active: Option<u32>,
+    pub tabs: Vec<TerminalTab>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub(crate) struct TerminalTab {
+    pub number: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub directory: Option<PathBuf>,
+    #[serde(skip_serializing_if = "str::is_empty")]
+    pub scrollback: Arc<str>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]

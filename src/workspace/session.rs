@@ -77,6 +77,7 @@ impl Workspace {
         if self.repository.is_none() && self.standalone.is_none() {
             return;
         }
+        self.capture_terminal_session(cx);
         let disconnected = self
             .repository
             .as_ref()

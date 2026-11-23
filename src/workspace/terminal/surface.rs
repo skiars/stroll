@@ -1,21 +1,28 @@
 use rust_i18n::t;
 
 use std::{
+    cell::RefCell,
     ffi::OsString,
     ops::Range,
     path::{Path, PathBuf},
-    sync::mpsc::{self, Sender},
+    sync::{
+        Arc,
+        mpsc::{self, Sender},
+    },
     time::{Duration, Instant},
 };
 
 use gpui::*;
 use gpui_component::{ActiveTheme, ThemeMode, animation::ease_in_cubic, menu::ContextMenuExt as _};
 
+use crate::session::TerminalTab;
 use crate::terminal::{
     Command, Emulator, Event, Frame, Link, LinkTarget, MouseAction, Process, PtySize,
-    SelectionAction,
+    SelectionAction, bounded_scrollback,
 };
 
+#[cfg(windows)]
+mod directory;
 mod links;
 mod paint;
 
@@ -45,6 +52,10 @@ pub(super) struct Session {
     pub(super) status: Status,
     root: PathBuf,
     shell: OsString,
+    last_directory: RefCell<Option<PathBuf>>,
+    last_scrollback: RefCell<Arc<str>>,
+    #[cfg(windows)]
+    directory_report: directory::DirectoryReport,
     ssh: Option<crate::remote::SshSession>,
     process: Option<Process>,
     commands: Sender<Command>,
@@ -172,13 +183,21 @@ impl Fade {
 
 impl Session {
     pub(super) fn new(
-        number: u32,
+        tab: TerminalTab,
         root: &Path,
         shell: OsString,
         ssh: Option<crate::remote::SshSession>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        let TerminalTab {
+            number,
+            directory,
+            scrollback,
+        } = tab;
+        let directory = directory
+            .filter(|_| ssh.is_none())
+            .map(|path| root.join(path));
         let name = Path::new(&shell)
             .file_stem()
             .unwrap_or(&shell)
@@ -240,6 +259,16 @@ impl Session {
             label,
             root: root.to_owned(),
             shell,
+            last_directory: RefCell::new(directory),
+            last_scrollback: RefCell::new(
+                if bounded_scrollback(&scrollback).len() == scrollback.len() {
+                    scrollback
+                } else {
+                    bounded_scrollback(&scrollback).into()
+                },
+            ),
+            #[cfg(windows)]
+            directory_report: directory::DirectoryReport::default(),
             ssh,
             commands,
             pending: Some((requests, output)),
@@ -273,6 +302,44 @@ impl Session {
         }
     }
 
+    pub(super) fn relocate_root(&mut self, root: &Path) {
+        let directory = self.last_directory.get_mut();
+        if let Some(relative) = directory
+            .as_deref()
+            .and_then(|path| path.strip_prefix(&self.root).ok())
+        {
+            *directory = Some(root.join(relative));
+        }
+        self.root = root.to_owned();
+    }
+
+    pub(super) fn working_directory(&self) -> Option<PathBuf> {
+        if self.ssh.is_some() {
+            return None;
+        }
+        #[cfg(unix)]
+        let reported = self.process.as_ref().and_then(Process::working_directory);
+        #[cfg(windows)]
+        let reported = self.directory_report.path().cloned();
+        if let Some(path) = reported.filter(|path| path.is_absolute() && path.to_str().is_some()) {
+            self.last_directory.replace(Some(path));
+        }
+        self.last_directory.borrow().clone()
+    }
+
+    pub(super) fn scrollback_snapshot(&self, enabled: bool) -> Arc<str> {
+        if !enabled {
+            self.last_scrollback.replace(Arc::default());
+        } else if let Some(history) = self
+            .emulator
+            .as_ref()
+            .and_then(Emulator::scrollback_snapshot)
+        {
+            self.last_scrollback.replace(history);
+        }
+        self.last_scrollback.borrow().clone()
+    }
+
     pub(super) fn terminate(&mut self) -> Option<Process> {
         let mut process = self.process.take()?;
         process.terminate();
@@ -293,6 +360,10 @@ impl Session {
         for event in events {
             match event {
                 Event::Output(bytes) => {
+                    #[cfg(windows)]
+                    if self.ssh.is_none() {
+                        self.directory_report.advance(&bytes);
+                    }
                     if let Some(emulator) = &mut self.emulator {
                         emulator.write(&bytes);
                         self.dirty = true;
@@ -376,13 +447,19 @@ impl Session {
         };
         let size = geometry.size();
         if let Some((commands, output)) = self.pending.take() {
-            self.emulator = Some(Emulator::new(size, self.commands.clone()));
+            let mut emulator = Emulator::new(size, self.commands.clone());
+            emulator.restore_scrollback(
+                &self.last_scrollback.borrow(),
+                &t!("terminal.scrollback_restored"),
+                cfg!(windows) && self.ssh.is_none(),
+            );
+            self.emulator = Some(emulator);
             let process = match &self.ssh {
                 Some(ssh) => Process::start_remote(ssh.clone(), size, commands, output),
-                None => Process::start(
+                None => Process::start_local(
                     self.shell.clone(),
-                    crate::pty::ShellMode::Interactive,
                     &self.root,
+                    self.last_directory.borrow().as_deref(),
                     size,
                     commands,
                     output,
@@ -1231,7 +1308,17 @@ mod tests {
         let (commands, input) = mpsc::channel();
         let (_, cx) = cx.add_window_view(move |window, cx| {
             let session = cx.new(|cx| {
-                let mut session = Session::new(1, Path::new("."), "shell".into(), None, window, cx);
+                let mut session = Session::new(
+                    crate::session::TerminalTab {
+                        number: 1,
+                        ..Default::default()
+                    },
+                    Path::new("."),
+                    "shell".into(),
+                    None,
+                    window,
+                    cx,
+                );
                 session.pending = None;
                 session.commands = commands;
                 session.emulator = Some(Emulator::new(
@@ -1432,6 +1519,214 @@ mod tests {
         });
     }
 
+    #[gpui::test]
+    fn docs_share_terminal_input_and_restore_worktree_tabs(cx: &mut TestAppContext) {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("repo");
+        assert!(
+            std::process::Command::new("git")
+                .args(["init", "-q"])
+                .arg(&root)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let doc_path = Path::new("README.md");
+        let snippet = "printf terminal-doc-marker";
+        fs::write(
+            root.join(doc_path),
+            format!("# Commands\n\n```sh\n{snippet}\n```\n"),
+        )
+        .unwrap();
+        fs::create_dir(root.join("examples")).unwrap();
+        let store = Arc::new(Store::new(temp.path().join("state")).unwrap());
+        let config_path = temp.path().join("config.toml");
+        fs::write(&config_path, "[terminal]\nrestore_scrollback = true\n").unwrap();
+        let open_workspace = |cx: &mut TestAppContext, saved: crate::session::WorktreeSession| {
+            let repo = Repository::open(&root).unwrap();
+            let mut workspace = None;
+            let (_, visual) = cx.add_window_view(|window, cx| {
+                let config = ConfigFile::load(Some(config_path.clone()));
+                let view = cx.new(|cx| {
+                    Workspace::with_config(store.clone(), config, WorkspaceView::Docs, window, cx)
+                });
+                view.update(cx, |view, cx| {
+                    view.apply_repository(repo, saved, Some(doc_path.into()), None, window, cx);
+                    if let Some(panel) = view.current_terminal() {
+                        for tab in &panel.tabs {
+                            tab.session.update(cx, |session, _| {
+                                let (_, events) = session.pending.as_mut().unwrap();
+                                // Exercise lazy layout without waking the deterministic UI scheduler from the PTY thread.
+                                *events = async_channel::bounded(1).0;
+                            });
+                        }
+                    }
+                });
+                workspace = Some(view.clone());
+                Root::new(view, window, cx)
+            });
+            visual.simulate_resize(size(px(1000.), px(760.)));
+            workspace.unwrap()
+        };
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            Workspace::bind_terminal_keys(cx);
+            cx.bind_keys([KeyBinding::new(
+                "ctrl-`",
+                crate::workspace::ToggleTerminal,
+                None,
+            )]);
+        });
+        let workspace = open_workspace(cx, Default::default());
+        let mut visual = VisualTestContext::from_window(*cx.windows().last().unwrap(), cx);
+        visual.run_until_parked();
+        let repo = Repository::open(&root).unwrap();
+        let (session, commands) = visual.update(|window, cx| {
+            workspace.update(cx, |view, cx| {
+                view.show_terminal(window, cx);
+                let session = view.current_terminal().unwrap().tabs[0].session.clone();
+                let (command_tx, commands) = mpsc::channel();
+                session.update(cx, |session, _| {
+                    session.pending = None;
+                    let mut terminal = Emulator::new(
+                        PtySize {
+                            cols: 80,
+                            rows: 24,
+                            cell_width: 8,
+                            cell_height: 16,
+                        },
+                        command_tx.clone(),
+                    );
+                    terminal.write(b"\x1b[?2004hprevious output\r\n");
+                    session.commands = command_tx;
+                    session.emulator = Some(terminal);
+                    #[cfg(unix)]
+                    session.last_directory.replace(Some(root.join("examples")));
+                });
+                view.hide_terminal(window, cx);
+                (session, commands)
+            })
+        });
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+        let copy = visual
+            .debug_bounds("docs-copy-code")
+            .expect("document code block is visible");
+        visual.simulate_click(copy.center(), Modifiers::none());
+        let copied = visual.update(|_, cx| cx.read_from_clipboard().unwrap().text().unwrap());
+        assert_eq!(copied.trim_end(), snippet);
+        assert!(
+            !commands
+                .try_iter()
+                .any(|command| matches!(command, Command::Input(_)))
+        );
+
+        assert!(visual.debug_bounds("document-terminal").is_none());
+        visual.simulate_keystrokes("ctrl-`");
+        visual.update(|window, cx| {
+            let view = workspace.read(cx);
+            assert_eq!(view.view, WorkspaceView::Docs);
+            assert!(view.terminal_focused(window, cx));
+        });
+        #[cfg(target_os = "macos")]
+        visual.simulate_keystrokes("cmd-v");
+        #[cfg(not(target_os = "macos"))]
+        visual.simulate_keystrokes("ctrl-shift-v");
+        let pasted = commands
+            .try_iter()
+            .find_map(|command| match command {
+                Command::Input(bytes) => Some(bytes),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(
+            String::from_utf8(pasted).unwrap(),
+            format!("\x1b[200~{}\x1b[201~", copied.replace("\r\n", "\n")),
+        );
+
+        visual.update(|window, cx| {
+            workspace.update(cx, |view, cx| {
+                view.current_terminal_mut().unwrap().maximized = true;
+                view.switch_view(WorkspaceView::Editor, window, cx);
+                assert!(!view.terminal_maximized());
+                assert!(!view.terminal_open());
+                view.show_terminal(window, cx);
+                assert!(view.terminal_open());
+                assert_eq!(view.current_terminal().unwrap().tabs[0].session, session);
+                view.switch_view(WorkspaceView::Docs, window, cx);
+                assert_eq!(view.current_terminal().unwrap().tabs[0].session, session);
+                view.create_terminal(window, cx);
+                view.close_active_terminal(window, cx);
+                view.create_terminal(window, cx);
+                assert_eq!(view.current_terminal().unwrap().tabs[1].number, 3);
+                view.doc
+                    .as_ref()
+                    .unwrap()
+                    .update(cx, |doc, cx| doc.focus_content(window, cx));
+                assert!(!view.terminal_focused(window, cx));
+                view.toggle_terminal_shortcut(&crate::workspace::ToggleTerminal, window, cx);
+                assert!(!view.terminal_open());
+                assert!(!view.terminal_focused(window, cx));
+                view.flush_session(cx).unwrap();
+            });
+        });
+        let saved = store.session(&repo).unwrap();
+        assert_eq!(saved.view, Some(WorkspaceView::Docs));
+        let terminal = saved.terminal.as_ref().unwrap();
+        assert!(terminal.open);
+        assert_eq!(terminal.docs_open, Some(false));
+        assert_eq!(terminal.active, Some(3));
+        assert_eq!(
+            terminal
+                .tabs
+                .iter()
+                .map(|tab| tab.number)
+                .collect::<Vec<_>>(),
+            [1, 3]
+        );
+        assert!(terminal.tabs[0].scrollback.contains("previous output"));
+        #[cfg(unix)]
+        assert_eq!(
+            terminal.tabs[0].directory.as_deref(),
+            Some(Path::new("examples"))
+        );
+
+        let reopened = open_workspace(cx, saved);
+        let mut visual = VisualTestContext::from_window(*cx.windows().last().unwrap(), cx);
+        visual.update(|_, cx| {
+            let view = reopened.read(cx);
+            assert!(!view.terminal_open());
+            let panel = view.current_terminal().unwrap();
+            assert_eq!(panel.tabs[panel.active].number, 3);
+            assert!(
+                panel
+                    .tabs
+                    .iter()
+                    .all(|tab| tab.session.read(cx).pending.is_some())
+            );
+        });
+        visual.simulate_keystrokes("ctrl-`");
+        visual.update(|window, cx| {
+            let view = reopened.read(cx);
+            assert_eq!(view.view, WorkspaceView::Docs);
+            assert!(view.terminal_focused(window, cx));
+            reopened.update(cx, |view, cx| view.flush_session(cx).unwrap());
+        });
+
+        let visible = open_workspace(cx, store.session(&repo).unwrap());
+        let mut visual = VisualTestContext::from_window(*cx.windows().last().unwrap(), cx);
+        visual.run_until_parked();
+        visual.update(|window, cx| {
+            let view = visible.read(cx);
+            assert_eq!(view.view, WorkspaceView::Docs);
+            assert!(view.terminal_open());
+            assert!(!view.terminal_focused(window, cx));
+            let panel = view.current_terminal().unwrap();
+            assert!(panel.tabs[0].session.read(cx).pending.is_some());
+            assert!(panel.tabs[1].session.read(cx).pending.is_none());
+        });
+        assert!(visual.debug_bounds("terminal-toolbar").is_some());
+    }
+
     #[test]
     fn ctrl_tab_cycles_only_the_focused_terminal_tabs() -> anyhow::Result<()> {
         let temp = tempfile::tempdir()?;
@@ -1602,7 +1897,17 @@ mod tests {
             gpui_component::init(cx);
             Workspace::bind_terminal_keys(cx);
             let session = cx.new(|cx| {
-                let mut session = Session::new(1, Path::new("."), "shell".into(), None, window, cx);
+                let mut session = Session::new(
+                    crate::session::TerminalTab {
+                        number: 1,
+                        ..Default::default()
+                    },
+                    Path::new("."),
+                    "shell".into(),
+                    None,
+                    window,
+                    cx,
+                );
                 session.pending = None;
                 session.commands = commands;
                 session.emulator = Some(Emulator::new(
@@ -1987,7 +2292,17 @@ mod tests {
         let (commands, requests) = mpsc::channel();
         let (_, cx) = cx.add_window_view(|window, cx| {
             let session = cx.new(|cx| {
-                let mut session = Session::new(1, Path::new("."), "shell".into(), None, window, cx);
+                let mut session = Session::new(
+                    crate::session::TerminalTab {
+                        number: 1,
+                        ..Default::default()
+                    },
+                    Path::new("."),
+                    "shell".into(),
+                    None,
+                    window,
+                    cx,
+                );
                 session.pending = None;
                 session.commands = commands;
                 session.emulator = Some(Emulator::new(
@@ -2112,7 +2427,17 @@ mod tests {
         let (_, cx) = cx.add_window_view(|window, cx| {
             gpui_component::init(cx);
             let session = cx.new(|cx| {
-                let mut session = Session::new(1, Path::new("."), "shell".into(), None, window, cx);
+                let mut session = Session::new(
+                    crate::session::TerminalTab {
+                        number: 1,
+                        ..Default::default()
+                    },
+                    Path::new("."),
+                    "shell".into(),
+                    None,
+                    window,
+                    cx,
+                );
                 session.pending = None;
                 let mut emulator = Emulator::new(
                     PtySize {

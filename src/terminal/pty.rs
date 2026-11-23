@@ -22,6 +22,9 @@ mod platform;
 
 pub(crate) use platform::shell;
 
+#[cfg(all(feature = "desktop", unix))]
+use std::{path::PathBuf, sync::atomic::AtomicU32};
+
 #[derive(Clone, Copy)]
 pub(crate) enum ShellMode {
     #[cfg(feature = "desktop")]
@@ -52,6 +55,8 @@ pub(crate) struct Process {
     stop: Arc<AtomicBool>,
     events: async_channel::Sender<Event>,
     worker: Option<JoinHandle<()>>,
+    #[cfg(all(feature = "desktop", unix))]
+    pid: Option<Arc<AtomicU32>>,
 }
 
 impl Process {
@@ -63,10 +68,73 @@ impl Process {
         commands: mpsc::Receiver<Command>,
         events: async_channel::Sender<Event>,
     ) -> io::Result<Self> {
+        Self::start_in(shell, mode, root, None, size, commands, events)
+    }
+
+    #[cfg(feature = "desktop")]
+    pub(crate) fn start_local(
+        shell: OsString,
+        root: &Path,
+        directory: Option<&Path>,
+        size: PtySize,
+        commands: mpsc::Receiver<Command>,
+        events: async_channel::Sender<Event>,
+    ) -> io::Result<Self> {
+        Self::start_in(
+            shell,
+            ShellMode::Interactive,
+            root,
+            directory,
+            size,
+            commands,
+            events,
+        )
+    }
+
+    fn start_in(
+        shell: OsString,
+        mode: ShellMode,
+        root: &Path,
+        directory: Option<&Path>,
+        size: PtySize,
+        commands: mpsc::Receiver<Command>,
+        events: async_channel::Sender<Event>,
+    ) -> io::Result<Self> {
         let root = root.to_owned();
-        Self::spawn(events, move |output, stopping| {
-            run(&shell, mode, &root, size, commands, output, stopping)
-        })
+        let directory = directory.map(Path::to_owned);
+        #[cfg(all(feature = "desktop", unix))]
+        let pid = Arc::new(AtomicU32::new(0));
+        #[cfg(all(feature = "desktop", unix))]
+        let child_pid = pid.clone();
+        let process = Self::spawn(events, move |output, stopping| {
+            let pty = if let Some(directory) = directory.as_deref().filter(|path| path != &root) {
+                platform::Pty::open(&shell, mode, directory, size)
+                    .or_else(|_| platform::Pty::open(&shell, mode, &root, size))?
+            } else {
+                platform::Pty::open(&shell, mode, &root, size)?
+            };
+            #[cfg(all(feature = "desktop", unix))]
+            child_pid.store(pty.0.pid(), Ordering::Relaxed);
+            let result = run(pty, size, commands, output, stopping);
+            #[cfg(all(feature = "desktop", unix))]
+            child_pid.store(0, Ordering::Relaxed);
+            result
+        })?;
+        #[cfg(all(feature = "desktop", unix))]
+        let process = {
+            let mut process = process;
+            process.pid = Some(pid);
+            process
+        };
+        Ok(process)
+    }
+
+    #[cfg(all(feature = "desktop", unix))]
+    pub(crate) fn working_directory(&self) -> Option<PathBuf> {
+        let pid = self.pid.as_ref()?.load(Ordering::Relaxed);
+        (pid != 0)
+            .then(|| platform::working_directory(pid))
+            .flatten()
     }
 
     #[cfg(feature = "desktop")]
@@ -110,6 +178,8 @@ impl Process {
             stop,
             events,
             worker: Some(worker),
+            #[cfg(all(feature = "desktop", unix))]
+            pid: None,
         })
     }
 
@@ -134,15 +204,16 @@ impl Drop for Process {
 }
 
 fn run(
-    shell: &OsString,
-    mode: ShellMode,
-    root: &Path,
+    (mut pty, reader, writer): (
+        platform::Pty,
+        impl Read + Send + 'static,
+        impl Write + Send + 'static,
+    ),
     size: PtySize,
     commands: mpsc::Receiver<Command>,
     events: &async_channel::Sender<Event>,
     stopping: &AtomicBool,
 ) -> io::Result<Option<u32>> {
-    let (mut pty, reader, writer) = platform::Pty::open(shell, mode, root, size)?;
     // Keep ConPTY's synchronous input and output pipes on separate threads.
     // Output is bounded so an unbounded producer cannot starve the UI or fill memory.
     let reader_stop = Arc::new(AtomicBool::new(false));
@@ -343,4 +414,60 @@ fn remote_run(
     })();
     _ = ssh.call::<()>(Request::TerminalClose(id));
     result
+}
+
+#[cfg(all(test, unix, feature = "desktop"))]
+mod tests {
+    use std::{fs, path::Path, time::Instant};
+
+    use super::*;
+
+    #[test]
+    fn terminal_starts_in_saved_directory_and_falls_back_if_removed() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().canonicalize()?;
+        let saved = root.join("saved");
+        let next = root.join("next");
+        fs::create_dir(&saved)?;
+        fs::create_dir(&next)?;
+        let start = |directory: &Path| -> anyhow::Result<_> {
+            let (tx, rx) = mpsc::channel();
+            let (output, events) = async_channel::bounded(16);
+            let process = Process::start_local(
+                "/bin/sh".into(),
+                &root,
+                Some(directory),
+                PtySize {
+                    cols: 80,
+                    rows: 24,
+                    cell_width: 8,
+                    cell_height: 16,
+                },
+                rx,
+                output,
+            )?;
+            Ok((process, tx, events))
+        };
+        let wait_for = |process: &Process, directory: &Path| {
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while process.working_directory().as_deref() != Some(directory) {
+                assert!(
+                    Instant::now() < deadline,
+                    "expected {directory:?}, got {:?}",
+                    process.working_directory()
+                );
+                thread::sleep(Duration::from_millis(10));
+            }
+        };
+        let (process, tx, _events) = start(&saved)?;
+        wait_for(&process, &saved);
+        tx.send(Command::Input(b"cd ../next\n".to_vec()))?;
+        wait_for(&process, &next);
+        drop(process);
+
+        fs::remove_dir(&saved)?;
+        let (process, _tx, _events) = start(&saved)?;
+        wait_for(&process, &root);
+        Ok(())
+    }
 }

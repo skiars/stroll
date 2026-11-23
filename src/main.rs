@@ -11,8 +11,8 @@ use stroll::repository::{Location, Store};
 use stroll::workspace::{
     CloseRepositoryPicker, CloseSettings, CloseTab, CompleteRepositoryPath, FindInDocument,
     FindReferences, FormatDocument, NextRepositoryPath, NextTab, OpenLocator, OpenRepository,
-    PreviousRepositoryPath, PreviousTab, SaveFile, ToggleSettings, ToggleTerminal, ToggleWrap,
-    Workspace, WorkspaceView, repository_window_bounds,
+    PreviousRepositoryPath, PreviousTab, SaveFile, SwitchWorkspaceView, ToggleSettings,
+    ToggleTerminal, ToggleWrap, Workspace, WorkspaceView, repository_window_bounds,
 };
 
 fn primary<'a>(mac: &'a str, other: &'a str) -> &'a str {
@@ -24,6 +24,18 @@ fn primary<'a>(mac: &'a str, other: &'a str) -> &'a str {
 }
 
 fn bind_workspace_keys(cx: &mut App) {
+    let view_context = Some("!Terminal && !Locator && !RepoPicker && !SettingsPage");
+    for (view, control, command) in [
+        (WorkspaceView::Docs, "ctrl-1", "cmd-1"),
+        (WorkspaceView::Editor, "ctrl-2", "cmd-2"),
+        (WorkspaceView::Git, "ctrl-3", "cmd-3"),
+    ] {
+        let action = SwitchWorkspaceView(view);
+        cx.bind_keys([KeyBinding::new(control, action, view_context)]);
+        if cfg!(target_os = "macos") {
+            cx.bind_keys([KeyBinding::new(command, action, view_context)]);
+        }
+    }
     cx.bind_keys([
         KeyBinding::new(
             primary("cmd-p", "ctrl-p"),
@@ -253,6 +265,13 @@ mod shortcut_tests {
                 .on_action(cx.listener(|this, _: &CloseTab, _, _| this.seen.push("close")))
                 .on_action(cx.listener(|this, _: &OpenLocator, _, _| this.seen.push("locator")))
                 .on_action(cx.listener(|this, _: &FindInDocument, _, _| this.seen.push("find")))
+                .on_action(cx.listener(|this, action: &SwitchWorkspaceView, _, _| {
+                    this.seen.push(match action.0 {
+                        WorkspaceView::Docs => "docs",
+                        WorkspaceView::Editor => "workspace",
+                        WorkspaceView::Git => "git",
+                    })
+                }))
                 .on_action(
                     cx.listener(|this, _: &gpui_component::input::ShowCompletions, _, _| {
                         this.seen.push("complete")
@@ -350,6 +369,57 @@ mod shortcut_tests {
             });
             visual.simulate_keystrokes("ctrl-s ctrl-o ctrl-w ctrl-p");
             visual.update(|_, cx| assert!(probe.read(cx).seen.is_empty()));
+        }
+    }
+    #[::core::prelude::v1::test]
+    fn view_shortcuts_preserve_terminal_and_overlay_input() {
+        let mut cx = TestAppContext::single();
+        cx.update(bind_workspace_keys);
+        let (probe, visual) = cx.add_window_view(|window, cx| {
+            let focus = cx.focus_handle();
+            focus.focus(window, cx);
+            Probe {
+                focus,
+                context: "WorkspaceEditor",
+                seen: Vec::new(),
+            }
+        });
+        let command_expected: &[&str] = if cfg!(target_os = "macos") {
+            &["docs", "workspace", "git"]
+        } else {
+            &[]
+        };
+        for context in [
+            "WorkspaceEditor",
+            "Reader",
+            "Terminal",
+            "Locator",
+            "RepoPicker",
+            "SettingsPage",
+        ] {
+            visual.update(|window, cx| {
+                probe.update(cx, |this, cx| {
+                    this.context = context;
+                    cx.notify();
+                });
+                window.draw(cx).clear(cx);
+            });
+            let navigation_allowed = matches!(context, "WorkspaceEditor" | "Reader");
+            for (keys, expected) in [
+                ("ctrl-1 ctrl-2 ctrl-3", &["docs", "workspace", "git"][..]),
+                ("cmd-1 cmd-2 cmd-3", command_expected),
+            ] {
+                visual.simulate_keystrokes(keys);
+                visual.update(|_, cx| {
+                    probe.update(cx, |this, _| {
+                        assert_eq!(
+                            std::mem::take(&mut this.seen),
+                            if navigation_allowed { expected } else { &[] },
+                            "{context}: {keys}",
+                        );
+                    });
+                });
+            }
         }
     }
 }

@@ -1,4 +1,9 @@
-use std::{cell::RefCell, rc::Rc, sync::mpsc::Sender, time::Instant};
+use std::{
+    cell::{OnceCell, RefCell},
+    rc::Rc,
+    sync::{Arc, mpsc::Sender},
+    time::Instant,
+};
 
 use alacritty_terminal::{
     Term,
@@ -11,6 +16,9 @@ use alacritty_terminal::{
 };
 
 use crate::pty::{Command, PtySize};
+
+const PERSISTED_LINES: usize = 100;
+const PERSISTED_BYTES: usize = 64 * 1024;
 
 mod input;
 mod links;
@@ -148,6 +156,7 @@ pub(crate) struct Emulator {
     ansi: [Rgb; 16],
     selection_autoscroll: i32,
     last_mouse_cell: Option<(u16, u16)>,
+    scrollback_snapshot: OnceCell<Arc<str>>,
 }
 
 impl Emulator {
@@ -173,10 +182,12 @@ impl Emulator {
             ansi: [Rgb::default(); 16],
             selection_autoscroll: 0,
             last_mouse_cell: None,
+            scrollback_snapshot: OnceCell::new(),
         }
     }
 
     pub(crate) fn resize(&mut self, size: PtySize, conpty: bool) {
+        self.scrollback_snapshot.take();
         if conpty && size.rows > self.size.rows {
             let grid = self.term.grid();
             let pulled = usize::from(size.rows - self.size.rows).min(grid.history_size());
@@ -201,6 +212,7 @@ impl Emulator {
     }
 
     pub(crate) fn write(&mut self, bytes: &[u8]) {
+        self.scrollback_snapshot.take();
         self.parser.advance(&mut self.term, bytes);
         self.reply();
     }
@@ -211,8 +223,68 @@ impl Emulator {
 
     pub(crate) fn finish_sync(&mut self) {
         if self.sync_deadline().is_some() {
+            self.scrollback_snapshot.take();
             self.parser.stop_sync(&mut self.term);
             self.reply();
+        }
+    }
+
+    pub(crate) fn scrollback_snapshot(&self) -> Option<Arc<str>> {
+        if self.term.mode().contains(TermMode::ALT_SCREEN) {
+            return None;
+        }
+        Some(
+            self.scrollback_snapshot
+                .get_or_init(|| {
+                    let grid = self.term.grid();
+                    let last_column = Column(grid.columns() - 1);
+                    let last_line = (0..grid.screen_lines() as i32)
+                        .rev()
+                        .map(Line)
+                        .find(|&line| {
+                            (0..grid.columns()).any(|column| {
+                                let cell = &grid[line][Column(column)];
+                                cell.c != ' ' || cell.zerowidth().is_some()
+                            })
+                        })
+                        .unwrap_or(grid.cursor.point.line);
+                    let first_line = (last_line.0 + 1 - PERSISTED_LINES as i32)
+                        .max(-(grid.history_size() as i32));
+                    let text = self.term.bounds_to_string(
+                        Point::new(Line(first_line), Column(0)),
+                        Point::new(last_line, last_column),
+                    );
+                    bounded_scrollback(text.trim_end_matches('\n')).into()
+                })
+                .clone(),
+        )
+    }
+
+    pub(crate) fn restore_scrollback(&mut self, text: &str, marker: &str, conpty: bool) {
+        let text = bounded_scrollback(text);
+        if text.is_empty() {
+            return;
+        }
+        // Insert text directly. The saved output must never be interpreted as terminal commands.
+        for character in text
+            .chars()
+            .chain(['\n'])
+            .chain(marker.chars())
+            .chain(['\n'])
+        {
+            match character {
+                '\n' => {
+                    self.term.carriage_return();
+                    self.term.linefeed();
+                }
+                character if !character.is_control() => self.term.input(character),
+                _ => {}
+            }
+        }
+        if conpty {
+            // ConPTY starts painting at the top of a fresh viewport.
+            self.term.scroll_up(self.term.screen_lines());
+            self.term.grid_mut().cursor.point = Point::new(Line(0), Column(0));
         }
     }
 
@@ -454,6 +526,17 @@ impl Emulator {
     }
 }
 
+pub(crate) fn bounded_scrollback(text: &str) -> &str {
+    let mut start = text.len().saturating_sub(PERSISTED_BYTES);
+    while !text.is_char_boundary(start) {
+        start += 1;
+    }
+    if let Some((newline, _)) = text[start..].rmatch_indices('\n').nth(PERSISTED_LINES - 1) {
+        start += newline + 1;
+    }
+    &text[start..]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -473,6 +556,45 @@ mod tests {
             ),
             rx,
         )
+    }
+
+    #[test]
+    fn terminal_scrollback_is_bounded_and_restored_as_plain_text() {
+        let (mut source, _) = terminal(30, 12);
+        for line in 0..150 {
+            source.write(format!("Line {line}\r\n").as_bytes());
+        }
+        source.write("输出 e\u{301} 🙂".as_bytes());
+        let history = source.scrollback_snapshot().unwrap();
+        assert_eq!(history.lines().count(), 100);
+        assert!(history.starts_with("Line 51\n"));
+        assert!(history.ends_with("输出 e\u{301} 🙂"));
+        source.write(b"\x1b[?1049hfull screen program");
+        assert!(source.scrollback_snapshot().is_none());
+
+        for conpty in [false, true] {
+            let (mut restored, input) = terminal(30, 12);
+            restored.restore_scrollback(
+                &(history.to_string() + "\n\x1b[6n"),
+                "History restored",
+                conpty,
+            );
+            let recovered = restored.scrollback_snapshot().unwrap();
+            assert!(recovered.contains("输出 e\u{301} 🙂"));
+            assert!(recovered.contains("History restored"));
+            assert!(input.try_recv().is_err());
+            restored.write(b"fresh prompt");
+            assert!(
+                restored
+                    .scrollback_snapshot()
+                    .unwrap()
+                    .contains("fresh prompt")
+            );
+        }
+        let large = "字".repeat(30_000);
+        let bounded = super::bounded_scrollback(&large);
+        assert!(bounded.len() <= 64 * 1024 && bounded.len() > 65_530);
+        assert!(bounded.chars().all(|character| character == '字'));
     }
 
     #[test]

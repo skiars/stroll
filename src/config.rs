@@ -284,6 +284,7 @@ pub(crate) enum DiffLayout {
 #[serde(default)]
 pub(crate) struct Terminal {
     pub shell: String,
+    pub restore_scrollback: bool,
 }
 
 impl Terminal {

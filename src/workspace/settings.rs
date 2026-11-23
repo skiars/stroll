@@ -1197,20 +1197,30 @@ impl SettingsPage {
                 }),
             ),
         ]);
-        let terminal = SettingGroup::new().item(
-            setting_item(
-                t!("settings.default_shell"),
-                self.input(|c| &mut c.terminal.shell),
+        let terminal = SettingGroup::new()
+            .item(
+                setting_item(
+                    t!("settings.default_shell"),
+                    self.input(|c| &mut c.terminal.shell),
+                )
+                .description(
+                    if cfg!(windows) {
+                        t!("settings.windows_shell_description")
+                    } else {
+                        t!("settings.shell_description")
+                    }
+                    .into_owned(),
+                ),
             )
-            .description(
-                if cfg!(windows) {
-                    t!("settings.windows_shell_description")
-                } else {
-                    t!("settings.shell_description")
-                }
-                .into_owned(),
-            ),
-        );
+            .item(
+                setting_item(
+                    t!("settings.terminal_restore_scrollback"),
+                    self.switch(default.terminal.restore_scrollback, |c| {
+                        &mut c.terminal.restore_scrollback
+                    }),
+                )
+                .description(t!("settings.terminal_restore_scrollback_description").into_owned()),
+            );
         let mut lsp = SettingGroup::new().item(setting_item(
             t!("settings.enable_lsp"),
             self.switch(default.lsp.enabled, |c| &mut c.lsp.enabled),

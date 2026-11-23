@@ -49,7 +49,40 @@ pub(crate) fn shell() -> OsString {
     "/bin/sh".into()
 }
 
+#[cfg(all(feature = "desktop", target_os = "linux"))]
+pub(super) fn working_directory(pid: u32) -> Option<std::path::PathBuf> {
+    std::fs::read_link(format!("/proc/{pid}/cwd")).ok()
+}
+
+#[cfg(all(feature = "desktop", target_os = "macos"))]
+pub(super) fn working_directory(pid: u32) -> Option<std::path::PathBuf> {
+    let mut info = MaybeUninit::<libc::proc_vnodepathinfo>::uninit();
+    let size = std::mem::size_of::<libc::proc_vnodepathinfo>() as libc::c_int;
+    let written = unsafe {
+        libc::proc_pidinfo(
+            pid as libc::c_int,
+            libc::PROC_PIDVNODEPATHINFO,
+            0,
+            info.as_mut_ptr().cast(),
+            size,
+        )
+    };
+    if written != size {
+        return None;
+    }
+    let info = unsafe { info.assume_init() };
+    let path = info.pvi_cdir.vip_path.as_flattened();
+    let path = path.split(|&byte| byte == 0).next()?;
+    let bytes: Vec<u8> = path.iter().map(|&byte| byte as u8).collect();
+    (!bytes.is_empty()).then(|| OsStr::from_bytes(&bytes).into())
+}
+
 impl Pty {
+    #[cfg(feature = "desktop")]
+    pub(super) fn pid(&self) -> u32 {
+        self.child.as_ref().unwrap().id()
+    }
+
     pub(super) fn open(
         shell: &OsStr,
         mode: ShellMode,
