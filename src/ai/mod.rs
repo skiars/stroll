@@ -6,6 +6,8 @@ mod commit_message;
 mod hover_translation;
 #[cfg(feature = "desktop")]
 mod provider;
+#[cfg(feature = "desktop")]
+mod translation_cache;
 
 #[cfg(feature = "desktop")]
 use std::{
@@ -26,7 +28,7 @@ pub(crate) use provider::tests::{install_test_keyring, mock_endpoint};
 #[derive(Clone)]
 pub(crate) struct Service {
     config: Arc<Mutex<(u64, Settings)>>,
-    cache: PathBuf,
+    cache: translation_cache::TranslationCache,
     credential_scope: PathBuf,
 }
 
@@ -35,7 +37,7 @@ impl Service {
     pub(crate) fn new(settings: Settings, cache: PathBuf, config_file: Option<&Path>) -> Self {
         Self {
             config: Arc::new(Mutex::new((0, settings))),
-            cache,
+            cache: translation_cache::TranslationCache::new(cache),
             credential_scope: config_file.unwrap_or(Path::new("")).to_owned(),
         }
     }

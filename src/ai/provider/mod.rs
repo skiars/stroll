@@ -333,7 +333,6 @@ pub(super) enum Failure {
     ResponseTooLarge,
     Busy,
     Cancelled,
-    CacheWrite,
 }
 
 impl Failure {
@@ -396,6 +395,14 @@ pub(crate) mod tests {
         model: &str,
         replies: Vec<(u16, &'static str)>,
     ) -> (Provider, JoinHandle<RequestLog>) {
+        mock_provider_before_reply(model, replies, || {})
+    }
+
+    pub(in crate::ai) fn mock_provider_before_reply(
+        model: &str,
+        replies: Vec<(u16, &'static str)>,
+        before_reply: impl Fn() + Send + 'static,
+    ) -> (Provider, JoinHandle<RequestLog>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let base = format!("http://{}/v1", listener.local_addr().unwrap());
@@ -442,6 +449,7 @@ pub(crate) mod tests {
                 let mut input = vec![0; content_length.unwrap()];
                 reader.read_exact(&mut input).unwrap();
                 requests.push(serde_json::from_slice(&input).unwrap());
+                before_reply();
                 write!(connection,
                     "HTTP/1.1 {status} Mock\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                     body.len(),

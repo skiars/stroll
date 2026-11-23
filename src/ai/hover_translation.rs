@@ -1,6 +1,6 @@
 use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
-    path::{Path, PathBuf},
+    path::PathBuf,
     sync::{
         Arc, Condvar, LazyLock, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -17,6 +17,7 @@ use sha2::{Digest, Sha256};
 use super::{
     Cancellation, Snapshot,
     provider::{Failure, Provider, Thinking},
+    translation_cache::{CacheKey, TranslationCache},
 };
 use crate::repository::Repository;
 
@@ -459,30 +460,25 @@ fn link_end(url: &str) -> String {
 struct Work {
     active: usize,
     requests: VecDeque<Instant>,
-    pending: HashMap<PathBuf, Arc<Pending>>,
+    pending: HashMap<(Arc<PathBuf>, CacheKey), Arc<Pending>>,
 }
 
 #[derive(Default)]
 struct Pending {
-    result: Mutex<Option<Result<(), Failure>>>,
+    result: Mutex<Option<Result<Translations, Failure>>>,
     ready: Condvar,
 }
 
 static WORK: LazyLock<Mutex<Work>> = LazyLock::new(Mutex::default);
 
-fn cache_file(root: &Path, text: &str, provider: &Provider) -> PathBuf {
+fn cache_key(text: &str, provider: &Provider) -> CacheKey {
     let key = serde_json::to_vec(&[CACHE_VERSION, &provider.base, &provider.model, text]).unwrap();
-    root.join(format!("{}.json", hex::encode(Sha256::digest(key))))
-}
-
-fn cached(path: &Path) -> Option<String> {
-    let translated: String = serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
-    (!translated.trim().is_empty()).then(|| unwrap(&translated))
+    Sha256::digest(key).into()
 }
 
 fn translate(
     fragments: &[&str],
-    cache: &Path,
+    cache: &TranslationCache,
     provider: &Provider,
     cancelled: &AtomicBool,
 ) -> Result<Translations, Failure> {
@@ -524,32 +520,23 @@ fn check_cancelled(cancelled: &AtomicBool) -> Result<(), Failure> {
 
 fn translate_batch(
     texts: &[&str],
-    cache: &Path,
+    cache: &TranslationCache,
     provider: &Provider,
     output: &mut Translations,
     cancelled: &AtomicBool,
 ) -> Result<(), Failure> {
     let mut remaining: Vec<_> = texts
         .iter()
-        .map(|text| (*text, cache_file(cache, text, provider)))
+        .map(|text| (*text, (cache.path().clone(), cache_key(text, provider))))
         .collect();
-    let (missing, task) = loop {
+    let task = loop {
         check_cancelled(cancelled)?;
         let mut work = WORK.lock().unwrap();
-        let mut wait = None;
-        remaining.retain(|(text, path)| {
-            if let Some(task) = work.pending.get(path) {
-                wait = Some(task.clone());
-            } else if let Some(value) = cached(path) {
-                output.insert((*text).to_owned(), value);
-                return false;
-            }
-            true
-        });
-        if remaining.is_empty() {
-            return Ok(());
-        }
-        if let Some(wait) = wait {
+        if let Some(wait) = remaining
+            .iter()
+            .find_map(|(_, key)| work.pending.get(key))
+            .cloned()
+        {
             drop(work);
             let mut result = wait.result.lock().unwrap();
             while result.is_none() {
@@ -560,56 +547,96 @@ fn translate_batch(
                     .unwrap()
                     .0;
             }
-            (*result).unwrap()?;
-        } else {
-            let task = Arc::new(Pending::default());
-            for (_, path) in &remaining {
-                work.pending.insert(path.clone(), task.clone());
+            let translated = result.as_ref().unwrap().as_ref().map_err(|error| *error)?;
+            remaining.retain(|(text, _)| {
+                if let Some(value) = translated.get(*text) {
+                    output.insert((*text).to_owned(), value.clone());
+                    false
+                } else {
+                    true
+                }
+            });
+            if remaining.is_empty() {
+                return Ok(());
             }
-            break (remaining, task);
+        } else {
+            // Reserve keys before reading SQLite so another hover can share this result.
+            let task = Arc::new(Pending::default());
+            for (_, key) in &remaining {
+                work.pending.insert(key.clone(), task.clone());
+            }
+            break task;
         }
     };
+    let fragments: Vec<_> = remaining
+        .iter()
+        .map(|(text, (_, key))| (*text, *key))
+        .collect();
     // Once a batch is on the wire, finish it so other hovers can reuse the result.
-    let result = run_batch(&missing, provider, output);
-    let mut work = WORK.lock().unwrap();
-    for (_, path) in &missing {
-        work.pending.remove(path);
+    let result = run_batch(&fragments, provider, cache);
+    {
+        let mut work = WORK.lock().unwrap();
+        for (_, key) in &remaining {
+            work.pending.remove(key);
+        }
+        *task.result.lock().unwrap() = Some(result.clone());
+        task.ready.notify_all();
     }
-    *task.result.lock().unwrap() = Some(result);
-    task.ready.notify_all();
-    result
+    output.extend(result?);
+    Ok(())
 }
 
 fn run_batch(
-    missing: &[(&str, PathBuf)],
+    fragments: &[(&str, CacheKey)],
     provider: &Provider,
-    output: &mut Translations,
-) -> Result<(), Failure> {
-    let mut save = |(text, path): &(&str, PathBuf), value: String| {
-        let bytes = serde_json::to_vec(&value).map_err(|_| Failure::CacheWrite)?;
-        crate::repository::atomic_write(path, &bytes).map_err(|_| {
-            eprintln!("stroll:hover-translation: cache-write-failed");
-            Failure::CacheWrite
-        })?;
-        output.insert((*text).to_owned(), value);
-        Ok::<_, Failure>(())
-    };
-    let texts: Vec<_> = missing.iter().map(|(text, _)| *text).collect();
-    match request(&texts, provider) {
-        Ok(values) => {
-            for (fragment, value) in missing.iter().zip(values) {
-                save(fragment, value)?;
+    cache: &TranslationCache,
+) -> Result<Translations, Failure> {
+    let keys: Vec<_> = fragments.iter().map(|(_, key)| *key).collect();
+    let mut hits = cache.load(&keys).unwrap_or_default();
+    let mut output = HashMap::new();
+    let missing: Vec<_> = fragments
+        .iter()
+        .filter(|(text, key)| {
+            if let Some(value) = hits.remove(key) {
+                output.insert((*text).to_owned(), value);
+                false
+            } else {
+                true
             }
+        })
+        .collect();
+    if missing.is_empty() {
+        return Ok(output);
+    }
+
+    let texts: Vec<_> = missing.iter().map(|(text, _)| *text).collect();
+    let mut entries = Vec::new();
+    let mut save = |(text, key): &(&str, CacheKey), value: String| {
+        output.insert((*text).to_owned(), value.clone());
+        entries.push((*key, value));
+    };
+    let result = match request(&texts, provider) {
+        Ok(values) => {
+            for (fragment, value) in missing.into_iter().zip(values) {
+                save(fragment, value);
+            }
+            Ok(())
         }
         Err(error) if texts.len() > 1 && error.response_error() => {
-            for fragment in missing {
+            missing.into_iter().try_for_each(|fragment| {
                 let value = request(&[fragment.0], provider)?.pop().unwrap();
-                save(fragment, value)?;
-            }
+                save(fragment, value);
+                Ok(())
+            })
         }
-        Err(error) => return Err(error),
+        Err(error) => Err(error),
+    };
+    // Keep completed fragments even when a later request fails.
+    if cache.store(&entries).is_err() {
+        eprintln!("stroll:hover-translation: cache-write-failed");
     }
-    Ok(())
+    result?;
+    Ok(output)
 }
 
 struct ActiveRequest;
@@ -703,7 +730,7 @@ mod tests {
     use lsp_types::MarkupContent;
 
     use super::*;
-    use crate::ai::provider::tests::mock_provider;
+    use crate::ai::provider::tests::{mock_provider, mock_provider_before_reply};
 
     fn markdown(value: &str) -> HoverText {
         HoverText::parse(HoverContents::Markup(MarkupContent {
@@ -835,16 +862,27 @@ mod tests {
                 (200, BODY),
             ],
         );
-        let cache = tempfile::tempdir().unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let cache = TranslationCache::new(directory.path().join("translations.sqlite3"));
         let fragments = ["First paragraph", "Second paragraph"];
         let cancelled = AtomicBool::new(false);
-        let translate = || translate(&fragments, cache.path(), &provider, &cancelled);
+        let translate = || translate(&fragments, &cache, &provider, &cancelled);
         assert_eq!(translate(), Err(Failure::RateLimited));
-        assert!(cache_file(cache.path(), fragments[0], &provider).exists());
+        assert_eq!(
+            cache
+                .load(&[cache_key(fragments[0], &provider)])
+                .unwrap()
+                .len(),
+            1
+        );
         let output = translate().unwrap();
         assert_eq!(output[fragments[0]], "标题");
         assert_eq!(output[fragments[1]], "正文");
-        assert_eq!(translate().unwrap(), output);
+        let reopened = TranslationCache::new(cache.path().as_ref().clone());
+        assert_eq!(
+            super::translate(&fragments, &reopened, &provider, &cancelled).unwrap(),
+            output,
+        );
         let requests = server.join().unwrap();
         assert_eq!(
             requests
@@ -873,8 +911,9 @@ mod tests {
                 r#"{"choices":[{"finish_reason":"stop","message":{"content":"指南"}}]}"#,
             )],
         );
-        let cache = tempfile::tempdir().unwrap();
-        let run = || translate(&["Guide"], cache.path(), &provider, &AtomicBool::new(false));
+        let directory = tempfile::tempdir().unwrap();
+        let cache = TranslationCache::new(directory.path().join("translations.sqlite3"));
+        let run = || translate(&["Guide"], &cache, &provider, &AtomicBool::new(false));
         std::thread::scope(|threads| {
             let first = threads.spawn(run);
             let second = threads.spawn(run);
@@ -883,6 +922,59 @@ mod tests {
                 second.join().unwrap().unwrap()
             );
         });
+        assert_eq!(server.join().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn concurrent_hovers_share_translation_when_cache_write_fails() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("translations.sqlite3");
+        let cache = TranslationCache::new(path.clone());
+        cache.load(&[[0; 32]]).unwrap();
+        rusqlite::Connection::open(path)
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER reject_cache_write BEFORE INSERT ON translations
+                 BEGIN SELECT RAISE(ABORT, 'cache write failed'); END;",
+            )
+            .unwrap();
+
+        let (request_arrived, arrived) = std::sync::mpsc::channel();
+        let (send_reply, reply) = std::sync::mpsc::channel();
+        let (provider, server) = mock_provider_before_reply(
+            "reader",
+            vec![(
+                200,
+                r#"{"choices":[{"finish_reason":"stop","message":{"content":"指南"}}]}"#,
+            )],
+            move || {
+                request_arrived.send(()).unwrap();
+                reply.recv_timeout(Duration::from_secs(5)).unwrap();
+            },
+        );
+        let pending = (cache.path().clone(), cache_key("Guide", &provider));
+        let run = || translate(&["Guide"], &cache, &provider, &AtomicBool::new(false));
+        std::thread::scope(|threads| {
+            let first = threads.spawn(run);
+            arrived.recv_timeout(Duration::from_secs(5)).unwrap();
+            let second = threads.spawn(run);
+            let deadline = Instant::now() + Duration::from_secs(3);
+            loop {
+                // The first request and the registry each hold a reference.
+                if Arc::strong_count(&WORK.lock().unwrap().pending[&pending]) == 3 {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "second hover did not join the request"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            send_reply.send(()).unwrap();
+            assert_eq!(first.join().unwrap().unwrap()["Guide"], "指南");
+            assert_eq!(second.join().unwrap().unwrap()["Guide"], "指南");
+        });
+        assert!(cache.load(&[pending.1]).unwrap().is_empty());
         assert_eq!(server.join().unwrap().len(), 1);
     }
 }

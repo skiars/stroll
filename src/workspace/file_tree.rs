@@ -450,6 +450,39 @@ fn system_menu_for_entry(
 }
 
 impl Workspace {
+    pub(super) fn reveal_tree_path(&mut self, path: &Path, cx: &mut Context<Self>) {
+        let expanded = if self.view == WorkspaceView::Docs {
+            &mut self.docs_expanded
+        } else {
+            &mut self.expanded
+        };
+        let count = expanded.len();
+        expanded.extend(
+            path.ancestors()
+                .skip(1)
+                .take_while(|parent| !parent.as_os_str().is_empty())
+                .map(Path::to_owned),
+        );
+        if expanded.len() != count {
+            self.rebuild_tree();
+        }
+        if let Some(index) = self.rows.iter().position(|row| row.entry.path == path) {
+            self.scroll_tree_row_into_view(index);
+            cx.notify();
+        }
+    }
+
+    fn scroll_tree_row_into_view(&self, index: usize) {
+        let inset = if self.config.current().appearance.file_tree_sticky_scroll {
+            let viewport = self.tree_scroll.0.borrow().base_handle.bounds();
+            tree_sticky_scroll::row_limit(viewport.size.height).min(self.rows[index].depth)
+        } else {
+            0
+        };
+        self.tree_scroll
+            .scroll_to_item_with_offset(index, ScrollStrategy::Nearest, inset);
+    }
+
     pub(super) fn open_tree_file(
         &mut self,
         preview: bool,
@@ -469,7 +502,9 @@ impl Workspace {
             return;
         };
         let path = entry.path.clone();
-        if audio_preview::is_audio(&path) {
+        if self.view == WorkspaceView::Docs {
+            self.navigate_document(path, None, window, cx);
+        } else if audio_preview::is_audio(&path) {
             self.preview_audio(path, window, cx);
         } else {
             self.request_file(path, FileOpen::Tree { preview }, window, cx);
@@ -1349,6 +1384,125 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    #[::core::prelude::v1::test]
+    fn document_tree_keyboard_navigation_and_open_reveal() -> Result<()> {
+        let fixture = tempfile::tempdir()?;
+        let root = fixture.path().join("repo");
+        fs::create_dir_all(root.join("guide/nested"))?;
+        fs::write(root.join("README.md"), "# Project\n")?;
+        for index in 0..40 {
+            fs::write(root.join(format!("guide/nested/{index:02}.md")), "# Page\n")?;
+        }
+        assert!(
+            std::process::Command::new("git")
+                .args(["init", "-q", "--"])
+                .arg(&root)
+                .status()?
+                .success()
+        );
+
+        let mut cx = TestAppContext::single();
+        cx.update(gpui_component::init);
+        let store = Arc::new(Store::new(fixture.path().join("state"))?);
+        let config = ConfigFile::load(Some(fixture.path().join("config.toml")));
+        let mut workspace = None;
+        let (_, mut visual) = cx.add_window_view(|window, cx| {
+            let view =
+                cx.new(|cx| Workspace::with_config(store, config, WorkspaceView::Docs, window, cx));
+            workspace = Some(view.clone());
+            gpui_component::Root::new(view, window, cx)
+        });
+        let workspace = workspace.unwrap();
+        let visual = &mut visual;
+        visual.simulate_resize(size(px(900.), px(500.)));
+        visual.update(|window, cx| {
+            window.activate_window();
+            cx.set_reduce_motion(true);
+            workspace.update(cx, |this, cx| {
+                this.open_repository(Location { root, file: None }, window, cx);
+            });
+        });
+
+        let document_is_open = |this: &Workspace, path: &str| {
+            this.doc.is_some()
+                && this.doc_loading.is_none()
+                && this.session.document.as_deref() == Some(Path::new(path))
+        };
+        let assert_visible = |visual: &mut VisualTestContext, selector: &'static str| {
+            let row = visual
+                .debug_bounds(selector)
+                .unwrap_or_else(|| panic!("missing {selector}"));
+            let viewport = visual.update(|_, cx| {
+                workspace
+                    .read(cx)
+                    .tree_scroll
+                    .0
+                    .borrow()
+                    .base_handle
+                    .bounds()
+            });
+            assert!(row.top() >= viewport.top() && row.bottom() <= viewport.bottom());
+        };
+
+        settle(visual, &workspace, |this| {
+            this.docs_tree_complete && document_is_open(this, "README.md")
+        });
+        let guide = visual.debug_bounds("workspace-tree-row:guide").unwrap();
+        visual.simulate_click(guide.center(), Modifiers::default());
+        visual.simulate_keystrokes("right right right");
+        visual.simulate_keystrokes(&vec!["down"; 39].join(" "));
+        settle(visual, &workspace, |_| true);
+        let target = "guide/nested/39.md";
+        visual.update(|window, cx| {
+            let this = workspace.read(cx);
+            assert!(this.tree_focus.is_focused(window));
+            assert_eq!(this.tree_keyboard_path, Path::new(target));
+            assert!(document_is_open(this, "README.md"));
+        });
+        assert_visible(visual, "workspace-tree-row:guide/nested/39.md");
+
+        visual.simulate_keystrokes("enter");
+        settle(visual, &workspace, |this| document_is_open(this, target));
+        visual.simulate_keystrokes("up space");
+        settle(visual, &workspace, |this| {
+            document_is_open(this, "guide/nested/38.md")
+        });
+
+        visual.update(|window, cx| {
+            workspace.update(cx, |this, cx| {
+                this.focus.focus(window, cx);
+                this.set_file_tree_visible(false);
+                this.toggle_tree_directory("guide".into(), window, cx);
+                this.docs_tree = Rc::new(DocumentTree::from_paths(vec!["README.md".into()]));
+                this.docs_tree_complete = false;
+                this.docs_tree_dirty = true;
+                this.rebuild_tree();
+                this.follow_document_link(Path::new("README.md"), target, window, cx);
+            });
+        });
+        settle(visual, &workspace, |this| document_is_open(this, target));
+        let show = visual.debug_bounds("show-file-tree").unwrap();
+        visual.simulate_click(show.center(), Modifiers::default());
+        settle(visual, &workspace, |_| true);
+        visual.update(|window, cx| {
+            workspace.update(cx, |this, cx| {
+                assert_eq!(this.docs_tree_reveal.as_deref(), Some(Path::new(target)));
+                this.load_docs_tree(window, cx);
+            });
+        });
+        settle(visual, &workspace, |this| {
+            this.docs_tree_complete && this.docs_tree_reveal.is_none()
+        });
+        assert_visible(visual, "workspace-tree-row:guide/nested/39.md");
+        visual.update(|window, cx| {
+            let this = workspace.read(cx);
+            assert!(!this.tree_focus.is_focused(window));
+            assert!(this.docs_expanded.contains(Path::new("guide")));
+            assert!(this.docs_expanded.contains(Path::new("guide/nested")));
+        });
+        Ok(())
     }
 
     #[::core::prelude::v1::test]

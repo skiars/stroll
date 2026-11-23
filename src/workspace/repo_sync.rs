@@ -24,6 +24,7 @@ impl Workspace {
         self.tree_keyboard_path.clear();
         self.tree_clipboard = None;
         self.docs_tree = Rc::default();
+        self.docs_tree_reveal = None;
         self.docs_tree_seeded = false;
         self.docs_tree_complete = false;
         self.docs_scan_pending = false;
@@ -81,7 +82,11 @@ impl Workspace {
     }
 
     pub(super) fn resume_tree_reveal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.finish_tree_reveal(&BTreeSet::new(), window, cx);
+        if self.view == WorkspaceView::Docs {
+            self.resume_document_tree_reveal(cx);
+        } else {
+            self.finish_tree_reveal(&BTreeSet::new(), window, cx);
+        }
     }
 
     fn finish_tree_reveal(
@@ -130,32 +135,30 @@ impl Workspace {
             return;
         }
         self.tree_reveal = None;
-        if chain[1..chain.len() - 1]
-            .iter()
-            .any(|parent| !self.expanded.contains(*parent))
-        {
-            self.expanded.extend(
-                chain[1..chain.len() - 1]
-                    .iter()
-                    .map(|path| path.to_path_buf()),
-            );
-            self.rebuild_tree();
-        }
-        if let Some(index) = self.rows.iter().position(|row| row.entry.path == path) {
-            self.scroll_tree_row_into_view(index);
-            cx.notify();
-        }
+        self.reveal_tree_path(&path, cx);
     }
 
-    pub(super) fn scroll_tree_row_into_view(&self, index: usize) {
-        let inset = if self.config.current().appearance.file_tree_sticky_scroll {
-            let viewport = self.tree_scroll.0.borrow().base_handle.bounds();
-            tree_sticky_scroll::row_limit(viewport.size.height).min(self.rows[index].depth)
-        } else {
-            0
+    pub(super) fn resume_document_tree_reveal(&mut self, cx: &mut Context<Self>) {
+        if self.view != WorkspaceView::Docs || !self.session.panels.docs_tree {
+            return;
+        }
+        let Some(path) = self.docs_tree_reveal.as_ref() else {
+            return;
         };
-        self.tree_scroll
-            .scroll_to_item_with_offset(index, ScrollStrategy::Nearest, inset);
+        if self.session.document.as_ref() != Some(path) {
+            self.docs_tree_reveal = None;
+            return;
+        }
+        let listed = path
+            .parent()
+            .and_then(|parent| self.docs_tree.children.get(parent))
+            .is_some_and(|entries| entries.iter().any(|entry| &entry.path == path));
+        if listed {
+            let path = self.docs_tree_reveal.take().unwrap();
+            self.reveal_tree_path(&path, cx);
+        } else if !self.docs_tree_loading && !self.docs_tree_dirty {
+            self.docs_tree_reveal = None;
+        }
     }
 
     pub(super) fn load_docs_tree(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -310,6 +313,7 @@ impl Workspace {
                     this.show_error(error, window, cx);
                 }
                 this.load_docs_tree(window, cx);
+                this.resume_document_tree_reveal(cx);
                 cx.notify();
             });
         });
@@ -326,7 +330,14 @@ impl Workspace {
         self.docs_tree_seeded = true;
         self.docs_tree_complete = complete;
         if self.view == WorkspaceView::Docs {
-            let scroll = self.tree_scroll.0.borrow().base_handle.clone();
+            let (scroll, deferred) = {
+                let state = self.tree_scroll.0.borrow();
+                let deferred = state.deferred_scroll_to_item.and_then(|request| {
+                    let row = self.rows.get(request.item_index)?;
+                    Some((request, row.entry.path.clone()))
+                });
+                (state.base_handle.clone(), deferred)
+            };
             let offset = scroll.offset();
             let top = ((-offset.y / tree_motion::ROW_HEIGHT) as usize).min(self.rows.len());
             let anchor = (offset.y < px(0.))
@@ -342,6 +353,17 @@ impl Workspace {
                     offset.y + tree_motion::ROW_HEIGHT * (top as f32 - index as f32),
                 ));
             }
+            if let Some((mut request, path)) = deferred {
+                self.tree_scroll.0.borrow_mut().deferred_scroll_to_item = self
+                    .rows
+                    .iter()
+                    .position(|row| row.entry.path == path)
+                    .map(|index| {
+                        request.item_index = index;
+                        request
+                    });
+            }
+            self.resume_document_tree_reveal(cx);
             if self.doc.is_none()
                 && self.doc_loading.is_none()
                 && self.doc_error.is_none()

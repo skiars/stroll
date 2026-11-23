@@ -71,12 +71,17 @@ impl Workspace {
             ("ctrl-c", "ctrl-x", "ctrl-v")
         };
         let context = Some("WorkspaceFileTree && !Input");
+        let navigation = Some("FileTree && !Input");
         cx.bind_keys([
-            KeyBinding::new("up", file_tree::NavigateTree::Up, context),
-            KeyBinding::new("down", file_tree::NavigateTree::Down, context),
-            KeyBinding::new("left", file_tree::NavigateTree::Left, context),
-            KeyBinding::new("right", file_tree::NavigateTree::Right, context),
-            KeyBinding::new("space", file_tree::OpenTreeFile { preview: true }, context),
+            KeyBinding::new("up", file_tree::NavigateTree::Up, navigation),
+            KeyBinding::new("down", file_tree::NavigateTree::Down, navigation),
+            KeyBinding::new("left", file_tree::NavigateTree::Left, navigation),
+            KeyBinding::new("right", file_tree::NavigateTree::Right, navigation),
+            KeyBinding::new(
+                "space",
+                file_tree::OpenTreeFile { preview: true },
+                navigation,
+            ),
             KeyBinding::new(
                 if cfg!(target_os = "macos") {
                     "cmd-down"
@@ -84,7 +89,13 @@ impl Workspace {
                     "enter"
                 },
                 file_tree::OpenTreeFile { preview: false },
-                context,
+                navigation,
+            ),
+            #[cfg(target_os = "macos")]
+            KeyBinding::new(
+                "enter",
+                file_tree::OpenTreeFile { preview: false },
+                Some("FileTree && !WorkspaceFileTree && !Input"),
             ),
             KeyBinding::new("f2", file_tree::RenameTreeEntry, context),
             #[cfg(target_os = "macos")]

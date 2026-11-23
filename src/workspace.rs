@@ -775,6 +775,7 @@ pub struct Workspace {
     tree_reveal: Option<PathBuf>,
     tree_selected: Option<PathBuf>,
     docs_tree_task: Task<()>,
+    docs_tree_reveal: Option<PathBuf>,
     docs_tree_seeded: bool,
     docs_scan_pending: bool,
     docs_tree_complete: bool,
@@ -984,6 +985,7 @@ impl Workspace {
             tree_reveal: None,
             tree_selected: None,
             docs_tree_task: Task::ready(()),
+            docs_tree_reveal: None,
             docs_tree_seeded: false,
             docs_scan_pending: false,
             docs_tree_complete: false,
@@ -1914,16 +1916,15 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.view == WorkspaceView::Editor
-            && (entry.directory || entry.symlink || !audio_preview::is_audio(&entry.path))
+        if self.view == WorkspaceView::Docs
+            || (self.view == WorkspaceView::Editor
+                && (entry.directory || entry.symlink || !audio_preview::is_audio(&entry.path)))
         {
             if event.click_count() < 2 {
                 self.focus_tree(entry.path.clone(), window, cx);
             } else if self.tree_focus.is_focused(window) {
                 self.focus.focus(window, cx);
             }
-        } else if self.view == WorkspaceView::Docs && self.tree_focus.is_focused(window) {
-            self.tree_keyboard_path = entry.path.clone();
         }
         if entry.directory {
             self.toggle_tree_directory(entry.path, window, cx);
@@ -1956,13 +1957,18 @@ impl Workspace {
             if self.view == WorkspaceView::Editor {
                 self.load_expanded_tree_directories(window, cx);
             }
-        } else if self.view == WorkspaceView::Editor
-            && self
-                .tree_reveal
+        } else {
+            let reveal = if self.view == WorkspaceView::Docs {
+                &mut self.docs_tree_reveal
+            } else {
+                &mut self.tree_reveal
+            };
+            if reveal
                 .as_ref()
                 .is_some_and(|reveal| reveal.starts_with(&path))
-        {
-            self.tree_reveal = None;
+            {
+                *reveal = None;
+            }
         }
         self.rebuild_tree();
         if self
@@ -2078,6 +2084,7 @@ impl Workspace {
         self.rebuild_tree();
         if view == WorkspaceView::Docs {
             self.load_docs_tree(window, cx);
+            self.resume_document_tree_reveal(cx);
             if let Some((path, prepared)) = document {
                 self.open_doc_at(path, None, None, prepared, window, cx);
             } else if self.doc.is_none() && self.doc_loading.is_none() && self.doc_error.is_none() {
@@ -2314,7 +2321,12 @@ impl Workspace {
                 if self.doc_error.is_none()
                     && let Some(navigation) = navigation
                 {
+                    let entering_docs = self.view != WorkspaceView::Docs;
                     self.finish_document_navigation(navigation, window, cx);
+                    if entering_docs && !path.is_absolute() {
+                        self.docs_tree_reveal = Some(path);
+                        self.resume_document_tree_reveal(cx);
+                    }
                 }
                 if self.doc_error != previous_error {
                     cx.notify();
@@ -2389,14 +2401,7 @@ impl Workspace {
                             entry.title = document.title().map(str::to_owned);
                             this.session_revision += 1;
                         }
-                        if !path.is_absolute() {
-                            this.docs_expanded.extend(
-                                path.ancestors()
-                                    .skip(1)
-                                    .filter(|parent| !parent.as_os_str().is_empty())
-                                    .map(Path::to_owned),
-                            );
-                        }
+                        this.docs_tree_reveal = (!path.is_absolute()).then(|| path.clone());
                         this.locator_visit(&path);
                         let workspace = cx.entity().downgrade();
                         let typography = this.config.current().docs;
@@ -2424,7 +2429,7 @@ impl Workspace {
                         if let Some(navigation) = navigation {
                             this.finish_document_navigation(navigation, window, cx);
                         }
-                        this.rebuild_tree();
+                        this.resume_document_tree_reveal(cx);
                     }
                     Err(error) => {
                         this.pause_document_images(false, cx);
@@ -4447,52 +4452,56 @@ impl Workspace {
             .h_full()
             .flex_shrink_0()
             .track_focus(&self.tree_focus)
+            .key_context(if in_workspace {
+                "FileTree WorkspaceFileTree"
+            } else {
+                "FileTree"
+            })
+            .on_action(
+                cx.listener(|this, action: &file_tree::OpenTreeFile, window, cx| {
+                    this.open_tree_file(action.preview, window, cx);
+                }),
+            )
+            .on_action(
+                cx.listener(|this, action: &file_tree::NavigateTree, window, cx| {
+                    this.navigate_tree(*action, window, cx);
+                }),
+            )
             .when(in_workspace, |pane| {
-                pane.key_context("WorkspaceFileTree")
-                    .on_action(
-                        cx.listener(|this, action: &file_tree::OpenTreeFile, window, cx| {
-                            this.open_tree_file(action.preview, window, cx);
-                        }),
-                    )
-                    .on_action(
-                        cx.listener(|this, action: &file_tree::NavigateTree, window, cx| {
-                            this.navigate_tree(*action, window, cx);
-                        }),
-                    )
-                    .on_action(
-                        cx.listener(|this, _: &file_tree::RenameTreeEntry, window, cx| {
-                            this.tree_key_action(file_tree::TreeAction::Rename, window, cx);
-                        }),
-                    )
-                    .on_action(
-                        cx.listener(|this, _: &file_tree::DeleteTreeEntry, window, cx| {
-                            this.tree_key_action(file_tree::TreeAction::Delete, window, cx);
-                        }),
-                    )
-                    .on_action(cx.listener(|this, _: &file_tree::RefreshTree, window, cx| {
-                        this.tree_key_action(file_tree::TreeAction::Refresh, window, cx);
-                    }))
-                    .on_drop(|_: &ExternalPaths, _, _| {})
-                    .on_action(
-                        cx.listener(|this, _: &tree_transfer::CopyTreeEntry, window, cx| {
-                            this.tree_key_copy(false, window, cx);
-                        }),
-                    )
-                    .on_action(
-                        cx.listener(|this, _: &tree_transfer::CutTreeEntry, window, cx| {
-                            this.tree_key_copy(true, window, cx);
-                        }),
-                    )
-                    .on_action(cx.listener(
-                        |this, _: &tree_transfer::PasteTreeEntry, window, cx| {
-                            this.tree_key_paste(false, window, cx);
-                        },
-                    ))
-                    .on_action(cx.listener(
-                        |this, _: &tree_transfer::MoveTreeClipboard, window, cx| {
-                            this.tree_key_paste(true, window, cx);
-                        },
-                    ))
+                pane.on_action(
+                    cx.listener(|this, _: &file_tree::RenameTreeEntry, window, cx| {
+                        this.tree_key_action(file_tree::TreeAction::Rename, window, cx);
+                    }),
+                )
+                .on_action(
+                    cx.listener(|this, _: &file_tree::DeleteTreeEntry, window, cx| {
+                        this.tree_key_action(file_tree::TreeAction::Delete, window, cx);
+                    }),
+                )
+                .on_action(cx.listener(|this, _: &file_tree::RefreshTree, window, cx| {
+                    this.tree_key_action(file_tree::TreeAction::Refresh, window, cx);
+                }))
+                .on_drop(|_: &ExternalPaths, _, _| {})
+                .on_action(
+                    cx.listener(|this, _: &tree_transfer::CopyTreeEntry, window, cx| {
+                        this.tree_key_copy(false, window, cx);
+                    }),
+                )
+                .on_action(
+                    cx.listener(|this, _: &tree_transfer::CutTreeEntry, window, cx| {
+                        this.tree_key_copy(true, window, cx);
+                    }),
+                )
+                .on_action(
+                    cx.listener(|this, _: &tree_transfer::PasteTreeEntry, window, cx| {
+                        this.tree_key_paste(false, window, cx);
+                    }),
+                )
+                .on_action(cx.listener(
+                    |this, _: &tree_transfer::MoveTreeClipboard, window, cx| {
+                        this.tree_key_paste(true, window, cx);
+                    },
+                ))
             })
             .child({
                 let header = h_flex()
@@ -4531,6 +4540,7 @@ impl Workspace {
                             this.tree_motion.get_mut().start();
                             if this.view == WorkspaceView::Docs {
                                 this.docs_expanded.clear();
+                                this.docs_tree_reveal = None;
                             } else {
                                 this.expanded.clear();
                                 this.tree_reveal = None;
@@ -4550,12 +4560,13 @@ impl Workspace {
                             this.set_file_tree_visible(false);
                             cx.notify();
                         })),
-                    );
+                    )
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.focus_tree(PathBuf::new(), window, cx);
+                    }));
                 if in_workspace {
                     let header = tree_transfer::tree_drop_target(
-                        header.on_click(cx.listener(|this, _, window, cx| {
-                            this.focus_tree(PathBuf::new(), window, cx);
-                        })),
+                        header,
                         PathBuf::new(),
                         root_menu.clone(),
                         colors,
@@ -4948,9 +4959,7 @@ impl Workspace {
             .debug_selector(|| "show-file-tree".into())
             .on_click(cx.listener(|this, _, window, cx| {
                 this.set_file_tree_visible(true);
-                if this.view == WorkspaceView::Editor {
-                    this.resume_tree_reveal(window, cx);
-                }
+                this.resume_tree_reveal(window, cx);
                 cx.notify();
             }))
         })

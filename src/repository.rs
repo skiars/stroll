@@ -862,7 +862,7 @@ impl Store {
             .get_or_init(|| {
                 crate::ai::Service::new(
                     config.current().ai.clone(),
-                    self.root.join("translations"),
+                    self.root.join("translations.sqlite3"),
                     config.path().ok(),
                 )
             })
