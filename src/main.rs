@@ -24,7 +24,7 @@ fn primary<'a>(mac: &'a str, other: &'a str) -> &'a str {
 }
 
 fn bind_workspace_keys(cx: &mut App) {
-    let view_context = Some("!Terminal && !Locator && !RepoPicker && !SettingsPage");
+    let view_context = Some("!Locator && !RepoPicker && !SettingsPage");
     for (view, control, command) in [
         (WorkspaceView::Docs, "ctrl-1", "cmd-1"),
         (WorkspaceView::Editor, "ctrl-2", "cmd-2"),
@@ -33,7 +33,11 @@ fn bind_workspace_keys(cx: &mut App) {
         let action = SwitchWorkspaceView(view);
         cx.bind_keys([KeyBinding::new(control, action, view_context)]);
         if cfg!(target_os = "macos") {
-            cx.bind_keys([KeyBinding::new(command, action, view_context)]);
+            cx.bind_keys([KeyBinding::new(
+                command,
+                action,
+                Some("!Terminal && !Locator && !RepoPicker && !SettingsPage"),
+            )]);
         }
     }
     cx.bind_keys([
@@ -372,7 +376,7 @@ mod shortcut_tests {
         }
     }
     #[::core::prelude::v1::test]
-    fn view_shortcuts_preserve_terminal_and_overlay_input() {
+    fn control_view_shortcuts_work_in_terminal_and_respect_overlays() {
         let mut cx = TestAppContext::single();
         cx.update(bind_workspace_keys);
         let (probe, visual) = cx.add_window_view(|window, cx| {
@@ -404,17 +408,28 @@ mod shortcut_tests {
                 });
                 window.draw(cx).clear(cx);
             });
-            let navigation_allowed = matches!(context, "WorkspaceEditor" | "Reader");
+            let views = &["docs", "workspace", "git"][..];
+            let in_workspace = matches!(context, "WorkspaceEditor" | "Reader");
             for (keys, expected) in [
-                ("ctrl-1 ctrl-2 ctrl-3", &["docs", "workspace", "git"][..]),
-                ("cmd-1 cmd-2 cmd-3", command_expected),
+                (
+                    "ctrl-1 ctrl-2 ctrl-3",
+                    if in_workspace || context == "Terminal" {
+                        views
+                    } else {
+                        &[]
+                    },
+                ),
+                (
+                    "cmd-1 cmd-2 cmd-3",
+                    if in_workspace { command_expected } else { &[] },
+                ),
             ] {
                 visual.simulate_keystrokes(keys);
                 visual.update(|_, cx| {
                     probe.update(cx, |this, _| {
                         assert_eq!(
                             std::mem::take(&mut this.seen),
-                            if navigation_allowed { expected } else { &[] },
+                            expected,
                             "{context}: {keys}",
                         );
                     });

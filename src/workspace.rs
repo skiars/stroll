@@ -1975,7 +1975,6 @@ impl Workspace {
         if self.repository.is_none()
             || self.repository_overlay_open()
             || window.has_active_dialog(cx)
-            || self.terminal_focused(window, cx)
         {
             return;
         }

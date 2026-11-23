@@ -1356,6 +1356,9 @@ mod tests {
             ("tab", &b"\t"[..]),
             ("shift-tab", &b"\x1b[Z"[..]),
             ("ctrl-c", &b"\x03"[..]),
+            ("ctrl-space", &b"\x00"[..]),
+            ("escape", &b"\x1b"[..]),
+            ("ctrl-[", &b"\x1b"[..]),
         ] {
             cx.simulate_keystrokes(key);
             cx.update(|window, _| assert!(terminal_focus.is_focused(window)));
@@ -1571,11 +1574,14 @@ mod tests {
         cx.update(|cx| {
             gpui_component::init(cx);
             Workspace::bind_terminal_keys(cx);
-            cx.bind_keys([KeyBinding::new(
-                "ctrl-`",
-                crate::workspace::ToggleTerminal,
-                None,
-            )]);
+            cx.bind_keys([
+                KeyBinding::new("ctrl-`", crate::workspace::ToggleTerminal, None),
+                KeyBinding::new(
+                    "ctrl-2",
+                    crate::workspace::SwitchWorkspaceView(WorkspaceView::Editor),
+                    None,
+                ),
+            ]);
         });
         let workspace = open_workspace(cx, Default::default());
         let mut visual = VisualTestContext::from_window(*cx.windows().last().unwrap(), cx);
@@ -1645,8 +1651,19 @@ mod tests {
 
         visual.update(|window, cx| {
             workspace.update(cx, |view, cx| {
+                assert!(view.terminal_focused(window, cx));
                 view.current_terminal_mut().unwrap().maximized = true;
-                view.switch_view(WorkspaceView::Editor, window, cx);
+            });
+        });
+        visual.simulate_keystrokes("ctrl-2");
+        assert!(
+            !commands
+                .try_iter()
+                .any(|command| matches!(command, Command::Input(_)))
+        );
+        visual.update(|window, cx| {
+            workspace.update(cx, |view, cx| {
+                assert_eq!(view.view, WorkspaceView::Editor);
                 assert!(!view.terminal_maximized());
                 assert!(!view.terminal_open());
                 view.show_terminal(window, cx);
