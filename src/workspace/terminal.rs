@@ -38,6 +38,37 @@ const DEFAULT_HEIGHT: f32 = 300.;
 const MIN_HEIGHT: f32 = 100.;
 const MAX_SESSIONS: usize = 32;
 
+fn add_mac_terminal_alias_context(
+    context: &mut KeyContext,
+    layout_id: &str,
+    backquote_equivalent: Option<char>,
+) {
+    let alias = match (layout_id, backquote_equivalent) {
+        // Use the keyboard layout ID returned by GPUI for Apple's Pinyin input source.
+        ("com.apple.keylayout.PinyinKeyboard", _) => Some("MiddleDot"),
+        (_, Some('<')) => Some("LessThan"),
+        _ => None,
+    };
+    if let Some(alias) = alias {
+        context.set("terminal_backquote", alias);
+    }
+}
+
+fn mac_terminal_alias_bindings() -> [KeyBinding; 2] {
+    [
+        KeyBinding::new(
+            "ctrl-<",
+            ToggleTerminal,
+            Some("terminal_backquote == LessThan && !Locator"),
+        ),
+        KeyBinding::new(
+            "ctrl-·",
+            ToggleTerminal,
+            Some("terminal_backquote == MiddleDot && !Locator"),
+        ),
+    ]
+}
+
 pub(super) fn maximum_height(window: &Window) -> Pixels {
     ((window.viewport_size().height - px(68.)) * 0.65).max(px(MIN_HEIGHT))
 }
@@ -109,15 +140,9 @@ impl Panel {
                 .iter()
                 .map(|tab| {
                     let session = tab.session.read(cx);
-                    let directory = session.working_directory().map(|directory| {
-                        directory
-                            .strip_prefix(&self.root)
-                            .map(Path::to_owned)
-                            .unwrap_or(directory)
-                    });
                     TerminalTab {
                         number: tab.number,
-                        directory,
+                        directory: session.snapshot_directory(),
                         scrollback: session.scrollback_snapshot(restore_scrollback),
                     }
                 })
@@ -165,8 +190,18 @@ impl Terminals {
 
 impl Workspace {
     pub fn bind_terminal_keys(cx: &mut App) {
+        if cfg!(target_os = "macos") {
+            cx.bind_keys(mac_terminal_alias_bindings());
+            cx.on_keyboard_layout_change(|cx| {
+                for window in cx.windows() {
+                    _ = window.update(cx, |_, window, _| window.refresh());
+                }
+            })
+            .detach();
+        }
         // GPUI dispatches shortcuts before the terminal's key-down handler.
         cx.bind_keys([
+            KeyBinding::new("ctrl-`", ToggleTerminal, Some("!Locator")),
             KeyBinding::new("tab", NoAction, Some("TerminalInput")),
             KeyBinding::new("shift-tab", NoAction, Some("TerminalInput")),
             KeyBinding::new("ctrl-tab", NextTab, Some("TerminalInput")),
@@ -183,6 +218,16 @@ impl Workspace {
             #[cfg(target_os = "macos")]
             KeyBinding::new("cmd-v", NoAction, Some("TerminalInput")),
         ]);
+    }
+
+    pub(super) fn add_terminal_key_context(context: &mut KeyContext, cx: &App) {
+        if cfg!(target_os = "macos") {
+            let equivalent = cx
+                .keyboard_mapper()
+                .get_key_equivalents()
+                .and_then(|equivalents| equivalents.get(&'`').copied());
+            add_mac_terminal_alias_context(context, cx.keyboard_layout().id(), equivalent);
+        }
     }
 
     fn current_terminal(&self) -> Option<&Panel> {
@@ -1126,4 +1171,50 @@ fn focus_session(session: &Entity<Session>, window: &mut Window, cx: &mut App) {
     window.on_next_frame(move |window, cx| {
         _ = session.update(cx, |session, cx| session.focus.focus(window, cx));
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[::core::prelude::v1::test]
+    fn mac_terminal_aliases_match_only_their_layout_and_allow_overrides() {
+        let mut keymap = Keymap::new(Vec::from(mac_terminal_alias_bindings()));
+        let terminal = KeyContext::parse("Terminal TerminalInput").unwrap();
+        let locator = KeyContext::parse("Locator").unwrap();
+        for (layout_id, equivalent, expected) in [
+            ("com.apple.keylayout.ABC", None, None),
+            ("com.apple.keylayout.German", Some('<'), Some("ctrl-<")),
+            ("com.apple.keylayout.French", Some('<'), Some("ctrl-<")),
+            ("com.apple.keylayout.PinyinKeyboard", None, Some("ctrl-·")),
+            ("com.apple.keylayout.Russian", Some(']'), None),
+        ] {
+            let mut workspace = KeyContext::parse("WorkspaceEditor").unwrap();
+            add_mac_terminal_alias_context(&mut workspace, layout_id, equivalent);
+            for chord in ["ctrl-<", "ctrl-·", "ctrl-]"] {
+                let keys = [Keystroke::parse(chord).unwrap()];
+                let (bindings, _) =
+                    keymap.bindings_for_input(&keys, &[workspace.clone(), terminal.clone()]);
+                assert_eq!(
+                    bindings.len(),
+                    usize::from(expected == Some(chord)),
+                    "{layout_id}: {chord}"
+                );
+                let (bindings, _) =
+                    keymap.bindings_for_input(&keys, &[workspace.clone(), locator.clone()]);
+                assert!(bindings.is_empty(), "Locator: {layout_id}: {chord}");
+            }
+        }
+
+        keymap.add_bindings([KeyBinding::new("ctrl-<", NoAction, None)]);
+        let mut workspace = KeyContext::parse("WorkspaceEditor").unwrap();
+        add_mac_terminal_alias_context(&mut workspace, "com.apple.keylayout.German", Some('<'));
+        let keys = [Keystroke::parse("ctrl-<").unwrap()];
+        assert!(
+            keymap
+                .bindings_for_input(&keys, &[workspace, terminal])
+                .0
+                .is_empty()
+        );
+    }
 }

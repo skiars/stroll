@@ -1574,14 +1574,11 @@ mod tests {
         cx.update(|cx| {
             gpui_component::init(cx);
             Workspace::bind_terminal_keys(cx);
-            cx.bind_keys([
-                KeyBinding::new("ctrl-`", crate::workspace::ToggleTerminal, None),
-                KeyBinding::new(
-                    "ctrl-2",
-                    crate::workspace::SwitchWorkspaceView(WorkspaceView::Editor),
-                    None,
-                ),
-            ]);
+            cx.bind_keys([KeyBinding::new(
+                "ctrl-2",
+                crate::workspace::SwitchWorkspaceView(WorkspaceView::Editor),
+                None,
+            )]);
         });
         let workspace = open_workspace(cx, Default::default());
         let mut visual = VisualTestContext::from_window(*cx.windows().last().unwrap(), cx);

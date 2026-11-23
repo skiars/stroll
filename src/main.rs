@@ -11,8 +11,8 @@ use stroll::repository::{Location, Store};
 use stroll::workspace::{
     CloseRepositoryPicker, CloseSettings, CloseTab, CompleteRepositoryPath, FindInDocument,
     FindReferences, FormatDocument, NextRepositoryPath, NextTab, OpenLocator, OpenRepository,
-    PreviousRepositoryPath, PreviousTab, SaveFile, SwitchWorkspaceView, ToggleSettings,
-    ToggleTerminal, ToggleWrap, Workspace, WorkspaceView, repository_window_bounds,
+    PreviousRepositoryPath, PreviousTab, SaveFile, SwitchWorkspaceView, ToggleSettings, ToggleWrap,
+    Workspace, WorkspaceView, repository_window_bounds,
 };
 
 fn primary<'a>(mac: &'a str, other: &'a str) -> &'a str {
@@ -88,7 +88,6 @@ fn bind_workspace_keys(cx: &mut App) {
             OpenRepository,
             Some("!Terminal && !Locator"),
         ),
-        KeyBinding::new("ctrl-`", ToggleTerminal, Some("!Locator")),
         KeyBinding::new("escape", CloseRepositoryPicker, Some("RepoPicker")),
         KeyBinding::new("escape", CloseRepositoryPicker, Some("RepoPicker > Input")),
         KeyBinding::new("down", NextRepositoryPath, Some("RepoPicker > Input")),

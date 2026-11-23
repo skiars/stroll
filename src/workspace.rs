@@ -5302,6 +5302,18 @@ impl Render for Workspace {
         let picker_opacity = self.repository_ui.picker_opacity(window, cx);
         let locator_overlay = self.locator_overlay(window, cx);
         let switching = self.repository_overlay_open();
+        let mut key_context = KeyContext::default();
+        if !switching {
+            match self.view {
+                WorkspaceView::Git => key_context.add("Reader"),
+                WorkspaceView::Docs => {
+                    key_context.add("Reader");
+                    key_context.add("WorkspaceDocs");
+                }
+                WorkspaceView::Editor => key_context.add("WorkspaceEditor"),
+            }
+            Self::add_terminal_key_context(&mut key_context, cx);
+        }
         v_flex()
             .id("workspace")
             .size_full()
@@ -5309,6 +5321,9 @@ impl Render for Workspace {
             .text_color(colors.ink)
             .text_size(px(13.5))
             .track_focus(&self.focus)
+            .when(!key_context.is_empty(), |view| {
+                view.key_context(key_context)
+            })
             .on_action(cx.listener(Self::toggle_settings))
             .on_action(cx.listener(|this, _: &OpenLocator, window, cx| {
                 if this.standalone.is_none() && !this.terminal_focused(window, cx) {
@@ -5322,32 +5337,25 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::toggle_wrap))
             .on_action(cx.listener(Self::toggle_terminal_shortcut))
             .on_action(cx.listener(Self::switch_view_shortcut))
-            .when(self.view == WorkspaceView::Git && !switching, |view| {
-                view.key_context("Reader")
-            })
-            .when(self.view == WorkspaceView::Docs && !switching, |view| {
-                view.key_context("Reader WorkspaceDocs")
-            })
             .on_action(cx.listener(Self::source_back))
             .on_action(cx.listener(Self::source_forward))
             .capture_any_mouse_down(cx.listener(Self::source_mouse_down))
             .when(self.view == WorkspaceView::Editor && !switching, |view| {
-                view.key_context("WorkspaceEditor")
-                    .on_action(cx.listener(|this, _: &FindNextMatch, window, cx| {
-                        this.navigate_find_match(false, window, cx);
-                    }))
-                    .on_action(cx.listener(|this, _: &FindPreviousMatch, window, cx| {
-                        this.navigate_find_match(true, window, cx);
-                    }))
-                    .on_action(cx.listener(Self::find_references))
-                    .on_action(cx.listener(Self::format_document))
-                    .on_action(cx.listener(Self::close_active_tab))
-                    .on_action(cx.listener(|this, _: &NextTab, window, cx| {
-                        this.cycle_tabs(true, window, cx);
-                    }))
-                    .on_action(cx.listener(|this, _: &PreviousTab, window, cx| {
-                        this.cycle_tabs(false, window, cx);
-                    }))
+                view.on_action(cx.listener(|this, _: &FindNextMatch, window, cx| {
+                    this.navigate_find_match(false, window, cx);
+                }))
+                .on_action(cx.listener(|this, _: &FindPreviousMatch, window, cx| {
+                    this.navigate_find_match(true, window, cx);
+                }))
+                .on_action(cx.listener(Self::find_references))
+                .on_action(cx.listener(Self::format_document))
+                .on_action(cx.listener(Self::close_active_tab))
+                .on_action(cx.listener(|this, _: &NextTab, window, cx| {
+                    this.cycle_tabs(true, window, cx);
+                }))
+                .on_action(cx.listener(|this, _: &PreviousTab, window, cx| {
+                    this.cycle_tabs(false, window, cx);
+                }))
             })
             .child(if self.standalone.is_some() {
                 self.standalone_topbar(window, cx, colors)
