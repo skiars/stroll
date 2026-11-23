@@ -997,7 +997,8 @@ impl Workspace {
             .repository
             .as_ref()
             .and_then(|repo| git_path(repo, path));
-        let Some((target, git_path)) = block.target.clone().zip(git_path) else {
+        let stage_file = untracked && patch.layer == Layer::Unstaged;
+        let Some(git_path) = git_path.filter(|_| stage_file || block.target.is_some()) else {
             let label = if untracked {
                 t!("git.editor_untracked_file")
             } else {
@@ -1014,8 +1015,13 @@ impl Workspace {
         let path = path.to_owned();
         let click_owner = owner.clone();
         let edit_version = changes.version.clone();
+        let (actions, target) = if stage_file {
+            (&[FileAction::Stage][..], None)
+        } else {
+            (patch.layer.actions(), block.target.clone())
+        };
         Some(hunk_toolbar(
-            patch.layer.actions(),
+            actions,
             false,
             false,
             code_font_size,
@@ -1026,7 +1032,7 @@ impl Workspace {
                         path: git_path.clone(),
                         version: edit_version.clone(),
                         action,
-                        block: Some(target.clone()),
+                        block: target.clone(),
                     };
                     workspace.edit_from_editor(path.clone(), edit, window, cx);
                 });
@@ -1678,7 +1684,8 @@ mod tests {
         worktree[60] = "LINE60".to_owned();
         fs::write(root.join(&path), worktree.join("\n") + "\n").unwrap();
         let untracked = PathBuf::from("new.txt");
-        fs::write(root.join(&untracked), "New untracked file\n").unwrap();
+        let new_text = "New untracked file\nSecond line\nLast line without a newline";
+        fs::write(root.join(&untracked), new_text).unwrap();
 
         let store = Arc::new(Store::new(fixture.path().join("state")).unwrap());
         let config = ConfigFile::load(Some(fixture.path().join("config.toml")));
@@ -1798,13 +1805,33 @@ mod tests {
                 let changes = file.git.changes.as_ref().unwrap();
                 assert!(changes.version.status.as_ref().unwrap().untracked);
                 assert!(editor_hunks(changes).next().unwrap().1.target.is_none());
+                assert!(workspace.saving.insert(untracked.clone()));
             });
             window.draw(cx).clear(cx);
         });
-        assert!(visual.debug_bounds("editor-git-hunk-status").is_some());
+        assert!(visual.debug_bounds("editor-git-hunk-status").is_none());
         assert!(visual.debug_bounds("editor-git-previous-hunk:0").is_some());
         assert!(visual.debug_bounds("editor-git-next-hunk:0").is_some());
-        assert!(visual.debug_bounds("git-hunk-action:0").is_none());
+        assert!(visual.debug_bounds("git-hunk-action:2").is_none());
+        let stage = visual.debug_bounds("git-hunk-action:0").unwrap();
+        let click = point(stage.center().x, stage.top() + px(6.));
+        visual.simulate_mouse_move(click, None, Modifiers::default());
+        visual.simulate_click(click, Modifiers::default());
+        visual.run_until_parked();
+        assert!(git(&["ls-files", "--", "new.txt"]).is_empty());
+
+        visual.update(|window, cx| {
+            workspace.update(cx, |workspace, _| {
+                assert!(workspace.saving.remove(&untracked));
+            });
+            window.draw(cx).clear(cx);
+        });
+        visual.simulate_click(click, Modifiers::default());
+        visual.run_until_parked();
+        assert_eq!(git(&["show", ":new.txt"]), new_text.as_bytes());
+        assert_eq!(fs::read_to_string(root.join(&untracked)).unwrap(), new_text);
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+        assert!(visual.debug_bounds("git-hunk-action:1").is_some());
     }
 
     #[cfg(debug_assertions)]

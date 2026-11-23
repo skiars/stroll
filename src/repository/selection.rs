@@ -226,6 +226,15 @@ pub(crate) struct RecentRepository {
     pub(crate) common_dir: PathBuf,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) worktree_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    previous_worktrees: Vec<RecentWorktree>,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+struct RecentWorktree {
+    root: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    id: Option<String>,
 }
 
 impl RecentRepository {
@@ -235,19 +244,68 @@ impl RecentRepository {
     }
 
     pub(crate) fn record(recents: &mut Vec<Self>, repo: &Repository) {
+        #[cfg(feature = "desktop")]
+        let worktree_id = repo.worktree_state.as_ref().map(|state| state.id.clone());
+        #[cfg(not(feature = "desktop"))]
+        let worktree_id: Option<String> = None;
+
+        let mut previous_worktrees = Vec::new();
+        if let Some(index) = recents
+            .iter()
+            .position(|item| item.common_dir == repo.common_dir)
+        {
+            let recent = recents.remove(index);
+            previous_worktrees = recent.previous_worktrees;
+            previous_worktrees.insert(
+                0,
+                RecentWorktree {
+                    root: recent.root,
+                    id: recent.worktree_id,
+                },
+            );
+            previous_worktrees.retain(|item| match (&item.id, &worktree_id) {
+                (Some(previous), Some(current)) => previous != current,
+                _ => item.root != repo.root,
+            });
+        }
         recents.retain(|item| item.common_dir != repo.common_dir && item.root != repo.root);
         recents.insert(
             0,
             Self {
                 root: repo.root.clone(),
                 common_dir: repo.common_dir.clone(),
-                #[cfg(feature = "desktop")]
-                worktree_id: repo.worktree_state.as_ref().map(|state| state.id.clone()),
-                #[cfg(not(feature = "desktop"))]
-                worktree_id: None,
+                worktree_id,
+                previous_worktrees,
             },
         );
         recents.truncate(30);
+    }
+
+    #[cfg(feature = "desktop")]
+    pub(crate) fn sort_worktrees(&self, trees: &mut [Worktree], remote: bool) {
+        let history = std::iter::once((&self.root, self.worktree_id.as_ref()))
+            .chain(
+                self.previous_worktrees
+                    .iter()
+                    .map(|item| (&item.root, item.id.as_ref())),
+            )
+            .collect::<Vec<_>>();
+        let has_ids = history.iter().any(|(_, id)| id.is_some());
+        trees.sort_by_cached_key(|tree| {
+            let id = (!remote && has_ids && !tree.main && tree.available)
+                .then(|| super::worktree_state::worktree_id(&tree.root))
+                .flatten();
+            history
+                .iter()
+                .position(|(root, saved_id)| {
+                    saved_id
+                        .filter(|_| tree.available)
+                        .map_or(tree.root == **root, |saved_id| {
+                            id.as_ref() == Some(saved_id)
+                        })
+                })
+                .unwrap_or(usize::MAX)
+        });
     }
 }
 
@@ -301,6 +359,7 @@ fn legacy_recent(root: &Path) -> Vec<RecentRepository> {
         root: root.to_owned(),
         common_dir,
         worktree_id: None,
+        previous_worktrees: Vec::new(),
     }]
 }
 
@@ -498,6 +557,82 @@ mod tests {
         assert!(store.recent_repositories()?.is_empty());
         assert_eq!(store.location()?.unwrap().root, review.root);
         assert_eq!(store.tabs(&main)?.active(), Some(Path::new("draft.md")));
+        Ok(())
+    }
+
+    #[cfg(feature = "desktop")]
+    #[test]
+    fn worktree_recency_survives_reopening_the_store() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = directory.path().canonicalize()?;
+        let project = root.join("project");
+        let first = root.join("first");
+        let second = root.join("second");
+        let unused = root.join("unused");
+        let other = root.join("other");
+        let state = root.join("state");
+        fs::create_dir(&project)?;
+        fs::create_dir(&other)?;
+        git(&project, &["init", "-qb", "main"])?;
+        git(&other, &["init", "-q"])?;
+        git(
+            &project,
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "--allow-empty",
+                "-qm",
+                "initial",
+            ],
+        )?;
+        for (branch, path) in [("first", &first), ("second", &second), ("unused", &unused)] {
+            git(
+                &project,
+                &["worktree", "add", "-qb", branch, path.to_str().unwrap()],
+            )?;
+        }
+        let main = Repository::open(&project)?;
+        let store = Store::new(state.clone())?;
+        // A legacy record only knows about the last checkout.
+        fs::write(
+            state.join("workspace.json"),
+            serde_json::to_vec(&Location {
+                root: project.clone(),
+                file: None,
+            })?,
+        )?;
+        for path in [&first, &second, &other, &first] {
+            let mut repo = Repository::open(path)?;
+            store.bind_worktree(&mut repo)?;
+            store.remember_repository(&repo)?;
+        }
+        drop(store);
+
+        let moved = root.join("moved-second");
+        git(
+            &project,
+            &[
+                "worktree",
+                "move",
+                second.to_str().unwrap(),
+                moved.to_str().unwrap(),
+            ],
+        )?;
+        let store = Store::new(state)?;
+        let recents = store.recent_repositories()?;
+        assert_eq!(
+            recents.iter().map(|item| &item.root).collect::<Vec<_>>(),
+            [&first, &other]
+        );
+        let mut trees = main.worktrees()?;
+        recents[0].sort_worktrees(&mut trees, false);
+        assert_eq!(
+            trees.iter().map(|tree| &tree.root).collect::<Vec<_>>(),
+            [&first, &moved, &project, &unused]
+        );
         Ok(())
     }
 }

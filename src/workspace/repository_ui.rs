@@ -96,6 +96,7 @@ pub(super) struct RepositoryUi {
     menu_focus: FocusHandle,
     trigger_focus: FocusHandle,
     menu_rows: Vec<FocusHandle>,
+    menu_scroll: ScrollHandle,
     directory_focus: FocusHandle,
     pub(super) menu_open: bool,
     pub(super) picker_open: bool,
@@ -318,6 +319,7 @@ impl RepositoryUi {
             menu_focus: cx.focus_handle(),
             trigger_focus: cx.focus_handle(),
             menu_rows: Vec::new(),
+            menu_scroll: ScrollHandle::new(),
             directory_focus: cx.focus_handle(),
             menu_open: false,
             picker_open: false,
@@ -1286,7 +1288,19 @@ impl Workspace {
         };
         self.repository_ui.worktrees_loading = true;
         self.repository_ui.worktree_error = None;
-        let query = cx.background_spawn(async move { repo.worktrees() });
+        let recent = self
+            .repository_ui
+            .recents
+            .iter()
+            .find(|item| item.common_dir == repo.common_dir)
+            .cloned();
+        let query = cx.background_spawn(async move {
+            let mut trees = repo.worktrees()?;
+            if let Some(recent) = recent {
+                recent.sort_worktrees(&mut trees, repo.ssh.is_some());
+            }
+            Ok::<_, anyhow::Error>(trees)
+        });
         self.repository_ui.worktree_task = cx.spawn(async move |this, cx| {
             let result = query.await;
             _ = this.update(cx, |this, cx| {
@@ -1358,16 +1372,12 @@ impl Workspace {
     }
 
     fn quick_recents(&self) -> impl Iterator<Item = &RecentRepository> {
-        self.repository_ui
-            .recents
-            .iter()
-            .filter(|item| {
-                self.repository
-                    .as_ref()
-                    .is_some_and(|repo| repo.common_dir != item.common_dir)
-                    && !self.repository_ui.unavailable.contains(&item.root)
-            })
-            .take(4)
+        self.repository_ui.recents.iter().filter(|item| {
+            self.repository
+                .as_ref()
+                .is_some_and(|repo| repo.common_dir != item.common_dir)
+                && !self.repository_ui.unavailable.contains(&item.root)
+        })
     }
 
     fn update_repository_menu_focus(&mut self, cx: &mut Context<Self>) {
@@ -1469,6 +1479,9 @@ impl Workspace {
                 this.repository_ui.menu_open = open;
                 if open {
                     this.repository_ui.menu_error = None;
+                    this.repository_ui
+                        .menu_scroll
+                        .set_offset(point(px(0.), px(0.)));
                     this.open_files_list = false;
                     if let Some(file) = this.active_file() {
                         file.editor
@@ -1482,6 +1495,7 @@ impl Workspace {
             }))
             .trigger(
                 quiet_button("repository-menu-trigger")
+                    .debug_selector(|| "repository-menu-trigger".into())
                     .disabled(ui.picker_open)
                     .input_h(gpui_component::Size::default())
                     .label_size(cx.theme().control_font_size)
@@ -1544,6 +1558,25 @@ impl Workspace {
         );
         let opening = ui.opening.is_some();
         let mut handles = ui.menu_rows.iter();
+        let menu_scroll = ui.menu_scroll.clone();
+        let worktree_feedback = ui
+            .worktree_error
+            .as_deref()
+            .map(|error| feedback(error, true, colors))
+            .or_else(|| {
+                (ui.worktrees_loading && ui.worktrees.is_empty())
+                    .then(|| feedback(t!("repository.loading_worktrees"), false, colors))
+            });
+        let first_worktree = 1 + usize::from(worktree_feedback.is_some());
+        let first_recent = first_worktree + ui.worktrees.len() + 1;
+        let scroll_rows: Vec<_> = ui
+            .worktrees
+            .iter()
+            .enumerate()
+            .filter(|(_, tree)| tree.available)
+            .map(|(index, _)| first_worktree + index)
+            .chain(first_recent..first_recent + recents.len())
+            .collect();
         let worktrees: Vec<_> = ui
             .worktrees
             .iter()
@@ -1568,6 +1601,7 @@ impl Workspace {
                     active,
                     colors,
                 )
+                .flex_none()
                 .disabled(!tree.available || opening)
                 .tooltip(tooltip)
                 .when_some(focus, |button, focus| button.track_focus(focus))
@@ -1584,7 +1618,10 @@ impl Workspace {
             .collect();
         let recent_rows: Vec<_> = recents
             .iter()
-            .map(|item| self.recent_repository_row(item, handles.next(), false, cx, colors))
+            .map(|item| {
+                self.recent_repository_row(item, handles.next(), false, cx, colors)
+                    .flex_none()
+            })
             .collect();
         let open_focus = handles.next();
         let rows = ui.menu_rows.clone();
@@ -1600,15 +1637,16 @@ impl Workspace {
                 let down = event.keystroke.key == "down";
                 let index = rows.iter().position(|focus| focus.is_focused(window));
                 let next = match index {
-                    Some(index) if down => rows.get(index + 1).or_else(|| rows.first()),
-                    Some(index) => index
-                        .checked_sub(1)
-                        .and_then(|i| rows.get(i))
-                        .or_else(|| rows.last()),
-                    None if down => rows.first(),
-                    None => rows.last(),
+                    Some(index) if down => (index + 1) % rows.len(),
+                    Some(index) => index.checked_sub(1).unwrap_or(rows.len() - 1),
+                    None if down => 0,
+                    None => rows.len().saturating_sub(1),
                 };
-                if let Some(focus) = next {
+                if let Some(focus) = rows.get(next) {
+                    if let Some(&row) = scroll_rows.get(next) {
+                        menu_scroll.scroll_to_item(row);
+                        window.refresh();
+                    }
                     focus.focus(window, cx);
                     cx.stop_propagation();
                 }
@@ -1673,56 +1711,50 @@ impl Workspace {
             .child(
                 v_flex()
                     .id("repository-menu-lists")
+                    .debug_selector(|| "repository-menu-lists".into())
                     .max_h(
                         (window.viewport_size().height - px(230.))
                             .max(px(100.))
                             .min(px(380.)),
                     )
-                    .overflow_y_popup_scrollbar()
+                    .pb_1()
+                    .track_scroll(&ui.menu_scroll)
+                    .overflow_y_scroll()
+                    .lock_scroll_axis()
+                    .vertical_popup_scrollbar(&ui.menu_scroll)
                     .child(
-                        menu_section(colors)
-                            .child(
-                                h_flex()
-                                    .pl_2()
-                                    .pr_1()
-                                    .justify_between()
-                                    .child(section_title(t!("repository.worktrees"), colors))
-                                    .child(
-                                        compact_icon_button(
-                                            "refresh-worktrees",
-                                            IconName::RefreshCw,
-                                            t!("repository.refresh_worktrees"),
-                                        )
-                                        .disabled(ui.worktrees_loading)
-                                        .on_click(
-                                            cx.listener(|this, _, _, cx| {
-                                                this.refresh_worktrees(cx)
-                                            }),
-                                        ),
-                                    ),
-                            )
-                            .when_some(ui.worktree_error.as_deref(), |section, error| {
-                                section.child(feedback(error, true, colors))
-                            })
-                            .when(ui.worktrees_loading && worktrees.is_empty(), |section| {
-                                section.child(feedback(
-                                    t!("repository.loading_worktrees"),
-                                    false,
-                                    colors,
-                                ))
-                            })
-                            .children(worktrees),
-                    )
-                    .when(!recent_rows.is_empty(), |lists| {
-                        lists.child(
-                            menu_section(colors)
+                        menu_section(colors).pb_0().flex_none().child(
+                            h_flex()
+                                .pl_2()
+                                .pr_1()
+                                .justify_between()
+                                .child(section_title(t!("repository.worktrees"), colors))
                                 .child(
-                                    div()
-                                        .px_2()
-                                        .child(section_title(t!("repository.recent"), colors)),
-                                )
-                                .children(recent_rows),
-                        )
+                                    compact_icon_button(
+                                        "refresh-worktrees",
+                                        IconName::RefreshCw,
+                                        t!("repository.refresh_worktrees"),
+                                    )
+                                    .disabled(ui.worktrees_loading)
+                                    .on_click(
+                                        cx.listener(|this, _, _, cx| this.refresh_worktrees(cx)),
+                                    ),
+                                ),
+                        ),
+                    )
+                    .children(worktree_feedback)
+                    .children(worktrees)
+                    .when(!recent_rows.is_empty(), |lists| {
+                        lists
+                            .child(
+                                menu_section(colors)
+                                    .pb_0()
+                                    .mt_1()
+                                    .px_2()
+                                    .flex_none()
+                                    .child(section_title(t!("repository.recent"), colors)),
+                            )
+                            .children(recent_rows)
                     }),
             )
             .child(
@@ -2311,6 +2343,7 @@ impl Workspace {
             active,
             colors,
         )
+        .debug_selector(|| format!("recent-repository:{}", root.display()))
         .flex_1()
         .when(show_missing, |button| button.bg(transparent_black()))
         .disabled(ui.opening.is_some())

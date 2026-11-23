@@ -275,3 +275,95 @@ fn repository_picker_keeps_switches_in_place_and_submits_the_displayed_action() 
     });
     Ok(())
 }
+
+#[::core::prelude::v1::test]
+fn repository_menu_reveals_projects_focused_by_keyboard() -> anyhow::Result<()> {
+    let fixture = tempfile::tempdir()?;
+    let root = fixture.path().canonicalize()?;
+    let state = root.join("state");
+    let store = Store::new(state.clone())?;
+    let projects: Vec<_> = (0..32)
+        .map(|ix| root.join(format!("project-{ix}")))
+        .collect();
+    for path in &projects {
+        fs::create_dir(path)?;
+        assert!(
+            Command::new("git")
+                .args(["init", "-q"])
+                .current_dir(path)
+                .status()?
+                .success()
+        );
+        store.remember_repository(&Repository::open(path)?)?;
+    }
+    let store = Arc::new(Store::new(state)?);
+    let config = ConfigFile::load(Some(root.join("config.toml")));
+    let mut app = TestAppContext::build_with_text_system(
+        TestDispatcher::new(0),
+        None,
+        crate::test_support::text_system(true),
+    );
+    app.update(|cx| {
+        gpui_component::init(cx);
+        cx.set_reduce_motion(true);
+    });
+    let (workspace, visual) = app.add_window_view(|window, cx| {
+        Workspace::with_config(store, config, WorkspaceView::Editor, window, cx)
+    });
+    visual.simulate_resize(size(px(740.), px(480.)));
+    visual.update(|window, cx| {
+        workspace.update(cx, |workspace, cx| workspace.restore_repository(window, cx));
+    });
+    frame(visual);
+    let trigger = visual
+        .debug_bounds("repository-menu-trigger")
+        .unwrap()
+        .center();
+    visual.simulate_click(trigger, Modifiers::none());
+    frame(visual);
+    let project_row = format!("recent-repository:{}", projects[2].display()).leak();
+    let viewport = visual.debug_bounds("repository-menu-lists").unwrap();
+    assert!(visual.debug_bounds(project_row).unwrap().top() >= viewport.bottom());
+    visual.update(|_, cx| {
+        let actual: Vec<_> = workspace
+            .read(cx)
+            .quick_recents()
+            .map(|item| &item.root)
+            .collect();
+        assert_eq!(actual, projects[2..31].iter().rev().collect::<Vec<_>>());
+    });
+
+    // Up wraps to the fixed footer, then moves into the last project.
+    for _ in 0..2 {
+        visual.simulate_keystrokes("up");
+        frame(visual);
+    }
+    let row = visual.debug_bounds(project_row).unwrap();
+    assert!(row.top() >= viewport.top() && row.bottom() <= viewport.bottom());
+
+    // Move up far enough to reveal the first project again, then open it.
+    for _ in 0..28 {
+        visual.simulate_keystrokes("up");
+        frame(visual);
+    }
+    let first_row = format!("recent-repository:{}", projects[30].display()).leak();
+    let row = visual.debug_bounds(first_row).unwrap();
+    assert!(row.top() >= viewport.top() && row.bottom() <= viewport.bottom());
+    let keystroke = Keystroke::parse("enter").unwrap();
+    visual.simulate_event(KeyDownEvent {
+        keystroke: keystroke.clone(),
+        is_held: false,
+        prefer_character_input: false,
+    });
+    visual.simulate_event(KeyUpEvent { keystroke });
+    frame(visual);
+    visual.update(|_, cx| {
+        let workspace = workspace.read(cx);
+        assert_eq!(workspace.repository.as_ref().unwrap().root, projects[30]);
+        assert_eq!(
+            workspace.store.recent_repositories().unwrap()[0].root,
+            projects[30]
+        );
+    });
+    Ok(())
+}

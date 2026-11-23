@@ -79,6 +79,10 @@ fn marker(admin: &Path) -> Result<Option<String>> {
     }
 }
 
+pub(super) fn worktree_id(root: &Path) -> Option<String> {
+    marker(&linked_admin(root)?).ok().flatten()
+}
+
 fn ensure_marker(admin: &Path) -> Result<String> {
     if let Some(id) = marker(admin)? {
         return Ok(id);
