@@ -82,10 +82,17 @@ pub struct HoverPopoverState {
     pub(super) documentation_target: Option<Range<usize>>,
     pub(super) pointer: Option<gpui::Point<gpui::Pixels>>,
     pub(super) waiting_for_delay: bool,
+    pub(super) presented: Cell<bool>,
     pub(super) pointer_handoff: Cell<Option<gpui::Point<gpui::Pixels>>>,
 }
 
 impl HoverPopoverState {
+    /// Mark the first frame in which the popup can handle pointer handoff.
+    #[doc(hidden)]
+    pub fn mark_presented(&self) {
+        self.presented.set(true);
+    }
+
     pub(super) fn visible(&self) -> bool {
         !self.waiting_for_delay && (self.hover.is_some() || !self.diagnostics.is_empty())
     }
@@ -155,6 +162,7 @@ impl InputBaseState<EditorMode> {
             pointer: None,
             documentation_target: None,
             waiting_for_delay: false,
+            presented: Cell::default(),
             pointer_handoff: Cell::default(),
             symbol_range,
             hover: Some(hover),
@@ -183,6 +191,7 @@ impl InputBaseState<EditorMode> {
                 pointer: None,
                 documentation_target: None,
                 waiting_for_delay: false,
+                presented: Cell::default(),
                 pointer_handoff: Cell::default(),
                 symbol_range: range,
                 hover: None,
@@ -297,6 +306,7 @@ impl InputBaseState<EditorMode> {
                 pointer: None,
                 documentation_target: None,
                 waiting_for_delay: false,
+                presented: Cell::default(),
                 pointer_handoff: Cell::default(),
                 hover: None,
                 documentation: None,

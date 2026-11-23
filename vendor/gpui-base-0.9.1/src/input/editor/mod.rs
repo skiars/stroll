@@ -116,12 +116,20 @@ impl InputModeKind for EditorMode {
         state.clear_hover_state(cx);
     }
 
+    fn cancel_pending_pointer_hover(
+        state: &gpui::Entity<InputBaseState<Self>>,
+        cx: &mut gpui::App,
+    ) {
+        if state.read(cx).has_pending_pointer_hover() {
+            state.update(cx, |state, cx| state.clear_hover_state(cx));
+        }
+    }
+
     fn validate_hover_anchor(
         state: &mut InputBaseState<Self>,
-        clip: gpui::Bounds<gpui::Pixels>,
         cx: &mut gpui::Context<InputBaseState<Self>>,
     ) {
-        state.validate_language_hover(clip, cx);
+        state.validate_language_hover(cx);
     }
 
     fn on_text_typed(

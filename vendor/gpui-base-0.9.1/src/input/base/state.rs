@@ -571,6 +571,7 @@ pub struct InputBaseState<M: InputModeKind> {
     pub(super) ime_anchor: Option<(Point<Pixels>, Option<Bounds<Pixels>>)>,
     /// The input container bounds
     pub(super) input_bounds: Bounds<Pixels>,
+    pub(crate) visible_text_bounds: Bounds<Pixels>,
     /// The text bounds
     pub(super) last_bounds: Option<Bounds<Pixels>>,
     /// The fully visible part of the window this input last asked its scroll
@@ -845,6 +846,25 @@ impl<M: InputModeKind> InputBaseState<M> {
         self.input_bounds
     }
 
+    /// The current input viewport after ancestor clipping and projected headers.
+    #[doc(hidden)]
+    pub fn visible_text_bounds(&self) -> Bounds<Pixels> {
+        self.visible_text_bounds
+    }
+
+    /// The visible part of a laid-out range, including a zero-width anchor.
+    #[doc(hidden)]
+    pub fn visible_text_range_bounds(&self, range: &Range<usize>) -> Option<Bounds<Pixels>> {
+        let range = self.range_to_bounds(range)?;
+        let viewport = self.visible_text_bounds;
+        let top = range.top().max(viewport.top());
+        let bottom = range.bottom().min(viewport.bottom());
+        let left = range.left().max(viewport.left());
+        let right = range.left().max(range.right()).min(viewport.right());
+        (bottom > top && right >= left && viewport.size.width > px(0.))
+            .then(|| Bounds::from_corners(point(left, top), point(right, bottom)))
+    }
+
     pub fn text_bounds(&self) -> Option<Bounds<Pixels>> {
         self.last_bounds
     }
@@ -1091,6 +1111,7 @@ impl<M: InputModeKind> InputBaseState<M> {
             ime_original_text: None,
             projected_ime_edit: None,
             input_bounds: Bounds::default(),
+            visible_text_bounds: Bounds::default(),
             selecting: false,
             touch_selection: Default::default(),
             disabled: false,
@@ -3147,7 +3168,7 @@ impl<M: InputModeKind> InputBaseState<M> {
         cx: &mut Context<Self>,
     ) {
         // `last_bounds` is moved by the scroll offset; `input_bounds` is the visible area.
-        let within_bounds = self.input_bounds.contains(&event.position);
+        let within_bounds = self.visible_text_bounds.contains(&event.position);
 
         if !within_bounds {
             // Clear hover when mouse leaves the input

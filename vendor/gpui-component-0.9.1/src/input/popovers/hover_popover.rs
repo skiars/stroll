@@ -769,6 +769,12 @@ impl Element for Popover {
         };
 
         popover.paint(window, cx);
+        if !self.closing
+            && let Some(hover) = self.editor.read(cx).hover_popover()
+            && hover.symbol_range == self.range
+        {
+            hover.mark_presented();
+        }
 
         let editor = self.editor.clone();
         let pointer_down = self.pointer_down.clone();

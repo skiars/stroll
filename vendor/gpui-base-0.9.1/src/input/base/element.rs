@@ -1130,10 +1130,15 @@ impl<M: InputModeKind> TextElement<M> {
 
         window.on_mouse_event({
             let state = self.state.clone();
-
+            let hitbox = hitbox.clone();
             move |event: &MouseMoveEvent, phase, window, cx| {
                 if !phase.capture() {
                     return;
+                }
+                if !hitbox.is_hovered(window) {
+                    // The editor's bubble listener only sees events that hit the
+                    // input. An already visible popup owns its own pointer handoff.
+                    M::cancel_pending_pointer_hover(&state, cx);
                 }
                 if event.dragging() {
                     state.update(cx, |state, cx| {
@@ -1143,6 +1148,15 @@ impl<M: InputModeKind> TextElement<M> {
                     && (state.read(cx).selecting || state.read(cx).column_select_start.is_some())
                 {
                     state.update(cx, |state, _| state.end_mouse_selection());
+                }
+            }
+        });
+
+        window.on_mouse_event({
+            let state = self.state.clone();
+            move |_: &gpui::MouseExitEvent, phase, _, cx| {
+                if phase.capture() {
+                    M::cancel_pending_pointer_hover(&state, cx);
                 }
             }
         });
@@ -5122,6 +5136,7 @@ impl<M: InputModeKind> Element for TextElement<M> {
             state.last_bounds = Some(bounds);
             state.last_cursor = Some(state.cursor());
             state.set_input_bounds(input_bounds, cx);
+            state.visible_text_bounds = input_bounds.intersect(&window.content_mask().bounds);
             state.last_selected_range = Some(selected_range);
             state.pending_edit_reveal = false;
             state.scroll_size = scroll_size;
@@ -5129,7 +5144,7 @@ impl<M: InputModeKind> Element for TextElement<M> {
             state.deferred_scroll_offset = None;
             state.pending_projected_scroll = None;
             state.pending_scroll_navigation = false;
-            M::validate_hover_anchor(state, window.content_mask().bounds, cx);
+            M::validate_hover_anchor(state, cx);
 
             // Layout consumers need changed geometry, not another notification
             // for every paint of an unchanged input.

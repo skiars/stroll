@@ -1,5 +1,5 @@
 use anyhow::Result;
-use gpui::{App, Bounds, Context, MouseMoveEvent, Pixels, Point, SharedString, Task, Window};
+use gpui::{App, Context, MouseMoveEvent, Pixels, Point, SharedString, Task, Window};
 use instant::Duration;
 use ropey::Rope;
 use std::{collections::BTreeMap, ops::Range, rc::Rc, sync::Arc, task::Poll};
@@ -180,6 +180,7 @@ impl InputBaseState<EditorMode> {
             hover: None,
             documentation: None,
             waiting_for_delay: true,
+            presented: Default::default(),
             pointer_handoff: Default::default(),
         };
         if had_visible_popover {
@@ -195,6 +196,7 @@ impl InputBaseState<EditorMode> {
             let mut request = if let Some(provider) = provider.as_ref() {
                 cx.background_executor().timer(HOVER_DELAY / 2).await;
                 this.update_in(cx, |editor, window, cx| {
+                    editor.validate_language_hover(cx);
                     (editor.document_revision == revision
                         && editor.extras.hover_popover.as_ref().is_some_and(|popover| {
                             popover.documentation_target == documentation_target
@@ -214,6 +216,7 @@ impl InputBaseState<EditorMode> {
                 early_hover = result.ok().flatten();
             }
             this.update_in(cx, |editor, _, cx| {
+                editor.validate_language_hover(cx);
                 if let Some(popover) = editor.extras.hover_popover.as_mut()
                     && editor.document_revision == revision
                 {
@@ -238,6 +241,7 @@ impl InputBaseState<EditorMode> {
             };
 
             let enrichment = this.update_in(cx, |editor, window, cx| {
+                editor.validate_language_hover(cx);
                 if editor.document_revision != revision {
                     return None;
                 }
@@ -366,18 +370,28 @@ impl InputBaseState<EditorMode> {
         }
     }
 
-    pub(crate) fn validate_language_hover(&mut self, clip: Bounds<Pixels>, cx: &mut Context<Self>) {
+    pub(crate) fn has_pending_pointer_hover(&self) -> bool {
+        self.extras.hover_popover.as_ref().is_some_and(|popover| {
+            popover.pointer.is_some() && (!popover.visible() || !popover.presented.get())
+        })
+    }
+
+    pub(crate) fn validate_language_hover(&mut self, cx: &mut Context<Self>) {
         let Some(popover) = self.extras.hover_popover.as_ref() else {
             return;
         };
         let Some(pointer) = popover.pointer else {
             return;
         };
-        let offset = (self.input_bounds.contains(&pointer) && clip.contains(&pointer))
+        let offset = self
+            .visible_text_bounds
+            .contains(&pointer)
             .then(|| self.text_offset_at_point(pointer))
             .flatten();
-        let Some(offset) = offset.filter(|_| self.range_to_bounds(&popover.symbol_range).is_some())
-        else {
+        let Some(offset) = offset.filter(|_| {
+            self.visible_text_range_bounds(&popover.symbol_range)
+                .is_some()
+        }) else {
             self.clear_language_hover(cx);
             return;
         };

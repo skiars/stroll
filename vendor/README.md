@@ -131,6 +131,9 @@ dialogs in a Wayland window after changes to paint order or focus handling.
   Code Actions shortcut, opens the menu immediately.
   Explicit diagnostic presentation replaces a pending pointer hover immediately.
   The popup integration tests cover timing, cancellation, and scrolling.
+- Pending hover requests are dropped when the pointer leaves the text hitbox,
+  and responses are checked against the visible anchor. The popup takes over
+  pointer tracking after its first paint.
 - Interactive code editor edits reveal the caret with minimal scrolling before shaping the
   viewport. Programmatic replacements and history replay use the existing caret-follow margin.
   Mapped edit transactions support both endpoint and range callbacks. Range

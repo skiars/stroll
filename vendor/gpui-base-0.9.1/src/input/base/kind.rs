@@ -23,7 +23,7 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use gpui::{Div, Entity, Stateful, Window};
+use gpui::{App, Div, Entity, Stateful, Window};
 use ropey::{Rope, RopeSlice};
 
 use super::decorations::DecorationCollections;
@@ -301,9 +301,11 @@ pub trait InputModeKind: sealed::Sealed + Sized + 'static {
     }
 
     #[doc(hidden)]
+    fn cancel_pending_pointer_hover(_state: &gpui::Entity<InputBaseState<Self>>, _cx: &mut App) {}
+
+    #[doc(hidden)]
     fn validate_hover_anchor(
         _state: &mut InputBaseState<Self>,
-        _clip: gpui::Bounds<gpui::Pixels>,
         _cx: &mut gpui::Context<InputBaseState<Self>>,
     ) {
     }
