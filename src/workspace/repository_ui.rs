@@ -2,6 +2,8 @@ use rust_i18n::t;
 
 mod hosts;
 #[cfg(all(test, target_os = "linux"))]
+mod picker_tests;
+#[cfg(all(test, target_os = "linux"))]
 mod ssh_tests;
 
 use std::{
@@ -39,13 +41,35 @@ use crate::repository::{
 
 use super::{
     CloseRepositoryPicker, CompleteRepositoryPath, NextRepositoryPath, OpenRepository, Palette,
-    PreviousRepositoryPath, Workspace, action_button, compact_icon_button, icon, quiet_button,
+    PreviousRepositoryPath, Workspace, action_button, compact_icon_button, icon, icon_button,
+    quiet_button, text_base_size, topbar_segment, topbar_segments,
 };
+
+const REPOSITORY_PICKER_SCROLL_GUTTER: Pixels = px(11.);
 
 #[derive(Clone, Copy, PartialEq)]
 enum PickerTab {
     Recent,
     Browse,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PathAction {
+    Open,
+    Browse,
+    OpenOrBrowse,
+    ConnectAndGo,
+}
+
+impl PathAction {
+    fn label(self) -> Cow<'static, str> {
+        match self {
+            Self::Open => t!("repository.open"),
+            Self::Browse => t!("repository.browse"),
+            Self::OpenOrBrowse => t!("repository.open_or_browse"),
+            Self::ConnectAndGo => t!("repository.connect_and_go"),
+        }
+    }
 }
 
 struct RemotePicker {
@@ -104,11 +128,96 @@ impl RemotePicker {
     fn input(&self) -> &Entity<InputState> {
         self.input.as_ref().expect("repository host input")
     }
+
+    fn connected(&self) -> bool {
+        self.connection
+            .as_ref()
+            .is_some_and(|session| session.failure().is_none())
+    }
 }
 
 impl RepositoryUi {
     fn input(&self) -> &Entity<InputState> {
         self.input.as_ref().expect("repository path input")
+    }
+
+    fn path_action(&self, cx: &App) -> (PathAction, Option<PathBuf>) {
+        let value = self.input().read(cx).value();
+        let value = value.trim();
+        let ssh_address = !self.remote.active && value.starts_with("ssh://");
+        let path = if self.remote.active || ssh_address {
+            PathBuf::from(value)
+        } else {
+            resolve_typed_path(value, self.home.as_deref())
+        };
+        let connected = self.remote.connected();
+        let action = if self.remote.active && !connected {
+            PathAction::ConnectAndGo
+        } else if ssh_address || (self.remote.active && self.remote.legacy) {
+            PathAction::Open
+        } else if value.is_empty() {
+            PathAction::OpenOrBrowse
+        } else {
+            match self.known_path_kind(&path) {
+                Some(true) => PathAction::Open,
+                Some(false) => PathAction::Browse,
+                None => PathAction::OpenOrBrowse,
+            }
+        };
+        let available = !value.is_empty()
+            && self.opening.is_none()
+            && self.browsing.is_none()
+            && !self.remote.connecting
+            && (action != PathAction::ConnectAndGo
+                || !self.remote.input().read(cx).value().trim().is_empty());
+        (action, available.then_some(path))
+    }
+
+    fn known_path_kind(&self, path: &Path) -> Option<bool> {
+        let remote = self.remote.active;
+        // Only submit a cached SSH path directly when it is absolute on the remote host.
+        let matches = |candidate: &Path| {
+            if remote {
+                path.to_str()
+                    .zip(candidate.to_str())
+                    .is_some_and(|(path, candidate)| {
+                        path.starts_with('/')
+                            && path.trim_end_matches('/') == candidate.trim_end_matches('/')
+                    })
+            } else {
+                let path = paths::simplified(path);
+                let candidate = paths::simplified(candidate);
+                path == candidate
+                    || (path.is_relative()
+                        && env::current_dir().is_ok_and(|cwd| cwd.join(path) == candidate))
+            }
+        };
+        if let Some(directory) = &self.directory {
+            if matches(&directory.path) {
+                return Some(directory.repository);
+            }
+            if let Some(entry) = directory.entries.iter().find(|entry| matches(&entry.path)) {
+                return Some(entry.repository);
+            }
+        }
+        let authority = self
+            .remote
+            .connection
+            .as_ref()
+            .map(|session| session.target().authority());
+        self.recents
+            .iter()
+            .filter(|item| !self.unavailable.contains(&item.root))
+            .any(|item| match SshTarget::parse(&item.root) {
+                Ok(Some(target)) => {
+                    remote
+                        && authority.as_deref() == Some(&target.authority())
+                        && matches(&target.path)
+                }
+                Ok(None) => !remote && matches(&item.root),
+                Err(_) => false,
+            })
+            .then_some(true)
     }
 
     pub(super) fn refresh_language(&self, window: &mut Window, cx: &mut App) {
@@ -503,6 +612,9 @@ impl Workspace {
 
     fn confirm_ssh_host(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let ui = &self.repository_ui;
+        if ui.opening.is_some() || ui.remote.connecting {
+            return;
+        }
         let typed = ui.remote.input().read(cx).value().trim().to_owned();
         let hosts = ui.host_candidates(cx);
         let authority = if ui.remote.suggestions
@@ -517,7 +629,11 @@ impl Workspace {
         } else {
             typed
         };
-        if !authority.is_empty() {
+        if !authority.is_empty()
+            && !ui.remote.connection.as_ref().is_some_and(|session| {
+                session.failure().is_none() && session.target().authority() == authority
+            })
+        {
             self.choose_ssh_host(authority, window, cx);
         }
     }
@@ -630,12 +746,20 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         if self.repository_ui.remote.active {
-            let Some(session) = self.repository_ui.remote.connection.take() else {
-                return;
+            let remote = &mut self.repository_ui.remote;
+            let session = remote.connection.take();
+            let root = if let Some(session) = &session {
+                session.target().locator(&path)
+            } else {
+                let authority = remote.input().read(cx).value();
+                let address = format!("ssh://{}/.", authority.trim());
+                let Ok(Some(target)) = SshTarget::parse(Path::new(&address)) else {
+                    return;
+                };
+                target.locator(&path)
             };
-            let root = session.target().locator(&path);
             self.repository_ui.close_path_completions();
-            self.open_repository_with_ssh(Location { root, file: None }, Some(session), window, cx);
+            self.open_repository_with_ssh(Location { root, file: None }, session, window, cx);
         } else {
             self.open_directory_path(path, window, cx);
         }
@@ -692,7 +816,7 @@ impl Workspace {
         if self.repository_ui.remote.active {
             self.browse_ssh_directory(path, false, window, cx);
         } else {
-            self.load_repository_directory(path, cx);
+            self.submit_local_directory(path, false, window, cx);
         }
     }
 
@@ -767,33 +891,30 @@ impl Workspace {
     }
 
     fn submit_repository_path(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let value = self
-            .repository_ui
-            .input()
-            .read(cx)
-            .value()
-            .trim()
-            .to_owned();
-        if self.repository_ui.remote.active {
-            if self.repository_ui.remote.legacy {
-                if value.starts_with('/') {
-                    self.open_browsed_directory(PathBuf::from(value), window, cx);
-                } else {
-                    self.repository_ui.error = Some(t!("repository.absolute_path_required").into());
-                    cx.notify();
-                }
-            } else if !value.is_empty() {
-                self.repository_ui.close_path_completions();
-                self.browse_ssh_directory(PathBuf::from(value), true, window, cx);
-            } else {
-                self.confirm_ssh_host(window, cx);
+        let ui = &mut self.repository_ui;
+        let (action, path) = ui.path_action(cx);
+        let Some(path) = path else {
+            return;
+        };
+        ui.close_path_completions();
+        ui.error = None;
+        match action {
+            PathAction::Open if ui.remote.active && !path.to_string_lossy().starts_with('/') => {
+                ui.error = Some(t!("repository.absolute_path_required").into());
+                cx.notify();
             }
-        } else if !value.is_empty() {
-            let root = resolve_typed_path(&value, self.repository_ui.home.as_deref());
-            if value.starts_with("ssh://") {
-                self.open_directory_path(PathBuf::from(value), window, cx);
-            } else {
-                self.submit_local_directory(root, window, cx);
+            PathAction::Open => self.open_browsed_directory(path, window, cx),
+            PathAction::ConnectAndGo => {
+                let authority = ui.remote.input().read(cx).value().trim().to_owned();
+                self.connect_ssh_picker(authority, Some(path), true, window, cx);
+            }
+            PathAction::Browse | PathAction::OpenOrBrowse => {
+                let open = action == PathAction::OpenOrBrowse;
+                if ui.remote.active {
+                    self.browse_ssh_directory(path, open, window, cx);
+                } else {
+                    self.submit_local_directory(path, open, window, cx);
+                }
             }
         }
     }
@@ -801,6 +922,7 @@ impl Workspace {
     fn submit_local_directory(
         &mut self,
         root: PathBuf,
+        open: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -809,11 +931,13 @@ impl Workspace {
             return;
         }
         ui.close_path_completions();
+        ui.error = None;
         ui.browsing = Some(root.clone());
         ui.directory_error = None;
+        let input_before = ui.input().read(cx).value();
         let path = root.clone();
         let task = cx.background_spawn(async move {
-            if crate::repository::repository_root(&path).is_ok() {
+            if open && crate::repository::repository_root(&path).is_ok() {
                 Ok(None)
             } else {
                 DirectoryListing::read(path).map(Some)
@@ -827,6 +951,11 @@ impl Workspace {
                 match result {
                     Ok(None) => this.open_directory_path(root, window, cx),
                     Ok(Some(directory)) => {
+                        if ui.input().read(cx).value() == input_before {
+                            ui.input().update(cx, |input, cx| {
+                                input.set_value(paths::display(&directory.path), window, cx)
+                            });
+                        }
                         ui.tab = PickerTab::Browse;
                         ui.directory = Some(directory);
                         ui.directory_scroll.set_offset(point(px(0.), px(0.)));
@@ -952,7 +1081,11 @@ impl Workspace {
                 return;
             }
         }
-        self.submit_repository_path(window, cx);
+        if ui.remote.active && ui.input().read(cx).value().trim().is_empty() {
+            self.confirm_ssh_host(window, cx);
+        } else {
+            self.submit_repository_path(window, cx);
+        }
     }
 
     fn choose_path_completion(
@@ -1673,16 +1806,20 @@ impl Workspace {
         opacity: f32,
     ) -> impl IntoElement {
         let open = self.repository_ui.picker_open;
+        let height = window.viewport_size().height;
+        let list_height = repository_picker_list_height(height, true);
+        // Anchor the header while the fields and feedback change the panel height.
+        let top = ((height - list_height - px(192.)) / 2.).max(px(48.));
         deferred(PopupFrame::new(
             v_flex()
                 .id("repository-picker-panel")
                 .absolute()
                 .inset_0()
-                .pt(px(48.))
+                .pt(top)
                 .px_4()
                 .key_context("RepoPicker")
                 .items_center()
-                .justify_center()
+                .justify_start()
                 .opacity(opacity)
                 .occlude()
                 .tab_group()
@@ -1693,7 +1830,16 @@ impl Workspace {
     }
 
     fn ssh_host_input(&self, cx: &Context<Self>, colors: Palette) -> impl IntoElement {
-        let remote = &self.repository_ui.remote;
+        let ui = &self.repository_ui;
+        let remote = &ui.remote;
+        let connected = remote.connected();
+        let label = if connected {
+            t!("repository.connected")
+        } else if remote.error.is_some() || remote.connection.is_some() {
+            t!("common.retry")
+        } else {
+            t!("repository.connect")
+        };
         let candidates = if remote.suggestions {
             self.repository_ui.host_candidates(cx)
         } else {
@@ -1730,7 +1876,7 @@ impl Workspace {
                             .child(
                                 Input::new(remote.input())
                                     .aria_label(t!("common.ssh_host"))
-                                    .readonly(self.repository_ui.opening.is_some()),
+                                    .readonly(ui.opening.is_some() || remote.connecting),
                             )
                             .when(count > 0, |field| {
                                 field.child(
@@ -1758,7 +1904,7 @@ impl Workspace {
                                                                 let label = host.clone();
                                                                 picker_row(
                                                         format!("ssh-host:{host}"),
-                                                        IconName::Terminal,
+                                                        IconName::Network,
                                                         label,
                                                         None,
                                                         None,
@@ -1788,8 +1934,12 @@ impl Workspace {
                             }),
                     )
                     .child(if remote.connecting {
-                        quiet_button("cancel-ssh-browse")
+                        action_button("cancel-ssh-browse")
+                            .secondary()
+                            .h(rems(2.))
+                            .flex_shrink_0()
                             .label(t!("common.cancel"))
+                            .accessibility_label(t!("repository.cancel_connection"))
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.reset_ssh_picker();
                                 cx.notify();
@@ -1797,20 +1947,15 @@ impl Workspace {
                     } else {
                         action_button("select-ssh-host")
                             .secondary()
-                            .label(if remote.error.is_some() {
-                                t!("common.retry")
-                            } else if remote.connection.is_some() {
-                                t!("repository.connected")
-                            } else {
-                                t!("repository.connect")
-                            })
+                            .h(rems(2.))
+                            .debug_selector(|| "select-ssh-host".into())
+                            .flex_shrink_0()
+                            .label(label)
+                            .when(connected, |button| button.text_color(cx.theme().success))
                             .disabled(
-                                self.repository_ui.opening.is_some()
+                                ui.opening.is_some()
                                     || remote.input().read(cx).value().trim().is_empty()
-                                    || remote
-                                        .connection
-                                        .as_ref()
-                                        .is_some_and(|session| session.failure().is_none()),
+                                    || connected,
                             )
                             .on_click(
                                 cx.listener(|this, _, window, cx| {
@@ -1819,19 +1964,128 @@ impl Workspace {
                             )
                     }),
             )
-            .when(remote.connecting, |row| {
-                row.child(feedback(t!("repository.connecting"), false, colors))
+    }
+
+    fn repository_picker_header(
+        &self,
+        modal: bool,
+        busy: bool,
+        cx: &Context<Self>,
+        colors: Palette,
+    ) -> impl IntoElement + use<> {
+        let remote_active = self.repository_ui.remote.active;
+        h_flex()
+            .relative()
+            .justify_center()
+            .flex_shrink_0()
+            .child(
+                h_flex()
+                    .absolute()
+                    .left_0()
+                    .top_0()
+                    .bottom_0()
+                    .text_size(px(18.))
+                    .font_semibold()
+                    .child(t!("repository.open")),
+            )
+            .child(
+                topbar_segments(colors)
+                    .relative()
+                    .top(px(1.))
+                    .id("repository-location-modes")
+                    .role(Role::Group)
+                    .children(
+                        [
+                            (
+                                "repository-location:local",
+                                false,
+                                IconName::Monitor,
+                                t!("repository.local"),
+                            ),
+                            (
+                                "repository-location:ssh",
+                                true,
+                                IconName::Network,
+                                Cow::Borrowed("SSH"),
+                            ),
+                        ]
+                        .map(|(id, remote, glyph, label)| {
+                            let selected = remote_active == remote;
+                            topbar_segment(id, selected, colors)
+                                .w(px(84.))
+                                .content_gap(px(5.))
+                                .icon(glyph)
+                                .icon_size(px(14.))
+                                .label(label)
+                                .toggled(selected)
+                                .disabled(busy)
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.select_location_mode(remote, window, cx);
+                                }))
+                        }),
+                    ),
+            )
+            .when(modal, |header| {
+                header.child(
+                    h_flex().absolute().right_0().top_0().bottom_0().child(
+                        icon_button("close-repository-picker", IconName::X, t!("common.close"))
+                            .icon_size(px(text_base_size(cx)))
+                            .disabled(busy)
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.dismiss_repository_picker(window, cx);
+                                cx.notify();
+                            })),
+                    ),
+                )
             })
-            .when_some(remote.error.as_deref(), |row, error| {
-                row.child(feedback(error, true, colors))
-            })
-            .when(remote.legacy, |row| {
-                row.child(feedback(
-                    t!("repository.browse_requires_helper_update"),
-                    false,
-                    colors,
-                ))
-            })
+    }
+
+    fn repository_picker_status(&self, cx: &Context<Self>, colors: Palette) -> Option<Div> {
+        let ui = &self.repository_ui;
+        let remote_error = ui.remote.error.as_deref().filter(|_| ui.remote.active);
+        let status = if let Some(error) = ui.error.as_deref().or(remote_error) {
+            Some((SharedString::from(error.to_owned()), true))
+        } else if let Some(path) = ui.opening.as_deref() {
+            Some((
+                t!("repository.opening_path", path = ui.path_label(path))
+                    .into_owned()
+                    .into(),
+                false,
+            ))
+        } else if ui.remote.connecting {
+            Some((t!("repository.connecting").into(), false))
+        } else if ui.remote.legacy && ui.remote.connected() {
+            Some((t!("repository.browse_requires_helper_update").into(), false))
+        } else {
+            None
+        };
+        let (message, error) = status?;
+        Some(
+            h_flex()
+                .flex_shrink_0()
+                .child(
+                    feedback(message.clone(), error, colors)
+                        .flex_1()
+                        .line_clamp(1)
+                        .tooltip(move |window, cx| Tooltip::new(message.clone()).build(window, cx)),
+                )
+                .when(
+                    ui.opening
+                        .as_deref()
+                        .and_then(Path::to_str)
+                        .is_some_and(|path| path.starts_with("ssh://")),
+                    |row| {
+                        row.child(
+                            quiet_button("cancel-ssh-open")
+                                .icon(IconName::X)
+                                .label(t!("repository.cancel_connection"))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.cancel_ssh_open(cx);
+                                })),
+                        )
+                    },
+                ),
+        )
     }
 
     fn repository_picker(
@@ -1843,12 +2097,12 @@ impl Workspace {
     ) -> impl IntoElement + use<> {
         let ui = &self.repository_ui;
         let busy = ui.opening.is_some();
-        let extra = if ui.remote.active { 76. } else { 0. };
-        let list_height = (window.viewport_size().height
-            - px(if modal { 310. + extra } else { 270. + extra }))
-        .clamp(px(125.), px(276.));
+        let (action, path) = ui.path_action(cx);
+        let label = action.label();
+        let list_height = repository_picker_list_height(window.viewport_size().height, modal);
         v_flex()
             .id("repository-picker-surface")
+            .debug_selector(|| "repository-picker-surface".into())
             .role(if modal { Role::Dialog } else { Role::Group })
             .aria_label(t!("repository.open"))
             .w(px(564.))
@@ -1866,134 +2120,57 @@ impl Workspace {
                         .border_color(colors.border)
                 }
             })
-            .child(
-                h_flex()
-                    .justify_between()
-                    .child(
-                        div()
-                            .text_size(px(18.))
-                            .font_semibold()
-                            .child(t!("repository.open")),
-                    )
-                    .when(modal, |header| {
-                        header.child(
-                            compact_icon_button(
-                                "close-repository-picker",
-                                IconName::X,
-                                t!("common.close"),
-                            )
-                            .disabled(busy)
-                            .on_click(cx.listener(
-                                |this, _, window, cx| {
-                                    this.dismiss_repository_picker(window, cx);
-                                    cx.notify();
-                                },
-                            )),
-                        )
-                    }),
-            )
-            .child(
-                h_flex()
-                    .id("repository-location-modes")
-                    .role(Role::TabList)
-                    .gap_1()
-                    .children(
-                        [
-                            (false, t!("repository.local")),
-                            (true, Cow::Borrowed("SSH")),
-                        ]
-                        .map(|(remote, label)| {
-                            quiet_button(if remote {
-                                "repository-location:ssh"
-                            } else {
-                                "repository-location:local"
-                            })
-                            .role(Role::Tab)
-                            .label(label)
-                            .selected(ui.remote.active == remote)
-                            .disabled(busy)
-                            .on_click(cx.listener(
-                                move |this, _, window, cx| {
-                                    this.select_location_mode(remote, window, cx)
-                                },
-                            ))
-                        }),
-                    ),
-            )
-            .when(ui.remote.active, |panel| {
-                panel.child(self.ssh_host_input(cx, colors))
-            })
+            .child(self.repository_picker_header(modal, busy, cx, colors))
             .child(
                 v_flex()
+                    .flex_shrink_0()
                     .gap_1()
-                    .child(section_title(
-                        if ui.remote.active {
-                            t!("repository.remote_path")
-                        } else {
-                            t!("repository.local_path")
-                        },
-                        colors,
-                    ))
+                    .when(ui.remote.active, |fields| {
+                        fields.child(self.ssh_host_input(cx, colors))
+                    })
                     .child(
-                        h_flex()
-                            .gap_2()
-                            .child(self.repository_path_input(busy, cx, colors))
+                        v_flex()
+                            .gap_1()
+                            .child(section_title(
+                                if ui.remote.active {
+                                    t!("repository.remote_path")
+                                } else {
+                                    t!("repository.local_path")
+                                },
+                                colors,
+                            ))
                             .child(
-                                action_button("submit-repository")
-                                    .primary()
-                                    .label(
-                                        if ui.remote.active
-                                            && !ui.remote.legacy
-                                            && !ui.directory.as_ref().is_some_and(|dir| {
-                                                dir.repository
-                                                    && dir.path.to_string_lossy()
-                                                        == ui.input().read(cx).value().trim()
-                                            })
-                                        {
-                                            t!("repository.browse")
-                                        } else {
-                                            t!("repository.open")
-                                        },
-                                    )
-                                    .disabled(
-                                        busy || ui.remote.connecting
-                                            || ui.browsing.is_some()
-                                            || ui.input().read(cx).value().trim().is_empty(),
-                                    )
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.submit_repository_path(window, cx)
-                                    })),
+                                h_flex()
+                                    .gap_2()
+                                    .child(self.repository_path_input(
+                                        busy || ui.remote.connecting,
+                                        cx,
+                                        colors,
+                                    ))
+                                    .child(
+                                        action_button("submit-repository")
+                                            .debug_selector(|| "submit-repository".into())
+                                            .primary()
+                                            .size(rems(2.))
+                                            .rounded(window.rem_size())
+                                            .p_0()
+                                            .flex_shrink_0()
+                                            .icon(IconName::ArrowRight)
+                                            .accessibility_label(label.clone())
+                                            .tooltip(label)
+                                            .disabled(path.is_none())
+                                            .on_click(cx.listener(|this, _, window, cx| {
+                                                this.submit_repository_path(window, cx);
+                                            })),
+                                    ),
                             ),
                     ),
             )
-            .when_some(ui.error.as_deref(), |panel, error| {
-                panel.child(feedback(error, true, colors))
-            })
-            .when_some(ui.opening.as_deref(), |panel, path| {
-                panel.child(feedback(
-                    t!("repository.opening_path", path = ui.path_label(path)).into_owned(),
-                    false,
-                    colors,
-                ))
-            })
-            .when(
-                ui.opening
-                    .as_deref()
-                    .and_then(|path| path.to_str())
-                    .is_some_and(|path| path.starts_with("ssh://")),
-                |panel| {
-                    panel.child(
-                        quiet_button("cancel-ssh-open")
-                            .label(t!("repository.cancel_connection"))
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.cancel_ssh_open(cx);
-                            })),
-                    )
-                },
-            )
+            .children(self.repository_picker_status(cx, colors))
             .child(
                 h_flex()
                     .id("repository-picker-tabs")
+                    .debug_selector(|| "repository-picker-tabs".into())
                     .role(Role::TabList)
                     .gap_2()
                     .border_b_1()
@@ -2005,6 +2182,10 @@ impl Workspace {
                         ]
                         .map(|(tab, label)| {
                             let selected = ui.tab == tab;
+                            let id = match tab {
+                                PickerTab::Recent => "repository-tab-recent",
+                                PickerTab::Browse => "repository-tab-browse",
+                            };
                             h_flex()
                                 .pb(px(2.))
                                 .border_b_1()
@@ -2014,16 +2195,14 @@ impl Workspace {
                                     transparent_black()
                                 })
                                 .child(
-                                    quiet_button(match tab {
-                                        PickerTab::Recent => "repository-tab-recent",
-                                        PickerTab::Browse => "repository-tab-browse",
-                                    })
-                                    .role(Role::Tab)
-                                    .selected(selected)
-                                    .label(label)
-                                    .on_click(cx.listener(
-                                        move |this, _, _, cx| this.pick_repository_tab(tab, cx),
-                                    )),
+                                    quiet_button(id)
+                                        .debug_selector(move || id.into())
+                                        .role(Role::Tab)
+                                        .selected(selected)
+                                        .label(label)
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            this.pick_repository_tab(tab, cx)
+                                        })),
                                 )
                         }),
                     ),
@@ -2052,9 +2231,10 @@ impl Workspace {
                 SshTarget::parse(&item.root).ok().flatten().is_some() == ui.remote.active
             })
             .collect::<Vec<_>>();
-        v_flex()
+        let list = v_flex()
             .id("recent-repositories")
-            .h(height.min(px((recents.len().max(3) * 44) as f32)))
+            .h(height)
+            .pr(REPOSITORY_PICKER_SCROLL_GUTTER)
             .overflow_y_popup_scrollbar()
             .when(recents.is_empty(), |list| {
                 list.child(feedback(t!("repository.no_recent"), false, colors))
@@ -2066,8 +2246,10 @@ impl Workspace {
                     .repository
                     .as_ref()
                     .is_some_and(|repo| repo.root == item.root);
+                let row_id = format!("recent-row:{}", item.root.display());
                 h_flex()
-                    .id(format!("recent-row:{}", item.root.display()))
+                    .id(SharedString::from(row_id.clone()))
+                    .debug_selector(move || row_id)
                     .gap_1()
                     .pr_1()
                     .rounded_md()
@@ -2090,7 +2272,9 @@ impl Workspace {
                             },
                         )),
                     )
-            }))
+            }));
+        // Let the scrollbar use the dialog padding while keeping the rows aligned with the tabs.
+        div().mr(-REPOSITORY_PICKER_SCROLL_GUTTER).child(list)
     }
 
     fn recent_repository_row(
@@ -2289,7 +2473,6 @@ impl Workspace {
                         |header, dir| {
                             header.child(open_directory_button(
                                 "open-current-directory",
-                                t!("repository.open_this"),
                                 dir.path.clone(),
                                 busy,
                                 cx,
@@ -2315,6 +2498,8 @@ impl Workspace {
                     .id("repository-directory-entries")
                     .flex_1()
                     .min_h_0()
+                    .mr(-REPOSITORY_PICKER_SCROLL_GUTTER)
+                    .pr(REPOSITORY_PICKER_SCROLL_GUTTER)
                     .overflow_y_scroll()
                     .track_scroll(&ui.directory_scroll)
                     .lock_scroll_axis()
@@ -2332,8 +2517,12 @@ impl Workspace {
                                 IconName::Folder
                             };
                             let label = paths::display(&path);
+                            let row_id = format!("browse-directory-row:{label}");
                             h_flex()
-                                .gap_1()
+                                .id(SharedString::from(row_id.clone()))
+                                .debug_selector(move || row_id)
+                                .rounded(px(5.))
+                                .when(!busy, |row| row.hover(|style| style.bg(colors.hover)))
                                 .child(
                                     picker_row(
                                         format!("browse-directory:{label}"),
@@ -2345,6 +2534,7 @@ impl Workspace {
                                         colors,
                                     )
                                     .flex_1()
+                                    .text()
                                     .disabled(busy)
                                     .tooltip(label.clone())
                                     .when(entry.repository, |button| {
@@ -2363,13 +2553,19 @@ impl Workspace {
                                     )),
                                 )
                                 .when(entry.repository, |row| {
-                                    row.child(open_directory_button(
-                                        format!("open-listed-directory:{label}"),
-                                        t!("repository.open_item"),
-                                        path,
-                                        busy,
-                                        cx,
-                                    ))
+                                    let action_id = format!("open-listed-directory:{label}");
+                                    row.child(
+                                        open_directory_button(
+                                            SharedString::from(action_id.clone()),
+                                            path,
+                                            busy,
+                                            cx,
+                                        )
+                                        .debug_selector(move || action_id)
+                                        .text()
+                                        .h(px(31.))
+                                        .w(px(34.)),
+                                    )
                                 })
                         }))
                     })
@@ -2442,6 +2638,10 @@ fn menu_section(colors: Palette) -> Div {
         .pb_1()
         .border_t_1()
         .border_color(colors.border)
+}
+
+fn repository_picker_list_height(viewport_height: Pixels, modal: bool) -> Pixels {
+    (viewport_height - px(if modal { 310. } else { 270. })).clamp(px(125.), px(276.))
 }
 
 fn section_title(text: impl Into<SharedString>, colors: Palette) -> Div {
@@ -2598,18 +2798,19 @@ fn picker_row(
 
 fn open_directory_button(
     id: impl Into<ElementId>,
-    label: impl Into<SharedString>,
     path: PathBuf,
     busy: bool,
     cx: &Context<Workspace>,
 ) -> Button {
-    action_button(id)
-        .secondary()
-        .h(px(26.))
-        .label(label)
+    let label = t!("repository.open_path", path = paths::display(&path)).into_owned();
+    quiet_button(id)
+        .size(px(26.))
+        .p_0()
+        .icon(IconName::ArrowRight)
+        .tooltip(label.clone())
         .disabled(busy)
         .flex_shrink_0()
-        .accessibility_label(t!("repository.open_path", path = paths::display(&path)).into_owned())
+        .accessibility_label(label)
         .on_click(cx.listener(move |this, _, window, cx| {
             this.open_browsed_directory(path.clone(), window, cx)
         }))

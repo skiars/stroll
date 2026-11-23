@@ -4002,11 +4002,7 @@ impl Workspace {
     }
 
     fn topbar(&self, window: &Window, cx: &Context<Self>, colors: Palette) -> impl IntoElement {
-        let nav = h_flex()
-            .gap(px(4.))
-            .p(px(3.))
-            .rounded(px(8.))
-            .bg(colors.nav_track)
+        let nav = topbar_segments(colors)
             .child(
                 nav_item(
                     "nav-docs",
@@ -5237,6 +5233,30 @@ impl Render for Workspace {
     }
 }
 
+fn topbar_segments(colors: Palette) -> Div {
+    h_flex()
+        .gap(px(4.))
+        .p(px(3.))
+        .rounded(px(8.))
+        .bg(colors.nav_track)
+}
+
+fn topbar_segment(id: &'static str, active: bool, colors: Palette) -> Button {
+    quiet_button(id)
+        .debug_selector(move || id.into())
+        .with_size(px(20.))
+        .rounded(px(6.))
+        .h(px(24.))
+        .px_3()
+        .selected(active)
+        .when(active, |button| {
+            button
+                .bg(colors.elevated)
+                .text_color(colors.accent)
+                .shadow_xs()
+        })
+}
+
 fn nav_item(
     id: &'static str,
     label: impl Into<SharedString>,
@@ -5310,20 +5330,8 @@ fn nav_item(
         .flex_shrink_0()
     };
 
-    quiet_button(id)
-        .debug_selector(move || id.into())
-        .with_size(px(20.))
-        .rounded(px(6.))
-        .h(px(24.))
-        .px_3()
+    topbar_segment(id, active, colors)
         .accessibility_label(label.clone())
-        .selected(active)
-        .when(active, |button| {
-            button
-                .bg(colors.elevated)
-                .text_color(colors.accent)
-                .shadow_xs()
-        })
         .child(text(
             label,
             label_size,
