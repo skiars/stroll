@@ -95,13 +95,17 @@ fn diff_toolbar_navigates_in_unified_split_and_single_file_modes() {
         });
         settle(visual);
     };
-    let back_to_top = |visual: &mut VisualTestContext, split: bool| {
+    let back_to_top = |visual: &mut VisualTestContext, split: bool, smooth, reduce_motion| {
+        visual.update(|_, cx| {
+            cx.set_smooth_scrolling(smooth);
+            cx.set_reduce_motion(reduce_motion);
+        });
         let offsets = |visual: &mut VisualTestContext| {
-            visual.update(|window, cx| {
+            visual.update(|_, cx| {
                 let editor = &panel.read(cx).editor;
                 (
                     editor.original_state().read(cx).scroll_offset().y,
-                    editor.focused_column(window, cx).read(cx).scroll_offset().y,
+                    editor.modified_state().read(cx).scroll_offset().y,
                 )
             })
         };
@@ -111,7 +115,31 @@ fn diff_toolbar_navigates_in_unified_split_and_single_file_modes() {
         if split {
             assert_eq!(left, right);
         }
-        click(visual, "git-diff-back-to-top");
+        let button = visual.debug_bounds("git-diff-back-to-top").unwrap();
+        visual.simulate_click(button.center(), Modifiers::default());
+        let (before_left, before_right) = (left, right);
+        if smooth && !reduce_motion {
+            let mut saw_split_motion = false;
+            for _ in 0..3 {
+                draw_frame(visual);
+                let (left, right) = offsets(visual);
+                saw_split_motion |=
+                    before_left < left && left < px(0.) && before_right < right && right < px(0.);
+            }
+            let (_, right) = offsets(visual);
+            assert!(before_right < right && right < px(0.));
+            if split {
+                assert!(saw_split_motion);
+            }
+        } else {
+            draw_frame(visual);
+            let (left, right) = offsets(visual);
+            assert_eq!(right, px(0.));
+            if split {
+                assert_eq!(left, px(0.));
+            }
+        }
+        settle(visual);
         let (left, right) = offsets(visual);
         assert_eq!(right, px(0.));
         if split {
@@ -127,12 +155,14 @@ fn diff_toolbar_navigates_in_unified_split_and_single_file_modes() {
     assert!(back_button.right() <= single_file_button.left());
 
     assert_eq!(paths(visual), ["first.txt", "second.txt"]);
-    back_to_top(visual, false);
+    back_to_top(visual, false, true, false);
+    back_to_top(visual, false, false, false);
+    back_to_top(visual, false, true, true);
     click(visual, "git-diff-single-file");
     assert_eq!(paths(visual), ["first.txt"]);
     click(visual, "git-tree-row:file:second.txt");
     assert_eq!(paths(visual), ["second.txt"]);
-    back_to_top(visual, false);
+    back_to_top(visual, false, true, false);
     assert_eq!(paths(visual), ["second.txt"]);
     click(visual, "git-tree-row:file:first.txt");
     assert_eq!(paths(visual), ["first.txt"]);
@@ -152,7 +182,7 @@ fn diff_toolbar_navigates_in_unified_split_and_single_file_modes() {
     visual.simulate_keystrokes("down down enter");
     settle(visual);
     assert!(visual.update(|_, cx| panel.read(cx).split));
-    back_to_top(visual, true);
+    back_to_top(visual, true, true, false);
 
     let left = visual.update(|window, cx| {
         let left = panel.read(cx).editor.original_state().clone();
@@ -160,6 +190,7 @@ fn diff_toolbar_navigates_in_unified_split_and_single_file_modes() {
         left
     });
     settle(visual);
+    back_to_top(visual, true, true, false);
     click(visual, "git-reading-options");
     visual.simulate_keystrokes("down down down down enter");
     settle(visual);

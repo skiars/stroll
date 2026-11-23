@@ -1247,6 +1247,11 @@ impl ReviewEditor {
         &self.original.editor
     }
 
+    #[cfg(test)]
+    pub(super) fn modified_state(&self) -> &Entity<EditorState> {
+        &self.modified.editor
+    }
+
     pub(super) fn close_other_search(&self, active: &Entity<EditorState>, cx: &mut App) {
         for column in [&self.original.editor, &self.modified.editor] {
             if column != active && column.read(cx).search_session().open {
@@ -1332,6 +1337,10 @@ impl ReviewEditor {
         cx.notify();
     }
 
+    fn can_animate_scroll(driver: &Entity<EditorState>, cx: &App) -> bool {
+        cx.smooth_scrolling() && !cx.reduce_motion() && driver.read(cx).line_height().is_some()
+    }
+
     fn scroll_to_rows(
         &self,
         rows: [usize; 2],
@@ -1341,10 +1350,7 @@ impl ReviewEditor {
         cx: &mut App,
     ) -> bool {
         let driver = self.focused_column(window, cx);
-        let animate = animate
-            && cx.smooth_scrolling()
-            && !cx.reduce_motion()
-            && driver.read(cx).line_height().is_some();
+        let animate = animate && Self::can_animate_scroll(driver, cx);
         for (column, row) in [(&self.original, rows[0]), (&self.modified, rows[1])] {
             if !animate || &column.editor == driver {
                 column.editor.update(cx, |editor, cx| {
@@ -1747,9 +1753,19 @@ impl ReviewEditor {
             panel
                 .diff
                 .update(cx, |diff, _| diff.clear_projected_navigation());
+            let driver = panel.editor.focused_column(window, cx);
+            let animate = Self::can_animate_scroll(driver, cx);
             for column in [&panel.editor.original, &panel.editor.modified] {
+                let is_driver = &column.editor == driver;
                 column.editor.update(cx, |editor, cx| {
-                    editor.set_scroll_offset(point(editor.scroll_offset().x, px(0.)), cx);
+                    let offset = editor.scroll_offset();
+                    let follows_driver = animate && panel.editor.split && !is_driver;
+                    // Clear the follower's queued scroll so it can track the driver.
+                    let y = if follows_driver { offset.y } else { px(0.) };
+                    editor.set_scroll_offset(point(offset.x, y), cx);
+                    if animate && is_driver {
+                        editor.animate_pending_scroll();
+                    }
                 });
             }
             return;
