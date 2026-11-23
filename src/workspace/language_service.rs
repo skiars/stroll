@@ -490,10 +490,12 @@ impl Workspace {
         let is_markdown = crate::docs::is_markdown(path);
         let completion_activation = if is_markdown {
             CompletionActivation::Link
-        } else if matches!(language, "text" | "plaintext") {
-            CompletionActivation::TriggerOnly
-        } else {
+        } else if !matches!(language, "text" | "plaintext")
+            || self.source_resources(path).is_source_file(path)
+        {
             CompletionActivation::Code
+        } else {
+            CompletionActivation::TriggerOnly
         };
         let (server, refresh) = connection
             .map(|(document, refresh)| {

@@ -79,6 +79,14 @@ while (message := receive()) is not None:
                     }],
                 },
             ]}
+        elif prefix.startswith("let value = sub."):
+            assert context == {"triggerKind": 1}
+            assert line[len(prefix):] == ".items()"
+            start = {"line": row, "character": utf16("let value = sub.")}
+            end = {"line": row, "character": column}
+            result = [{"label": "fragments", "textEdit": {
+                "range": {"start": start, "end": end}, "newText": "fragments"
+            }}]
         elif prefix.endswith("objectid"):
             assert context == {"triggerKind": 1}
             result = [{"label": "objectIdentifier"}]

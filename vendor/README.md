@@ -322,6 +322,8 @@ dialogs in a Wayland window after changes to paint order or focus handling.
   side can no longer fit a row. A close followed by a reopen before the
   next render also chooses a fresh side. The menu
   validates the document and menu revisions before applying a candidate's edits.
+  A single backward deletion also reports the removed text to the completion
+  provider so it can request candidates for a shortened member name.
 
 - C++ overload names use function captures, and primitive type captures
   recover after declaration macros. Boolean literals `true` and `false` use

@@ -327,6 +327,84 @@ fn workspace_completion_triggers_filters_applies_and_drops_stale_replies() -> Re
 }
 
 #[test]
+fn workspace_completion_requeries_deleted_members_in_language_packs() -> Result<()> {
+    use crate::{repository::Repository, session::WorktreeSession};
+    use serde_json::json;
+
+    let fixture = tempfile::tempdir()?;
+    let script = fixture.path().join("server.py");
+    fs::write(
+        &script,
+        include_str!("../../../tests/fixtures/lsp_completion.py"),
+    )?;
+    let root = fixture.path().join("repository");
+    fs::create_dir(&root)?;
+    ensure!(
+        Command::new("git")
+            .args(["init", "-q"])
+            .arg(&root)
+            .status()?
+            .success()
+    );
+    let extension = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/textmate");
+    fs::write(
+        root.join(".stroll.json"),
+        serde_json::to_vec(&json!({
+            "languageExtensionPaths": [extension],
+            "lsp": [{"id": "example", "languages": {".example": "example"},
+                "server": {"command": "python3", "args": ["-u", script]}}],
+        }))?,
+    )?;
+    let store = Store::new(fixture.path().join("state"))?;
+    store.save_session(
+        &Repository::open(&root)?,
+        &WorktreeSession {
+            worktree_lsp_trusted: true,
+            ..Default::default()
+        },
+    )?;
+
+    let source = "let value = sub.fragments.items()\n";
+    let caret = source.find(".items").unwrap();
+    with_source_editor(
+        fixture.path(),
+        "main.example",
+        "",
+        source,
+        caret,
+        |visual, editor| {
+            visual
+                .simulate_keystrokes("backspace backspace backspace backspace backspace backspace");
+            wait(visual, "shortened member", |visual| {
+                labels(visual, editor) == ["fragments"]
+            })?;
+            visual.simulate_keystrokes("escape g");
+            wait(visual, "language-pack identifier", |visual| {
+                labels(visual, editor) == ["fragments"]
+            })?;
+            visual.simulate_keystrokes("backspace backspace backspace backspace");
+            wait(visual, "empty member", |visual| {
+                labels(visual, editor) == ["fragments"]
+            })?;
+            let requests = fs::read_to_string(fixture.path().join("requests"))?;
+            assert_eq!(
+                requests.lines().collect::<Vec<_>>(),
+                [
+                    "1 let value = sub.fra",
+                    "1 let value = sub.frag",
+                    "1 let value = sub.",
+                ]
+            );
+            visual.simulate_keystrokes("tab");
+            wait(visual, "restored member", |visual| {
+                visual.update(|_, cx| editor.read(cx).text().to_string() == source)
+            })?;
+            Ok(())
+        },
+    )
+}
+
+#[test]
 fn workspace_completion_keeps_the_selected_candidate_across_a_refresh() -> Result<()> {
     let fixture = tempfile::tempdir()?;
     let script = fixture.path().join("server.py");

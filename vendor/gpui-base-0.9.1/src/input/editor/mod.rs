@@ -134,6 +134,15 @@ impl InputModeKind for EditorMode {
         state.handle_completion_trigger(range, text, window, cx);
     }
 
+    fn on_text_deleted(
+        state: &mut InputBaseState<Self>,
+        text: ropey::RopeSlice<'_>,
+        window: &mut Window,
+        cx: &mut gpui::Context<InputBaseState<Self>>,
+    ) {
+        state.handle_completion_deletion(text, window, cx);
+    }
+
     fn clear_inline_completion(
         state: &mut InputBaseState<Self>,
         cx: &mut gpui::Context<InputBaseState<Self>>,

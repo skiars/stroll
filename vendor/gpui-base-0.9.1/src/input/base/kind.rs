@@ -24,7 +24,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use gpui::{Div, Entity, Stateful, Window};
-use ropey::Rope;
+use ropey::{Rope, RopeSlice};
 
 use super::decorations::DecorationCollections;
 use super::lsp::{ContextMenuContent, HoverDefinition, InlineCompletion};
@@ -313,6 +313,15 @@ pub trait InputModeKind: sealed::Sealed + Sized + 'static {
         _state: &mut InputBaseState<Self>,
         _range: &std::ops::Range<usize>,
         _text: &str,
+        _window: &mut Window,
+        _cx: &mut gpui::Context<InputBaseState<Self>>,
+    ) {
+    }
+
+    /// Offers the text removed by one interactive backward deletion.
+    fn on_text_deleted(
+        _state: &mut InputBaseState<Self>,
+        _text: RopeSlice<'_>,
         _window: &mut Window,
         _cx: &mut gpui::Context<InputBaseState<Self>>,
     ) {

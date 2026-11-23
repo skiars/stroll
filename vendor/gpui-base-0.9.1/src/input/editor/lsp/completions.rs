@@ -6,7 +6,7 @@ use lsp_types::{
     InlineCompletionItem, InlineCompletionResponse, InlineCompletionTriggerKind,
     request::Completion,
 };
-use ropey::Rope;
+use ropey::{Rope, RopeSlice};
 use std::{cell::RefCell, ops::Range, rc::Rc, time::Duration};
 
 use crate::input::{InputBaseState, ShowCompletions};
@@ -146,6 +146,7 @@ impl Default for CompletionMenuOptions {
 #[doc(hidden)]
 pub enum CompletionInput<'a> {
     Invoked,
+    Deleted(RopeSlice<'a>),
     Typed {
         text: &'a str,
         /// Start of a single insertion. Compound edits have no insertion start.
@@ -253,6 +254,26 @@ impl Default for InlineCompletion {
 }
 
 impl InputBaseState<EditorMode> {
+    pub(crate) fn handle_completion_deletion(
+        &mut self,
+        text: RopeSlice<'_>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(provider) = self.extras.lsp.completion_provider.clone()
+            && self.selections.is_single()
+            && !self.is_composing()
+            && self.is_editable()
+        {
+            self.request_prepared_completion(
+                &*provider,
+                CompletionInput::Deleted(text),
+                window,
+                cx,
+            );
+        }
+    }
+
     pub(crate) fn handle_completion_trigger(
         &mut self,
         range: &Range<usize>,
@@ -423,7 +444,7 @@ impl InputBaseState<EditorMode> {
             CompletionInput::Typed {
                 insertion_start, ..
             } => insertion_start,
-            CompletionInput::Invoked => None,
+            CompletionInput::Invoked | CompletionInput::Deleted(_) => None,
         };
         let was_open =
             std::mem::take(&mut self.extras.context_menu_content.completion.open_before_edit);

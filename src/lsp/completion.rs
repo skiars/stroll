@@ -207,6 +207,18 @@ impl CompletionProvider for EditorLsp {
         let invoked = CompletionTriggerKind::INVOKED;
         let (start, kind, trigger_character, delay, code_only) = match input {
             CompletionInput::Invoked => (prefix(text, caret), invoked, None, Duration::ZERO, false),
+            CompletionInput::Deleted(removed) => {
+                let start = prefix(text, caret);
+                if activation != CompletionActivation::Code
+                    || text.chars_at(start).reversed().next() != Some('.')
+                    || !removed.chars().all(identifier)
+                {
+                    return None;
+                }
+                // The server may have filtered against the longer prefix.
+                // Requery against this revision even after a complete list.
+                (start, invoked, None, DEBOUNCE, true)
+            }
             CompletionInput::Typed {
                 text: typed,
                 insertion_start,

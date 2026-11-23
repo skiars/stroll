@@ -2306,6 +2306,12 @@ impl<M: InputModeKind> InputBaseState<M> {
             selection.end = end;
             new_selections.push(selection);
         }
+        let deleted = match new_selections.as_slice() {
+            [selection] if collapsed_intent == EditIntent::Backspace && !selection.is_empty() => {
+                Some((self.text.clone(), selection.start..selection.end))
+            }
+            _ => None,
+        };
         // Capture the user's selections before expanding or merging deletion
         // ranges. The edit ranges cannot reconstruct their original carets.
         self.undo_manager.begin_transaction_with(intent);
@@ -2319,6 +2325,14 @@ impl<M: InputModeKind> InputBaseState<M> {
         self.silent_replace_text = silent;
         self.replace_text_in_range(None, "", window, cx);
         self.silent_replace_text = was_silent;
+        if let Some((old_text, range)) = deleted
+            && !silent
+            && !was_silent
+            && self.document_revision != revision
+            && self.cursor() == range.start
+        {
+            M::on_text_deleted(self, old_text.slice(range), window, cx);
+        }
         self.reveal_after_interactive_edit(revision);
         self.undo_manager
             .record_selections(cursors, self.selections.iter().copied().collect());
