@@ -8,7 +8,7 @@ use std::{
     ptr,
 };
 
-use super::PtySize;
+use super::{PtySize, ShellMode};
 
 #[repr(C)]
 struct Handles {
@@ -43,6 +43,7 @@ pub(crate) fn shell() -> OsString {
 impl Pty {
     pub(super) fn open(
         shell: &OsStr,
+        _mode: ShellMode,
         root: &Path,
         size: PtySize,
     ) -> io::Result<(Self, File, File)> {

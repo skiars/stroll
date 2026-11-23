@@ -22,6 +22,13 @@ mod platform;
 
 pub(crate) use platform::shell;
 
+#[derive(Clone, Copy)]
+pub(crate) enum ShellMode {
+    #[cfg(feature = "desktop")]
+    Interactive,
+    Login,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct PtySize {
     pub cols: u16,
@@ -50,6 +57,7 @@ pub(crate) struct Process {
 impl Process {
     pub(crate) fn start(
         shell: OsString,
+        mode: ShellMode,
         root: &Path,
         size: PtySize,
         commands: mpsc::Receiver<Command>,
@@ -57,7 +65,7 @@ impl Process {
     ) -> io::Result<Self> {
         let root = root.to_owned();
         Self::spawn(events, move |output, stopping| {
-            run(&shell, &root, size, commands, output, stopping)
+            run(&shell, mode, &root, size, commands, output, stopping)
         })
     }
 
@@ -127,13 +135,14 @@ impl Drop for Process {
 
 fn run(
     shell: &OsString,
+    mode: ShellMode,
     root: &Path,
     size: PtySize,
     commands: mpsc::Receiver<Command>,
     events: &async_channel::Sender<Event>,
     stopping: &AtomicBool,
 ) -> io::Result<Option<u32>> {
-    let (mut pty, reader, writer) = platform::Pty::open(shell, root, size)?;
+    let (mut pty, reader, writer) = platform::Pty::open(shell, mode, root, size)?;
     // Keep ConPTY's synchronous input and output pipes on separate threads.
     // Output is bounded so an unbounded producer cannot starve the UI or fill memory.
     let reader_stop = Arc::new(AtomicBool::new(false));

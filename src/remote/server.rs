@@ -492,7 +492,14 @@ impl Server {
                 ensure!(terminals.len() < 32, "Remote terminal limit reached");
                 let (commands, requests) = mpsc::channel();
                 let (output, events) = async_channel::bounded(16);
-                let process = pty::Process::start(pty::shell(), root, size, requests, output)?;
+                let process = pty::Process::start(
+                    pty::shell(),
+                    pty::ShellMode::Login,
+                    root,
+                    size,
+                    requests,
+                    output,
+                )?;
                 let id = self.next_terminal.fetch_add(1, Ordering::Relaxed);
                 terminals.insert(
                     id,

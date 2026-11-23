@@ -1,6 +1,6 @@
 //! End-to-end stdio protocol tests for `stroll-remote`.
 //!
-//! Send frames to a real helper to cover Windows paths, grouped diffs, and invalidation after staging.
+//! Send frames to a real helper to cover workspace operations and terminal startup.
 
 use std::{
     io::{BufReader, Read, Write},
@@ -19,7 +19,11 @@ struct Helper {
 
 impl Helper {
     fn start() -> Self {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_stroll-remote"))
+        Self::start_with(&mut Command::new(env!("CARGO_BIN_EXE_stroll-remote")))
+    }
+
+    fn start_with(command: &mut Command) -> Self {
+        let mut child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -107,6 +111,48 @@ fn fixture() -> tempfile::TempDir {
 
 fn comparison() -> Value {
     json!({ "Worktree": { "mode": "All", "base": null } })
+}
+
+#[cfg(unix)]
+#[test]
+fn helper_opens_a_login_shell_on_a_pty() {
+    use std::{
+        fs,
+        os::unix::fs::PermissionsExt as _,
+        thread,
+        time::{Duration, Instant},
+    };
+
+    let repo = fixture();
+    let shell = repo.path().join("test-shell");
+    fs::write(
+        &shell,
+        "#!/bin/sh\n[ \"$1\" = -l ] && [ -t 0 ] && [ -t 1 ] && [ -t 2 ]\n",
+    )
+    .unwrap();
+    fs::set_permissions(&shell, fs::Permissions::from_mode(0o755)).unwrap();
+    let mut helper =
+        Helper::start_with(Command::new(env!("CARGO_BIN_EXE_stroll-remote")).env("SHELL", shell));
+    helper.ok(json!({ "OpenWorkspace": repo.path() }));
+    let terminal = helper.ok(json!({ "TerminalOpen": {
+        "cols": 80, "rows": 24, "cell_width": 8, "cell_height": 16
+    }}));
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let events = helper.ok(json!({ "TerminalPoll": terminal }));
+        let events = events.as_array().unwrap();
+        if let Some(exit) = events.iter().find_map(|event| event.get("Exit")) {
+            assert_eq!(*exit, 0, "Expected a login shell with terminal descriptors");
+            break;
+        }
+        assert!(
+            events.iter().all(|event| event.get("Error").is_none()),
+            "{events:?}"
+        );
+        assert!(Instant::now() < deadline, "Terminal did not exit");
+        thread::sleep(Duration::from_millis(10));
+    }
 }
 
 #[test]

@@ -14,7 +14,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use super::PtySize;
+use super::{PtySize, ShellMode};
 
 pub(super) struct Pty {
     master: File,
@@ -52,6 +52,7 @@ pub(crate) fn shell() -> OsString {
 impl Pty {
     pub(super) fn open(
         shell: &OsStr,
+        mode: ShellMode,
         root: &Path,
         size: PtySize,
     ) -> io::Result<(Self, File, File)> {
@@ -76,8 +77,14 @@ impl Pty {
         let reader = master.try_clone()?;
         let writer = master.try_clone()?;
         let mut command = Command::new(shell);
+        // The terminal descriptors make a login shell interactive.
+        let flag = match mode {
+            #[cfg(feature = "desktop")]
+            ShellMode::Interactive => "-i",
+            ShellMode::Login => "-l",
+        };
         command
-            .arg("-i")
+            .arg(flag)
             .current_dir(root)
             .env("TERM", "xterm-256color")
             .env("COLORTERM", "truecolor")

@@ -379,7 +379,14 @@ impl Session {
             self.emulator = Some(Emulator::new(size, self.commands.clone()));
             let process = match &self.ssh {
                 Some(ssh) => Process::start_remote(ssh.clone(), size, commands, output),
-                None => Process::start(self.shell.clone(), &self.root, size, commands, output),
+                None => Process::start(
+                    self.shell.clone(),
+                    crate::pty::ShellMode::Interactive,
+                    &self.root,
+                    size,
+                    commands,
+                    output,
+                ),
             };
             match process {
                 Ok(process) => self.process = Some(process),
