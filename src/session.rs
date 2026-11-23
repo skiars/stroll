@@ -197,6 +197,8 @@ pub(crate) struct GitSession {
     pub diff: Option<DiffPosition>,
     #[serde(skip_serializing_if = "BTreeSet::is_empty")]
     pub worktree_directories: Arc<BTreeSet<String>>,
+    #[serde(skip_serializing_if = "BTreeSet::is_empty")]
+    pub worktree_collapsed_files: Arc<BTreeSet<String>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

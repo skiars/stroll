@@ -243,6 +243,13 @@ pub(super) fn change_stat(stats: &git::ChangeStats, file: &git::ChangedFile) -> 
 }
 
 impl Review {
+    pub(super) fn is_uncommitted(&self) -> bool {
+        matches!(
+            self.detail.comparison,
+            Comparison::Worktree { base: None, .. }
+        )
+    }
+
     fn defer_image_patch(&self, ix: usize, stats_loading: bool) -> bool {
         let file = &self.detail.files[ix];
         let regular = |mode: &str| matches!(mode, "100644" | "100755");
@@ -906,6 +913,9 @@ impl GitPanel {
         self.pending_position = None;
         if !keep {
             if let Some(review) = self.review.take() {
+                if review.is_uncommitted() {
+                    self.worktree_collapsed_files = review.collapsed;
+                }
                 for (_, images) in review.images {
                     release_diff_images(images, window);
                 }
@@ -1005,16 +1015,31 @@ impl GitPanel {
                                 }
                             })
                             .collect();
-                        let directories =
-                            if matches!(detail.comparison, Comparison::Worktree { base: None, .. })
-                            {
-                                this.worktree_directories.clone()
-                            } else {
-                                previous
-                                    .as_ref()
-                                    .map(|review| review.directories.clone())
-                                    .unwrap_or_default()
-                            };
+                        let uncommitted =
+                            matches!(detail.comparison, Comparison::Worktree { base: None, .. });
+                        let directories = if uncommitted {
+                            this.worktree_directories.clone()
+                        } else {
+                            previous
+                                .as_ref()
+                                .map(|review| review.directories.clone())
+                                .unwrap_or_default()
+                        };
+                        let mut collapsed = previous.as_ref().map_or_else(
+                            || {
+                                if uncommitted {
+                                    this.worktree_collapsed_files.clone()
+                                } else {
+                                    Arc::default()
+                                }
+                            },
+                            |review| review.collapsed.clone(),
+                        );
+                        if uncommitted && let Some(status) = &detail.status {
+                            Arc::make_mut(&mut collapsed).retain(|path| {
+                                status.contains_key(path) || by_path.contains_key(path)
+                            });
+                        }
                         this.review = Some(Review {
                             patch_display: vec![PatchDisplay::default(); detail.files.len()],
                             image_files: detail.files.iter().map(image_diff_candidate).collect(),
@@ -1052,10 +1077,7 @@ impl GitPanel {
                             summary_layout: None,
                             active,
                             directories,
-                            collapsed: previous
-                                .as_ref()
-                                .map(|review| review.collapsed.clone())
-                                .unwrap_or_default(),
+                            collapsed,
                         });
                         let anchor_neighbor = viewport.as_ref().and_then(|anchor| {
                             let old = previous.as_ref()?;
@@ -1111,7 +1133,7 @@ impl GitPanel {
                                 this.only_matching = false;
                             }
                             review.active = Some(ix);
-                            review.collapsed.remove(path);
+                            Arc::make_mut(&mut review.collapsed).remove(path);
                         }
                         if locale != *rust_i18n::locale() {
                             this.refresh_placeholders(cx);
@@ -1322,7 +1344,7 @@ impl GitPanel {
             } else {
                 diff.set_files(visible, cx);
             }
-            diff.restore_collapsed_files(collapsed, cx);
+            diff.restore_collapsed_files(collapsed.iter().cloned(), cx);
         });
     }
 
@@ -1384,7 +1406,7 @@ impl GitPanel {
         review.active = Some(ix);
         if expand {
             self.pending_editor_open = None;
-            review.collapsed.remove(&path);
+            Arc::make_mut(&mut review.collapsed).remove(&path);
         }
         self.snapshot = None;
         self.snapshot_task = Task::ready(());
@@ -1514,7 +1536,7 @@ impl GitPanel {
 
     fn reveal_hunk(&mut self, jump: HunkNavigation, cx: &mut Context<Self>) {
         if let Some(review) = &mut self.review
-            && review.collapsed.remove(jump.path.as_str())
+            && Arc::make_mut(&mut review.collapsed).remove(jump.path.as_str())
         {
             self.diff.update(cx, |diff, cx| {
                 diff.set_file_collapsed(&jump.path, false, cx)
@@ -2212,7 +2234,7 @@ impl GitPanel {
         review.patches[ix] = PatchState::Pending;
         review.pending_assets.remove(&ix);
         let path = review.detail.files[ix].path.clone();
-        review.collapsed.remove(&path);
+        Arc::make_mut(&mut review.collapsed).remove(&path);
         self.diff
             .update(cx, |diff, cx| diff.set_file_collapsed(&path, false, cx));
         self.request_patch(ix, window, cx);
@@ -2230,11 +2252,11 @@ impl GitPanel {
             return;
         };
         self.pending_hunk_navigation = None;
-        review.collapsed.clear();
+        let paths = Arc::make_mut(&mut review.collapsed);
         if collapsed {
-            review
-                .collapsed
-                .extend(review.detail.files.iter().map(|file| file.path.clone()));
+            paths.extend(review.detail.files.iter().map(|file| file.path.clone()));
+        } else {
+            paths.retain(|path| !review.by_path.contains_key(path));
         }
         self.diff.update(cx, |diff, cx| {
             diff.set_all_files_collapsed(collapsed, cx);

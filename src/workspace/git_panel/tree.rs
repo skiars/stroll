@@ -972,10 +972,7 @@ impl GitPanel {
         if let Some(review) = &mut self.review {
             review.tree_rows.get_mut().take();
             review.tree_motion.get_mut().start();
-            if matches!(
-                review.detail.comparison,
-                Comparison::Worktree { base: None, .. }
-            ) {
+            if review.is_uncommitted() {
                 self.worktree_directories.clone_from(&review.directories);
             }
             cx.notify();

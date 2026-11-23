@@ -1582,7 +1582,7 @@ fn hunk_arrows_align_under_the_pointer_across_files_in_both_layouts() {
                     review.patches[review.by_path[last]],
                     PatchState::Pending
                 ));
-                review.collapsed.insert(last.to_owned());
+                Arc::make_mut(&mut review.collapsed).insert(last.to_owned());
                 panel.only_matching = false;
                 panel.sync_documents(cx);
                 cx.notify();

@@ -191,7 +191,7 @@ struct Review {
     contexts: HashMap<usize, usize>,
     live: HashMap<usize, review::LivePatch>,
     by_path: Rc<HashMap<String, usize>>,
-    collapsed: HashSet<String>,
+    collapsed: Arc<BTreeSet<String>>,
     directories: Arc<BTreeSet<String>>,
     tree_rows: std::cell::RefCell<Option<tree::TreeRows>>,
     tree_motion: std::cell::RefCell<super::tree_motion::TreeMotion<tree::Row>>,
@@ -314,6 +314,7 @@ pub(super) struct GitPanel {
     tree_scroll: UniformListScrollHandle,
     tree_followed_file: Option<String>,
     worktree_directories: Arc<BTreeSet<String>>,
+    worktree_collapsed_files: Arc<BTreeSet<String>>,
     query: String,
     filter: String,
     only_matching: bool,
@@ -491,10 +492,11 @@ impl GitPanel {
                     }
                     let primary = review.detail.files[ix].path.clone();
                     let expanded = matches!(event, DiffEvent::FileExpanded(_));
+                    let collapsed = Arc::make_mut(&mut review.collapsed);
                     if expanded {
-                        review.collapsed.remove(&primary);
+                        collapsed.remove(&primary);
                     } else {
-                        review.collapsed.insert(primary);
+                        collapsed.insert(primary);
                     }
                     if expanded {
                         this.request_visible_patch(ix, window, cx);
@@ -570,6 +572,11 @@ impl GitPanel {
                 .git
                 .as_ref()
                 .map(|git| git.worktree_directories.clone())
+                .unwrap_or_default(),
+            worktree_collapsed_files: session
+                .git
+                .as_ref()
+                .map(|git| git.worktree_collapsed_files.clone())
                 .unwrap_or_default(),
             query,
             filter: String::new(),
@@ -1252,6 +1259,12 @@ impl GitPanel {
             selection: selection.map(Selection::without_commit_range),
             history,
             worktree_directories: self.worktree_directories.clone(),
+            worktree_collapsed_files: self
+                .review
+                .as_ref()
+                .filter(|review| review.is_uncommitted())
+                .map_or(&self.worktree_collapsed_files, |review| &review.collapsed)
+                .clone(),
         })
     }
 
@@ -2379,6 +2392,7 @@ mod tests {
         );
         let repo = Repository::open(&root).unwrap();
         let other_repo = Repository::open(&other).unwrap();
+        fs::write(root.join("pending.txt"), "Uncommitted change\n").unwrap();
         let store = Arc::new(Store::new(fixture.path().join("state")).unwrap());
         let platform = gpui_platform::current_platform(true);
         let mut cx = TestAppContext::build_with_text_system(
@@ -2465,6 +2479,8 @@ mod tests {
         let selection = visual.update(|window, cx| {
             window.draw(cx).clear(cx);
             panel.update(cx, |panel, cx| {
+                panel.set_files_collapsed(true, cx);
+                assert!(panel.diff.read(cx).is_file_collapsed("pending.txt"));
                 let selection = Selection::Commit(panel.commits[66].oid.to_string(), None);
                 panel.load_review(selection.clone(), false, window, cx);
                 panel.history_scroll.scroll_to(ListOffset {
@@ -2504,6 +2520,7 @@ mod tests {
         assert_eq!(saved.documents[&document].block, 60);
         let git_state = saved.git.unwrap();
         assert_eq!(git_state.selection.as_ref(), Some(&selection));
+        assert!(git_state.worktree_collapsed_files.contains("pending.txt"));
         let history = git_state.history.unwrap();
         assert!(history.oid.is_some());
         assert_eq!(store.session(&other_repo).unwrap().tabs, Default::default());
@@ -2527,6 +2544,17 @@ mod tests {
                 let panel = workspace.git.as_ref().unwrap().read(cx);
                 assert_eq!(panel.selection, Some(selection));
                 assert_eq!(panel.session(cx).unwrap().history, Some(history));
+                let panel = workspace.git.as_ref().unwrap().clone();
+                panel.update(cx, |panel, cx| {
+                    panel.load_review(Selection::Worktree(Mode::All), false, window, cx);
+                });
+            })
+        });
+        visual.run_until_parked();
+        visual.update(|window, cx| {
+            restored.update(cx, |workspace, cx| {
+                let panel = workspace.git.as_ref().unwrap().read(cx);
+                assert!(panel.diff.read(cx).is_file_collapsed("pending.txt"));
                 workspace.switch_view(WorkspaceView::Editor, window, cx);
             })
         });
@@ -2660,6 +2688,7 @@ mod tests {
                         assert!(editor.next_search_match(cx).is_some());
                         editor.close_search(cx);
                     });
+                panel.set_files_collapsed(true, cx);
                 panel.stage_files(vec!["review.txt".into()], true, window, cx);
             });
         });
@@ -2676,6 +2705,7 @@ mod tests {
         visual.update(|window, cx| {
             panel.update(cx, |panel, cx| {
                 assert_eq!(panel.review.as_ref().unwrap().detail.files[0].code, 'A');
+                assert!(panel.diff.read(cx).is_file_collapsed("review.txt"));
                 panel.stage_files(vec!["review.txt".into()], false, window, cx);
             });
         });
@@ -2684,6 +2714,15 @@ mod tests {
             let panel = panel.read(cx);
             assert!(panel.stage_error.is_none(), "{:?}", panel.stage_error);
             assert!(panel.review.as_ref().unwrap().detail.files.is_empty());
+        });
+        visual.update(|window, cx| {
+            panel.update(cx, |panel, cx| {
+                panel.load_review(Selection::Worktree(Mode::Unstaged), false, window, cx);
+            });
+        });
+        visual.run_until_parked();
+        visual.update(|_, cx| {
+            assert!(panel.read(cx).diff.read(cx).is_file_collapsed("review.txt"));
         });
         assert_eq!(
             fs::read_to_string(root.join("review.txt")).unwrap(),
