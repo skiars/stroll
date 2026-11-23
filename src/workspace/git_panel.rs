@@ -228,6 +228,19 @@ enum CompactPane {
     HistoryDismissed,
 }
 
+#[derive(Clone, PartialEq, Eq)]
+struct FileReveal {
+    path: String,
+    scroll: FileRevealScroll,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FileRevealScroll {
+    Immediate,
+    Animate,
+    Animating,
+}
+
 struct GitPane {
     panel: WeakEntity<GitPanel>,
     kind: PaneKind,
@@ -309,7 +322,7 @@ pub(super) struct GitPanel {
     review: Option<Review>,
     snapshot: Option<Snapshot>,
     editor: editor::ReviewEditor,
-    pending_file_reveal: Option<String>,
+    pending_file_reveal: Option<FileReveal>,
     pending_hunk_navigation: Option<review::HunkNavigation>,
     pending_editor_open: Option<String>,
     pending_position: Option<DiffLinePosition>,

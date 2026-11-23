@@ -1101,7 +1101,7 @@ fn check_file_tree_navigation(split: bool) {
     git(&root, &["config", "user.name", "Reviewer"]);
     git(&root, &["config", "user.email", "reviewer@example.invalid"]);
     git(&root, &["config", "commit.gpgsign", "false"]);
-    let paths = (0..52)
+    let paths = (0..100)
         .map(|ix| format!("folder/{ix:02}.txt"))
         .chain(["last.txt".into()])
         .collect::<Vec<_>>();
@@ -1152,6 +1152,8 @@ fn check_file_tree_navigation(split: bool) {
     });
     settle(visual);
     visual.update(|_, cx| {
+        cx.set_smooth_scrolling(true);
+        cx.set_reduce_motion(false);
         assert_eq!(
             panel.read(cx).diff.read(cx).mode(),
             if split {
@@ -1239,6 +1241,8 @@ fn check_file_tree_navigation(split: bool) {
         );
         assert!(viewport.contains(&position));
         visual.simulate_click(position, Modifiers::default());
+        draw_frame(visual);
+        check_target(visual, path, selector);
         for _ in 0..8 {
             draw_frame(visual);
             assert_eq!(
@@ -1280,22 +1284,174 @@ fn check_file_tree_navigation(split: bool) {
         });
     }
 
-    let viewport = visual.debug_bounds("git-diff-editor").unwrap();
-    let position = point(viewport.right() - px(100.), viewport.center().y);
-    visual.simulate_event(ScrollEvent {
-        position,
-        delta: ScrollDelta::Pixels(point(px(0.), px(600.))),
-        modifiers: Modifiers::default(),
-        touch_phase: TouchPhase::Moved,
-        source: ScrollSource::Pointer,
+    let reveal = |visual: &mut VisualTestContext, path| {
+        visual.update(|window, cx| {
+            panel.update(cx, |panel, cx| panel.reveal_tree_file(path, window, cx));
+        });
+        draw_frame(visual);
+    };
+    let patch_state = |visual: &mut VisualTestContext, path| {
+        visual.update(|_, cx| {
+            let review = panel.read(cx).review.as_ref().unwrap();
+            review.patches[review.by_path[path]].clone()
+        })
+    };
+    let patch_delay = Duration::from_secs(1);
+    let finish_patch = |visual: &mut VisualTestContext| {
+        visual.executor().advance_clock(patch_delay);
+        visual.run_until_parked();
+    };
+    visual.update(|_, cx| {
+        panel.update(cx, |panel, _| {
+            panel.patch_loading[0] = true;
+            panel.review_read_delay = patch_delay;
+        });
     });
+
+    assert!(matches!(
+        patch_state(visual, "folder/55.txt"),
+        PatchState::Pending
+    ));
+    reveal(visual, "folder/55.txt");
+    check_target(
+        visual,
+        "folder/55.txt",
+        "git-editor-file-header:folder/55.txt",
+    );
+    assert!(matches!(
+        patch_state(visual, "folder/55.txt"),
+        PatchState::Loading
+    ));
+    reveal(visual, "folder/67.txt");
+    check_target(
+        visual,
+        "folder/67.txt",
+        "git-editor-file-header:folder/67.txt",
+    );
+    assert!(matches!(
+        patch_state(visual, "folder/55.txt"),
+        PatchState::Loading
+    ));
+    assert!(matches!(
+        patch_state(visual, "folder/67.txt"),
+        PatchState::Pending
+    ));
+    finish_patch(visual);
+    draw_frame(visual);
+    assert!(matches!(
+        patch_state(visual, "folder/55.txt"),
+        PatchState::Ready
+    ));
+    check_target(
+        visual,
+        "folder/67.txt",
+        "git-editor-file-header:folder/67.txt",
+    );
+    finish_patch(visual);
     settle(visual);
+    assert!(matches!(
+        patch_state(visual, "folder/67.txt"),
+        PatchState::Ready
+    ));
+    check_target(
+        visual,
+        "folder/67.txt",
+        "git-editor-file-header:folder/67.txt",
+    );
+
+    assert!(matches!(
+        patch_state(visual, "folder/80.txt"),
+        PatchState::Pending
+    ));
+    reveal(visual, "folder/80.txt");
+    check_target(
+        visual,
+        "folder/80.txt",
+        "git-editor-file-header:folder/80.txt",
+    );
+    reveal(visual, "folder/31.txt");
+    visual.update(|_, cx| {
+        let panel = panel.read(cx);
+        assert!(matches!(
+            panel
+                .pending_file_reveal
+                .as_ref()
+                .map(|reveal| reveal.scroll),
+            Some(FileRevealScroll::Animating),
+        ));
+    });
+    assert!(matches!(
+        patch_state(visual, "folder/80.txt"),
+        PatchState::Loading
+    ));
+    finish_patch(visual);
+    settle(visual);
+    assert!(matches!(
+        patch_state(visual, "folder/80.txt"),
+        PatchState::Ready
+    ));
+    check_target(
+        visual,
+        "folder/31.txt",
+        "git-editor-file-header:folder/31.txt",
+    );
+
+    assert!(matches!(
+        patch_state(visual, "folder/85.txt"),
+        PatchState::Pending
+    ));
+    reveal(visual, "folder/85.txt");
+    check_target(
+        visual,
+        "folder/85.txt",
+        "git-editor-file-header:folder/85.txt",
+    );
+    let viewport = visual.debug_bounds("git-diff-editor").unwrap();
+    let anchor = |visual: &mut VisualTestContext| {
+        visual.update(|_, cx| {
+            let panel = panel.read(cx);
+            let anchor = panel.diff.read(cx).viewport_anchor().unwrap();
+            (
+                anchor.path().to_owned(),
+                anchor.line().cloned(),
+                anchor.offset(),
+            )
+        })
+    };
+    visual.update(|window, cx| {
+        use gpui::InputEvent as _;
+        window.dispatch_event(
+            ScrollEvent {
+                position: point(viewport.right() - px(100.), viewport.center().y),
+                delta: ScrollDelta::Pixels(point(px(0.), px(-460.))),
+                modifiers: Modifiers::default(),
+                touch_phase: TouchPhase::Moved,
+                source: ScrollSource::Pointer,
+            }
+            .to_platform_input(),
+            cx,
+        );
+    });
+    for _ in 0..8 {
+        draw_frame(visual);
+    }
+    let scrolled = anchor(visual);
+    assert_ne!(scrolled.0, "folder/85.txt");
+    assert!(matches!(
+        patch_state(visual, "folder/85.txt"),
+        PatchState::Loading
+    ));
+    finish_patch(visual);
+    settle(visual);
+    assert!(matches!(
+        patch_state(visual, "folder/85.txt"),
+        PatchState::Ready
+    ));
+    assert_eq!(anchor(visual), scrolled);
     visual.update(|_, cx| {
         let panel = panel.read(cx);
         let review = panel.review.as_ref().unwrap();
-        let top = panel.diff.read(cx).top_file().unwrap();
-        assert_ne!(top.as_str(), "folder/31.txt");
-        assert_eq!(panel.active_file(cx), Some(review.by_path[top.as_str()]));
+        assert_eq!(panel.active_file(cx), Some(review.by_path[&scrolled.0]));
     });
 }
 

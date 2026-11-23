@@ -1417,16 +1417,26 @@ impl GitPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(&ix) = self
-            .review
-            .as_ref()
-            .and_then(|review| review.by_path.get(path))
-        else {
+        let Some(review) = &self.review else {
             return;
         };
+        let Some(&ix) = review.by_path.get(path) else {
+            return;
+        };
+        let scroll = if matches!(
+            review.patches[ix],
+            PatchState::Pending | PatchState::Loading
+        ) && review.patch_display[ix].truncated.is_none()
+        {
+            FileRevealScroll::Immediate
+        } else {
+            FileRevealScroll::Animate
+        };
         self.reveal_file(ix, true, window, cx);
-        self.editor.navigating_file = None;
-        self.pending_file_reveal = Some(path.to_owned());
+        self.pending_file_reveal = Some(FileReveal {
+            path: path.to_owned(),
+            scroll,
+        });
     }
 
     pub(super) fn adjacent_hunk_file(

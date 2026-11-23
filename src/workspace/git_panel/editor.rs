@@ -941,7 +941,6 @@ pub(super) struct ReviewEditor {
     viewport: Rc<std::cell::Cell<(usize, usize, usize, Pixels)>>,
     navigation_row: usize,
     navigation_source: Option<DiffLinePosition>,
-    pub(super) navigating_file: Option<String>,
     pub(super) image_hover: ImageHoverDismiss,
     scroll_to_top: bool,
     restore_viewport: bool,
@@ -1012,7 +1011,6 @@ impl ReviewEditor {
             viewport: Rc::default(),
             navigation_row: 0,
             navigation_source: None,
-            navigating_file: None,
             image_hover: ImageHoverDismiss::default(),
             scroll_to_top: false,
             restore_viewport: false,
@@ -1744,7 +1742,6 @@ impl ReviewEditor {
         if std::mem::take(&mut panel.editor.scroll_to_top) {
             panel.editor.navigation_row = target;
             panel.editor.navigation_source = None;
-            panel.editor.navigating_file = None;
             panel.editor.revealed_hunk.set(None);
             panel.editor.restore_viewport = false;
             panel
@@ -1801,13 +1798,19 @@ impl ReviewEditor {
                 return;
             }
         }
-        let file_row = panel.pending_file_reveal.as_deref().and_then(|path| {
+        let file_row = panel.pending_file_reveal.as_ref().and_then(|reveal| {
             panel.editor.headers.iter().copied().find(|&row| {
-                matches!(&panel.editor.rows[row], DiffEditorRow::File(header) if header.as_str() == path)
+                matches!(&panel.editor.rows[row], DiffEditorRow::File(header) if header.as_str() == reveal.path)
             })
         });
-        if panel.editor.navigating_file.is_some()
-            && panel.editor.navigating_file == panel.pending_file_reveal
+        let reveal_scroll = panel
+            .pending_file_reveal
+            .as_ref()
+            .map(|reveal| reveal.scroll);
+        if reveal_scroll == Some(FileRevealScroll::Animating)
+            && [&panel.editor.original, &panel.editor.modified]
+                .iter()
+                .any(|column| column.editor.read(cx).is_scroll_navigating())
         {
             return;
         }
@@ -1846,13 +1849,21 @@ impl ReviewEditor {
             } else {
                 px(0.)
             };
-            let animate =
-                !preserve_offset && !panel.single_file && (explicit || file_row.is_some());
-            if panel
+            let animate = !panel.single_file
+                && if file_row.is_some() {
+                    reveal_scroll == Some(FileRevealScroll::Animate)
+                } else {
+                    !preserve_offset && explicit
+                };
+            let animating = panel
                 .editor
-                .scroll_to_rows([target; 2], inset, animate, window, cx)
-            {
-                panel.editor.navigating_file = panel.pending_file_reveal.clone();
+                .scroll_to_rows([target; 2], inset, animate, window, cx);
+            if let Some(reveal) = &mut panel.pending_file_reveal {
+                reveal.scroll = if animating {
+                    FileRevealScroll::Animating
+                } else {
+                    FileRevealScroll::Immediate
+                };
             }
         }
     }
@@ -1893,8 +1904,6 @@ impl ReviewEditor {
         let revision = self.row_revision.unwrap_or_default();
         let navigation = panel.diff.read(cx).editor_viewport_position();
         let pending_file = panel.pending_file_reveal.clone();
-        let navigating_file =
-            panel.editor.navigating_file.is_some() && panel.editor.navigating_file == pending_file;
         let headers = self.headers.clone();
         let blocks = self.blocks.clone();
         let mixed = panel.review.as_ref().is_some_and(|review| {
@@ -2060,12 +2069,18 @@ impl ReviewEditor {
                     });
                 }
                 let report = (revision, start, end, offset);
-                let aligned = pending_file.as_deref().is_some_and(|path| {
-                    matches!(rows.get(start), Some(DiffEditorRow::File(header)) if header.as_str() == path)
+                let aligned = pending_file.as_ref().is_some_and(|reveal| {
+                    matches!(rows.get(start), Some(DiffEditorRow::File(header)) if header.as_str() == reveal.path)
                         && measured_offset.is_some_and(|offset| offset.abs() < px(0.5))
+                        && (!split || left.read(cx).projected_line_bounds(start).is_some_and(|header| {
+                            (left.read(cx).input_bounds().top() - header.top()).abs() < px(0.5)
+                        }))
+                });
+                let finished_animation = pending_file.as_ref().is_some_and(|reveal| {
+                    reveal.scroll == FileRevealScroll::Animating
                 });
                 let navigating = left_navigating || right_navigating;
-                if !navigating && (viewport.replace(report) != report || aligned || navigating_file) {
+                if !navigating && (viewport.replace(report) != report || aligned || finished_animation) {
                     let weak = weak.clone();
                     let pending_file = pending_file.clone();
                     window.defer(cx, move |_, cx| {
@@ -2081,9 +2096,12 @@ impl ReviewEditor {
                             panel.diff.update(cx, |diff, cx| {
                                 diff.set_editor_viewport_offset(start..end, offset, cx)
                             });
-                            if aligned || navigating_file {
+                            if aligned {
                                 panel.pending_file_reveal = None;
-                                panel.editor.navigating_file = None;
+                            } else if finished_animation && let Some(reveal) = &mut panel.pending_file_reveal {
+                                // Re-resolve the header if a projection update stopped the animation.
+                                reveal.scroll = FileRevealScroll::Immediate;
+                                App::notify(cx, panel.review_pane.entity_id());
                             }
                             panel.follow_review_viewport(cx);
                         });
