@@ -17,8 +17,9 @@ use crate::{
     input::{
         EditorState, HoverPopoverState,
         popovers::{
-            CodeActionMenu, DOCUMENTATION_FONT_SIZE, QUICK_FIX_BUTTON_SIZE, quick_fix_button,
-            render_markdown_with_code_style,
+            CodeActionMenu, DOCUMENTATION_FONT_SIZE, QUICK_FIX_BUTTON_SIZE,
+            caret_anchored::{CARET_POPUP_MARGIN, editor_popup_vertical_bounds},
+            quick_fix_button, render_markdown_with_code_style,
         },
     },
     scroll::{ScrollbarMode, popup_scrollbar},
@@ -293,7 +294,7 @@ impl Render for HoverPopover {
             popover.position = Some(self.position.clone());
         }
         popover.style.opacity = Some(self.motion.opacity(window, cx));
-        PopupFrame::new(popover, self.closing)
+        deferred(PopupFrame::new(popover, self.closing)).with_priority(gpui_base::POPUP_PRIORITY)
     }
 }
 
@@ -593,12 +594,16 @@ impl Popover {
     /// Get the bounds of the range in the editor, if it is visible.
     fn trigger_bounds(&self, cx: &App) -> Option<Bounds<Pixels>> {
         let editor = self.editor.read(cx);
-        if self.closing || (!self.actions && editor.hover_popover().is_none()) {
+        if self.closing {
             return self.last_trigger_bounds.get();
         }
-        let bounds = editor.range_to_bounds(&self.range)?;
-        self.last_trigger_bounds.set(Some(bounds));
-        Some(bounds)
+        let bounds = editor.visible_text_range_bounds(&self.range);
+        if bounds.is_none() || self.actions || editor.hover_popover().is_some() {
+            self.last_trigger_bounds.set(bounds);
+            bounds
+        } else {
+            None
+        }
     }
 }
 
@@ -610,14 +615,15 @@ impl IntoElement for Popover {
     }
 }
 
-pub(crate) struct PopoverLayoutState {
+pub(crate) struct PopoverPlacement {
     bounds: Bounds<Pixels>,
-    element: Option<AnyElement>,
+    trigger_bounds: Bounds<Pixels>,
+    element: AnyElement,
 }
 
 impl Element for Popover {
-    type RequestLayoutState = PopoverLayoutState;
-    type PrepaintState = ();
+    type RequestLayoutState = ();
+    type PrepaintState = Option<PopoverPlacement>;
 
     fn id(&self) -> Option<ElementId> {
         Some(self.id.clone())
@@ -634,104 +640,7 @@ impl Element for Popover {
         window: &mut Window,
         cx: &mut App,
     ) -> (gpui::LayoutId, Self::RequestLayoutState) {
-        let trigger_bounds = match self.trigger_bounds(cx) {
-            Some(bounds) => bounds,
-            None => {
-                return (
-                    div().into_any_element().request_layout(window, cx),
-                    PopoverLayoutState {
-                        bounds: Bounds::default(),
-                        element: None,
-                    },
-                );
-            }
-        };
-
-        const SNAP_TO_EDGE: Pixels = px(8.);
-        let viewport = window.viewport_size();
-        let max_width = self
-            .width_limit
-            .end
-            .min(viewport.width - SNAP_TO_EDGE * 2)
-            .max(px(0.));
-        let above = (trigger_bounds.top() - SNAP_TO_EDGE).max(px(0.));
-        let below = (viewport.height - trigger_bounds.bottom() - SNAP_TO_EDGE).max(px(0.));
-        // Leave room for the two one-pixel borders around the viewport.
-        let pinned = self
-            .position
-            .as_ref()
-            .and_then(|position| self.actions.then(|| position.get()).flatten());
-        let max_height = (viewport.height * 0.5)
-            .min(px(360.))
-            .min((above.max(below) - px(2.)).max(px(0.)))
-            .min(pinned.map_or(viewport.height, |pos| {
-                (viewport.height - pos.y - SNAP_TO_EDGE).max(px(0.))
-            }));
-
-        let mut popover = deferred(
-            div()
-                .id("hover-popover-content")
-                .flex_none()
-                .occlude()
-                .popover_style(cx)
-                .max_w(max_width)
-                .min_w(self.width_limit.start.min(max_width))
-                .refine_style(&self.style)
-                .child(
-                    div()
-                        .id("hover-documentation")
-                        .max_h(max_height)
-                        .overflow_y_scroll()
-                        .track_scroll(&self.scroll)
-                        .text_size(px(12.5))
-                        .line_height(relative(1.6))
-                        .child((self.content_builder)(window, cx)),
-                )
-                .relative()
-                .child(popup_scrollbar(&self.scroll).mode(ScrollbarMode::Always)),
-        )
-        .with_priority(gpui_base::POPUP_PRIORITY)
-        .into_any_element();
-
-        let available = if self.prefers_natural_width {
-            gpui::size(AvailableSpace::MaxContent, AvailableSpace::MinContent)
-        } else {
-            AvailableSpace::min_size()
-        };
-        let popover_size = popover.layout_as_root(available, window, cx);
-        let y = if popover_size.height <= above {
-            trigger_bounds.top() - popover_size.height
-        } else {
-            trigger_bounds.bottom()
-        };
-        let pos = pinned.unwrap_or_else(|| {
-            point(
-                trigger_bounds.left().clamp(
-                    SNAP_TO_EDGE,
-                    (viewport.width - popover_size.width - SNAP_TO_EDGE).max(SNAP_TO_EDGE),
-                ),
-                y.clamp(
-                    SNAP_TO_EDGE,
-                    (viewport.height - popover_size.height - SNAP_TO_EDGE).max(SNAP_TO_EDGE),
-                ),
-            )
-        });
-        if let Some(position) = &self.position {
-            position.set(Some(pos));
-        }
-
-        let mut empty = div().into_any_element();
-        let layout_id = empty.request_layout(window, cx);
-        (
-            layout_id,
-            PopoverLayoutState {
-                bounds: Bounds {
-                    origin: pos,
-                    size: popover_size,
-                },
-                element: Some(popover),
-            },
-        )
+        (window.request_layout(gpui::Style::default(), [], cx), ())
     }
 
     fn prepaint(
@@ -739,17 +648,92 @@ impl Element for Popover {
         _: Option<&gpui::GlobalElementId>,
         _: Option<&gpui::InspectorElementId>,
         _: Bounds<Pixels>,
-        request_layout: &mut Self::RequestLayoutState,
+        _: &mut (),
         window: &mut Window,
         cx: &mut App,
     ) -> Self::PrepaintState {
-        let bounds = request_layout.bounds;
-        let Some(popover) = request_layout.element.as_mut() else {
-            return;
-        };
+        let trigger_bounds = self.trigger_bounds(cx)?;
+        let viewport = window.viewport_size();
+        let vertical = editor_popup_vertical_bounds(self.editor.read(cx), window);
+        let margin = CARET_POPUP_MARGIN;
+        let max_width = self.width_limit.end.min(viewport.width - margin * 2);
+        let height = vertical.end - vertical.start;
+        if max_width <= px(0.) || height <= px(2.) {
+            return None;
+        }
 
-        window.with_absolute_element_offset(bounds.origin, |window| {
-            popover.prepaint(window, cx);
+        let above = trigger_bounds.top().clamp(vertical.start, vertical.end) - vertical.start;
+        let below = vertical.end - trigger_bounds.bottom().clamp(vertical.start, vertical.end);
+        // Leave room for the two borders around the scroll viewport.
+        let pinned = self
+            .position
+            .as_ref()
+            .and_then(|position| self.actions.then(|| position.get()).flatten())
+            .filter(|pos| pos.y >= vertical.start && pos.y < vertical.end - px(2.));
+        let max_height = (viewport.height * 0.5)
+            .min(px(360.))
+            .min(pinned.map_or(above.max(below), |pos| vertical.end - pos.y) - px(2.));
+        if max_height <= px(0.) {
+            return None;
+        }
+
+        let mut popover = div()
+            .id("hover-popover-content")
+            .flex_none()
+            .occlude()
+            .popover_style(cx)
+            .max_w(max_width)
+            .min_w(self.width_limit.start.min(max_width))
+            .refine_style(&self.style)
+            .child(
+                div()
+                    .id("hover-documentation")
+                    .debug_selector(|| "hover-documentation".into())
+                    .max_h(max_height)
+                    .overflow_y_scroll()
+                    .track_scroll(&self.scroll)
+                    .text_size(px(12.5))
+                    .line_height(relative(1.6))
+                    .child((self.content_builder)(window, cx)),
+            )
+            .relative()
+            .child(popup_scrollbar(&self.scroll).mode(ScrollbarMode::Always))
+            .into_any_element();
+
+        let available = if self.prefers_natural_width {
+            gpui::size(AvailableSpace::MaxContent, AvailableSpace::MinContent)
+        } else {
+            AvailableSpace::min_size()
+        };
+        let popover_size = popover.layout_as_root(available, window, cx);
+        if popover_size.height > height {
+            return None;
+        }
+        let origin = pinned.unwrap_or_else(|| {
+            let y = if popover_size.height <= above {
+                trigger_bounds.top() - popover_size.height
+            } else {
+                trigger_bounds.bottom()
+            };
+            point(trigger_bounds.left(), y)
+        });
+        let origin = point(
+            origin.x.clamp(
+                margin,
+                (viewport.width - popover_size.width - margin).max(margin),
+            ),
+            origin
+                .y
+                .clamp(vertical.start, vertical.end - popover_size.height),
+        );
+        if let Some(position) = &self.position {
+            position.set(Some(origin));
+        }
+        popover.prepaint_at(origin, window, cx);
+        Some(PopoverPlacement {
+            bounds: Bounds::new(origin, popover_size),
+            trigger_bounds,
+            element: popover,
         })
     }
 
@@ -758,17 +742,14 @@ impl Element for Popover {
         _: Option<&gpui::GlobalElementId>,
         _: Option<&gpui::InspectorElementId>,
         _: Bounds<Pixels>,
-        request_layout: &mut Self::RequestLayoutState,
-        _: &mut Self::PrepaintState,
+        _: &mut (),
+        placement: &mut Self::PrepaintState,
         window: &mut Window,
         cx: &mut App,
     ) {
-        let bounds = request_layout.bounds;
-        let Some(popover) = request_layout.element.as_mut() else {
-            return;
-        };
-
-        popover.paint(window, cx);
+        let Some(placement) = placement else { return };
+        let bounds = placement.bounds;
+        placement.element.paint(window, cx);
         if !self.closing
             && let Some(hover) = self.editor.read(cx).hover_popover()
             && hover.symbol_range == self.range
@@ -812,7 +793,7 @@ impl Element for Popover {
                 }
             });
         }
-        let trigger_bounds = self.trigger_bounds(cx).unwrap_or(bounds);
+        let trigger_bounds = placement.trigger_bounds;
         let keep_open_region = trigger_bounds.union(&bounds);
         let editor = self.editor.clone();
         let pointer_down = self.pointer_down.clone();

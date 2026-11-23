@@ -2236,15 +2236,13 @@ impl ReviewEditor {
                         elements.push((chrome, controls_left(row), line.top(), line.size.height));
                     }
                 }
-                // Paint the header shadows above the hunk and notice rows they border.
-                elements.append(&mut file_headers);
-                if let Some((row, path)) = file_header
+                let sticky_header = if let Some((row, path)) = file_header
                     && header_stuck
                 {
                     let top = next_header_top.map_or(bounds.top(), |next| {
                         bounds.top().min(next - FILE_HEADER_HEIGHT)
                     });
-                    elements.push((
+                    Some((
                         render_header(
                             path,
                             &header,
@@ -2260,8 +2258,30 @@ impl ReviewEditor {
                         controls_left(row),
                         top,
                         FILE_HEADER_HEIGHT,
-                    ));
+                    ))
+                } else {
+                    None
+                };
+                // Clip each column to the contiguous run of headers at its top.
+                // A pending live edit can displace a header into the right column only.
+                let right_edge = if split { bounds.center().x } else { bounds.left() };
+                for (column, x) in [(&left, bounds.left()), (&right, right_edge)]
+                    .into_iter()
+                    .skip(usize::from(!split))
+                {
+                    let mut top = bounds.top();
+                    for (_, left, y, height) in sticky_header.iter().chain(&file_headers) {
+                        if *left <= x && *y <= top {
+                            top = top.max(*y + *height);
+                        }
+                    }
+                    if top > bounds.top() {
+                        column.update(cx, |editor, cx| editor.clip_text_viewport_top(top, cx));
+                    }
                 }
+                // Paint the header shadows above the hunk and notice rows they border.
+                elements.append(&mut file_headers);
+                elements.extend(sticky_header);
                 // Keep the destination label visible if scroll limits keep it off the click.
                 let revealed = revealed_hunk
                     .get()
@@ -2846,6 +2866,7 @@ fn render_header(
     h_flex()
         .id((ElementId::from("git-editor-file"), path.clone()))
         .debug_selector(|| format!("git-editor-file-header:{path}"))
+        .block_mouse_except_scroll()
         .w_full()
         .h_full()
         .px_2()

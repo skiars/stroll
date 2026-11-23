@@ -2380,8 +2380,13 @@ fn completion_popup_keeps_list_geometry_through_documentation_changes(
         let single = visual.debug_bounds("completion-menu").unwrap();
         assert!(single.top() > caret_y(visual));
         let last_fitting_row = visual.update(|window, cx| {
-            let row = editor.read(cx).projected_line_bounds(32).unwrap();
-            f32::from(row.top() + window.viewport_size().height - single.bottom() - px(8.25))
+            let editor = editor.read(cx);
+            let row = editor.projected_line_bounds(32).unwrap();
+            let bottom = editor
+                .visible_text_bounds()
+                .bottom()
+                .min(window.viewport_size().height - px(8.));
+            f32::from(row.top() + bottom - single.bottom() - px(0.25))
         });
         scroll_row_to(visual, last_fitting_row);
         assert!(visual.debug_bounds("completion-menu").unwrap().top() > caret_y(visual));

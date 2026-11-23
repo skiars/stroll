@@ -10,7 +10,7 @@ use crate::{list::List, scroll::ScrollableElement as _};
 
 use super::{
     super::{
-        caret_anchored::{CARET_POPUP_MARGIN, caret_popup_anchor},
+        caret_anchored::{CARET_POPUP_MARGIN, caret_popup_anchor, editor_popup_vertical_bounds},
         editor_popover, render_markdown,
     },
     CompletionMenu, ROW_HEIGHT_PADDING,
@@ -126,16 +126,18 @@ impl Element for CompletionPopup {
         let input_bounds = geometry.input_bounds();
         let mut caret = geometry.cursor_bounds();
         caret.origin.y += geometry.scroll_offset().y;
-        if !caret.intersects(&input_bounds) {
+        if !caret.intersects(&editor.visible_text_bounds()) {
             dismiss(window, cx);
             return None;
         }
 
         // The list owns the direction and the rectangle next to the caret.
         let anchor = caret_popup_anchor(geometry);
-        let above_edge = anchor.y - geometry.line_height() - px(8.);
-        let above = (above_edge - margin).max(px(0.));
-        let below = (viewport.height - margin - anchor.y).max(px(0.));
+        let vertical = editor_popup_vertical_bounds(editor, window);
+        let above_edge = (anchor.y - geometry.line_height() - px(8.)).min(vertical.end);
+        let below_edge = anchor.y.max(vertical.start);
+        let above = (above_edge - vertical.start).max(px(0.));
+        let below = (vertical.end - below_edge).max(px(0.));
         let text_size = (geometry.text_size() - px(0.5)).max(px(1.));
         let row_height = text_size + ROW_HEIGHT_PADDING;
         // editor_popover uses .p_1() and a 1px border on both sides.
@@ -151,7 +153,7 @@ impl Element for CompletionPopup {
         });
         let (near_edge, available) = match placement.side {
             Side::Above => (above_edge, above),
-            Side::Below => (anchor.y, below),
+            Side::Below => (below_edge, below),
         };
         let safe_right = viewport.width - margin;
         let list_width = editor

@@ -134,6 +134,12 @@ dialogs in a Wayland window after changes to paint order or focus handling.
 - Pending hover requests are dropped when the pointer leaves the text hitbox,
   and responses are checked against the visible anchor. The popup takes over
   pointer tracking after its first paint.
+- Workspace and Git diff editor popups use current-frame text viewport bounds
+  for vertical placement. Hover keeps its window-based height limit and uses
+  the available editor space to stay within the viewport. Pinned diff file
+  headers block pointer input to covered code while passing wheel events
+  through. Run the `editor_popup_bounds` integration tests and the Git diff
+  pinned-header hover test.
 - Interactive code editor edits reveal the caret with minimal scrolling before shaping the
   viewport. Programmatic replacements and history replay use the existing caret-follow margin.
   Mapped edit transactions support both endpoint and range callbacks. Range

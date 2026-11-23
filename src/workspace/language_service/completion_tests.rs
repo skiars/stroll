@@ -1317,15 +1317,19 @@ fn workspace_caret_hints_use_the_latest_symbol_and_signature() -> Result<()> {
                 files.join("triggered").exists()
                     && visual.debug_bounds("editor-signature-help").is_some()
             })?;
+            let viewport = visual.debug_bounds("workspace-editor").unwrap();
             let bounds = visual.debug_bounds("editor-signature-help").unwrap();
-            assert!(bounds.left() >= px(0.) && bounds.top() >= px(0.));
+            assert!(bounds.top() >= viewport.top() && bounds.bottom() <= viewport.bottom());
+            assert!(bounds.left() >= px(0.) && bounds.right() <= px(932.));
             assert!(bounds.size.width < px(320.));
-            assert!(bounds.right() <= px(932.));
             visual.simulate_keystrokes("ctrl-space");
             wait(visual, "completion while signature is active", |visual| {
                 labels(visual, editor) == ["candidate"]
                     && visual.debug_bounds("editor-signature-help").is_none()
+                    && visual.debug_bounds("completion-menu").is_some()
             })?;
+            let bounds = visual.debug_bounds("completion-menu").unwrap();
+            assert!(bounds.top() >= viewport.top() && bounds.bottom() <= viewport.bottom());
             visual.simulate_keystrokes("escape");
             wait(visual, "signature restored after completion", |visual| {
                 visual.debug_bounds("editor-signature-help").is_some()

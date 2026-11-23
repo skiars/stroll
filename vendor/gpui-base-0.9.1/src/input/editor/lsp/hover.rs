@@ -376,6 +376,17 @@ impl InputBaseState<EditorMode> {
         })
     }
 
+    /// Exclude the part of a projected editor covered by its pinned file headers.
+    /// Called in prepaint after the text layout and before the deferred popups.
+    #[doc(hidden)]
+    pub fn clip_text_viewport_top(&mut self, top: Pixels, cx: &mut Context<Self>) {
+        let bounds = &mut self.visible_text_bounds;
+        let top = top.clamp(bounds.top(), bounds.bottom());
+        bounds.size.height = bounds.bottom() - top;
+        bounds.origin.y = top;
+        self.validate_language_hover(cx);
+    }
+
     pub(crate) fn validate_language_hover(&mut self, cx: &mut Context<Self>) {
         let Some(popover) = self.extras.hover_popover.as_ref() else {
             return;

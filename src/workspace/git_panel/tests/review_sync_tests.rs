@@ -1533,3 +1533,156 @@ fn historical_binary_thumbnails_skip_automatic_patches_and_keep_text_diffs() {
         })
     });
 }
+
+#[::core::prelude::v1::test]
+fn pinned_diff_file_header_blocks_hover_and_keeps_popups_below_it() {
+    use gpui_component::input::{HoverProvider, Rope};
+    use lsp_types::{Hover, HoverContents, MarkedString};
+    use std::{cell::Cell, rc::Rc};
+
+    struct Documentation(Rc<Cell<usize>>);
+    impl HoverProvider for Documentation {
+        fn hover(
+            &self,
+            _: &Rope,
+            _: usize,
+            _: &mut Window,
+            _: &mut App,
+        ) -> Task<anyhow::Result<Option<Hover>>> {
+            self.0.set(self.0.get() + 1);
+            Task::ready(Ok(Some(Hover {
+                contents: HoverContents::Scalar(MarkedString::String("Diff documentation".into())),
+                range: None,
+            })))
+        }
+    }
+
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("repo");
+    fs::create_dir(&root).unwrap();
+    setup(&root);
+    let path = "symbols.txt";
+    let source = |prefix| {
+        (1..=120)
+            .map(|line| format!("{prefix}_symbol_{line:03}\n"))
+            .collect::<String>()
+    };
+    fs::write(root.join(path), source("old")).unwrap();
+    command(&root, &["add", path]);
+    command(&root, &["commit", "-qm", "Initial"]);
+    fs::write(root.join(path), source("new")).unwrap();
+
+    for split in [false, true] {
+        let mut cx = test_context();
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let state_dir = temp.path().join(if split { "split" } else { "unified" });
+        let (panel, visual) = open(&mut cx, &state_dir, &root);
+        visual.update(|window, cx| {
+            panel.update(cx, |panel, cx| {
+                panel.split = split;
+                panel.load_review(Selection::Worktree(Mode::All), false, window, cx);
+                cx.notify();
+            });
+        });
+
+        let position = DiffLinePosition::new(path, DiffSide::Modified, 24);
+        wait_for_review(visual, "the projected source rows", |visual| {
+            visual.update(|_, cx| panel.read(cx).review_source_bounds(&position, cx).is_some())
+        });
+        let (modified, original) = visual.update(|window, cx| {
+            let panel = panel.read(cx);
+            (
+                panel.editor.focused_column(window, cx).clone(),
+                panel.editor.original_state().clone(),
+            )
+        });
+        let viewport = visual.debug_bounds("git-diff-editor").unwrap();
+        let row =
+            visual.update(|_, cx| panel.read(cx).review_source_bounds(&position, cx).unwrap());
+        visual.update(|_, cx| {
+            modified.update(cx, |editor, cx| {
+                let offset = editor.scroll_offset();
+                editor.set_scroll_offset(
+                    point(offset.x, offset.y + viewport.top() + px(4.) - row.top()),
+                    cx,
+                );
+            });
+        });
+        settle(visual);
+
+        let header = visual
+            .debug_bounds("git-editor-file-header:symbols.txt")
+            .unwrap();
+        assert_eq!(header.top(), viewport.top());
+        let requests = Rc::new(Cell::new(0));
+        let advance_hover = |visual: &mut VisualTestContext| {
+            for millis in [150, 151] {
+                settle(visual);
+                visual
+                    .executor()
+                    .advance_clock(Duration::from_millis(millis));
+            }
+            settle(visual);
+        };
+        let mut wheel_position = header.center();
+        for (editor, prefix) in [(&modified, "new"), (&original, "old")]
+            .into_iter()
+            .take(if split { 2 } else { 1 })
+        {
+            visual.update(|_, cx| {
+                editor.update(cx, |state, cx| {
+                    state.lsp_mut().hover_provider = Some(Rc::new(Documentation(requests.clone())));
+                    cx.notify();
+                });
+            });
+            let symbol = |visual: &mut VisualTestContext, line| {
+                let name = format!("{prefix}_symbol_{line:03}");
+                visual.update(|_, cx| {
+                    let state = editor.read(cx);
+                    let offset = state.text().to_string().find(&name).unwrap();
+                    state
+                        .range_to_bounds(&(offset..offset + name.len()))
+                        .unwrap()
+                })
+            };
+            let covered = symbol(visual, 24).center();
+            let exposed = symbol(visual, 26).center();
+            assert!(header.contains(&covered));
+            assert!(exposed.y > header.bottom());
+            wheel_position = covered;
+            let before = requests.get();
+            visual.simulate_mouse_move(covered, None, Modifiers::default());
+            advance_hover(visual);
+            assert_eq!(requests.get(), before);
+            assert!(visual.debug_bounds("hover-markdown").is_none());
+
+            let caret = visual.update(|_, cx| editor.read(cx).cursor());
+            visual.simulate_click(covered, Modifiers::default());
+            assert_eq!(visual.update(|_, cx| editor.read(cx).cursor()), caret);
+
+            visual.simulate_mouse_move(exposed, None, Modifiers::default());
+            advance_hover(visual);
+            assert_eq!(requests.get(), before + 1);
+            let docs = visual.debug_bounds("hover-markdown").unwrap();
+            assert!(docs.top() >= header.bottom());
+            assert!(docs.bottom() <= viewport.bottom());
+            visual.simulate_mouse_move(
+                point(viewport.right() - px(2.), header.center().y),
+                None,
+                Modifiers::default(),
+            );
+            settle(visual);
+        }
+
+        let before = visual.update(|_, cx| modified.read(cx).scroll_offset().y);
+        visual.simulate_event(ScrollEvent {
+            position: wheel_position,
+            delta: ScrollDelta::Pixels(point(px(0.), px(-60.))),
+            modifiers: Modifiers::default(),
+            touch_phase: TouchPhase::Moved,
+            source: ScrollSource::Pointer,
+        });
+        settle(visual);
+        assert!(visual.update(|_, cx| modified.read(cx).scroll_offset().y) < before);
+    }
+}

@@ -1,14 +1,15 @@
 use std::{cell::Cell, rc::Rc, time::Duration};
 
 use gpui::{
-    App, AppContext as _, Context, Entity, InteractiveElement as _, ParentElement as _, Render,
-    Styled as _, Task, TestAppContext, VisualTestContext, Window, div, point, px, size,
+    App, AppContext as _, Context, Entity, InteractiveElement as _, IntoElement,
+    ParentElement as _, Render, Styled as _, Task, TestAppContext, VisualTestContext, Window,
+    deferred, div, point, px, size,
 };
 use gpui_component::{
     Root,
-    input::{Editor, EditorState, HoverProvider, Rope},
+    input::{CaretAnchoredPopup, Editor, EditorState, HoverProvider, Rope},
 };
-use lsp_types::{Hover, HoverContents, MarkedString};
+use lsp_types::{CompletionItem, Documentation, Hover, HoverContents, MarkedString};
 
 struct HoverDocumentation {
     requests: Rc<Cell<usize>>,
@@ -39,6 +40,7 @@ impl HoverProvider for HoverDocumentation {
 
 struct EditorPane {
     editor: Entity<EditorState>,
+    signature: bool,
 }
 
 impl Render for EditorPane {
@@ -56,7 +58,25 @@ impl Render for EditorPane {
                     .flex_1()
                     .min_h_0()
                     .overflow_hidden()
-                    .child(Editor::new(&self.editor).size_full()),
+                    .child(Editor::new(&self.editor).size_full())
+                    .children(self.signature.then(|| {
+                        deferred(
+                            CaretAnchoredPopup::new(
+                                self.editor.downgrade(),
+                                |_, height, _, _, _| {
+                                    div()
+                                        .id("test-signature-help")
+                                        .debug_selector(|| "test-signature-help".into())
+                                        .h(px(42.))
+                                        .max_h(height)
+                                        .child("first_symbol(argument)")
+                                        .into_any_element()
+                                },
+                            )
+                            .prefer_above(),
+                        )
+                        .with_priority(gpui_base::POPUP_PRIORITY)
+                    })),
             )
             .child(div().h(px(60.)).flex_none())
     }
@@ -64,6 +84,7 @@ impl Render for EditorPane {
 
 fn setup(
     cx: &mut TestAppContext,
+    signature: bool,
     latency: Duration,
 ) -> (Entity<EditorState>, Rc<Cell<usize>>, &mut VisualTestContext) {
     let requests = Rc::new(Cell::new(0));
@@ -82,7 +103,10 @@ fn setup(
             state
         });
         editor = Some(state.clone());
-        let pane = cx.new(|_| EditorPane { editor: state });
+        let pane = cx.new(|_| EditorPane {
+            editor: state,
+            signature,
+        });
         Root::new(pane, window, cx)
     });
     visual.simulate_resize(size(px(900.), px(470.)));
@@ -106,10 +130,56 @@ fn advance(visual: &mut VisualTestContext, millis: u64) {
 }
 
 #[gpui::test]
+fn hover_stays_in_the_editor_pane_and_preserves_pointer_handoff(cx: &mut TestAppContext) {
+    let (editor, _, visual) = setup(cx, false, Duration::ZERO);
+    let symbol = visual.update(|_, cx| editor.read(cx).range_to_bounds(&(0..12)).unwrap());
+    visual.simulate_mouse_move(symbol.center(), None, Default::default());
+    advance(visual, 150);
+    advance(visual, 151);
+    let pane = visual.debug_bounds("editor-pane").unwrap();
+    let docs = visual.debug_bounds("hover-markdown").unwrap();
+    assert!(docs.top() >= symbol.bottom());
+    assert!(docs.top() >= pane.top() && docs.bottom() <= pane.bottom());
+
+    let copy = visual.debug_bounds("hover-copy-documentation").unwrap();
+    visual.simulate_mouse_move(copy.center(), None, Default::default());
+    visual.simulate_click(copy.center(), Default::default());
+    assert_eq!(
+        visual.update(|_, cx| cx.read_from_clipboard().and_then(|item| item.text())),
+        Some("Example documentation".to_owned())
+    );
+}
+
+#[gpui::test]
+fn long_hover_uses_the_available_space_in_the_editor_pane(cx: &mut TestAppContext) {
+    let (editor, _, visual) = setup(cx, false, Duration::ZERO);
+    visual.update(|_, cx| {
+        editor.update(cx, |editor, cx| {
+            editor.present_hover(
+                0..12,
+                Hover {
+                    contents: HoverContents::Scalar(MarkedString::String(
+                        "Example documentation.\n\n".repeat(30),
+                    )),
+                    range: None,
+                },
+                cx,
+            );
+        });
+    });
+    draw(visual);
+
+    let pane = visual.debug_bounds("editor-pane").unwrap();
+    let docs = visual.debug_bounds("hover-documentation").unwrap();
+    assert!(docs.size.height > pane.size.height * 0.5);
+    assert!(docs.top() >= pane.top() && docs.bottom() <= pane.bottom());
+}
+
+#[gpui::test]
 fn hover_leaving_for_the_top_bar_discards_pending_requests_and_late_results(
     cx: &mut TestAppContext,
 ) {
-    let (editor, requests, visual) = setup(cx, Duration::from_millis(250));
+    let (editor, requests, visual) = setup(cx, false, Duration::from_millis(250));
     let symbol = visual.update(|_, cx| editor.read(cx).range_to_bounds(&(0..12)).unwrap());
     let pane = visual.debug_bounds("editor-pane").unwrap();
     let bar = point(symbol.center().x, pane.top() - px(2.));
@@ -145,4 +215,42 @@ fn hover_leaving_for_the_top_bar_discards_pending_requests_and_late_results(
     advance(visual, 251);
     assert!(moved_on_response.get());
     assert!(visual.debug_bounds("hover-markdown").is_none());
+}
+
+#[gpui::test]
+fn signature_help_flips_below_the_caret_at_the_editor_top(cx: &mut TestAppContext) {
+    let (editor, _, visual) = setup(cx, true, Duration::ZERO);
+    let pane = visual.debug_bounds("editor-pane").unwrap();
+    let first_row = visual.update(|_, cx| editor.read(cx).range_to_bounds(&(0..12)).unwrap());
+    let signature = visual.debug_bounds("test-signature-help").unwrap();
+    assert!(signature.top() >= first_row.bottom());
+    assert!(signature.top() >= pane.top() && signature.bottom() <= pane.bottom());
+}
+
+#[gpui::test]
+fn completion_list_and_documentation_fit_the_editor_pane(cx: &mut TestAppContext) {
+    let (editor, _, visual) = setup(cx, false, Duration::ZERO);
+    visual.update(|_, cx| {
+        editor.update(cx, |state, cx| {
+            let items = (0..24)
+                .map(|index| CompletionItem {
+                    label: format!("candidate{index:02}"),
+                    documentation: Some(Documentation::String("Candidate documentation".into())),
+                    ..Default::default()
+                })
+                .collect();
+            state.present_completion_items(0, "", items, cx);
+        });
+    });
+    draw(visual);
+
+    let pane = visual.debug_bounds("editor-pane").unwrap();
+    let first_row = visual.update(|_, cx| editor.read(cx).range_to_bounds(&(0..12)).unwrap());
+    for selector in ["completion-menu", "completion-documentation"] {
+        let popup = visual.debug_bounds(selector).unwrap();
+        assert!(
+            popup.top() >= first_row.bottom() && popup.bottom() <= pane.bottom(),
+            "{selector} at {popup:?} exceeds {pane:?}"
+        );
+    }
 }
