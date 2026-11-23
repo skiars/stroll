@@ -32,6 +32,10 @@ pub(crate) struct WorktreeSession {
     pub open_documents: Option<Vec<OpenDocument>>,
     pub git: Option<GitSession>,
     pub panels: PanelPreferences,
+    #[serde(skip_serializing_if = "BTreeSet::is_empty")]
+    pub editor_tree_expanded: BTreeSet<PathBuf>,
+    #[serde(skip_serializing_if = "BTreeSet::is_empty")]
+    pub docs_tree_expanded: BTreeSet<PathBuf>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub terminal: Option<TerminalSession>,
     #[serde(skip_serializing_if = "Option::is_none")]

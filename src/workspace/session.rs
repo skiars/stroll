@@ -95,6 +95,16 @@ impl Workspace {
             self.session.panels = panels;
             self.session_revision += 1;
         }
+        if self.session.editor_tree_expanded != self.expanded {
+            self.session.editor_tree_expanded.clone_from(&self.expanded);
+            self.session_revision += 1;
+        }
+        if self.session.docs_tree_expanded != self.docs_expanded {
+            self.session
+                .docs_tree_expanded
+                .clone_from(&self.docs_expanded);
+            self.session_revision += 1;
+        }
         if self.session.view != Some(self.view)
             && self
                 .standalone

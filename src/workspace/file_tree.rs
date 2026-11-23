@@ -655,7 +655,7 @@ impl Workspace {
         });
         if version.is_none() && !path.as_os_str().is_empty() {
             self.expanded.insert(path.clone());
-            self.load_tree_directory(path.clone(), window, cx);
+            self.load_expanded_tree_directories(window, cx);
             self.rebuild_tree();
         }
         let edit = TreeEdit {
@@ -1968,6 +1968,155 @@ mod tests {
                 assert!(!this.images.contains_key(picture));
                 assert!(this.request_window_close(window, cx));
             });
+        });
+        Ok(())
+    }
+
+    #[::core::prelude::v1::test]
+    fn tree_expansion_survives_switching_worktrees_and_reopening() -> Result<()> {
+        let fixture = tempfile::tempdir()?;
+        let directory = fixture.path().canonicalize()?;
+        let root = directory.join("repo");
+        let other = directory.join("other");
+        for directory in ["shared/deep", "editor/nested", "docs"] {
+            fs::create_dir_all(root.join(directory))?;
+            fs::write(root.join(directory).join("page.md"), "# Page")?;
+        }
+        fs::write(root.join("README.md"), "# Project")?;
+        let git = |args: &[&str]| -> Result<()> {
+            assert!(
+                std::process::Command::new("git")
+                    .current_dir(&root)
+                    .args(args)
+                    .status()?
+                    .success()
+            );
+            Ok(())
+        };
+        git(&["init", "-qb", "main"])?;
+        git(&["add", "."])?;
+        git(&[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-qm",
+            "initial",
+        ])?;
+        git(&["worktree", "add", "-qb", "other", other.to_str().unwrap()])?;
+
+        let mut cx = TestAppContext::single();
+        cx.update(gpui_component::init);
+        fn open_window<'a>(
+            cx: &'a mut TestAppContext,
+            directory: &Path,
+        ) -> Result<(Entity<Workspace>, &'a mut VisualTestContext)> {
+            let store = Arc::new(Store::new(directory.join("state"))?);
+            let config = ConfigFile::load(Some(directory.join("config.toml")));
+            let mut workspace = None;
+            let (_, visual) = cx.add_window_view(|window, cx| {
+                cx.set_reduce_motion(true);
+                let view = cx.new(|cx| {
+                    Workspace::with_config(store, config, WorkspaceView::Editor, window, cx)
+                });
+                workspace = Some(view.clone());
+                gpui_component::Root::new(view, window, cx)
+            });
+            visual.simulate_resize(size(px(1024.), px(650.)));
+            Ok((workspace.unwrap(), visual))
+        }
+        let open = |visual: &mut VisualTestContext, workspace: &Entity<Workspace>, root: &Path| {
+            visual.update(|window, cx| {
+                window.activate_window();
+                workspace.update(cx, |this, cx| {
+                    this.open_repository(
+                        Location {
+                            root: root.to_owned(),
+                            file: None,
+                        },
+                        window,
+                        cx,
+                    );
+                });
+            });
+            settle(visual, workspace, |this| {
+                this.repository
+                    .as_ref()
+                    .is_some_and(|repo| repo.root == root)
+                    && this.repository_ui.opening.is_none()
+            });
+        };
+        let switch_docs = |visual: &mut VisualTestContext, workspace: &Entity<Workspace>| {
+            visual.update(|window, cx| {
+                workspace.update(cx, |this, cx| {
+                    this.switch_view(WorkspaceView::Docs, window, cx)
+                });
+            });
+            settle(visual, workspace, |this| this.docs_tree_complete);
+        };
+        let has_row = |workspace: &Workspace, path: &str| {
+            workspace
+                .rows
+                .iter()
+                .any(|row| row.entry.path == Path::new(path))
+        };
+        let click = |visual: &mut VisualTestContext, selector| {
+            let bounds = visual.debug_bounds(selector).unwrap();
+            visual.simulate_click(bounds.center(), Modifiers::default());
+        };
+
+        let (workspace, visual) = open_window(&mut cx, &directory)?;
+        open(visual, &workspace, &root);
+        for (directory, child) in [
+            ("workspace-tree-row:shared", "shared/deep"),
+            ("workspace-tree-row:shared/deep", "shared/deep/page.md"),
+            ("workspace-tree-row:editor", "editor/nested"),
+            ("workspace-tree-row:editor/nested", "editor/nested/page.md"),
+        ] {
+            click(visual, directory);
+            settle(visual, &workspace, |this| has_row(this, child));
+        }
+        click(visual, "workspace-tree-row:shared");
+        settle(visual, &workspace, |this| !has_row(this, "shared/deep"));
+        visual.update(|window, cx| {
+            workspace.update(cx, |this, cx| this.rescan_workspace(window, cx));
+        });
+        settle(visual, &workspace, |this| !this.workspace_refreshing);
+        switch_docs(visual, &workspace);
+        click(visual, "workspace-tree-row:docs");
+        settle(visual, &workspace, |this| has_row(this, "docs/page.md"));
+
+        open(visual, &workspace, &other);
+        visual.update(|_, cx| {
+            let this = workspace.read(cx);
+            assert!(this.expanded.is_empty() && this.docs_expanded.is_empty());
+        });
+        open(visual, &workspace, &root);
+        settle(visual, &workspace, |this| has_row(this, "docs/page.md"));
+
+        let (reopened, visual) = open_window(&mut cx, &directory)?;
+        open(visual, &reopened, &root);
+        settle(visual, &reopened, |this| {
+            has_row(this, "editor/nested/page.md")
+        });
+        visual.update(|_, cx| {
+            let this = reopened.read(cx);
+            assert!(!has_row(this, "shared/deep"));
+            assert!(!has_row(this, "docs/page.md"));
+        });
+        click(visual, "workspace-tree-row:shared");
+        settle(visual, &reopened, |this| {
+            has_row(this, "shared/deep/page.md")
+        });
+
+        switch_docs(visual, &reopened);
+        visual.update(|_, cx| {
+            let this = reopened.read(cx);
+            assert!(has_row(this, "docs/page.md"));
+            assert!(!has_row(this, "editor/nested"));
         });
         Ok(())
     }

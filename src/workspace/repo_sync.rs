@@ -39,19 +39,30 @@ impl Workspace {
         self.tree_busy = false;
     }
 
-    pub(super) fn load_tree_directory(
+    pub(super) fn load_expanded_tree_directories(
         &mut self,
-        path: PathBuf,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if !self
-            .tree_snapshot()
-            .is_some_and(|repo| repo.children.contains_key(&path))
-        {
-            self.tree_load_pending.insert(path);
-            self.queue_workspace_refresh(Default::default(), window, cx);
-        }
+        let Some(repo) = self.tree_snapshot() else {
+            return;
+        };
+        let directories: Vec<_> = self
+            .expanded
+            .iter()
+            .filter(|path| {
+                self.tree_directory_is_expanded(path) && !repo.children.contains_key(*path)
+            })
+            .cloned()
+            .collect();
+        self.tree_load_pending.extend(directories);
+        self.queue_workspace_refresh(Default::default(), window, cx);
+    }
+
+    fn tree_directory_is_expanded(&self, path: &Path) -> bool {
+        path.ancestors()
+            .take_while(|ancestor| !ancestor.as_os_str().is_empty())
+            .all(|ancestor| self.expanded.contains(ancestor))
     }
 
     fn tree_snapshot(&self) -> Option<&Repository> {
@@ -409,11 +420,7 @@ impl Workspace {
             || (changes.structure && changes.directories.is_empty());
         let mut directories = std::mem::take(&mut self.tree_load_pending);
         let mut invalidate = BTreeSet::new();
-        let visible = |path: &Path| {
-            path.ancestors()
-                .take_while(|ancestor| !ancestor.as_os_str().is_empty())
-                .all(|ancestor| self.expanded.contains(ancestor))
-        };
+        let visible = |path: &Path| self.tree_directory_is_expanded(path);
         let changed: BTreeSet<_> = if refresh_all {
             snapshot
                 .children
@@ -530,12 +537,22 @@ impl Workspace {
                                 .collect();
                             this.sync_document_paths(paths, window, cx);
                         }
+                        // A collapsed ancestor can evict a directory listing without
+                        // deleting the directory. Keep its expansion until a parent
+                        // listing confirms the directory is gone.
+                        this.expanded.retain(|path| {
+                            path.ancestors().all(|ancestor| {
+                                ancestor
+                                    .parent()
+                                    .and_then(|parent| tree.children.get(parent))
+                                    .is_none_or(|entries| {
+                                        entries
+                                            .iter()
+                                            .any(|entry| entry.directory && entry.path == ancestor)
+                                    })
+                            })
+                        });
                         if previous_snapshot_changed(this, &repo, &tree) {
-                            this.expanded.retain(|path| {
-                                !previous.children.contains_key(path)
-                                    || tree.children.contains_key(path)
-                                    || this.tree_load_pending.contains(path)
-                            });
                             if this.view == WorkspaceView::Editor
                                 && this.expanded.iter().any(|path| {
                                     !previous.children.contains_key(path)

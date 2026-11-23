@@ -25,7 +25,6 @@ pub(super) struct CachedDocs {
     pub root: PathBuf,
     pub tree: std::rc::Rc<crate::docs::DocumentTree>,
     pub complete: bool,
-    pub expanded: std::collections::BTreeSet<PathBuf>,
     pub scroll: UniformListScrollHandle,
     pub reader: Option<Entity<crate::docs::DocReader>>,
 }
@@ -48,7 +47,6 @@ impl Workspace {
             root: repo.root.clone(),
             tree: self.docs_tree.clone(),
             complete: self.docs_tree_complete,
-            expanded: self.docs_expanded.clone(),
             scroll: if self.view == super::WorkspaceView::Docs {
                 self.tree_scroll.clone()
             } else {

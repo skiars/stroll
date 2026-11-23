@@ -1533,6 +1533,9 @@ impl Workspace {
         self.rebuild_tree();
         self.watch_connection(window, cx);
         self.load_docs_tree(window, cx);
+        if self.view == WorkspaceView::Editor {
+            self.load_expanded_tree_directories(window, cx);
+        }
         self.reveal_file_in_tree(window, cx);
         let repo = self.repository.clone().unwrap();
         let paths = self
@@ -1714,6 +1717,8 @@ impl Workspace {
             // The target session was read before flushing the current UI state.
             session.commit_draft = self.session.commit_draft.take();
             session.panels = self.session.panels;
+            session.editor_tree_expanded.clone_from(&self.expanded);
+            session.docs_tree_expanded.clone_from(&self.docs_expanded);
             session.worktree_lsp_trusted = self.session.worktree_lsp_trusted;
             session.source_history = std::mem::take(&mut self.session.source_history);
         }
@@ -1744,7 +1749,7 @@ impl Workspace {
         self.open_files_list = false;
         self.open_files_scroll = UniformListScrollHandle::new();
         self.close_queue.clear();
-        self.expanded.clear();
+        self.expanded.clone_from(&self.session.editor_tree_expanded);
         self.git = None;
         self.git_edit.clear();
         self.git_watch = Task::ready(());
@@ -1754,7 +1759,8 @@ impl Workspace {
         self.doc_error = None;
         self.open_documents_list = false;
         self.open_documents_scroll = UniformListScrollHandle::new();
-        self.docs_expanded.clear();
+        self.docs_expanded
+            .clone_from(&self.session.docs_tree_expanded);
         self.focus.focus(window, cx);
         let title = if let Some(ssh) = &repo.ssh {
             format!("{} · {} · Stroll", repo.name, ssh.target().authority())
@@ -1767,7 +1773,6 @@ impl Workspace {
             self.docs_tree = cached.tree;
             self.docs_tree_seeded = true;
             self.docs_tree_complete = cached.complete;
-            self.docs_expanded = cached.expanded;
             if self.view == WorkspaceView::Docs {
                 self.doc = cached.reader.filter(|reader| {
                     self.session.document.as_deref() == Some(&reader.read(cx).path)
@@ -1808,6 +1813,7 @@ impl Workspace {
             }
             WorkspaceView::Git => self.open_git_panel(window, cx),
             WorkspaceView::Editor => {
+                self.load_expanded_tree_directories(window, cx);
                 if let Some(file) = file {
                     self.request_file(file, FileOpen::Startup, window, cx);
                 } else {
@@ -1940,7 +1946,7 @@ impl Workspace {
         if !expanded.remove(&path) {
             expanded.insert(path.clone());
             if self.view == WorkspaceView::Editor {
-                self.load_tree_directory(path, window, cx);
+                self.load_expanded_tree_directories(window, cx);
             }
         } else if self.view == WorkspaceView::Editor
             && self
@@ -2090,6 +2096,7 @@ impl Workspace {
         } else if view == WorkspaceView::Git {
             self.open_git_panel(window, cx);
         } else {
+            self.load_expanded_tree_directories(window, cx);
             self.restore_active_file(window, cx);
         }
         cx.notify();
