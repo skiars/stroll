@@ -475,7 +475,7 @@ impl Workspace {
         self.locator.open = true;
         self.repository_ui.menu_open = false;
         self.open_files_list = false;
-        self.lsp_panel_open = false;
+        self.lsp_panel = None;
         self.locator.source = match self.view {
             WorkspaceView::Editor => self.tabs.active().map(Path::to_owned),
             WorkspaceView::Docs => self.doc.as_ref().map(|doc| doc.read(cx).path.clone()),

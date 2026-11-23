@@ -2,6 +2,7 @@ pub(crate) mod actions;
 mod completion;
 mod editor;
 mod indentation;
+mod process_memory;
 mod transport;
 
 use std::{
@@ -40,6 +41,7 @@ pub(crate) use editor::{
     editor_diagnostics, editor_inlay_hints, editor_position, semantic_style_key,
 };
 pub(crate) use indentation::{Newline, NewlineServer};
+pub(crate) use process_memory::{LocalProcess, ProcessMemory};
 use transport::Transport;
 
 const INITIALIZE_TIMEOUT: Duration = Duration::from_secs(12);
@@ -77,6 +79,7 @@ struct ClientHandle {
     state: Arc<Mutex<SessionState>>,
     state_changes: async_channel::Receiver<()>,
     progress: ActiveProgress,
+    local_process: Option<LocalProcess>,
     next_document: AtomicU64,
     stopped: async_channel::Receiver<()>,
     actions: Arc<Mutex<actions::Capabilities>>,
@@ -138,6 +141,7 @@ impl Client {
         options: ServerOptions,
     ) -> Result<Self> {
         let process_id = cwd.as_ref().map(|_| std::process::id());
+        let local_process = (cwd.is_some() && ProcessMemory::SUPPORTED).then(LocalProcess::default);
         let (events, inbox) = mpsc::channel();
         let state = Arc::new(Mutex::new(SessionState::Starting));
         let (changed, state_changes) = async_channel::bounded(1);
@@ -152,6 +156,7 @@ impl Client {
             state: state.clone(),
             state_changes,
             progress: progress.clone(),
+            local_process: local_process.clone(),
             next_document: AtomicU64::new(0),
             stopped,
             actions: actions.clone(),
@@ -174,6 +179,7 @@ impl Client {
                     let wire = Transport::start(
                         &mut command,
                         cwd.as_deref(),
+                        local_process,
                         events,
                         stderr.clone(),
                         stderr_done,
@@ -243,6 +249,17 @@ impl Client {
 
     pub(crate) fn state_changes(&self) -> async_channel::Receiver<()> {
         self.0.state_changes.clone()
+    }
+
+    pub(crate) fn local_process(&self) -> Option<LocalProcess> {
+        let process = self.0.local_process.as_ref()?;
+        if matches!(self.state(), SessionState::Starting | SessionState::Ready)
+            && process.is_running()
+        {
+            Some(process.clone())
+        } else {
+            None
+        }
     }
 
     pub(crate) fn progress(&self) -> Option<ServerProgress> {

@@ -45,7 +45,9 @@ pub use window_bounds::{repository_window_bounds, standalone_window_bounds};
 
 use file_icons::file_type_icon;
 use git_panel::GitPanel;
-use language_service::{LanguageService, ServerKey, ServerProject, WorktreeLanguageState};
+use language_service::{
+    LanguageService, LanguageServicePanel, ServerKey, ServerProject, WorktreeLanguageState,
+};
 use repository_ui::RepositoryUi;
 use settings::SettingsWindow;
 
@@ -800,7 +802,7 @@ pub struct Workspace {
     pub(crate) outline_visibility: Option<bool>,
     language_servers: HashMap<ServerKey, LanguageService>,
     worktree_language: WorktreeLanguageState,
-    lsp_panel_open: bool,
+    lsp_panel: Option<LanguageServicePanel>,
     language_action_groups: BTreeMap<u64, Vec<PathBuf>>,
     language_rename: Task<()>,
     language_format: Task<()>,
@@ -1011,7 +1013,7 @@ impl Workspace {
             outline_visibility: None,
             language_servers: HashMap::new(),
             worktree_language: WorktreeLanguageState::default(),
-            lsp_panel_open: false,
+            lsp_panel: None,
             language_action_groups: BTreeMap::new(),
             language_rename: Task::ready(()),
             language_format: Task::ready(()),
@@ -1756,7 +1758,7 @@ impl Workspace {
         self.audio_preview.stop();
         self.review_loads.clear();
         self.language_servers.clear();
-        self.lsp_panel_open = false;
+        self.lsp_panel = None;
         self.tab_scroll = ScrollHandle::new();
         self.tab_viewport_width = px(0.);
         self.tabs_overflow = false;
@@ -2083,7 +2085,7 @@ impl Workspace {
         self.terminal_view_changed();
         self.view = view;
         self.git_watch = Task::ready(());
-        self.lsp_panel_open = false;
+        self.lsp_panel = None;
         self.open_files_list = false;
         self.open_documents_list = false;
         self.rebuild_tree();
@@ -3822,7 +3824,7 @@ impl Workspace {
         if changed {
             self.language_rename = Task::ready(());
             self.language_format = Task::ready(());
-            self.lsp_panel_open = false;
+            self.lsp_panel = None;
             if let Some(file) = previous.and_then(|path| self.files.get(path)) {
                 file.editor.update(cx, |editor, cx| {
                     editor.cancel_scroll_navigation();
@@ -5008,6 +5010,7 @@ impl Workspace {
                                                 cx,
                                             ),
                                         )
+                                        .debug_selector(|| "status-language-service".into())
                                         .flex_shrink_0(),
                                     )
                                 },

@@ -9,6 +9,7 @@ use std::{
     path::{Path, PathBuf},
     rc::Rc,
     sync::Arc,
+    time::Duration,
 };
 
 use gpui::{prelude::FluentBuilder as _, *};
@@ -29,7 +30,10 @@ use crate::{
         BuiltinProject, CommandSource,
         worktree::{WorktreeLsp, WorktreeServer},
     },
-    lsp::{Client, CompletionActivation, EditorLsp, LanguageServer, NewlineServer, SessionState},
+    lsp::{
+        Client, CompletionActivation, EditorLsp, LanguageServer, LocalProcess, NewlineServer,
+        ProcessMemory, SessionState,
+    },
     paths,
     symbols::LocalSymbols,
 };
@@ -231,6 +235,11 @@ pub(super) enum LanguageService {
         _watch: Task<()>,
     },
     Failed(String),
+}
+
+pub(super) struct LanguageServicePanel {
+    memory: Option<(LocalProcess, ProcessMemory)>,
+    _poll_memory: Option<Task<()>>,
 }
 
 #[derive(PartialEq, Eq)]
@@ -703,6 +712,66 @@ impl Workspace {
         }
     }
 
+    fn language_memory_process(&self) -> Option<LocalProcess> {
+        if self.terminal_maximized() {
+            return None;
+        }
+        let project = self.active_file()?.server_project.as_ref()?;
+        match self.language_servers.get(&project.key)? {
+            LanguageService::Session { client, .. } => client.local_process(),
+            _ => None,
+        }
+    }
+
+    fn language_service_memory(&self) -> Option<ProcessMemory> {
+        let (process, memory) = self.lsp_panel.as_ref()?.memory.as_ref()?;
+        (self.language_memory_process().as_ref() == Some(process)).then_some(*memory)
+    }
+
+    fn open_language_service_panel(&mut self, cx: &mut Context<Self>) {
+        let sample_locally = ProcessMemory::SUPPORTED
+            && self.startup_lsp.enabled
+            && self
+                .repository
+                .as_ref()
+                .is_none_or(|repo| repo.ssh.is_none());
+        let poll = sample_locally.then(|| {
+            cx.spawn(async move |this, cx| {
+                loop {
+                    let Ok(process) = this.read_with(cx, |this, _| this.language_memory_process())
+                    else {
+                        return;
+                    };
+                    if let Some(process) = process {
+                        let sampler = process.clone();
+                        let sample = cx.background_spawn(async move { sampler.sample() }).await;
+                        if this
+                            .update(cx, |this, cx| {
+                                if this.language_memory_process().as_ref() == Some(&process)
+                                    && let Some(panel) = &mut this.lsp_panel
+                                {
+                                    let memory = sample.map(|sample| (process, sample));
+                                    if panel.memory != memory {
+                                        panel.memory = memory;
+                                        cx.notify();
+                                    }
+                                }
+                            })
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                    cx.background_executor().timer(Duration::from_secs(2)).await;
+                }
+            })
+        });
+        self.lsp_panel = Some(LanguageServicePanel {
+            memory: None,
+            _poll_memory: poll,
+        });
+    }
+
     pub(super) fn language_service_progress(
         &self,
         file: &OpenFile,
@@ -772,12 +841,16 @@ impl Workspace {
             .anchor(Anchor::BottomRight)
             .offset(px(6.))
             .p_3()
-            .open(self.lsp_panel_open)
+            .open(self.lsp_panel.is_some())
             .on_open_change(cx.listener(|this, &open, _, cx| {
-                this.lsp_panel_open = open;
-                if open && let Some(file) = this.active_file() {
-                    file.editor
-                        .update(cx, |editor, cx| editor.dismiss_lsp_overlays(cx));
+                if open {
+                    this.open_language_service_panel(cx);
+                    if let Some(file) = this.active_file() {
+                        file.editor
+                            .update(cx, |editor, cx| editor.dismiss_lsp_overlays(cx));
+                    }
+                } else {
+                    this.lsp_panel = None;
                 }
                 cx.notify();
             }))
@@ -827,6 +900,7 @@ impl Workspace {
         let running = status == ServiceStatus::Ready;
         let stop_disabled = !matches!(status, ServiceStatus::Starting | ServiceStatus::Ready);
         let start_disabled = status.pending();
+        let memory = self.language_service_memory();
         let mut panel = v_flex()
             .w(px(312.).min((viewport.width - px(42.)).max(px(0.))))
             .gap_2()
@@ -866,7 +940,20 @@ impl Workspace {
                         colors,
                     ))
             })
-            .child(service_detail(t!("lsp.status"), status.label(), colors));
+            .child(service_detail(t!("lsp.status"), status.label(), colors))
+            .when(project.is_some(), |panel| {
+                let rss = memory
+                    .map(|sample| format!("{:.1} MiB", sample.bytes as f64 / 1_048_576.))
+                    .unwrap_or_else(|| t!("lsp.memory_unavailable").into_owned());
+                panel.child(
+                    service_detail(t!("lsp.memory_rss"), rss, colors)
+                        .id("language-service-memory")
+                        .debug_selector(|| "language-service-memory".into())
+                        .managed_tooltip(|window, cx| {
+                            Tooltip::new(t!("lsp.memory_rss_hint").into_owned()).build(window, cx)
+                        }),
+                )
+            });
 
         let worktree_workspace = workspace.clone();
         if status.controls() {
@@ -947,13 +1034,13 @@ fn service_detail(
     label: impl Into<SharedString>,
     value: impl Into<SharedString>,
     colors: Palette,
-) -> impl IntoElement {
+) -> Div {
     h_flex()
         .items_start()
         .gap_3()
         .child(
             div()
-                .w(px(70.))
+                .w(px(84.))
                 .flex_shrink_0()
                 .text_color(colors.muted)
                 .child(label.into()),
@@ -978,6 +1065,9 @@ mod indentation_tests;
 
 #[cfg(all(test, unix))]
 mod markdown_tests;
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+mod memory_tests;
 
 #[cfg(test)]
 mod tests {

@@ -12,13 +12,14 @@ use std::{
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::Value;
 
-use super::Event;
+use super::{Event, LocalProcess};
 
 const MAX_MESSAGE_BYTES: usize = 32 * 1024 * 1024;
 const STDERR_TAIL_BYTES: usize = 4096;
 
 pub(super) struct Transport {
     child: Child,
+    local_process: Option<LocalProcess>,
     output: SyncSender<Value>,
 }
 
@@ -26,6 +27,7 @@ impl Transport {
     pub(super) fn start(
         command: &mut Command,
         root: Option<&Path>,
+        local_process: Option<LocalProcess>,
         events: Sender<Event>,
         stderr_tail: Arc<Mutex<Vec<u8>>>,
         stderr_done: Sender<()>,
@@ -44,6 +46,7 @@ impl Transport {
         let (outgoing, messages) = mpsc::sync_channel::<Value>(16);
         let transport = Self {
             child,
+            local_process,
             output: outgoing,
         };
 
@@ -96,6 +99,9 @@ impl Transport {
                     }
                 }
             })?;
+        if let Some(process) = &transport.local_process {
+            process.set_pid(transport.child.id());
+        }
         Ok(transport)
     }
 
@@ -115,6 +121,9 @@ impl Transport {
 
 impl Drop for Transport {
     fn drop(&mut self) {
+        if let Some(process) = &self.local_process {
+            process.set_pid(0);
+        }
         _ = self.child.kill();
         _ = self.child.wait();
     }
