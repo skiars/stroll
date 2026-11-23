@@ -1428,9 +1428,11 @@ impl Workspace {
         window: &Window,
         cx: &Context<Self>,
         colors: Palette,
+        available_width: Option<Pixels>,
     ) -> AnyElement {
         let ui = &self.repository_ui;
         let max_width = (window.viewport_size().width * 0.31).min(px(330.));
+        let max_width = available_width.map_or(max_width, |width| max_width.min(width));
         let Some(repo) = &self.repository else {
             return quiet_button("open-repository-trigger")
                 .h(px(28.))

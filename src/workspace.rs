@@ -4086,12 +4086,49 @@ impl Workspace {
     }
 
     fn topbar(&self, window: &Window, cx: &Context<Self>, colors: Palette) -> impl IntoElement {
-        let nav = topbar_segments(colors)
+        let actions = self.topbar_actions(cx);
+        let row = if cfg!(target_os = "macos") && self.repository.is_some() {
+            centered_topbar(cx.entity(), actions, colors).into_any_element()
+        } else {
+            h_flex()
+                .w_full()
+                .min_w_0()
+                .gap_2()
+                .pr_2()
+                .child(self.repository_trigger(window, cx, colors, None))
+                .child(div().flex_1())
+                .when(self.repository.is_some(), |bar| {
+                    bar.child(self.topbar_navigation(window, cx, colors, true))
+                })
+                .child(div().flex_1())
+                .child(actions)
+                .into_any_element()
+        };
+        TitleBar::new()
+            .on_close_window(cx.listener(|this, _, window, cx| {
+                if this.request_window_close(window, cx) {
+                    window.remove_window();
+                }
+            }))
+            .h(px(36.))
+            .bg(colors.titlebar)
+            .border_0()
+            .child(row)
+    }
+
+    fn topbar_navigation(
+        &self,
+        window: &Window,
+        cx: &Context<Self>,
+        colors: Palette,
+        subtitles: bool,
+    ) -> Div {
+        topbar_segments(colors)
             .child(
                 nav_item(
                     "nav-docs",
                     t!("common.docs"),
-                    "Markdown",
+                    subtitles.then(|| "Markdown".into()),
                     self.view == WorkspaceView::Docs,
                     window,
                     cx,
@@ -4106,7 +4143,7 @@ impl Workspace {
                 nav_item(
                     "nav-workspace",
                     t!("common.workspace"),
-                    t!("workspace.code"),
+                    subtitles.then(|| t!("workspace.code").into()),
                     self.view == WorkspaceView::Editor,
                     window,
                     cx,
@@ -4121,7 +4158,7 @@ impl Workspace {
                 nav_item(
                     "nav-git",
                     "Git",
-                    t!("git.history_nav"),
+                    subtitles.then(|| t!("git.history_nav").into()),
                     self.view == WorkspaceView::Git,
                     window,
                     cx,
@@ -4131,69 +4168,41 @@ impl Workspace {
                 .on_click(cx.listener(|this, _, window, cx| {
                     this.switch_view(WorkspaceView::Git, window, cx)
                 })),
-            );
-        TitleBar::new()
-            .on_close_window(cx.listener(|this, _, window, cx| {
-                if this.request_window_close(window, cx) {
-                    window.remove_window();
-                }
-            }))
-            .h(px(36.))
-            .bg(colors.titlebar)
-            .border_0()
-            .child(
-                h_flex()
-                    .w_full()
-                    .min_w_0()
-                    .gap_2()
-                    .pr_2()
-                    .child(self.repository_trigger(window, cx, colors))
-                    .child(div().flex_1())
-                    .when(self.repository.is_some(), |bar| bar.child(nav))
-                    .child(div().flex_1())
+            )
+    }
+
+    fn topbar_actions(&self, cx: &Context<Self>) -> Div {
+        titlebar_actions()
+            .debug_selector(|| "workspace-topbar-actions".into())
+            .gap(px(4.))
+            .when(self.repository.is_some(), |tools| {
+                tools
                     .child(
-                        titlebar_actions()
-                            .gap(px(4.))
-                            .when(self.repository.is_some(), |tools| {
-                                tools
-                                    .child(
-                                        icon_button(
-                                            "search",
-                                            IconName::Search,
-                                            t!(
-                                                "locator.shortcut",
-                                                keys = if cfg!(target_os = "macos") {
-                                                    "⌘P"
-                                                } else {
-                                                    "Ctrl+P"
-                                                }
-                                            )
-                                            .into_owned(),
-                                        )
-                                        .on_click(
-                                            cx.listener(|this, _, window, cx| {
-                                                this.open_locator(window, cx)
-                                            }),
-                                        ),
-                                    )
-                                    .child(self.theme_button(cx))
-                            })
-                            .child(
-                                icon_button(
-                                    "open-settings",
-                                    IconName::Settings,
-                                    t!("common.settings"),
-                                )
-                                .when(self.config.load_error.is_some(), |button| {
-                                    button.tooltip(t!("workspace.settings_read_failed"))
-                                })
-                                .on_click(cx.listener(
-                                    |this, _, window, cx| {
-                                        this.toggle_settings(&ToggleSettings, window, cx)
-                                    },
-                                )),
-                            ),
-                    ),
+                        icon_button(
+                            "search",
+                            IconName::Search,
+                            t!(
+                                "locator.shortcut",
+                                keys = if cfg!(target_os = "macos") {
+                                    "⌘P"
+                                } else {
+                                    "Ctrl+P"
+                                }
+                            )
+                            .into_owned(),
+                        )
+                        .on_click(cx.listener(|this, _, window, cx| this.open_locator(window, cx))),
+                    )
+                    .child(self.theme_button(cx))
+            })
+            .child(
+                icon_button("open-settings", IconName::Settings, t!("common.settings"))
+                    .when(self.config.load_error.is_some(), |button| {
+                        button.tooltip(t!("workspace.settings_read_failed"))
+                    })
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.toggle_settings(&ToggleSettings, window, cx)
+                    })),
             )
     }
 
@@ -5398,6 +5407,64 @@ impl Render for Workspace {
     }
 }
 
+fn centered_topbar(
+    workspace: Entity<Workspace>,
+    actions: Div,
+    colors: Palette,
+) -> impl IntoElement {
+    canvas(
+        move |bounds, window, cx| {
+            // The title bar has already reserved space for the native buttons.
+            // Center against the whole viewport while laying out inside the remaining bounds.
+            let center = window.viewport_size().width / 2.;
+            let gap = window.rem_size() * 0.5;
+            let available = size(AvailableSpace::MaxContent, AvailableSpace::MaxContent);
+            let mut actions = actions.into_any_element();
+            let actions_size = actions.layout_as_root(available, window, cx);
+            let actions_left = bounds.right() - gap - actions_size.width;
+            let navigation = |subtitles, window: &Window, cx: &mut App| {
+                workspace.update(cx, |this, cx| {
+                    this.topbar_navigation(window, cx, colors, subtitles)
+                        .into_any_element()
+                })
+            };
+            let mut nav = navigation(true, window, cx);
+            let mut nav_size = nav.layout_as_root(available, window, cx);
+
+            // Allow long repository labels to truncate before dropping navigation subtitles.
+            let repo_label_space = px(120.);
+            if center - nav_size.width / 2. < bounds.left() + repo_label_space + gap
+                || center + nav_size.width / 2. + gap > actions_left
+            {
+                nav = navigation(false, window, cx);
+                nav_size = nav.layout_as_root(available, window, cx);
+            }
+
+            let nav_left = (center - nav_size.width / 2.)
+                .min(actions_left - gap - nav_size.width)
+                .max(bounds.left() + gap);
+            let repo_width = nav_left - gap - bounds.left();
+            let mut repo = workspace.update(cx, |this, cx| {
+                this.repository_trigger(window, cx, colors, Some(repo_width))
+            });
+            let repo_size = repo.layout_as_root(available, window, cx);
+
+            let origin = |x, height| point(x, bounds.center().y - height / 2.);
+            repo.prepaint_at(origin(bounds.left(), repo_size.height), window, cx);
+            nav.prepaint_at(origin(nav_left, nav_size.height), window, cx);
+            actions.prepaint_at(origin(actions_left, actions_size.height), window, cx);
+            [repo, nav, actions]
+        },
+        |_, row, window, cx| {
+            for mut element in row {
+                element.paint(window, cx);
+            }
+        },
+    )
+    .size_full()
+    .min_w_0()
+}
+
 fn topbar_segments(colors: Palette) -> Div {
     h_flex()
         .gap(px(4.))
@@ -5425,14 +5492,13 @@ fn topbar_segment(id: &'static str, active: bool, colors: Palette) -> Button {
 fn nav_item(
     id: &'static str,
     label: impl Into<SharedString>,
-    description: impl Into<SharedString>,
+    description: Option<SharedString>,
     active: bool,
     window: &Window,
     cx: &App,
     colors: Palette,
 ) -> Button {
     let label = label.into();
-    let description = description.into();
     let label_size = px(text_base_size(cx));
     let description_size = px(11.);
     let mut ui_font = font(cx.theme().font_family.clone());
@@ -5455,7 +5521,6 @@ fn nav_item(
     };
     let regular = text_run(label.len(), FontWeight::NORMAL);
     let semibold = text_run(label.len(), FontWeight::SEMIBOLD);
-    let subtitle = text_run(description.len(), FontWeight::NORMAL);
     let text_width = |value: &str, size, run: &TextRun| {
         text_system
             .layout_line(value, size, std::slice::from_ref(run), None)
@@ -5464,7 +5529,6 @@ fn nav_item(
     };
     let label_width =
         text_width(&label, label_size, &regular).max(text_width(&label, label_size, &semibold));
-    let description_width = text_width(&description, description_size, &subtitle);
     let text = |value: SharedString, size, run, width, color: Option<Hsla>| {
         canvas(
             |_, _, _| (),
@@ -5504,13 +5568,17 @@ fn nav_item(
             label_width,
             None,
         ))
-        .child(text(
-            description,
-            description_size,
-            subtitle,
-            description_width,
-            Some(colors.muted),
-        ))
+        .when_some(description, |button, description| {
+            let subtitle = text_run(description.len(), FontWeight::NORMAL);
+            let width = text_width(&description, description_size, &subtitle);
+            button.child(text(
+                description,
+                description_size,
+                subtitle,
+                width,
+                Some(colors.muted),
+            ))
+        })
 }
 
 /// The vertical distance from a text baseline to the center of its line box is
@@ -6108,6 +6176,103 @@ mod layout_tests {
     use gpui::{TestAppContext, TestDispatcher, VisualTestContext, px, size};
     use gpui_component::Root;
     use std::process::Command;
+
+    #[::core::prelude::v1::test]
+    fn centered_topbar_fits_long_repository_names_and_compacts_navigation() -> Result<()> {
+        struct CenteredTopbarPreview(Entity<Workspace>);
+
+        impl Render for CenteredTopbarPreview {
+            fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+                let workspace = self.0.clone();
+                let colors = Palette::for_mode(cx.theme().mode);
+                let actions = workspace.update(cx, |this, cx| this.topbar_actions(cx));
+                TitleBar::new()
+                    .h(px(36.))
+                    .pl(px(80.))
+                    .child(centered_topbar(workspace, actions, colors))
+            }
+        }
+
+        let fixture = tempfile::tempdir()?;
+        let open = |name| -> Result<Arc<Repository>> {
+            let root = fixture.path().join(name);
+            assert!(
+                Command::new("git")
+                    .args([
+                        "init",
+                        "-qb",
+                        "feature/a-long-branch-name-for-the-title-bar"
+                    ])
+                    .arg(&root)
+                    .status()?
+                    .success()
+            );
+            Ok(Arc::new(Repository::open(&root)?))
+        };
+        let short_repo = open("repo")?;
+        let long_repo = open("a-much-longer-repository-name-to-test-title-bar-truncation")?;
+        let store = Arc::new(Store::new(fixture.path().join("state"))?);
+        let config = ConfigFile::load(Some(fixture.path().join("config.toml")));
+        let mut app = TestAppContext::build_with_text_system(
+            TestDispatcher::new(0),
+            None,
+            crate::test_support::text_system(true),
+        );
+        app.update(gpui_component::init);
+        let mut workspace = None;
+        let (_, visual) = app.add_window_view(|window, cx| {
+            let entity = cx.new(|cx| {
+                let mut workspace =
+                    Workspace::with_config(store, config, WorkspaceView::Editor, window, cx);
+                workspace.repository = Some(short_repo);
+                workspace
+            });
+            workspace = Some(entity.clone());
+            let preview = cx.new(|_| CenteredTopbarPreview(entity));
+            Root::new(preview, window, cx)
+        });
+        let workspace = workspace.unwrap();
+        let check = |visual: &mut VisualTestContext, width| {
+            visual.simulate_resize(size(px(width), px(480.)));
+            visual.run_until_parked();
+            visual.update(|window, cx| {
+                window.simulate_next_frame(cx);
+                window.draw(cx).clear(cx);
+            });
+            let docs = visual.debug_bounds("nav-docs").unwrap();
+            let work = visual.debug_bounds("nav-workspace").unwrap();
+            let git = visual.debug_bounds("nav-git").unwrap();
+            let repo = visual.debug_bounds("repository-menu-trigger").unwrap();
+            let actions = visual.debug_bounds("workspace-topbar-actions").unwrap();
+            assert!(((docs.left() + git.right()) / 2. - px(width / 2.)).abs() <= px(1.));
+            assert!(repo.left() >= px(80.) && repo.right() < docs.left());
+            assert!(docs.right() < work.left() && work.right() < git.left());
+            assert!(git.right() < actions.left());
+
+            (repo.size.width, docs.size.width)
+        };
+        let (short_trigger, full_nav) = check(visual, 1200.);
+        visual.update(|_, cx| {
+            workspace.update(cx, |this, cx| {
+                this.repository = Some(long_repo);
+                cx.notify();
+            });
+        });
+        let (long_trigger, _) = check(visual, 1200.);
+        let (narrow_trigger, _) = check(visual, 740.);
+        let (_, compact_nav) = check(visual, 620.);
+        assert!(short_trigger < long_trigger && narrow_trigger < long_trigger);
+        assert!(compact_nav < full_nav);
+
+        let docs = visual.debug_bounds("nav-docs").unwrap();
+        visual.simulate_click(docs.center(), Modifiers::none());
+        visual.update(|_, cx| assert_eq!(workspace.read(cx).view, WorkspaceView::Docs));
+
+        let repo = visual.debug_bounds("repository-menu-trigger").unwrap();
+        visual.simulate_click(repo.center(), Modifiers::none());
+        visual.update(|_, cx| assert!(workspace.read(cx).repository_ui.menu_open));
+        Ok(())
+    }
 
     #[::core::prelude::v1::test]
     fn editor_status_follows_caret_and_file_line_endings() -> Result<()> {
