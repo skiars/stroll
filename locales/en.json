@@ -175,7 +175,7 @@
   "git.filter_and_collapse": "Filter and collapse",
   "git.first_parent_suffix": " · First parent",
   "git.history": "Commit history",
-  "git.history_nav": "Commit history",
+  "git.history_nav": "History",
   "git.history_edit_local": "Commit history can be edited only on the checked-out branch of a local worktree.",
   "git.history_edit_stale": "The branch or Git operation has changed. Reload the history or reopen the operation.",
   "git.history_edit_blocked": "Finish the current Git operation before editing commit history.",

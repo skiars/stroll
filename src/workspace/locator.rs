@@ -1657,6 +1657,7 @@ impl Workspace {
         let mode = self.locator.mode;
         let query = &self.locator_tab().query;
         let scope_open = self.locator_session().scope_open;
+        let text_size = px(12.);
         let options = [
             (query.case_sensitive, "Aa", "locator.case_sensitive"),
             (query.whole_word, "Ab", "locator.whole_word"),
@@ -1667,12 +1668,12 @@ impl Workspace {
             .max_h((height * 0.35).min(px(180.)))
             .min_h_0()
             .overflow_y_scroll()
-            .text_size(px(12.))
+            .text_size(text_size)
             .when_some(self.locator.references.as_ref(), |area, search| {
                 area.child(
                     h_flex().px_3().pt_2().child(
                         Checkbox::new("locator-include-declaration")
-                            .small()
+                            .text_size(text_size)
                             .label(t!("lsp.include_declaration").into_owned())
                             .checked(search.include_declaration)
                             .on_change(cx.listener(|this, checked: &bool, window, cx| {

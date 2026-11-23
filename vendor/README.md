@@ -398,3 +398,13 @@ dialogs in a Wayland window after changes to paint order or focus handling.
 
 - Completed Markdown task items inherit the body text color. The `documents`
   integration test compares the painted text colors of both task states.
+
+- Markdown task lists and table task cells use the same indicator as form and
+  Git staging checkboxes. The box follows the surrounding text size and
+  baseline, with a filled accent for checked and mixed states. Staging hover
+  applies to the full hit area and only changes the indicator border and outer
+  outline. Checkbox alignment uses the magnitude of font descent to match
+  shaped text on platforms that expose descent as a negative coordinate.
+  Run `cargo test --release --locked --test checkbox` and the
+  `markdown_list_and_table_checkboxes_follow_document_typography` and
+  `stage_slot_covers_the_cell_and_hands_clicks_to_staging` library tests.

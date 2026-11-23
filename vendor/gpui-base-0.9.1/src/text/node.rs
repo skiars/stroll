@@ -7,16 +7,17 @@ use std::{
 
 use gpui::{
     AnyElement, App, Axis, Bounds, DefiniteLength, Div, Element, ElementId, FontStyle, FontWeight,
-    GlobalElementId, HighlightStyle, Hsla, Image, ImageFormat, ImageSource, InspectorElementId,
+    GlobalElementId, HighlightStyle, Hsla, Image, ImageSource, InspectorElementId,
     InteractiveElement as _, IntoElement, IsZero as _, LayoutId, Overflow, ParentElement, Pixels,
     Point, Refineable as _, Rems, ScrollHandle, SharedString, SharedUri,
     StatefulInteractiveElement, StyleRefinement, Styled, TextStyleRefinement, WhiteSpace, Window,
-    div, img, prelude::FluentBuilder as _, px, relative, rems,
+    div, prelude::FluentBuilder as _, px, relative, rems,
 };
 use markdown::mdast;
 
 use crate::{
-    GlobalState, ScrollableMask, Scrollbar, StyledExt, h_flex,
+    CheckboxIndicator, CheckboxIndicatorColors, CheckboxState, GlobalState, ScrollableMask,
+    Scrollbar, StyledExt, h_flex,
     scrollable_mask::horizontal_scroll_area,
     text::{
         CodeBlockActionsFn, CodeBlockHighlighterFn, ImageClickHandlerFn, ImageContextMenuHandlerFn,
@@ -38,9 +39,6 @@ use super::{
     SelectionFormat, TextViewStyle,
     utils::{data_url_image, list_item_prefix, ordered_list_ordinal},
 };
-
-const CHECK_SVG_LIGHT: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="none"><path d="m3.25 8.25 3 3 6.5-7" stroke="white" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>"#;
-const CHECK_SVG_DARK: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="none"><path d="m3.25 8.25 3 3 6.5-7" stroke="black" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>"#;
 
 /// The block-level nodes.
 ///
@@ -3993,8 +3991,10 @@ impl BlockNode {
         checked: Option<bool>,
         task_toggle: Option<(Arc<TaskToggleHandlerFn>, TaskToggleEvent)>,
         style: &TextViewStyle,
-        line_height: Pixels,
+        size: Pixels,
         indent: Pixels,
+        window: &Window,
+        cx: &App,
     ) -> Div {
         h_flex()
             .w_full()
@@ -4027,44 +4027,46 @@ impl BlockNode {
                 )
             })
             .when_some(checked, |this, checked| {
-                // Todo list checkbox
-                let check_svg = if style.is_dark() {
-                    CHECK_SVG_DARK
+                const HOVER_GROUP: &str = "markdown-task-checkbox";
+                let font = window.text_style().font();
+                let offset = CheckboxIndicator::text_top(window, &font, size, window.line_height());
+                let theme = cx.theme();
+                let colors = CheckboxIndicatorColors {
+                    border: style
+                        .list_style()
+                        .text
+                        .color
+                        .unwrap_or(style.muted_foreground()),
+                    accent: theme.tokens.colors.primary,
+                    mark: if style.is_dark() {
+                        theme.tokens.colors.background
+                    } else {
+                        Hsla::white()
+                    },
+                };
+                let state = if checked {
+                    CheckboxState::Checked
                 } else {
-                    CHECK_SVG_LIGHT
+                    CheckboxState::Unchecked
                 };
                 this.child(
                     div()
-                        .flex()
-                        .mr_2()
-                        .h(line_height)
+                        .mr(size * 0.53)
+                        .h(window.line_height())
                         .flex_none()
-                        .items_center()
-                        .justify_center()
+                        .when(task_toggle.is_some(), |this| {
+                            this.group(HOVER_GROUP).cursor_pointer()
+                        })
                         .child(
-                            div()
-                                .flex()
-                                .size(rems(0.9375))
-                                .items_center()
-                                .justify_center()
-                                .rounded(px(4.))
-                                .border(px(1.5))
-                                .border_color(
-                                    style
-                                        .list_style()
-                                        .text
-                                        .color
-                                        .unwrap_or(style.muted_foreground()),
-                                )
-                                .when(checked, |this| {
-                                    this.bg(style.link()).border_color(style.link()).child(
-                                        img(Arc::new(Image::from_bytes(
-                                            ImageFormat::Svg,
-                                            check_svg.to_vec(),
-                                        )))
-                                        .size(rems(0.75)),
-                                    )
-                                }),
+                            CheckboxIndicator::web(
+                                size,
+                                state,
+                                colors,
+                                false,
+                                if checked { 1. } else { 0. },
+                                task_toggle.is_some().then(|| HOVER_GROUP.into()),
+                            )
+                            .top(offset),
                         )
                         .map(|checkbox| match task_toggle {
                             Some((handler, event)) => checkbox
@@ -4174,8 +4176,10 @@ impl BlockNode {
                                         *checked,
                                         task_toggle.clone(),
                                         &node_cx.style,
-                                        window.line_height(),
+                                        body,
                                         indent,
+                                        window,
+                                        cx,
                                     ));
                                 }
                                 BlockNode::List { .. } => {
@@ -4219,8 +4223,10 @@ impl BlockNode {
                                             *checked,
                                             task_toggle.clone(),
                                             &node_cx.style,
-                                            window.line_height(),
+                                            body,
                                             indent,
+                                            window,
+                                            cx,
                                         ));
                                     } else {
                                         // Indent continuation blocks to align with a

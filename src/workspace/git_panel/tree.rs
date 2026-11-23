@@ -17,8 +17,12 @@ use crate::workspace::{
     tree_motion::{self, ROW_HEIGHT as TREE_ROW_HEIGHT},
 };
 
-/// Width of the clickable staging slot, slightly wider than the 16 px checkbox.
-const STAGE_SLOT_WIDTH: f32 = 24.;
+const MIN_STAGE_SLOT_WIDTH: Pixels = px(24.);
+// The slot already leaves space to the left of its indicator.
+const STAGE_SLOT_MARGIN_LEFT: Pixels = px(-4.);
+const STAGE_SLOT_PADDING_RIGHT: Pixels = px(6.);
+const ROW_HOVER_GROUP: &str = "git-tree-row";
+const TREE_ROW_RIGHT_PADDING: Pixels = px(16.);
 const HUNK_PANEL_MAX_HEIGHT: Pixels = px(190.);
 
 fn hunk_count(count: usize) -> Cow<'static, str> {
@@ -314,12 +318,17 @@ impl GitPanel {
             &self.tree_scroll,
             frame,
             move |index, visual, cx| {
+                let file_name_size = file_name_font_size(cx);
+                let checkbox_size = px(file_name_size);
+                let stage_slot_width = (checkbox_size + px(8.)).max(MIN_STAGE_SLOT_WIDTH);
+                let stage_slot = stage_allowed.then_some(stage_slot_width);
                 let stage_checkbox = |path: &str, files: &[usize], directory: bool| {
                     let stage = stage_paths(&detail, files, true, stage_allowed);
                     let unstage = stage_paths(&detail, files, false, stage_allowed);
                     let Some(state) = staging_state(&stage, &unstage) else {
                         return div()
-                            .w(px(STAGE_SLOT_WIDTH))
+                            .w(stage_slot_width)
+                            .ml(STAGE_SLOT_MARGIN_LEFT)
                             .flex_shrink_0()
                             .into_any_element();
                     };
@@ -361,45 +370,34 @@ impl GitPanel {
                     };
                     let tooltip = format!("{status} · {intent}");
                     let disabled = stage_busy || !ready || visual.exiting;
-                    // The entire slot handles staging clicks, including the space around the 16 px checkbox.
-                    // Clicks on the rest of the row still open the file or toggle the directory.
-                    let slot_action: Rc<dyn Fn(&mut Window, &mut App)> = {
-                        let view = view.clone();
-                        let paths = paths.clone();
-                        Rc::new(move |window, cx| {
+                    let tooltip_label = format!("{path} · {tooltip}");
+                    let path = path.to_owned();
+                    // The checkbox owns the full staging slot, including the space to its left.
+                    let view = view.clone();
+                    Checkbox::new(SharedString::from(format!("git-tree-stage:{path}")))
+                        .debug_selector(move || format!("git-tree-stage:{path}"))
+                        .w(stage_slot_width)
+                        .ml(STAGE_SLOT_MARGIN_LEFT)
+                        .h_full()
+                        .flex_shrink_0()
+                        .items_center()
+                        .justify_end()
+                        .pr(STAGE_SLOT_PADDING_RIGHT)
+                        .accessibility_label(tooltip_label)
+                        .tooltip(tooltip)
+                        .text_size(checkbox_size)
+                        .checked(state == StagingState::Staged)
+                        .indeterminate(state == StagingState::Mixed)
+                        .indicator_border_color(colors.control)
+                        .keep_indicator_color_when_disabled(ready && (stage_busy || visual.exiting))
+                        .tab_stop(!visual.exiting)
+                        .disabled(disabled)
+                        .on_click(move |_, window, cx| {
                             cx.stop_propagation();
                             _ = view.update(cx, |panel, cx| {
                                 panel.stage_files(paths.clone(), staged, window, cx);
                             });
                         })
-                    };
-                    let slot_click = slot_action.clone();
-                    let checkbox_click = slot_action.clone();
-                    div()
-                        .id(SharedString::from(format!("git-tree-stage-slot:{path}")))
-                        .debug_selector(|| format!("git-tree-stage:{path}"))
-                        .w(px(STAGE_SLOT_WIDTH))
-                        .h_full()
-                        .flex_shrink_0()
-                        .h_flex()
-                        .justify_end()
-                        .when(!disabled, |slot| {
-                            slot.on_click(move |_, window, cx| slot_click(window, cx))
-                        })
-                        .child(
-                            Checkbox::new(SharedString::from(format!("git-tree-stage:{path}")))
-                                .accessibility_label(format!("{path} · {tooltip}"))
-                                .tooltip(tooltip)
-                                .checked(state == StagingState::Staged)
-                                .indeterminate(state == StagingState::Mixed)
-                                .indicator_border_color(colors.control)
-                                .keep_indicator_color_when_disabled(
-                                    ready && (stage_busy || visual.exiting),
-                                )
-                                .tab_stop(!visual.exiting)
-                                .disabled(disabled)
-                                .on_click(move |_, window, cx| checkbox_click(window, cx)),
-                        )
                         .into_any_element()
                 };
                 Some(match &rows[index] {
@@ -417,8 +415,7 @@ impl GitPanel {
                         let files = files.clone();
                         let context_view = view.clone();
                         let system_workspace = workspace.clone();
-                        let file_name_size = file_name_font_size(cx);
-                        tree_row(("folder", path.clone()), *depth, colors)
+                        tree_row("folder", &path, *depth, colors, stage_slot)
                             .child(icon(
                                 if *closed {
                                     IconName::Folder
@@ -437,11 +434,16 @@ impl GitPanel {
                                     .text_size(px(file_name_size))
                                     .child(label.clone()),
                             )
-                            .child(
+                            .child(baseline_aligned(
+                                cx,
+                                GIT_BADGE_SIZE.as_f32(),
+                                file_name_size,
                                 div()
+                                    .flex_shrink_0()
+                                    .text_size(GIT_BADGE_SIZE)
                                     .text_color(colors.muted)
                                     .child(files.len().to_string()),
-                            )
+                            ))
                             .when(stage_allowed, |row| {
                                 row.child(stage_checkbox(&path, &files, true))
                             })
@@ -535,8 +537,7 @@ impl GitPanel {
                         let system_workspace = workspace.clone();
                         let stage = stage_paths(&detail, &[ix], true, stage_allowed);
                         let unstage = stage_paths(&detail, &[ix], false, stage_allowed);
-                        let file_name_size = file_name_font_size(cx);
-                        tree_row(("file", path.clone()), *depth, colors)
+                        tree_row("file", &path, *depth, colors, stage_slot)
                             .when(active == Some(ix), |row| {
                                 row.bg(colors.accent.opacity(0.13))
                                     .text_color(colors.accent)
@@ -999,8 +1000,20 @@ fn append_system_menu(
     }
 }
 
-fn tree_row((kind, path): (&str, String), depth: usize, colors: Palette) -> Stateful<Div> {
+fn tree_row(
+    kind: &str,
+    path: &str,
+    depth: usize,
+    colors: Palette,
+    stage_slot_width: Option<Pixels>,
+) -> Stateful<Div> {
     let id = format!("git-tree-row:{kind}:{path}");
+    // The indicator and the historical diff counts share the same visual edge.
+    let right_padding = if stage_slot_width.is_some() {
+        TREE_ROW_RIGHT_PADDING - STAGE_SLOT_PADDING_RIGHT
+    } else {
+        TREE_ROW_RIGHT_PADDING
+    };
     h_flex()
         .id(SharedString::from(id.clone()))
         .debug_selector(move || id)
@@ -1008,10 +1021,31 @@ fn tree_row((kind, path): (&str, String), depth: usize, colors: Palette) -> Stat
         .w_full()
         .gap_1()
         .pl(px(9. + depth.min(14) as f32 * 12.))
-        .pr(px(16.))
+        .pr(right_padding)
         .cursor_pointer()
-        .hover(|row| row.bg(colors.hover))
         .text_size(GIT_TEXT_SIZE)
+        .map(|row| match stage_slot_width {
+            None => row.hover(|row| row.bg(colors.hover)),
+            Some(width) => {
+                // The row keeps its hover feedback outside the staging hit area.
+                // The background spans the row, but its hover region ends at the slot.
+                let trailing = width + right_padding;
+                row.relative().child(
+                    div()
+                        .absolute()
+                        .inset_0()
+                        .right(trailing)
+                        .group(ROW_HOVER_GROUP)
+                        .child(
+                            div()
+                                .absolute()
+                                .inset_0()
+                                .right(-trailing)
+                                .group_hover(ROW_HOVER_GROUP, |style| style.bg(colors.hover)),
+                        ),
+                )
+            }
+        })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

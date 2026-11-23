@@ -7,10 +7,10 @@ use crate::{
 use crate::{StyleSized as _, StyledExt as _, ThemeStyled as _};
 use gpui::{
     AnyElement, App, ElementId, Hsla, InteractiveElement, IntoElement, MouseButton, ParentElement,
-    RenderOnce, SharedString, StatefulInteractiveElement, StyleRefinement, Styled, Window, div,
-    prelude::FluentBuilder as _, px, relative, rems, svg,
+    Refineable as _, RenderOnce, SharedString, StatefulInteractiveElement, StyleRefinement, Styled,
+    Window, div, prelude::FluentBuilder as _, relative, svg,
 };
-use gpui_base::{CheckboxIndicator, spring};
+use gpui_base::{CheckboxIndicator, CheckboxIndicatorColors, CheckboxState, spring};
 
 /// A Checkbox element.
 #[derive(IntoElement)]
@@ -256,12 +256,45 @@ impl RenderOnce for Checkbox {
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
         let checked = self.checked && !self.indeterminate;
         let has_content = self.label.is_some() || !self.children.is_empty();
-        let indicator_size = rems(match self.size {
-            Size::XSmall => 0.75,
-            Size::Small => 0.875,
-            Size::Large => 1.125,
-            _ => 1.,
-        });
+        let mut style = match self.size {
+            Size::Size(_) => StyleRefinement::default(),
+            size => StyleRefinement::default().input_text_size(size),
+        };
+        style.refine(&self.style);
+        let mut text_style = window.text_style();
+        text_style.refine(&style.text);
+        let font_size = text_style.font_size.to_pixels(window.rem_size());
+        let font = text_style.font();
+        let line_height = if has_content {
+            font_size * 1.25
+        } else {
+            font_size
+        };
+        let offset = CheckboxIndicator::text_top(window, &font, font_size, line_height);
+
+        const OWN_HOVER_GROUP: &str = "checkbox-hover";
+        let hover_group =
+            (!self.disabled && self.on_click.is_some()).then(|| OWN_HOVER_GROUP.into());
+        let dim = self.disabled && !self.keep_indicator_color;
+        let state = if self.indeterminate {
+            CheckboxState::Indeterminate
+        } else if checked {
+            CheckboxState::Checked
+        } else {
+            CheckboxState::Unchecked
+        };
+        let colors = CheckboxIndicatorColors {
+            border: self.indicator_border.unwrap_or(cx.theme().muted_foreground),
+            accent: cx.theme().primary,
+            mark: cx.theme().button_primary_foreground,
+        };
+        let check_opacity = spring(
+            (self.id.clone(), "mark"),
+            if checked { 1. } else { 0. },
+            cx.theme().motion_tokens().spring_control,
+            window,
+            cx,
+        );
 
         let base = self.base;
         let children = self.children;
@@ -275,22 +308,6 @@ impl RenderOnce for Checkbox {
             .clone();
         let is_focused = focus_handle.is_focused(window);
 
-        let unchecked_border = self.indicator_border.unwrap_or(cx.theme().input);
-        let checked_color = cx.theme().primary;
-        let dim = self.disabled && !self.keep_indicator_color;
-        let border_color = if checked || self.indeterminate {
-            checked_color
-        } else {
-            unchecked_border
-        };
-        let disabled_indicator_color = if !dim {
-            border_color
-        } else if checked {
-            checked_color.opacity(0.5)
-        } else {
-            unchecked_border.opacity(0.5)
-        };
-        let radius = cx.theme().radius.min(px(4.));
         let disabled_text_color = cx.theme().muted_foreground;
         let instance_style = self.style.clone();
         base.role(self.role)
@@ -307,6 +324,8 @@ impl RenderOnce for Checkbox {
             .tab_stop(self.tab_stop)
             .tab_index(self.tab_index)
             .track_focus(&focus_handle)
+            .when(hover_group.is_some(), |this| this.cursor_pointer())
+            .when(hover_group.is_some(), |this| this.group(OWN_HOVER_GROUP))
             .when_some(accessibility_label, |this, label| {
                 this.accessibility_label(label)
             })
@@ -321,75 +340,15 @@ impl RenderOnce for Checkbox {
             .items_start()
             .line_height(relative(1.))
             .text_color(cx.theme().foreground)
-            .map(|this| match self.size {
-                Size::Size(_) => this,
-                size => this.input_text_size(size),
-            })
             .rounded(cx.theme().radius * 0.5)
             .when(is_focused && self.focus_ring_enabled, |this| {
                 this.focus_ring_style(window, cx)
             })
-            .refine_style(&self.style)
+            .refine_style(&style)
             .child(
-                CheckboxIndicator::new()
-                    .checked(checked)
-                    .disabled(self.disabled)
-                    .relative()
-                    .size(indicator_size)
-                    // Center on the first 1.25em line, including when the label wraps.
-                    .when(has_content, |this| this.mt(indicator_size * 0.125))
-                    .flex_shrink_0()
-                    .border_1()
-                    .rounded(radius)
-                    .when(!checked, |this| {
-                        this.bg(cx.theme().input_background())
-                            .when(!self.disabled, |this| {
-                                // A mixed box keeps the unchecked fill but uses the
-                                // highlight border so it reads as active at a glance.
-                                this.border_color(if self.indeterminate {
-                                    checked_color
-                                } else {
-                                    unchecked_border
-                                })
-                            })
-                    })
-                    .styles(|styles| {
-                        styles
-                            .checked(|style| {
-                                style
-                                    .border_color(checked_color)
-                                    .bg(cx.theme().tokens.primary)
-                            })
-                            .disabled(|style| {
-                                style
-                                    .border_color(disabled_indicator_color)
-                                    .when(checked, |style| {
-                                        if dim {
-                                            style.bg(disabled_indicator_color)
-                                        } else {
-                                            style.bg(cx.theme().tokens.primary)
-                                        }
-                                    })
-                            })
-                    })
-                    .child(checkbox_check_icon(
-                        self.id,
-                        self.size,
-                        checked,
-                        dim,
-                        window,
-                        cx,
-                    ))
-                    .when(self.indeterminate, |indicator| {
-                        indicator.flex().items_center().justify_center().child(
-                            div()
-                                .debug_selector(|| "checkbox-indeterminate-mark".into())
-                                .w_2()
-                                .h(px(2.))
-                                .rounded_full()
-                                .bg(checked_color.opacity(if dim { 0.5 } else { 1. })),
-                        )
-                    }),
+                CheckboxIndicator::web(font_size, state, colors, dim, check_opacity, hover_group)
+                    // Match the first line's baseline even when the label wraps.
+                    .top(offset),
             )
             .when(self.label.is_some() || !children.is_empty(), |this| {
                 this.child(

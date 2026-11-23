@@ -10,7 +10,8 @@ use crate::{
     switch::Switch,
 };
 use gpui::{
-    AnyElement, App, IntoElement, ParentElement as _, SharedString, StyleRefinement, Window, div,
+    AnyElement, App, IntoElement, ParentElement as _, SharedString, StyleRefinement, Styled,
+    Window, div,
 };
 
 pub(crate) struct BoolField {
@@ -52,6 +53,7 @@ impl SettingFieldRender for BoolField {
                     .into_any_element()
             } else {
                 Checkbox::new("check")
+                    .text_size(options.font_size())
                     .accessibility_label(self.title.clone())
                     .checked(checked)
                     .disabled(options.is_disabled())

@@ -11,6 +11,7 @@ use anyhow::{Context as _, Result};
 #[cfg(test)]
 use core::prelude::v1::test;
 use gpui::{prelude::FluentBuilder as _, *};
+use gpui_base::{CheckboxIndicator, CheckboxIndicatorColors, CheckboxState};
 use gpui_component::{
     ActiveTheme, Selectable as _, StyledExt,
     button::Button,
@@ -18,8 +19,8 @@ use gpui_component::{
     input::{DocumentFind, Escape, SelectAll},
     scroll::ScrollbarViewport as _,
     text::{
-        MarkdownExtensions, MarkdownNode, MarkdownParseContext, MarkdownPlugin, RangeHighlight,
-        TextView, TextViewState, TextViewStyle, markdown_ast::Node,
+        InlineElement, InlineRenderContext, MarkdownExtensions, MarkdownNode, MarkdownParseContext,
+        MarkdownPlugin, RangeHighlight, TextView, TextViewState, TextViewStyle, markdown_ast::Node,
     },
     tooltip::Tooltip,
     v_flex,
@@ -38,7 +39,7 @@ use crate::{
     resource_cache::ResourceCache,
     session::{DocumentLinePosition, DocumentLocation, DocumentPosition},
     workspace::{
-        Palette, PaneDrag, Workspace, compact_icon_button, icon, icon_button, pane_scrollbar,
+        Palette, PaneDrag, Workspace, compact_icon_button, icon_button, pane_scrollbar,
         panel_resize, scroll_viewport_background,
     },
 };
@@ -386,21 +387,37 @@ impl MarkdownPlugin for TaskTable {
         )
     }
 
-    fn render(&self, node: &MarkdownNode, _: &mut Window, cx: &mut App) -> impl IntoElement {
+    fn render_inline(
+        &self,
+        node: &MarkdownNode,
+        context: &InlineRenderContext,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Option<InlineElement> {
         let checked = node.data::<bool>().copied().unwrap_or(false);
-        let color = if checked {
-            cx.theme().accent
+        let state = if checked {
+            CheckboxState::Checked
         } else {
-            cx.theme().muted_foreground
+            CheckboxState::Unchecked
         };
-        icon(
-            if checked {
-                IconName::SquareCheck
-            } else {
-                IconName::Square
-            },
-            color,
-            14.,
+        let theme = cx.theme();
+        let colors = CheckboxIndicatorColors {
+            border: theme.muted_foreground,
+            accent: theme.accent,
+            mark: theme.button_primary_foreground,
+        };
+        let size = context.font_size();
+        let baseline = CheckboxIndicator::text_baseline(window, &context.text_style().font(), size);
+        Some(
+            InlineElement::new(CheckboxIndicator::web(
+                size,
+                state,
+                colors,
+                false,
+                if checked { 1. } else { 0. },
+                None,
+            ))
+            .with_baseline(baseline),
         )
     }
 }
@@ -2611,6 +2628,70 @@ $$"
         visual.simulate_keystrokes("shift-enter");
         draw(visual);
         assert!(last_match_is_visible(visual));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[gpui::test]
+    fn markdown_list_and_table_checkboxes_follow_document_typography(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::workspace::apply_theme(gpui_component::ThemeMode::Light, cx);
+        });
+        let (reader, visual) = cx.add_window_view(|window, cx| {
+            DocReader::new(
+                PathBuf::new(),
+                "tasks.md".into(),
+                PreparedDocument::new(
+                    "- [x] Checked item\n\n| Status | Task |\n| --- | --- |\n| [x] | Table item |"
+                        .into(),
+                )
+                .unwrap(),
+                None,
+                WeakEntity::new_invalid(),
+                window,
+                cx,
+            )
+        });
+        visual.simulate_resize(size(px(640.), px(420.)));
+        for body_font_size in [16., 23.] {
+            visual.update(|_, cx| {
+                reader.update(cx, |reader, cx| {
+                    reader.set_typography(
+                        crate::config::Docs {
+                            body_font_size,
+                            ..Default::default()
+                        },
+                        cx,
+                    );
+                })
+            });
+            draw_scroll_test_frame(visual);
+            visual.update(|window, cx| {
+                let accent = cx.theme().accent;
+                let scale = window.scale_factor();
+                let mut boxes: Vec<_> = window
+                    .painted_quads()
+                    .into_iter()
+                    .filter(|quad| quad.background.as_solid() == Some(accent))
+                    .map(|quad| quad.bounds)
+                    .collect();
+                boxes.sort_by(|a, b| a.top().as_f32().total_cmp(&b.top().as_f32()));
+                let [list, table] = boxes.as_slice() else {
+                    panic!("expected two filled task indicators, got {boxes:?}");
+                };
+                // The table uses the reader's smaller table text size.
+                for (bounds, expected) in
+                    [(list, body_font_size), (table, body_font_size * 14. / 15.)]
+                {
+                    let width = f64::from(bounds.size.width.as_f32() / scale);
+                    let height = f64::from(bounds.size.height.as_f32() / scale);
+                    assert!(
+                        (width - expected).abs() <= 0.75 && (height - expected).abs() <= 0.75,
+                        "the task indicator follows its text size ({expected}px): {width}×{height}"
+                    );
+                }
+            });
+        }
     }
 
     #[test]

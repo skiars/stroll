@@ -103,7 +103,8 @@ pub use calendar::{
     CalendarView, Date, IntervalMatcher, Matcher, RangeMatcher,
 };
 pub use checkbox::{
-    Checkbox, CheckboxIndicator, CheckboxIndicatorStyles, CheckboxState, CheckboxStyles,
+    Checkbox, CheckboxIndicator, CheckboxIndicatorColors, CheckboxIndicatorStyles, CheckboxState,
+    CheckboxStyles,
 };
 pub use collapsible::Collapsible;
 pub use color_picker::{ColorPicker, ColorPickerEvent, ColorPickerState, ColorSwatch, HslaSliders};

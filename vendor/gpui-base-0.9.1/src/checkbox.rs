@@ -1,10 +1,10 @@
 use std::rc::Rc;
 
 use gpui::{
-    AnyElement, App, ClickEvent, Div, ElementId, FocusHandle, InteractiveElement, Interactivity,
-    IntoElement, ParentElement, Refineable as _, RenderOnce, Role, SharedString, Stateful,
-    StatefulInteractiveElement, StyleRefinement, Styled, Toggled, Window, div,
-    prelude::FluentBuilder as _,
+    AnyElement, App, ClickEvent, Div, ElementId, FocusHandle, Font, Hsla, InteractiveElement,
+    Interactivity, IntoElement, ParentElement, PathBuilder, Pixels, Refineable as _, RenderOnce,
+    Role, SharedString, Stateful, StatefulInteractiveElement, StyleRefinement, Styled, Toggled,
+    Window, canvas, div, point, prelude::FluentBuilder as _, px,
 };
 use smallvec::SmallVec;
 
@@ -319,6 +319,137 @@ impl CheckboxIndicator {
             .into_iter()
             .flatten(),
         )
+    }
+}
+
+/// Colors shared by the interactive and read-only checkbox indicators.
+#[derive(Clone, Copy)]
+pub struct CheckboxIndicatorColors {
+    pub border: Hsla,
+    pub accent: Hsla,
+    pub mark: Hsla,
+}
+
+impl CheckboxIndicator {
+    /// Draws a Web-style checkbox indicator at the surrounding text size.
+    /// A hover group highlights only the indicator, including when its hit area is larger.
+    pub fn web(
+        size: Pixels,
+        state: CheckboxState,
+        colors: CheckboxIndicatorColors,
+        dim: bool,
+        check_opacity: f32,
+        hover_group: Option<SharedString>,
+    ) -> Div {
+        let opacity = if dim { 0.5 } else { 1. };
+        let radius = (size * 0.25 + px(1.)).min(px(5.));
+        let selected = state != CheckboxState::Unchecked;
+        let border = if selected {
+            colors.accent
+        } else {
+            colors.border
+        };
+        let stroke = (size * 0.125).max(px(1.5));
+        let indicator = div()
+            .relative()
+            .size_full()
+            .items_center()
+            .justify_center()
+            .flex()
+            .rounded(radius)
+            .border((size * 0.094).clamp(px(1.), px(1.5)))
+            .border_color(border.opacity(opacity))
+            .when(selected, |indicator| {
+                indicator.bg(colors.accent.opacity(opacity))
+            })
+            .when(dim && !selected, |indicator| {
+                indicator.bg(colors.border.opacity(0.08))
+            })
+            .when_some(hover_group.clone(), |indicator, group| {
+                let contrast = if colors.accent.l > 0.65 {
+                    Hsla::white()
+                } else {
+                    Hsla::black()
+                };
+                let highlight = colors.accent.blend(contrast.opacity(0.24));
+                indicator.group_hover(group, |style| style.border_color(highlight))
+            })
+            .when(state == CheckboxState::Indeterminate, |indicator| {
+                indicator.child(
+                    div()
+                        .debug_selector(|| "checkbox-indeterminate-mark".into())
+                        .w(size * 0.48)
+                        .h(stroke)
+                        .rounded_full()
+                        .bg(colors.mark.opacity(opacity)),
+                )
+            })
+            .when(
+                state != CheckboxState::Indeterminate && check_opacity > 0.,
+                |indicator| {
+                    indicator.child(
+                        canvas(
+                            |_, _, _| (),
+                            move |bounds, (), window, _| {
+                                let center = bounds.center();
+                                let at = |x, y| center + point(size * x, size * y);
+                                let mut check = PathBuilder::stroke(stroke);
+                                check.move_to(at(-0.24, -0.025));
+                                check.line_to(at(-0.07, 0.145));
+                                check.line_to(at(0.24, -0.165));
+                                if let Ok(path) = check.build() {
+                                    window.paint_path(
+                                        path,
+                                        colors.mark.opacity(opacity * check_opacity),
+                                    );
+                                }
+                            },
+                        )
+                        .absolute()
+                        .inset_0(),
+                    )
+                },
+            );
+
+        div()
+            .debug_selector(|| "checkbox-indicator".into())
+            .relative()
+            .size(size)
+            .flex_shrink_0()
+            .child(indicator)
+            .when_some(hover_group, |indicator, group| {
+                indicator.child(
+                    div()
+                        .absolute()
+                        .top(-px(2.))
+                        .right(-px(2.))
+                        .bottom(-px(2.))
+                        .left(-px(2.))
+                        .rounded(radius + px(2.))
+                        .group_hover(group, |style| {
+                            style.border_1().border_color(colors.accent.opacity(0.72))
+                        }),
+                )
+            })
+    }
+
+    /// The position of the text baseline within a text-sized indicator.
+    /// Center the box on the adjacent font's capital letters.
+    pub fn text_baseline(window: &Window, font: &Font, size: Pixels) -> Pixels {
+        let text = window.text_system();
+        let font = text.resolve_font(font);
+        (size + text.cap_height(font, size)) / 2.
+    }
+
+    /// Positions the indicator within a line whose text is vertically centered.
+    pub fn text_top(window: &Window, font: &Font, size: Pixels, line_height: Pixels) -> Pixels {
+        let text = window.text_system();
+        let font_id = text.resolve_font(font);
+        // Raw font metrics can report descent as a negative coordinate. Line
+        // layout uses its magnitude as the distance below the baseline.
+        let ascent = text.ascent(font_id, size);
+        let descent = text.descent(font_id, size).abs();
+        (line_height + ascent - descent) / 2. - Self::text_baseline(window, font, size)
     }
 }
 

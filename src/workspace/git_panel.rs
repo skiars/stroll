@@ -2175,9 +2175,8 @@ mod tests {
         });
     }
 
-    // The checkbox is only 16 px wide. Clicks around it used to reach the row and open the file or
-    // collapse the directory. Check that the entire slot is clickable, hover adds a background,
-    // and the unchecked border uses the theme's control color.
+    // The staging slot extends past the indicator. Hover and clicks stay in
+    // the staging control while the rest of the row keeps its own behavior.
     #[::core::prelude::v1::test]
     fn stage_slot_covers_the_cell_and_hands_clicks_to_staging() {
         use crate::config::ConfigFile;
@@ -2248,17 +2247,62 @@ mod tests {
         );
 
         let colors = Palette::for_mode(gpui_component::ThemeMode::Dark);
-        let quads = visual.update(|window, _| window.painted_quads());
-        assert!(
-            quads.iter().any(
-                |quad| color_bytes(quad.border_color) == color_bytes(colors.control)
-                    && quad.border_widths.left.0 > 0.
-            ),
-            "The unchecked checkbox should use the theme's control border color"
-        );
-
-        // Click two pixels from the left edge of the slot, in the space before the right-aligned checkbox.
         let target = gpui::point(slot.left() + px(2.), slot.center().y);
+        let indicator = visual.update(|window, cx| {
+            let scale = window.scale_factor();
+            let expected = crate::workspace::file_name_font_size(cx);
+            let indicator = window
+                .painted_quads()
+                .into_iter()
+                .find(|quad| {
+                    slot.scale(scale).contains(&quad.bounds.center())
+                        && (quad.bounds.size.width.as_f32() / scale - expected).abs() <= 1.
+                        && color_bytes(quad.border_color) == color_bytes(colors.control)
+                })
+                .expect("the checkbox is the same size as its filename and uses the control color");
+            let inset = slot.right().as_f32() - indicator.bounds.right().as_f32() / scale;
+            assert!(
+                (inset - 6.).abs() <= 0.5,
+                "staging indicator right inset: {inset}"
+            );
+            indicator
+        });
+        visual.simulate_mouse_move(target, None, gpui::Modifiers::default());
+        visual.update(|window, cx| {
+            window.simulate_next_frame(cx);
+            window.draw(cx).clear(cx);
+            let quads = window.painted_quads();
+            let scale = window.scale_factor();
+            let slot_quads: Vec<_> = quads.iter()
+                .filter(|quad| slot.scale(scale).contains(&quad.bounds.center()))
+                .map(|quad| (quad.bounds, quad.border_color, quad.background))
+                .collect();
+            assert!(
+                quads.iter().any(|quad| {
+                    quad.bounds == indicator.bounds
+                        && quad.border_color != indicator.border_color
+                        && quad.background.is_transparent()
+                }),
+                "hover changes the indicator border from {indicator:?} at {target:?}: {slot_quads:?}"
+            );
+            assert!(
+                quads.iter().any(|quad| {
+                    quad.bounds == indicator.bounds.dilate(px(2.).scale(scale))
+                        && color_bytes(quad.border_color)
+                            == color_bytes(colors.accent.opacity(0.72))
+                        && quad.background.is_transparent()
+                }),
+                "hover draws a thin outer outline around the indicator: {slot_quads:?}"
+            );
+            assert!(
+                !quads.iter().any(|quad| {
+                    quad.bounds.contains(&target.scale(scale))
+                        && quad.background == Background::from(colors.hover)
+                }),
+                "the staging hit area does not highlight the row or paint a background block"
+            );
+        });
+
         visual.simulate_click(target, gpui::Modifiers::default());
         visual.run_until_parked();
         visual.update(|_, cx| {
