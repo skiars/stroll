@@ -14,7 +14,7 @@ use stroll::{
 };
 
 #[test]
-fn tree_status_tooltip_keeps_its_content_width() -> anyhow::Result<()> {
+fn modified_file_row_does_not_show_a_status_tooltip() -> anyhow::Result<()> {
     let temp = tempfile::tempdir()?;
     let repo = temp.path().join("example");
     fs::create_dir(&repo)?;
@@ -95,29 +95,16 @@ fn tree_status_tooltip_keeps_its_content_width() -> anyhow::Result<()> {
     cx.run_until_parked();
     let _ = cx.update_window(handle.into(), |_, window, cx| window.draw(cx).clear(cx))?;
     let after = cx.update_window(handle.into(), |_, window, _| window.painted_quads())?;
-    let popup = after
-        .iter()
-        .filter(|quad| {
-            // The tooltip surface is translucent; the hovered row background is opaque.
-            !before.iter().any(|old| old.bounds == quad.bounds)
-                && quad.bounds.size.width > ScaledPixels(20.)
-                && quad.bounds.size.height > ScaledPixels(20.)
-                && quad
-                    .background
-                    .as_solid()
-                    .is_some_and(|color| color.a > 0. && color.a < 1.)
-        })
-        .max_by_key(|quad| quad.bounds.size.width.0 as i64)
-        .expect("tooltip must paint");
-    assert!(
-        popup.bounds.size.width > ScaledPixels(40.),
-        "tooltip must have content width: {:?}",
-        popup.bounds
-    );
-    assert!(
-        popup.bounds.size.width > popup.bounds.size.height,
-        "tooltip must not collapse into a vertical strip: {:?}",
-        popup.bounds
-    );
+    let popup = after.iter().find(|quad| {
+        // The tooltip surface is translucent; the hovered row background is opaque.
+        !before.iter().any(|old| old.bounds == quad.bounds)
+            && quad.bounds.size.width > ScaledPixels(20.)
+            && quad.bounds.size.height > ScaledPixels(20.)
+            && quad
+                .background
+                .as_solid()
+                .is_some_and(|color| color.a > 0. && color.a < 1.)
+    });
+    assert!(popup.is_none(), "unexpected tooltip surface");
     Ok(())
 }

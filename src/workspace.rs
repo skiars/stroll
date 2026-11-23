@@ -4261,8 +4261,8 @@ impl Workspace {
                 let clicked = entry.clone();
                 let row_id = format!("workspace-tree-row:{}", paths::display(&entry.path));
                 let name = file_name(&entry.path).to_owned();
-                let decoration = in_workspace
-                    .then(|| status.decoration(&entry, colors, cx))
+                let status_color = in_workspace
+                    .then(|| status.decoration_color(&entry, colors, cx))
                     .flatten();
                 let icon_color = if selected {
                     colors.accent
@@ -4325,13 +4325,9 @@ impl Workspace {
                             .truncate()
                             .text_size(px(file_name_font_size(cx)))
                             .when(dimmed, |name| name.text_color(colors.muted))
-                            .when_some(decoration.as_ref(), |name, (color, _)| {
-                                name.text_color(*color)
-                            })
+                            .when_some(status_color, |name, color| name.text_color(color))
                             .child(name),
                     );
-                // Native tooltips lay out at min-content and collapse this row's
-                // clamped content into a vertical strip; use the window-managed tooltip.
                 let element = if in_workspace
                     && !directory
                     && !entry.symlink
@@ -4349,12 +4345,7 @@ impl Workspace {
                         entry.path.clone(),
                     )
                 } else {
-                    element.when_some(decoration, |row, (_, label)| {
-                        use gpui_component::tooltip::{ManagedTooltipExt as _, Tooltip};
-                        row.managed_tooltip(move |window, cx| {
-                            Tooltip::new(label.clone()).build(window, cx)
-                        })
-                    })
+                    element
                 };
                 Some(if in_workspace {
                     let element =

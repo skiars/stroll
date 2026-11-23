@@ -2241,6 +2241,9 @@ mod tests {
         let slot = visual
             .debug_bounds("git-tree-stage:folder/visible.txt")
             .unwrap();
+        let row = visual
+            .debug_bounds("git-tree-row:file:folder/visible.txt")
+            .unwrap();
         assert!(
             slot.size.width >= px(24.) && slot.size.height >= px(24.),
             "The staging slot should be at least 24×24: {slot:?}"
@@ -2264,6 +2267,11 @@ mod tests {
             assert!(
                 (inset - 6.).abs() <= 0.5,
                 "staging indicator right inset: {inset}"
+            );
+            let row_inset = row.right().as_f32() - indicator.bounds.right().as_f32() / scale;
+            assert!(
+                (row_inset - 16.).abs() <= 0.5,
+                "the checkbox must share the historical count's right edge: {row_inset}"
             );
             indicator
         });

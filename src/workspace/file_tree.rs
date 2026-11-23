@@ -131,6 +131,7 @@ impl TreeEdit {
 pub(super) enum TreeAction {
     Open(bool),
     OpenInDocs,
+    OpenSource,
     PreviewAudio,
     SaveCopy,
     Create(bool),
@@ -163,6 +164,7 @@ impl TreeAction {
             Self::Open(true) => IconName::FileInput,
             Self::Open(false) => IconName::Pin,
             Self::OpenInDocs => IconName::BookOpen,
+            Self::OpenSource => IconName::FileCode,
             Self::PreviewAudio => IconName::Play,
             Self::SaveCopy => IconName::Download,
             Self::Create(false) => IconName::FilePlus,
@@ -226,27 +228,7 @@ pub(super) fn tree_menu(
                     )
                     .separator();
             }
-            let item = |action: TreeAction, label: SharedString, enabled: bool| {
-                let workspace = workspace.clone();
-                let repo = repo.clone();
-                let entry = entry.clone();
-                PopupMenuItem::new(label)
-                    .icon(action.icon())
-                    .when_some(action.shortcut_action(), |item, action| item.action(action))
-                    .disabled(!enabled)
-                    .on_click(move |_, window, cx| {
-                        _ = workspace.update(cx, |this, cx| {
-                            if this.view == WorkspaceView::Editor
-                                && this
-                                    .repository
-                                    .as_ref()
-                                    .is_some_and(|current| Arc::ptr_eq(current, &repo))
-                            {
-                                this.tree_action(action, entry.clone(), window, cx);
-                            }
-                        });
-                    })
-            };
+            let item = tree_action_item(&workspace, &repo, &entry, WorkspaceView::Editor);
             if entry.as_ref().is_none_or(|entry| entry.directory) {
                 menu = menu
                     .item(item(
@@ -322,27 +304,18 @@ pub(super) fn tree_menu(
             }
             menu = menu.separator();
             if entry.is_some() {
-                menu.item(item(
-                    TreeAction::CopyPath(false),
-                    t!("tabs.copy_relative_path").into(),
-                    true,
-                ))
-                .item(item(
-                    TreeAction::CopyPath(true),
-                    t!("tabs.copy_absolute_path").into(),
-                    true,
-                ))
-                .separator()
-                .item(item(
-                    TreeAction::Rename,
-                    t!("workspace.tree_rename").into(),
-                    mutable,
-                ))
-                .item(item(
-                    TreeAction::Delete,
-                    t!("workspace.tree_delete").into(),
-                    mutable,
-                ))
+                path_copy_menu(menu, &item)
+                    .separator()
+                    .item(item(
+                        TreeAction::Rename,
+                        t!("workspace.tree_rename").into(),
+                        mutable,
+                    ))
+                    .item(item(
+                        TreeAction::Delete,
+                        t!("workspace.tree_delete").into(),
+                        mutable,
+                    ))
             } else {
                 menu.item(item(
                     TreeAction::Refresh,
@@ -367,10 +340,81 @@ pub(super) fn document_tree_menu(
 ) -> AnyElement {
     element
         .context_menu(move |menu, _, cx| {
-            system_menu_for_entry(menu, entry.as_ref(), &workspace, cx)
+            let Some(repo) = workspace
+                .read_with(cx, |this, _| this.repository.clone())
+                .ok()
+                .flatten()
+            else {
+                return menu;
+            };
+            let item = tree_action_item(&workspace, &repo, &entry, WorkspaceView::Docs);
+            let menu = menu.when(
+                entry
+                    .as_ref()
+                    .is_some_and(|entry| !entry.directory && !entry.symlink),
+                |menu| {
+                    menu.item(item(
+                        TreeAction::OpenSource,
+                        t!("docs.open_source").into(),
+                        true,
+                    ))
+                    .separator()
+                },
+            );
+            let menu = system_menu_for_entry(menu, entry.as_ref(), &workspace, cx);
+            if entry.is_some() {
+                path_copy_menu(menu.separator(), &item)
+            } else {
+                menu
+            }
         })
         .shared_layer()
         .into_any_element()
+}
+
+fn tree_action_item<'a>(
+    workspace: &'a WeakEntity<Workspace>,
+    repo: &'a Arc<Repository>,
+    entry: &'a Option<Entry>,
+    view: WorkspaceView,
+) -> impl Fn(TreeAction, SharedString, bool) -> PopupMenuItem + 'a {
+    move |action, label, enabled| {
+        let workspace = workspace.clone();
+        let repo = repo.clone();
+        let entry = entry.clone();
+        PopupMenuItem::new(label)
+            .icon(action.icon())
+            .when_some(action.shortcut_action(), |item, action| item.action(action))
+            .disabled(!enabled)
+            .on_click(move |_, window, cx| {
+                _ = workspace.update(cx, |this, cx| {
+                    if this.view == view
+                        && this
+                            .repository
+                            .as_ref()
+                            .is_some_and(|current| Arc::ptr_eq(current, &repo))
+                    {
+                        this.tree_action(action, entry.clone(), window, cx);
+                    }
+                });
+            })
+    }
+}
+
+fn path_copy_menu(
+    menu: PopupMenu,
+    item: &impl Fn(TreeAction, SharedString, bool) -> PopupMenuItem,
+) -> PopupMenu {
+    menu.item(item(
+        TreeAction::CopyPath(false),
+        t!("tabs.copy_relative_path").into(),
+        true,
+    ))
+    .item(item(
+        TreeAction::CopyPath(true),
+        t!("tabs.copy_absolute_path").into(),
+        true,
+    ))
 }
 
 fn system_menu_for_entry(
@@ -438,6 +482,7 @@ impl Workspace {
         match action {
             TreeAction::Open(preview) => self.open_file(path, preview, window, cx),
             TreeAction::OpenInDocs => self.open_markdown_in_docs(path, window, cx),
+            TreeAction::OpenSource => self.open_document_source(path, window, cx),
             TreeAction::PreviewAudio => self.preview_audio(path, window, cx),
             TreeAction::SaveCopy => self.save_tree_copy(repo, path, window, cx),
             TreeAction::CopyPath(absolute) => {
@@ -1106,38 +1151,28 @@ impl TreeStatus {
         Self { files, directories }
     }
 
-    pub(super) fn decoration(
+    pub(super) fn decoration_color(
         &self,
         entry: &Entry,
         colors: Palette,
         cx: &App,
-    ) -> Option<(Hsla, SharedString)> {
-        let (code, label) = if entry.directory {
+    ) -> Option<Hsla> {
+        let code = if entry.directory {
             match self.directories.get(&entry.path)? {
-                DirectoryStatus::Added => ('A', t!("workspace.tree_status_directory")),
-                DirectoryStatus::Changed => ('M', t!("workspace.tree_status_directory")),
-                DirectoryStatus::Conflict => ('U', t!("workspace.tree_status_directory_conflict")),
+                DirectoryStatus::Added => 'A',
+                DirectoryStatus::Changed => 'M',
+                DirectoryStatus::Conflict => 'U',
             }
         } else {
             let key = entry.path.to_str()?.replace(std::path::MAIN_SEPARATOR, "/");
             let status = self.files.get(&key)?;
-            let code = if status.conflict { 'U' } else { status.code };
-            let label = match code {
-                '?' => t!("workspace.tree_status_untracked"),
-                'A' => t!("workspace.tree_status_added"),
-                'D' => t!("workspace.tree_status_deleted"),
-                'U' => t!("workspace.tree_status_conflict"),
-                'R' => t!("workspace.tree_status_renamed"),
-                'C' => t!("workspace.tree_status_copied"),
-                _ => t!("workspace.tree_status_modified"),
-            };
-            (code, label)
+            if status.conflict { 'U' } else { status.code }
         };
         let mut color = super::git_panel::status_color(code, colors, cx);
         if matches!(code, 'A' | '?') {
             color.s *= 0.55;
         }
-        Some((color, label.into()))
+        Some(color)
     }
 }
 
@@ -1196,11 +1231,9 @@ mod tests {
                     ignored: false,
                 };
                 assert_eq!(
-                    status
-                        .decoration(&directory, colors, cx)
-                        .map(|(color, _)| color),
+                    status.decoration_color(&directory, colors, cx),
                     color,
-                    "{path}",
+                    "{path}"
                 );
             }
         });
@@ -1485,7 +1518,7 @@ mod tests {
     }
 
     #[::core::prelude::v1::test]
-    fn workspace_tree_context_menu_opens_markdown_in_docs() -> Result<()> {
+    fn file_tree_context_menus_open_docs_and_source_and_copy_paths() -> Result<()> {
         let fixture = tempfile::tempdir()?;
         let root = fixture.path().join("repo");
         fs::create_dir(&root)?;
@@ -1498,6 +1531,9 @@ mod tests {
         );
         let path = Path::new("guide.md");
         fs::write(root.join(path), "# Project guide\n")?;
+        let source = Path::new("other.md");
+        fs::write(root.join(source), "# Other document\n")?;
+        let absolute_source = paths::display(&root.canonicalize()?.join(source));
 
         let mut cx = TestAppContext::build_with_text_system(
             TestDispatcher::new(0),
@@ -1543,6 +1579,38 @@ mod tests {
             assert_eq!(this.doc.as_ref().unwrap().read(cx).path, path);
             assert_eq!(this.session.document.as_deref(), Some(path));
             assert!(!this.tabs.paths().iter().any(|tab| tab == path));
+        });
+        settle(visual, &workspace, |this| {
+            this.rows.iter().any(|row| row.entry.path == source)
+        });
+        let open_docs_menu = |visual: &mut VisualTestContext| {
+            let position = visual
+                .debug_bounds("workspace-tree-row:other.md")
+                .unwrap()
+                .center();
+            visual.simulate_mouse_down(position, MouseButton::Right, Modifiers::default());
+            visual.simulate_mouse_up(position, MouseButton::Right, Modifiers::default());
+            settle(visual, &workspace, |_| true);
+        };
+        for (keys, expected) in [
+            ("up enter", absolute_source.as_str()),
+            ("up up enter", "other.md"),
+        ] {
+            open_docs_menu(visual);
+            visual.simulate_keystrokes(keys);
+            settle(visual, &workspace, |_| true);
+            assert_eq!(
+                visual
+                    .read_from_clipboard()
+                    .and_then(|item| item.text())
+                    .as_deref(),
+                Some(expected),
+            );
+        }
+        open_docs_menu(visual);
+        visual.simulate_keystrokes("down enter");
+        settle(visual, &workspace, |this| {
+            this.view == WorkspaceView::Editor && this.tabs.active() == Some(source)
         });
         Ok(())
     }
