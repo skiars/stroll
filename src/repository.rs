@@ -4,10 +4,12 @@ mod edit_history;
 pub(crate) mod files;
 pub(crate) mod resources;
 mod selection;
+mod session_state;
+mod state;
 #[cfg(feature = "desktop")]
 mod worktree_state;
 #[cfg(feature = "desktop")]
-pub(crate) use edit_history::SavedEditHistory;
+pub(crate) use edit_history::{DraftRelocation, SavedEditHistory};
 
 pub(crate) use selection::{DirectoryEntry, DirectoryListing, directory_name, repository_root};
 #[cfg(feature = "desktop")]
@@ -29,9 +31,8 @@ use sha2::{Digest, Sha256};
 use tempfile::NamedTempFile;
 
 use crate::{
-    paths,
     remote::{Bytes, RepoPath, Request, SshSession, SshTarget},
-    session::{self, SessionFile, WorktreeSession},
+    session::WorktreeSession,
     tabs::TabSession,
 };
 
@@ -59,8 +60,6 @@ pub struct Repository {
     remote_resource_chunks: bool,
     #[cfg(feature = "desktop")]
     pub(crate) worktree_state: Option<WorktreeState>,
-    #[cfg(feature = "desktop")]
-    local_storage_key: Option<Vec<u8>>,
     #[cfg(feature = "desktop")]
     language_resources:
         std::sync::Arc<std::sync::OnceLock<crate::language::resources::LanguageResources>>,
@@ -126,8 +125,6 @@ impl Repository {
             #[cfg(feature = "desktop")]
             worktree_state: None,
             #[cfg(feature = "desktop")]
-            local_storage_key: None,
-            #[cfg(feature = "desktop")]
             language_resources: Default::default(),
             #[cfg(feature = "desktop")]
             worktree_lsp: Default::default(),
@@ -156,8 +153,6 @@ impl Repository {
             remote_resource_chunks: false,
             #[cfg(feature = "desktop")]
             worktree_state: None,
-            #[cfg(feature = "desktop")]
-            local_storage_key: None,
             #[cfg(feature = "desktop")]
             language_resources: Default::default(),
             #[cfg(feature = "desktop")]
@@ -315,10 +310,6 @@ impl Repository {
         if let Some(state) = &self.worktree_state {
             return state.storage_key();
         }
-        #[cfg(feature = "desktop")]
-        if let Some(key) = &self.local_storage_key {
-            return key;
-        }
         self.remote_identity
             .as_ref()
             .map_or(self.root.as_os_str().as_encoded_bytes(), |key| {
@@ -340,22 +331,6 @@ impl Repository {
         self.worktree_state
             .as_ref()
             .map_or_else(|| self.storage_key(), |state| state.id.as_bytes())
-    }
-
-    fn legacy_local_draft_root(&self) -> Option<&Path> {
-        if self.ssh.is_some() {
-            return None;
-        }
-        #[cfg(feature = "desktop")]
-        {
-            if let Some(state) = &self.worktree_state {
-                return state.legacy_root.as_deref();
-            }
-            if self.local_storage_key.is_some() {
-                return None;
-            }
-        }
-        Some(&self.root)
     }
 
     #[cfg(feature = "desktop")]
@@ -843,8 +818,7 @@ fn digest(bytes: &[u8]) -> [u8; 32] {
 
 /// Remembers window geometry per top-level window mode.
 #[cfg(feature = "desktop")]
-#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum WindowSlot {
     Document,
     Editor,
@@ -867,7 +841,7 @@ pub struct Store {
     root: PathBuf,
     #[cfg(feature = "desktop")]
     ai: std::sync::OnceLock<crate::ai::Service>,
-    edit_history: std::sync::Mutex<Option<rusqlite::Connection>>,
+    state: std::sync::Mutex<Option<rusqlite::Connection>>,
 }
 
 struct Draft {
@@ -915,7 +889,7 @@ impl Store {
             root,
             #[cfg(feature = "desktop")]
             ai: Default::default(),
-            edit_history: Default::default(),
+            state: Default::default(),
         })
     }
 
@@ -923,68 +897,25 @@ impl Store {
         self.editor_draft(Some(repo), path)
     }
 
-    pub fn location(&self) -> Result<Option<Location>> {
-        Ok(self.workspace_state()?.map(|state| state.location))
-    }
-
-    #[cfg(feature = "desktop")]
-    pub(crate) fn terminal_height(&self) -> Result<Option<f32>> {
-        read_json(&self.root.join("terminal-height.json"))
-    }
-
-    #[cfg(feature = "desktop")]
-    pub(crate) fn save_terminal_height(&self, height: f32) -> Result<()> {
-        atomic_write(
-            &self.root.join("terminal-height.json"),
-            &serde_json::to_vec(&height)?,
-        )
-    }
-
-    #[cfg(feature = "desktop")]
-    fn window_geometries_path(&self) -> PathBuf {
-        self.root.join("window-sizes.json")
-    }
-
-    #[cfg(feature = "desktop")]
-    pub(crate) fn window_geometry(&self, slot: WindowSlot) -> Result<Option<WindowGeometry>> {
-        Ok(
-            read_json::<BTreeMap<WindowSlot, WindowGeometry>>(&self.window_geometries_path())?
-                .unwrap_or_default()
-                .remove(&slot),
-        )
-    }
-
-    #[cfg(feature = "desktop")]
-    pub(crate) fn save_window_geometry(
-        &self,
-        slot: WindowSlot,
-        geometry: WindowGeometry,
-    ) -> Result<()> {
-        let path = self.window_geometries_path();
-        // A malformed record only loses remembered sizes, so replace it instead of
-        // failing every later save.
-        let mut sizes = match read_json(&path) {
-            Ok(sizes) => sizes.unwrap_or_default(),
-            Err(_) => BTreeMap::new(),
-        };
-        sizes.insert(slot, geometry);
-        atomic_write(&path, &serde_json::to_vec(&sizes)?)
-    }
-
     pub fn tabs(&self, repo: &Repository) -> Result<TabSession> {
         Ok(self.session(repo)?.tabs)
     }
 
     pub(crate) fn session(&self, repo: &Repository) -> Result<WorktreeSession> {
-        let mut session = match self.read_session(repo)? {
-            Some(session) => session,
-            None => WorktreeSession {
-                tabs: self.legacy_tabs(repo)?,
-                ..WorktreeSession::default()
-            },
-        };
+        let mut session = self.read_worktree_session(repo)?;
         self.restore_session_tabs(repo, &mut session)?;
         Ok(session)
+    }
+
+    #[cfg(feature = "desktop")]
+    pub(crate) fn session_for_open(
+        &self,
+        repo: &Repository,
+    ) -> Result<(WorktreeSession, WorktreeSession)> {
+        let baseline = self.read_worktree_session(repo)?;
+        let mut session = baseline.clone();
+        self.restore_session_tabs(repo, &mut session)?;
+        Ok((baseline, session))
     }
 
     pub(crate) fn restore_session_tabs(
@@ -1032,41 +963,6 @@ impl Store {
         Ok(())
     }
 
-    fn read_session(&self, repo: &Repository) -> Result<Option<WorktreeSession>> {
-        Self::read_session_file(&self.session_path(repo))
-    }
-
-    pub(crate) fn read_session_file<T: serde::de::DeserializeOwned>(
-        path: &Path,
-    ) -> Result<Option<T>> {
-        let Some(file) = read_json::<SessionFile<T>>(path)? else {
-            return Ok(None);
-        };
-        ensure!(
-            file.version == session::VERSION,
-            t!("storage.session_version", version = file.version)
-        );
-        Ok(Some(file.session))
-    }
-
-    fn legacy_tabs(&self, repo: &Repository) -> Result<TabSession> {
-        let tabs = match read_json::<TabSession>(&self.tabs_path(repo))? {
-            Some(tabs) => tabs,
-            None => {
-                let mut tabs = TabSession::default();
-                if let Some(location) = self
-                    .location()?
-                    .filter(|location| location.root == repo.root)
-                    && let Some(path) = location.file
-                {
-                    tabs.open(path, false);
-                }
-                tabs
-            }
-        };
-        Ok(tabs)
-    }
-
     pub(crate) fn session_file_exists(&self, repo: &Repository, path: &Path) -> bool {
         if path.is_absolute() {
             resolve_local_file(path).is_ok()
@@ -1084,47 +980,6 @@ impl Store {
         }
     }
 
-    pub fn save_tabs(&self, repo: &Repository, tabs: &TabSession) -> Result<()> {
-        let mut session = self.read_session(repo)?.unwrap_or_default();
-        session.tabs = tabs.clone();
-        self.save_session(repo, &session)
-    }
-
-    pub(crate) fn save_session(&self, repo: &Repository, session: &WorktreeSession) -> Result<()> {
-        Self::write_session_file(&self.session_path(repo), session)
-    }
-
-    pub(crate) fn write_session_file(path: &Path, session: &impl Serialize) -> Result<()> {
-        let file = SessionFile {
-            version: session::VERSION,
-            session,
-        };
-        atomic_write(path, &serde_json::to_vec(&file)?)
-    }
-
-    #[cfg(feature = "desktop")]
-    pub(crate) fn standalone_session_path(&self, path: &Path) -> PathBuf {
-        let key = Sha256::digest(path.as_os_str().as_encoded_bytes());
-        self.root
-            .join("standalone-sessions")
-            .join(format!("{}.json", hex::encode(key)))
-    }
-
-    pub(crate) fn session_path(&self, repo: &Repository) -> PathBuf {
-        self.worktree_state_path(repo, "sessions")
-    }
-
-    fn tabs_path(&self, repo: &Repository) -> PathBuf {
-        self.worktree_state_path(repo, "tabs")
-    }
-
-    fn worktree_state_path(&self, repo: &Repository, directory: &str) -> PathBuf {
-        let key = Sha256::digest(repo.storage_key());
-        self.root
-            .join(directory)
-            .join(format!("{}.json", hex::encode(key)))
-    }
-
     pub(crate) fn write_draft(
         &self,
         repo: &Repository,
@@ -1134,15 +989,6 @@ impl Store {
         dirty: bool,
     ) -> Result<()> {
         self.update_editor_draft(Some(repo), path, Some(baseline), dirty.then_some(text))
-    }
-
-    #[cfg(feature = "desktop")]
-    pub(crate) fn move_draft(&self, repo: &Repository, from: &Path, to: &Path) -> Result<()> {
-        if let Some(draft) = self.draft(repo, from)? {
-            self.write_draft(repo, to, draft.baseline, &draft.text, true)?;
-            self.discard_draft(repo, from)?;
-        }
-        Ok(())
     }
 
     pub(crate) fn has_draft(&self, repo: &Repository, path: &Path) -> bool {
@@ -1156,16 +1002,6 @@ impl Store {
     #[cfg(feature = "desktop")]
     pub(crate) fn discard_local_editor_draft(&self, path: &Path) -> Result<()> {
         self.update_editor_draft(None, path, None, None)
-    }
-}
-
-fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<Option<T>> {
-    match fs::read(path) {
-        Ok(bytes) => Ok(Some(serde_json::from_slice(&bytes).with_context(|| {
-            t!("common.read_failed", path = paths::display(path)).into_owned()
-        })?)),
-        Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(error.into()),
     }
 }
 

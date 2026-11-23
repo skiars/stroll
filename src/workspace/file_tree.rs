@@ -946,6 +946,7 @@ impl Workspace {
             .is_some_and(|path| path.starts_with(from));
         self.capture_active_file_position(cx);
         self.capture_document_position(cx);
+        let mut relocations = Vec::new();
         for path in paths {
             let target = map(&path);
             if let Some(mut file) = self.files.remove(&path) {
@@ -955,20 +956,13 @@ impl Workspace {
                 }
                 let state = file.draft_write.clone();
                 let mut pending = state.lock().unwrap();
-                let dirty = file.committed != file.saved;
-                let draft = self
-                    .store
-                    .write_draft(
-                        repo,
-                        &target,
-                        file.document.draft_baseline(),
-                        &file.committed.to_string(),
-                        dirty,
-                    )
-                    .and_then(|()| self.store.discard_draft(repo, &path));
-                if let Err(error) = draft {
-                    self.show_error(error, window, cx);
-                }
+                let draft = (file.committed != file.saved).then(|| file.committed.to_string());
+                relocations.push(self.store.draft_relocation(
+                    repo,
+                    &path,
+                    &target,
+                    Some((file.document.draft_baseline(), draft)),
+                ));
                 pending.revision = file.revision;
                 pending.result = None;
                 file.path = target.clone();
@@ -994,8 +988,8 @@ impl Workspace {
                 file.server_project = ServerProject::for_file(repo, &target);
                 self.files.insert(target.clone(), file);
                 self.connect_file_to_language_service(&target, cx);
-            } else if let Err(error) = self.store.move_draft(repo, &path, &target) {
-                self.show_error(error, window, cx);
+            } else {
+                relocations.push(self.store.draft_relocation(repo, &path, &target, None));
             }
             if let Some(position) = self.session.files.remove(&path) {
                 self.session.files.insert(target, position);
@@ -1054,6 +1048,10 @@ impl Workspace {
             }
         }
         self.session_revision += 1;
+        self.queue_draft_relocations(relocations);
+        if let Err(error) = self.flush_session(cx) {
+            self.show_error(error, window, cx);
+        }
         self.rebuild_tree();
     }
 

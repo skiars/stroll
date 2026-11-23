@@ -58,7 +58,7 @@ fn opens_current_draft_storage_without_reading_previous_formats() -> Result<()> 
     let legacy_dir = state.join("drafts");
     fs::create_dir(&legacy_dir)?;
     let legacy_draft = legacy_dir.join(format!("{key}.json"));
-    let previous_database = state.join("edit-history-v1.sqlite3");
+    let previous_database = state.join("edit-history.sqlite3");
     fs::write(&legacy_draft, "old draft")?;
     fs::write(&previous_database, "old database")?;
 

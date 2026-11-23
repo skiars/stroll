@@ -947,8 +947,9 @@ mod tests {
         git(&["worktree", "add", "-qb", "other", other.to_str().unwrap()])?;
 
         let repo = Repository::open(&root)?;
-        let other_repo = Repository::open(&other)?;
+        let mut other_repo = Repository::open(&other)?;
         let store = Arc::new(Store::new(fixture.path().join("state"))?);
+        store.bind_worktree(&mut other_repo)?;
         let config = ConfigFile::load(Some(fixture.path().join("config.toml")));
         let mut cx = TestAppContext::build_with_text_system(
             TestDispatcher::new(0),
@@ -970,9 +971,11 @@ mod tests {
         visual.simulate_resize(size(px(1120.), px(760.)));
         visual.update(|window, cx| {
             workspace.update(cx, |this, cx| {
-                let legacy: WorktreeSession =
-                    serde_json::from_str(r#"{"document":"README.md"}"#).unwrap();
-                this.apply_repository(repo.clone(), legacy, None, None, window, cx);
+                let session = WorktreeSession {
+                    document: Some(readme.clone()),
+                    ..Default::default()
+                };
+                this.apply_repository(repo.clone(), session, None, None, window, cx);
             });
         });
         visual.run_until_parked();

@@ -8,23 +8,88 @@ use gpui::*;
 use gpui_component::input::{EditorState, Position, RopeExt as _};
 
 use crate::{
-    repository::Store,
+    repository::{DraftRelocation, Repository, Store},
     session::{FilePosition, StandaloneSession, WorktreeSession},
 };
 
 use super::{Workspace, WorkspaceView};
 
 enum SavedSession {
-    Worktree(WorktreeSession),
-    Standalone(StandaloneSession),
+    Worktree {
+        key: Vec<u8>,
+        checkout: Vec<u8>,
+        session: WorktreeSession,
+    },
+    Standalone {
+        path: PathBuf,
+        session: StandaloneSession,
+    },
 }
 
 impl SavedSession {
-    fn write(&self, path: &Path) -> Result<()> {
-        match self {
-            Self::Worktree(session) => Store::write_session_file(path, session),
-            Self::Standalone(session) => Store::write_session_file(path, session),
+    fn worktree(repo: &Repository, session: WorktreeSession) -> Self {
+        Self::Worktree {
+            key: repo.storage_key().to_vec(),
+            checkout: repo.checkout_key().to_vec(),
+            session,
         }
+    }
+}
+
+#[derive(Default)]
+pub(super) struct SessionWriter {
+    revision: u64,
+    baseline: Option<SavedSession>,
+    relocations: Vec<(u64, DraftRelocation)>,
+}
+
+impl SessionWriter {
+    fn write(&mut self, store: &Store, revision: u64, snapshot: SavedSession) -> Result<()> {
+        if revision <= self.revision {
+            return Ok(());
+        }
+        let moves = self
+            .relocations
+            .partition_point(|(queued, _)| *queued <= revision);
+        match &snapshot {
+            SavedSession::Worktree {
+                key,
+                checkout,
+                session,
+            } => {
+                let previous = match &self.baseline {
+                    Some(SavedSession::Worktree {
+                        key: previous_key,
+                        checkout: previous_checkout,
+                        session: previous,
+                    }) if previous_key == key && previous_checkout == checkout => previous,
+                    _ => &WorktreeSession::default(),
+                };
+                store.update_worktree_session(
+                    key,
+                    checkout,
+                    previous,
+                    session,
+                    self.relocations[..moves]
+                        .iter()
+                        .map(|(_, relocation)| relocation),
+                )?;
+                self.relocations.drain(..moves);
+            }
+            SavedSession::Standalone { path, session } => {
+                let previous = match &self.baseline {
+                    Some(SavedSession::Standalone {
+                        path: current,
+                        session,
+                    }) if current == path => session,
+                    _ => &StandaloneSession::default(),
+                };
+                store.update_standalone_session(path, previous, session)?;
+            }
+        }
+        self.revision = revision;
+        self.baseline = Some(snapshot);
+        Ok(())
     }
 }
 
@@ -39,19 +104,15 @@ impl Workspace {
                     .await;
                 let Ok(write) = workspace.update(cx, |this, cx| {
                     this.capture_session(cx);
-                    if this.session_revision == *this.session_write.lock().unwrap() {
+                    if this.session_revision == this.session_write.lock().unwrap().revision {
                         return None;
                     }
-                    let (path, session) = this.saved_session()?;
+                    let session = this.saved_session()?;
+                    let store = this.store.clone();
                     let state = this.session_write.clone();
                     let revision = this.session_revision;
                     let write = cx.background_spawn(async move {
-                        let mut written = state.lock().unwrap();
-                        if revision > *written {
-                            session.write(&path)?;
-                            *written = revision;
-                        }
-                        Ok::<_, anyhow::Error>(())
+                        state.lock().unwrap().write(&store, revision, session)
                     });
                     Some((revision, write))
                 }) else {
@@ -172,23 +233,50 @@ impl Workspace {
         }
     }
 
-    fn saved_session(&self) -> Option<(PathBuf, SavedSession)> {
+    fn saved_session(&self) -> Option<SavedSession> {
         if let Some(path) = &self.standalone {
-            return Some((
-                self.store.standalone_session_path(path),
-                SavedSession::Standalone(StandaloneSession {
+            return Some(SavedSession::Standalone {
+                path: path.clone(),
+                session: StandaloneSession {
                     view: self.session.view,
                     panels: self.session.panels,
                     file_position: self.session.files.get(path).copied(),
                     document_position: self.session.documents.get(path).copied(),
-                }),
-            ));
+                },
+            });
         }
         let repo = self.repository.as_ref()?;
-        Some((
-            self.store.session_path(repo),
-            SavedSession::Worktree(self.session.clone()),
-        ))
+        Some(SavedSession::worktree(repo, self.session.clone()))
+    }
+
+    pub(super) fn set_worktree_session_baseline(
+        &self,
+        repo: &Repository,
+        session: WorktreeSession,
+    ) {
+        let mut writer = self.session_write.lock().unwrap();
+        // A reopen may have read the database before flushing this window.
+        if !matches!(&writer.baseline, Some(SavedSession::Worktree { key, checkout, .. })
+            if key == repo.storage_key() && checkout == repo.checkout_key())
+        {
+            writer.baseline = Some(SavedSession::worktree(repo, session));
+        }
+    }
+
+    pub(super) fn set_standalone_session_baseline(&self, path: &Path, session: &StandaloneSession) {
+        self.session_write.lock().unwrap().baseline = Some(SavedSession::Standalone {
+            path: path.to_owned(),
+            session: session.clone(),
+        });
+    }
+
+    pub(super) fn queue_draft_relocations(&mut self, relocations: Vec<DraftRelocation>) {
+        let revision = self.session_revision;
+        self.session_write.lock().unwrap().relocations.extend(
+            relocations
+                .into_iter()
+                .map(|relocation| (revision, relocation)),
+        );
     }
 
     pub(super) fn restore_panel_preferences(&mut self) {
@@ -201,13 +289,15 @@ impl Workspace {
 
     pub(super) fn flush_session(&mut self, cx: &App) -> Result<()> {
         self.capture_session(cx);
-        let mut written = self.session_write.lock().unwrap();
-        if *written < self.session_revision
-            && let Some((path, session)) = self.saved_session()
         {
-            session.write(&path)?;
-            *written = self.session_revision;
+            let mut writer = self.session_write.lock().unwrap();
+            if writer.revision < self.session_revision
+                && let Some(session) = self.saved_session()
+            {
+                writer.write(&self.store, self.session_revision, session)?;
+            }
         }
+        self.mark_terminal_session_saved();
         Ok(())
     }
 

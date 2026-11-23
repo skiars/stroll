@@ -89,12 +89,19 @@ fn moved_and_deleted_worktrees_restore_the_expected_workspace() -> Result<()> {
             ..Default::default()
         },
     )?;
-    // Seed path-keyed state as it would have existed before worktree identities.
     let draft = "unsaved review text\n";
-    let linked = Repository::open(&original)?;
+    let mut linked = Repository::open(&original)?;
+    assert!(store.bind_worktree(&mut linked)?.is_none());
     let mut tabs = crate::tabs::TabSession::default();
     tabs.open(path.to_owned(), false);
-    store.save_tabs(&linked, &tabs)?;
+    store.save_session(
+        &linked,
+        &WorktreeSession {
+            tabs,
+            worktree_lsp_trusted: true,
+            ..Default::default()
+        },
+    )?;
     Document::open(&linked, path, &store)?.persist_draft(&linked, path, &store, draft, true)?;
 
     let config_path = fixture.path().join("config.toml");
@@ -139,7 +146,7 @@ fn moved_and_deleted_worktrees_restore_the_expected_workspace() -> Result<()> {
         let mut cx = new_app();
         let (workspace, visual) = new_workspace(&mut cx, store.clone(), &config_path);
         open(visual, &workspace, &original);
-        wait(visual, "legacy review draft", |visual| {
+        wait(visual, "review draft with worktree identity", |visual| {
             has_draft(visual, &workspace, &original)
         })?;
         cx.quit();
@@ -159,6 +166,8 @@ fn moved_and_deleted_worktrees_restore_the_expected_workspace() -> Result<()> {
     wait(visual, "moved worktree at startup", |visual| {
         has_draft(visual, &workspace, &moved)
     })?;
+
+    visual.update(|_, cx| assert!(workspace.read(cx).session.worktree_lsp_trusted));
 
     git(&[
         "worktree",
@@ -202,6 +211,7 @@ fn moved_and_deleted_worktrees_restore_the_expected_workspace() -> Result<()> {
     wait(visual, "explicitly restored draft", |visual| {
         has_draft(visual, &workspace, &original)
     })?;
+    visual.update(|_, cx| assert!(!workspace.read(cx).session.worktree_lsp_trusted));
     cx.quit();
     Ok(())
 }

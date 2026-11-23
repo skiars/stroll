@@ -1690,7 +1690,7 @@ mod tests {
         assert_eq!(saved.view, Some(WorkspaceView::Docs));
         let terminal = saved.terminal.as_ref().unwrap();
         assert!(terminal.open);
-        assert_eq!(terminal.docs_open, Some(false));
+        assert!(!terminal.docs_open);
         assert_eq!(terminal.active, Some(3));
         assert_eq!(
             terminal

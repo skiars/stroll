@@ -2,15 +2,15 @@ use std::{
     fs,
     io::{ErrorKind, Write as _},
     path::{Path, PathBuf},
-    time::SystemTime,
 };
 
 use anyhow::{Result, anyhow};
+use rusqlite::{Connection, OptionalExtension as _, params};
 use rust_i18n::t;
 use serde::{Deserialize, Serialize};
 
 use super::{
-    Repository, Store, atomic_write, read_json,
+    Repository, Store,
     selection::{Worktree, common_dir, local_worktrees, path_from_git},
 };
 
@@ -24,21 +24,15 @@ pub(crate) struct WorktreeState {
     admin: PathBuf,
     branch: Option<String>,
     state_id: String,
-    pub(crate) legacy_root: Option<PathBuf>,
 }
 
 impl WorktreeState {
     pub(crate) fn storage_key(&self) -> &[u8] {
-        self.legacy_root
-            .as_deref()
-            .map_or(self.state_id.as_bytes(), |root| {
-                root.as_os_str().as_encoded_bytes()
-            })
+        self.state_id.as_bytes()
     }
 
     pub(crate) fn inherit(&mut self, archived: Self) {
         self.state_id = archived.state_id;
-        self.legacy_root = archived.legacy_root;
     }
 
     pub(crate) fn still_at_root(&self) -> bool {
@@ -109,23 +103,31 @@ fn ensure_marker(admin: &Path) -> Result<String> {
     }
 }
 
+pub(super) fn write_worktree(db: &Connection, state: &WorktreeState) -> Result<()> {
+    db.execute(
+        "INSERT INTO worktrees (id, common_dir, updated, value)
+         VALUES (?1, ?2, (SELECT coalesce(max(updated), 0) + 1 FROM worktrees WHERE common_dir = ?2), ?3)
+         ON CONFLICT(id) DO UPDATE SET
+            common_dir = excluded.common_dir, updated = excluded.updated, value = excluded.value",
+        params![
+            state.id,
+            state.common_dir.as_os_str().as_encoded_bytes(),
+            serde_json::to_vec(state)?,
+        ],
+    )?;
+    Ok(())
+}
+
 impl Store {
-    fn worktree_state_dir(&self) -> PathBuf {
-        self.root.join("worktree-state")
-    }
-
     fn read_worktree_state(&self, id: &str) -> Result<Option<WorktreeState>> {
-        if !valid_id(id) {
-            return Ok(None);
-        }
-        read_json(&self.worktree_state_dir().join(format!("{id}.json")))
-    }
-
-    pub(crate) fn write_worktree_state(&self, state: &WorktreeState) -> Result<()> {
-        atomic_write(
-            &self.worktree_state_dir().join(format!("{}.json", state.id)),
-            &serde_json::to_vec(state)?,
-        )
+        self.with_state(|db| {
+            let value: Option<Vec<u8>> = db
+                .query_row("SELECT value FROM worktrees WHERE id = ?1", [id], |row| {
+                    row.get(0)
+                })
+                .optional()?;
+            Ok(value.as_deref().map(serde_json::from_slice).transpose()?)
+        })
     }
 
     pub(crate) fn update_worktree_branch(&self, state: &mut WorktreeState) -> Result<()> {
@@ -133,48 +135,28 @@ impl Store {
         if branch != state.branch {
             let mut updated = state.clone();
             updated.branch = branch;
-            self.write_worktree_state(&updated)?;
+            self.with_state(|db| write_worktree(db, &updated))?;
             *state = updated;
         }
         Ok(())
     }
 
-    fn worktree_records(&self) -> Result<Vec<(SystemTime, WorktreeState)>> {
-        let mut records = Vec::new();
-        match fs::read_dir(self.worktree_state_dir()) {
-            Ok(entries) => {
-                for entry in entries {
-                    let entry = entry?;
-                    if entry
-                        .path()
-                        .extension()
-                        .is_some_and(|extension| extension == "json")
-                        && let Ok(Some(state)) = read_json::<WorktreeState>(&entry.path())
-                    {
-                        records.push((entry.metadata()?.modified()?, state));
-                    }
-                }
-            }
-            Err(error) if error.kind() == ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
-        }
-        Ok(records)
+    fn worktree_records(&self, common_dir: &Path) -> Result<Vec<WorktreeState>> {
+        self.with_state(|db| {
+            let mut query = db.prepare_cached(
+                "SELECT value FROM worktrees WHERE common_dir = ?1 ORDER BY updated DESC, id DESC",
+            )?;
+            query
+                .query_map([common_dir.as_os_str().as_encoded_bytes()], |row| {
+                    row.get::<_, Vec<u8>>(0)
+                })?
+                .map(|row| Ok(serde_json::from_slice(&row?)?))
+                .collect()
+        })
     }
 
     pub(crate) fn bind_worktree(&self, repo: &mut Repository) -> Result<Option<WorktreeState>> {
         let Some(admin) = linked_admin(&repo.root).filter(|admin| admin != &repo.common_dir) else {
-            // A newly initialized repository can occupy a linked worktree's former path.
-            if self.session_path(repo).try_exists()? || self.tabs_path(repo).try_exists()? {
-                let claimed = self
-                    .worktree_records()?
-                    .iter()
-                    .any(|(_, state)| state.legacy_root.as_ref() == Some(&repo.root));
-                if claimed {
-                    let mut key = b"local-repository\0".to_vec();
-                    key.extend(repo.root.as_os_str().as_encoded_bytes());
-                    repo.local_storage_key = Some(key);
-                }
-            }
             return Ok(None);
         };
         let id = ensure_marker(&admin)?;
@@ -189,34 +171,20 @@ impl Store {
             return Ok(None);
         }
 
-        let records = self.worktree_records()?;
-        let legacy_exists =
-            self.session_path(repo).try_exists()? || self.tabs_path(repo).try_exists()?;
-        let legacy_root = (legacy_exists
-            && !records.iter().any(|(_, state)| {
-                state.root == repo.root || state.legacy_root.as_ref() == Some(&repo.root)
-            }))
-        .then(|| repo.root.clone());
-
+        let records = self.worktree_records(&repo.common_dir)?;
         // A surviving marker may belong to a worktree that can still be repaired.
         let archived = records
             .iter()
-            .filter(|(_, state)| {
+            .find(|state| {
                 branch.is_some()
                     && state.branch == branch
-                    && state.common_dir == repo.common_dir
                     && matches!(marker(&state.admin), Ok(id) if id.as_ref() != Some(&state.id))
-                    && !records.iter().any(|(_, other)| {
+                    && !records.iter().any(|other| {
                         other.storage_key() == state.storage_key()
                             && marker(&other.admin).ok().flatten().as_ref() == Some(&other.id)
                     })
             })
-            .max_by(|(left_time, left), (right_time, right)| {
-                left_time
-                    .cmp(right_time)
-                    .then_with(|| left.id.cmp(&right.id))
-            })
-            .map(|(_, state)| state.clone());
+            .cloned();
         repo.worktree_state = Some(WorktreeState {
             state_id: id.clone(),
             id,
@@ -224,26 +192,12 @@ impl Store {
             common_dir: repo.common_dir.clone(),
             admin,
             branch,
-            legacy_root,
         });
         Ok(archived)
     }
 
     pub(crate) fn resolve_saved_worktree(&self, root: &Path) -> Result<Option<PathBuf>> {
-        let Some(state) = self.workspace_state()? else {
-            return Ok(None);
-        };
-        let saved = if state.location.root == root && state.common_dir.is_some() {
-            state.common_dir.map(|dir| (dir, state.worktree_id))
-        } else {
-            state.recents.and_then(|recents| {
-                recents
-                    .into_iter()
-                    .find(|recent| recent.root == root)
-                    .map(|recent| (recent.common_dir, recent.worktree_id))
-            })
-        };
-        let Some((common, id)) = saved else {
+        let Some((common, id)) = self.saved_repository(root)? else {
             return Ok(None);
         };
         if let Some(id) = id {

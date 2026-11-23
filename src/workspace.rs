@@ -859,7 +859,7 @@ pub struct Workspace {
     visible_editor: Option<EntityId>,
     draft_task: Task<()>,
     session: WorktreeSession,
-    session_write: Arc<Mutex<u64>>,
+    session_write: Arc<Mutex<session::SessionWriter>>,
     session_revision: u64,
     startup_view: Option<WorkspaceView>,
     saved_window: Option<(WindowSlot, WindowGeometry)>,
@@ -1192,7 +1192,7 @@ impl Workspace {
             if let Some(repo) =
                 cached.filter(|repo| repo.ssh.as_ref().is_some_and(|ssh| ssh.failure().is_none()))
             {
-                let session = opening_store.session(&repo)?;
+                let session = opening_store.session_for_open(&repo)?;
                 if repo.ssh.as_ref().is_some_and(|ssh| ssh.failure().is_none()) {
                     return Ok(Some(((*repo).clone(), Some(session), None, restore_view)));
                 }
@@ -1276,9 +1276,9 @@ impl Workspace {
                 let reused = cached_session.is_some();
                 cx.background_spawn(async move {
                     repo.language_resources();
-                    let mut session = match cached_session {
+                    let (baseline, mut session) = match cached_session {
                         Some(session) => session,
-                        None => store.session(&repo)?,
+                        None => store.session_for_open(&repo)?,
                     };
                     if inherited {
                         // A recreated checkout may contain different language server commands.
@@ -1314,7 +1314,15 @@ impl Workspace {
                             .map(DocumentTree::from_paths)
                     })
                     .flatten();
-                    Ok(Some((repo, session, file, docs, reused, restore_view)))
+                    Ok(Some((
+                        repo,
+                        baseline,
+                        session,
+                        file,
+                        docs,
+                        reused,
+                        restore_view,
+                    )))
                 })
                 .await
             }
@@ -1322,12 +1330,12 @@ impl Workspace {
             _ = this.update_in(cx, move |this, window, cx| {
                 this.repository_ui.opening = None;
                 let result = result.and_then(|target| {
-                    if let Some((repo, mut session, file, docs, reused, restore_view)) = target {
+                    if let Some((repo, baseline, mut session, file, docs, reused, restore_view)) =
+                        target
+                    {
                         this.flush_drafts(cx)?;
                         this.flush_session(cx)?;
-                        if let Some(state) = &repo.worktree_state {
-                            this.store.write_worktree_state(state)?;
-                        }
+                        this.set_worktree_session_baseline(&repo, baseline);
                         if this.repository.as_ref().is_some_and(|current| {
                             current.root != repo.root && current.same_worktree(&repo)
                         }) {

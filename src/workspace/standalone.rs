@@ -48,10 +48,8 @@ impl Workspace {
                 return Ok(());
             }
         }
-        let session = match Store::read_session_file::<StandaloneSession>(
-            &store.standalone_session_path(&path),
-        ) {
-            Ok(session) => session.unwrap_or_default(),
+        let session = match store.standalone_session(&path) {
+            Ok(session) => session,
             Err(error) => {
                 eprintln!("Could not load standalone session: {error:#}");
                 StandaloneSession::default()
@@ -98,6 +96,7 @@ impl Workspace {
                 .unwrap_or(true)
             });
             workspace.update(cx, |this, cx| {
+                this.set_standalone_session_baseline(&path, &session);
                 this.session.view = session.view;
                 this.session.panels = session.panels;
                 if let Some(position) = session.file_position {
@@ -419,8 +418,7 @@ fn standalone_markdown_keeps_the_editor_buffer_and_reads_saved_text() -> Result<
         assert!(workspace.update(cx, |this, cx| this.request_window_close(window, cx)));
         window.remove_window();
     });
-    let saved: StandaloneSession =
-        Store::read_session_file(&store.standalone_session_path(&path))?.unwrap();
+    let saved: StandaloneSession = store.standalone_session(&path)?;
     assert!(saved.document_position.is_some());
     app.update(|cx| Workspace::open_standalone(store, config, path.clone(), None, cx))?;
     app.run_until_parked();

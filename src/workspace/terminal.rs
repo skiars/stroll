@@ -24,7 +24,7 @@ use gpui_kit_assets::IconName;
 use crate::{
     remote::{RepoPath, SshTarget},
     repository::{Repository, Store},
-    session::{TerminalSession, TerminalTab, WorktreeSession},
+    session::{TerminalSession, TerminalTab},
     terminal::Process,
 };
 
@@ -51,7 +51,7 @@ pub(super) struct Terminals {
 
 struct Panel {
     root: PathBuf,
-    session_path: PathBuf,
+    saved: Option<TerminalSession>,
     editor_open: bool,
     docs_open: bool,
     maximized: bool,
@@ -65,10 +65,10 @@ struct Panel {
 }
 
 impl Panel {
-    fn new(repo: &Repository, store: &Store, cx: &App) -> Self {
+    fn new(repo: &Repository, cx: &App) -> Self {
         Self {
             root: repo.root.clone(),
-            session_path: store.session_path(repo),
+            saved: None,
             editor_open: false,
             docs_open: false,
             maximized: false,
@@ -102,7 +102,7 @@ impl Panel {
         let active = self.tabs.get(self.active)?.number;
         Some(TerminalSession {
             open: self.editor_open,
-            docs_open: Some(self.docs_open),
+            docs_open: self.docs_open,
             active: Some(active),
             tabs: self
                 .tabs
@@ -238,26 +238,26 @@ impl Workspace {
         }
     }
 
-    pub(super) fn flush_inactive_terminal_sessions(&self, cx: &App) {
+    pub(super) fn mark_terminal_session_saved(&mut self) {
+        let terminal = self.session.terminal.clone();
+        if let Some(panel) = self.current_terminal_mut() {
+            panel.saved = terminal;
+        }
+    }
+
+    pub(super) fn flush_inactive_terminal_sessions(&mut self, cx: &App) {
         let current = self.repository.as_ref().map(|repo| repo.storage_key());
         let restore_scrollback = self.config.current().terminal.restore_scrollback;
-        let _write = self.session_write.lock().unwrap();
-        for (key, panel) in &self.terminals.panels {
+        for (key, panel) in &mut self.terminals.panels {
             if current == Some(key.as_slice()) {
                 continue;
             }
-            let result = (|| -> anyhow::Result<()> {
-                let mut session = Store::read_session_file::<WorktreeSession>(&panel.session_path)?
-                    .unwrap_or_default();
-                let terminal = panel.snapshot(restore_scrollback, cx);
-                if session.terminal != terminal {
-                    session.terminal = terminal;
-                    Store::write_session_file(&panel.session_path, &session)?;
+            let terminal = panel.snapshot(restore_scrollback, cx);
+            if terminal != panel.saved {
+                match self.store.save_terminal_session(key, &terminal) {
+                    Ok(()) => panel.saved = terminal,
+                    Err(error) => eprintln!("terminal session write failed: {error:#}"),
                 }
-                Ok(())
-            })();
-            if let Err(error) = result {
-                eprintln!("terminal session write failed: {error:#}");
             }
         }
     }
@@ -281,7 +281,8 @@ impl Workspace {
         let Some(saved) = self.session.terminal.clone() else {
             return;
         };
-        let mut panel = Panel::new(&repo, &self.store, cx);
+        let mut panel = Panel::new(&repo, cx);
+        panel.saved = Some(saved.clone());
         let mut numbers = HashSet::new();
         for mut tab in saved
             .tabs
@@ -300,11 +301,9 @@ impl Workspace {
             .iter()
             .position(|tab| Some(tab.number) == saved.active)
             .unwrap_or(0);
-        let legacy_docs =
-            saved.docs_open.is_none() && self.session.view == Some(WorkspaceView::Docs);
         if !panel.tabs.is_empty() {
-            panel.editor_open = saved.open && !legacy_docs;
-            panel.docs_open = saved.docs_open.unwrap_or(legacy_docs && saved.open);
+            panel.editor_open = saved.open;
+            panel.docs_open = saved.docs_open;
         }
         self.terminals.panels.insert(key, panel);
     }
@@ -368,7 +367,7 @@ impl Workspace {
             .terminals
             .panels
             .entry(repo.storage_key().to_vec())
-            .or_insert_with(|| Panel::new(&repo, &self.store, cx));
+            .or_insert_with(|| Panel::new(&repo, cx));
         if previous_focus.is_some() {
             panel.previous_focus = previous_focus;
         }

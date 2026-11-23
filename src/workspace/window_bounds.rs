@@ -357,12 +357,14 @@ mod tests {
     #[::core::prelude::v1::test]
     fn store_keeps_one_geometry_per_slot() -> anyhow::Result<()> {
         let fixture = tempfile::tempdir()?;
-        let store = Store::new(fixture.path().join("state"))?;
+        let state = fixture.path().join("state");
+        let store = Store::new(state.clone())?;
+        let second = Store::new(state)?;
         let repository = geometry(10., 20., 1200., 800.);
         let document = geometry(30., 40., 900., 700.);
 
         store.save_window_geometry(WindowSlot::Repository, repository)?;
-        store.save_window_geometry(WindowSlot::Document, document)?;
+        second.save_window_geometry(WindowSlot::Document, document)?;
 
         assert_eq!(
             store.window_geometry(WindowSlot::Repository)?,
@@ -374,16 +376,19 @@ mod tests {
     }
 
     #[::core::prelude::v1::test]
-    fn malformed_records_are_replaced_instead_of_blocking_saves() -> anyhow::Result<()> {
+    fn prior_window_size_files_are_ignored() -> anyhow::Result<()> {
         let fixture = tempfile::tempdir()?;
         let state = fixture.path().join("state");
         let store = Store::new(state.clone())?;
-        fs::write(state.join("window-sizes.json"), b"{ not json")?;
+        let previous = state.join("window-sizes.json");
+        fs::write(&previous, b"{ not json")?;
+        assert!(store.window_geometry(WindowSlot::Editor)?.is_none());
         let geometry = geometry(10., 20., 1200., 800.);
 
         store.save_window_geometry(WindowSlot::Editor, geometry)?;
 
         assert_eq!(store.window_geometry(WindowSlot::Editor)?, Some(geometry));
+        assert_eq!(fs::read(previous)?, b"{ not json");
         Ok(())
     }
 }

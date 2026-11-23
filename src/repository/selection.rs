@@ -10,7 +10,9 @@ use std::{
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 
-use super::{Location, Repository, Store, atomic_write, git, read_json};
+use rusqlite::{OptionalExtension as _, TransactionBehavior, params};
+
+use super::{Location, Repository, Store, git};
 use crate::paths;
 
 pub(crate) fn repository_root(path: &Path) -> Result<PathBuf> {
@@ -220,6 +222,8 @@ fn is_repository_root(path: &Path) -> bool {
             .is_ok_and(|root| path.canonicalize().is_ok_and(|path| root == path))
 }
 
+const RECENT_REPOSITORY_LIMIT: usize = 30;
+
 #[derive(Clone, Deserialize, Serialize)]
 pub(crate) struct RecentRepository {
     pub(crate) root: PathBuf,
@@ -278,7 +282,7 @@ impl RecentRepository {
                 previous_worktrees,
             },
         );
-        recents.truncate(30);
+        recents.truncate(RECENT_REPOSITORY_LIMIT);
     }
 
     #[cfg(feature = "desktop")]
@@ -334,83 +338,132 @@ pub(crate) fn ssh_project_name(target: &crate::remote::SshTarget, common_dir: &P
 }
 
 #[derive(Deserialize, Serialize)]
-pub(super) struct WorkspaceState {
-    #[serde(flatten)]
-    pub(super) location: Location,
-    // None identifies a legacy workspace.json. An explicit empty list stays empty.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(super) recents: Option<Vec<RecentRepository>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(super) worktree_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(super) common_dir: Option<PathBuf>,
+struct StartupLocation {
+    location: Location,
+    worktree_id: Option<String>,
+    common_dir: PathBuf,
 }
 
-impl WorkspaceState {
-    fn recents(self) -> Vec<RecentRepository> {
-        self.recents
-            .unwrap_or_else(|| legacy_recent(&self.location.root))
-    }
-}
-
-fn legacy_recent(root: &Path) -> Vec<RecentRepository> {
-    let common_dir = common_dir(root).unwrap_or_else(|_| root.join(".git"));
-    vec![RecentRepository {
-        root: root.to_owned(),
-        common_dir,
-        worktree_id: None,
-        previous_worktrees: Vec::new(),
-    }]
+fn startup_location(db: &rusqlite::Connection) -> Result<Option<StartupLocation>> {
+    let value: Option<Vec<u8>> = db
+        .query_row(
+            "SELECT value FROM startup_location WHERE id = 1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(value.as_deref().map(serde_json::from_slice).transpose()?)
 }
 
 impl Store {
-    pub(super) fn workspace_state(&self) -> Result<Option<WorkspaceState>> {
-        read_json(&self.root.join("workspace.json"))
+    pub fn location(&self) -> Result<Option<Location>> {
+        self.with_state(|db| Ok(startup_location(db)?.map(|state| state.location)))
     }
 
+    #[cfg(feature = "desktop")]
+    pub(super) fn saved_repository(
+        &self,
+        root: &Path,
+    ) -> Result<Option<(PathBuf, Option<String>)>> {
+        self.with_state(|db| {
+            let tx = db.transaction()?;
+            if let Some(state) = startup_location(&tx)?
+                && state.location.root == root
+            {
+                return Ok(Some((state.common_dir, state.worktree_id)));
+            }
+            let value: Option<Vec<u8>> = tx
+                .query_row(
+                    "SELECT value FROM recent_repositories WHERE root = ?1",
+                    [root.as_os_str().as_encoded_bytes()],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            Ok(value
+                .as_deref()
+                .map(serde_json::from_slice::<RecentRepository>)
+                .transpose()?
+                .map(|recent| (recent.common_dir, recent.worktree_id)))
+        })
+    }
+
+    #[cfg(any(feature = "desktop", test))]
     pub(crate) fn recent_repositories(&self) -> Result<Vec<RecentRepository>> {
-        Ok(self
-            .workspace_state()?
-            .map(WorkspaceState::recents)
-            .unwrap_or_default())
+        self.with_state(|db| {
+            let mut query =
+                db.prepare_cached("SELECT value FROM recent_repositories ORDER BY opened DESC")?;
+            query
+                .query_map([], |row| row.get::<_, Vec<u8>>(0))?
+                .map(|row| Ok(serde_json::from_slice(&row?)?))
+                .collect()
+        })
     }
 
     pub fn remember_repository(&self, repo: &Repository) -> Result<()> {
-        let mut recents = self.recent_repositories()?;
-        RecentRepository::record(&mut recents, repo);
-        self.save_workspace_state(WorkspaceState {
-            location: Location {
-                root: repo.root.clone(),
-                file: None,
-            },
-            recents: Some(recents),
+        self.with_state(|db| {
+            let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
             #[cfg(feature = "desktop")]
-            worktree_id: repo.worktree_state.as_ref().map(|state| state.id.clone()),
-            #[cfg(not(feature = "desktop"))]
-            worktree_id: None,
-            common_dir: Some(repo.common_dir.clone()),
+            if let Some(state) = &repo.worktree_state {
+                super::worktree_state::write_worktree(&tx, state)?;
+            }
+
+            let common_dir = repo.common_dir.as_os_str().as_encoded_bytes();
+            let root = repo.root.as_os_str().as_encoded_bytes();
+            let previous: Option<Vec<u8>> = tx
+                .query_row(
+                    "SELECT value FROM recent_repositories WHERE common_dir = ?1",
+                    [common_dir],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let mut recents = previous.as_deref()
+                .map(serde_json::from_slice)
+                .transpose()?
+                .into_iter()
+                .collect();
+            RecentRepository::record(&mut recents, repo);
+            let recent = &recents[0];
+            tx.execute(
+                "DELETE FROM recent_repositories WHERE root = ?1 AND common_dir != ?2",
+                params![root, common_dir],
+            )?;
+            tx.execute(
+                "INSERT INTO recent_repositories (common_dir, root, opened, value)
+                 VALUES (?1, ?2, (SELECT coalesce(max(opened), 0) + 1 FROM recent_repositories), ?3)
+                 ON CONFLICT(common_dir) DO UPDATE SET
+                    root = excluded.root, opened = excluded.opened, value = excluded.value",
+                params![common_dir, root, serde_json::to_vec(recent)?],
+            )?;
+            tx.execute(
+                "DELETE FROM recent_repositories WHERE common_dir IN (
+                    SELECT common_dir FROM recent_repositories ORDER BY opened DESC LIMIT -1 OFFSET ?1
+                )",
+                [RECENT_REPOSITORY_LIMIT as i64],
+            )?;
+            let startup = StartupLocation {
+                location: Location { root: repo.root.clone(), file: None },
+                worktree_id: recent.worktree_id.clone(),
+                common_dir: repo.common_dir.clone(),
+            };
+            tx.execute(
+                "INSERT INTO startup_location VALUES (1, ?1)
+                 ON CONFLICT(id) DO UPDATE SET value = excluded.value",
+                [serde_json::to_vec(&startup)?],
+            )?;
+            tx.commit()?;
+            Ok(())
         })
     }
 
     #[cfg(any(feature = "desktop", test))]
     pub(crate) fn forget_recent(&self, common_dir: &Path) -> Result<()> {
-        if let Some(mut state) = self.workspace_state()? {
-            let mut recents = state
-                .recents
-                .take()
-                .unwrap_or_else(|| legacy_recent(&state.location.root));
-            recents.retain(|item| item.common_dir != common_dir);
-            state.recents = Some(recents);
-            self.save_workspace_state(state)?;
-        }
-        Ok(())
-    }
-
-    fn save_workspace_state(&self, state: WorkspaceState) -> Result<()> {
-        atomic_write(
-            &self.root.join("workspace.json"),
-            &serde_json::to_vec(&state)?,
-        )
+        self.with_state(|db| {
+            db.execute(
+                "DELETE FROM recent_repositories WHERE common_dir = ?1",
+                [common_dir.as_os_str().as_encoded_bytes()],
+            )?;
+            Ok(())
+        })
     }
 }
 
@@ -446,8 +499,29 @@ mod tests {
         let state = directory.path().join("state");
         let first = Store::new(state.clone())?;
         let second = Store::new(state)?;
-        assert!(first.recent_repositories()?.is_empty());
-        assert!(second.recent_repositories()?.is_empty());
+        let init_repo = |name| -> Result<Repository> {
+            let root = directory.path().join(name);
+            fs::create_dir(&root)?;
+            git(&root, &["init", "-q"])?;
+            Repository::open(&root)
+        };
+        let one = init_repo("first")?;
+        let two = init_repo("second")?;
+        let start = std::sync::Barrier::new(2);
+        std::thread::scope(|scope| {
+            // The two independent connections contend for the same state directory.
+            let remember_one = scope.spawn(|| {
+                start.wait();
+                first.remember_repository(&one)
+            });
+            start.wait();
+            let result = second.remember_repository(&two);
+            remember_one.join().unwrap()?;
+            result
+        })?;
+        let recents = first.recent_repositories()?;
+        assert_eq!(recents.len(), 2);
+        assert_eq!(first.location()?.unwrap().root, recents[0].root);
         Ok(())
     }
 
@@ -524,13 +598,8 @@ mod tests {
         assert_eq!(repository_root(&linked.join("nested"))?, review.root);
 
         let store = Store::new(state.clone())?;
-        let legacy = Location {
-            root: project.clone(),
-            file: Some("legacy.md".into()),
-        };
-        fs::write(state.join("workspace.json"), serde_json::to_vec(&legacy)?)?;
-        assert_eq!(store.recent_repositories()?[0].root, legacy.root);
-        assert_eq!(store.location()?.unwrap().file, legacy.file);
+        store.remember_repository(&main)?;
+        assert_eq!(store.location()?.unwrap().root, main.root);
 
         fs::write(project.join("draft.md"), "draft")?;
         let mut tabs = crate::tabs::TabSession::default();
@@ -596,14 +665,7 @@ mod tests {
         }
         let main = Repository::open(&project)?;
         let store = Store::new(state.clone())?;
-        // A legacy record only knows about the last checkout.
-        fs::write(
-            state.join("workspace.json"),
-            serde_json::to_vec(&Location {
-                root: project.clone(),
-                file: None,
-            })?,
-        )?;
+        store.remember_repository(&main)?;
         for path in [&first, &second, &other, &first] {
             let mut repo = Repository::open(path)?;
             store.bind_worktree(&mut repo)?;

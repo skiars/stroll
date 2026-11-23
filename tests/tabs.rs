@@ -69,55 +69,26 @@ fn restores_many_tabs_in_order_with_active_preview_and_repository_isolation() ->
 }
 
 #[test]
-fn migrates_the_legacy_active_file_and_honors_an_empty_session() -> Result<()> {
+fn starts_with_empty_state_and_reopens_current_tabs() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let repo = repository(&dir.path().join("repo"))?;
     let state = dir.path().join("state");
     let store = Store::new(state.clone())?;
-    fs::write(repo.root.join("legacy.rs"), "")?;
-    fs::write(
-        state.join("workspace.json"),
-        serde_json::to_vec(&serde_json::json!({
-            "root": repo.root, "file": "legacy.rs"
-        }))?,
-    )?;
+    fs::write(repo.root.join("current.rs"), "")?;
+    fs::write(state.join("workspace.json"), b"obsolete state")?;
 
-    let tabs = store.tabs(&repo)?;
-    assert_eq!(tabs.paths(), [PathBuf::from("legacy.rs")]);
-    assert_eq!(tabs.active(), Some(Path::new("legacy.rs")));
-    assert!(!tabs.is_preview(Path::new("legacy.rs")));
-
-    store.save_tabs(&repo, &TabSession::default())?;
+    assert!(store.location()?.is_none());
     assert_eq!(store.tabs(&repo)?, TabSession::default());
-    Ok(())
-}
 
-#[test]
-fn imports_legacy_worktree_tab_json_and_prefers_the_new_snapshot() -> Result<()> {
-    use sha2::{Digest, Sha256};
-
-    let dir = tempfile::tempdir()?;
-    let repo = repository(&dir.path().join("repo"))?;
-    let state = dir.path().join("state");
-    let store = Store::new(state.clone())?;
-    let path = PathBuf::from("legacy.rs");
-    fs::write(repo.root.join(&path), "")?;
-    let mut legacy = TabSession::default();
-    legacy.open(path, true);
-    let key = hex::encode(Sha256::digest(repo.root.as_os_str().as_encoded_bytes()));
-    fs::create_dir_all(state.join("tabs"))?;
-    fs::write(
-        state.join("tabs").join(format!("{key}.json")),
-        serde_json::to_vec(&legacy)?,
-    )?;
-
-    assert_eq!(store.tabs(&repo)?, legacy);
-    store.save_tabs(&repo, &TabSession::default())?;
-    assert!(state.join("sessions").join(format!("{key}.json")).is_file());
+    let mut tabs = TabSession::default();
+    tabs.open("current.rs".into(), false);
+    store.save_tabs(&repo, &tabs)?;
     drop(store);
 
-    let store = Store::new(state)?;
-    assert_eq!(store.tabs(&repo)?, TabSession::default());
+    let store = Store::new(state.clone())?;
+    assert!(state.join("state.sqlite3").is_file());
+    assert_eq!(fs::read(state.join("workspace.json"))?, b"obsolete state");
+    assert_eq!(store.tabs(&repo)?, tabs);
     Ok(())
 }
 

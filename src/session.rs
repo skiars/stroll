@@ -8,8 +8,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::{git::Mode, tabs::TabSession};
 
-pub(crate) const VERSION: u32 = 1;
-
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkspaceView {
@@ -28,7 +26,7 @@ pub(crate) struct WorktreeSession {
     pub source_history: SourceHistory,
     pub document: Option<PathBuf>,
     pub documents: BTreeMap<PathBuf, DocumentPosition>,
-    // None represents a session saved before the first visit to the document list.
+    // None indicates that the document list has not been opened.
     pub open_documents: Option<Vec<OpenDocument>>,
     pub git: Option<GitSession>,
     pub panels: PanelPreferences,
@@ -48,9 +46,7 @@ pub(crate) struct WorktreeSession {
 #[serde(default)]
 pub(crate) struct TerminalSession {
     pub open: bool,
-    // None marks a snapshot from when both views shared one visibility flag.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub docs_open: Option<bool>,
+    pub docs_open: bool,
     pub active: Option<u32>,
     pub tabs: Vec<TerminalTab>,
 }
@@ -277,14 +273,8 @@ pub(crate) struct DiffPosition {
     pub horizontal: f32,
 }
 
-#[derive(Deserialize, Serialize)]
-pub(crate) struct SessionFile<T> {
-    pub version: u32,
-    pub session: T,
-}
-
 #[cfg(feature = "desktop")]
-#[derive(Default, Deserialize, Serialize)]
+#[derive(Clone, Default, PartialEq, Deserialize, Serialize)]
 #[serde(default)]
 pub(crate) struct StandaloneSession {
     pub view: Option<WorkspaceView>,
