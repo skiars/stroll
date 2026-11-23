@@ -581,7 +581,28 @@ impl SyntaxHighlighter {
     /// without re-parsing.
     pub fn edit_tree(&mut self, edit: Option<InputEdit>, text: &Rope) {
         self.visible_captures.get_mut().take();
-        self.external_captures.clear();
+        if self.external.is_some() {
+            if let Some(edit) = &edit {
+                // Syntax on an edited line may change outside the edited bytes.
+                // Retain other lines until the current tokenization is ready.
+                let start = self.text.line_start_offset(edit.start_position.row);
+                let end = self.text.line_start_offset(edit.old_end_position.row + 1);
+                let shift = edit.new_end_byte as isize - edit.old_end_byte as isize;
+                self.external_captures.retain_mut(|capture| {
+                    if capture.range.end <= start {
+                        return true;
+                    }
+                    if capture.range.start < end {
+                        return false;
+                    }
+                    capture.range.start = capture.range.start.saturating_add_signed(shift);
+                    capture.range.end = capture.range.end.saturating_add_signed(shift);
+                    true
+                });
+            } else {
+                self.external_captures.clear();
+            }
+        }
         if let (Some(edit), Some(tree)) = (edit, self.tree.as_mut()) {
             tree.edit(&edit);
         }

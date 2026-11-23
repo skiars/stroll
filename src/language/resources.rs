@@ -733,6 +733,195 @@ export const render = (visible: boolean) => <div>{visible}</div>
         Ok(())
     }
 
+    fn example_textmate_resources() -> Result<LanguageResources> {
+        let mut textmate = TextMate::default();
+        textmate.add(
+            TextMateGrammar {
+                language: Some("example".into()),
+                scope_name: "source.example".into(),
+                path: PathBuf::new(),
+                inject_to: None,
+            },
+            serde_json::from_str(include_str!(
+                "../../tests/fixtures/textmate/example.tmLanguage.json"
+            ))?,
+        )?;
+        let mut resources = LanguageResources::default();
+        resources.register_textmate(textmate);
+        Ok(resources)
+    }
+
+    #[test]
+    fn textmate_keeps_untouched_comment_styles_while_edits_are_pending() -> Result<()> {
+        use gpui::FontStyle;
+        use tree_sitter::{InputEdit, Point};
+
+        struct Comments;
+        impl HighlightStyleResolver for Comments {
+            fn style(&self, name: &str) -> Option<HighlightStyle> {
+                (name == "comment").then_some(HighlightStyle {
+                    font_style: Some(FontStyle::Italic),
+                    ..Default::default()
+                })
+            }
+        }
+
+        let resources = example_textmate_resources()?;
+        let language = resources
+            .syntax_for_id("example")
+            .context("Example grammar")?;
+        let original = "# before ☀\n# changed 🧪\n# after 雪\n";
+        let start = original.find("# changed").unwrap();
+        let intermediate = original.replacen("# changed", "x changed", 1);
+        let final_text = intermediate.replacen("x changed", "x changed\nlet x = 0", 1);
+        let mut highlighter = SyntaxHighlighter::new(&language);
+        assert!(highlighter.update(None, &Rope::from(original), None));
+
+        let italic_lines = |highlighter: &SyntaxHighlighter, source: &str| {
+            let styles = highlighter.styles(&(0..source.len()), &Comments);
+            source
+                .split_inclusive('\n')
+                .scan(0, |start, line| {
+                    let italic = styles.iter().any(|(range, style)| {
+                        range.contains(start) && style.font_style == Some(FontStyle::Italic)
+                    });
+                    *start += line.len();
+                    Some(italic)
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(italic_lines(&highlighter, original), [true, true, true]);
+        highlighter.edit_tree(
+            Some(InputEdit {
+                start_byte: start,
+                old_end_byte: start + 1,
+                new_end_byte: start + 1,
+                start_position: Point::new(1, 0),
+                old_end_position: Point::new(1, 1),
+                new_end_position: Point::new(1, 1),
+            }),
+            &Rope::from(intermediate.as_str()),
+        );
+        assert_eq!(
+            italic_lines(&highlighter, &intermediate),
+            [true, false, true]
+        );
+
+        let column = "x changed".len();
+        highlighter.edit_tree(
+            Some(InputEdit {
+                start_byte: start + column,
+                old_end_byte: start + column,
+                new_end_byte: start + column + "\nlet x = 0".len(),
+                start_position: Point::new(1, column),
+                old_end_position: Point::new(1, column),
+                new_end_position: Point::new(2, "let x = 0".len()),
+            }),
+            &Rope::from(final_text.as_str()),
+        );
+        assert_eq!(
+            italic_lines(&highlighter, &final_text),
+            [true, false, false, true]
+        );
+
+        let mut refreshed = SyntaxHighlighter::new(&language);
+        assert!(refreshed.update(None, &Rope::from(final_text.as_str()), None));
+        assert_eq!(
+            italic_lines(&refreshed, &final_text),
+            [true, false, false, true]
+        );
+        Ok(())
+    }
+
+    #[gpui::test]
+    fn textmate_batch_edits_keep_untouched_comment_styles(cx: &mut gpui::TestAppContext) {
+        use gpui::{
+            AppContext as _, Context, Entity, Render, Styled as _, UnderlineStyle, Window, px,
+        };
+        use gpui_component::{
+            Root, Theme,
+            input::{Editor, EditorState},
+        };
+        use std::time::Duration;
+
+        struct SourceEditor(Entity<EditorState>);
+        impl Render for SourceEditor {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl gpui::IntoElement {
+                Editor::new(&self.0).size_full()
+            }
+        }
+
+        const ORIGINAL: &str = "# top ☀\n# kept middle\n# change 🧪\n# kept tail\n";
+        const INSERTED: &str = "# inserted comment is longer than the old first line\n";
+        let resources = example_textmate_resources().unwrap();
+        let language = resources.syntax_for_id("example").unwrap();
+        let mut editor = None;
+        let (_, visual) = cx.add_window_view(|window, cx| {
+            gpui_component::init(cx);
+            let mut theme = (*HighlightTheme::default_dark()).clone();
+            theme.style.syntax.comment.as_mut().unwrap().underline = Some(UnderlineStyle {
+                thickness: px(1.),
+                ..Default::default()
+            });
+            Theme::global_mut(cx).highlight_theme = Arc::new(theme);
+            let state = cx.new(|cx| {
+                let mut state = EditorState::new(window, cx)
+                    .language(language)
+                    .default_value(ORIGINAL);
+                state.ensure_highlighter_factory(
+                    gpui_component::highlighter::input_highlighter_factory(),
+                );
+                state.prepare_language(window, cx);
+                state
+            });
+            editor = Some(state.clone());
+            Root::new(cx.new(|_| SourceEditor(state)), window, cx)
+        });
+        let editor = editor.unwrap();
+        let underlined_rows = |visual: &mut gpui::VisualTestContext| {
+            visual.update(|window, cx| {
+                window.draw(cx).clear(cx);
+                let state = editor.read(cx);
+                let underlines = window.painted_underlines();
+                state
+                    .text()
+                    .to_string()
+                    .split_inclusive('\n')
+                    .scan(0, |start, line| {
+                        let row = state.range_to_bounds(&(*start..*start + 1)).unwrap();
+                        *start += line.len();
+                        Some(underlines.iter().any(|underline| {
+                            let y = px(underline.bounds.origin.y.0 / window.scale_factor());
+                            (row.top()..row.bottom()).contains(&y)
+                        }))
+                    })
+                    .collect::<Vec<_>>()
+            })
+        };
+
+        visual.run_until_parked();
+        assert_eq!(underlined_rows(visual), [true, true, true, true]);
+
+        let lower = ORIGINAL.find("# change").unwrap();
+        visual.update(|window, cx| {
+            editor.update(cx, |state, cx| {
+                state.edit_ranges(
+                    &[(0..1, INSERTED.into()), (lower..lower + 1, "x".into())],
+                    window,
+                    cx,
+                );
+            });
+        });
+        // The lower edit is applied first. Using the final snapshot for it
+        // would make the next edit discard the untouched middle comment.
+        assert_eq!(underlined_rows(visual), [false, false, true, false, true]);
+
+        visual.run_until_parked();
+        visual.executor().advance_clock(Duration::from_millis(100));
+        visual.run_until_parked();
+        assert_eq!(underlined_rows(visual), [true, false, true, false, true]);
+    }
+
     #[test]
     fn textmate_source_files_use_the_same_language_match_as_highlighting() -> Result<()> {
         let mut resources = LanguageResources::default();

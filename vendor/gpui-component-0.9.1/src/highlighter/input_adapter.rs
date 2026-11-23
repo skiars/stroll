@@ -53,9 +53,9 @@ impl TreeSitterInputHighlighter {
         }
     }
 
-    fn schedule(
+    fn schedule<'a>(
         &mut self,
-        edits: impl IntoIterator<Item = InputEdit>,
+        edits: impl IntoIterator<Item = (InputEdit, &'a Rope)>,
         text: &Rope,
         folding: bool,
         window: &mut gpui::Window,
@@ -68,8 +68,8 @@ impl TreeSitterInputHighlighter {
         let language = self.language.clone();
         let text = text.clone();
         let (previous, injections) = if let Some(highlighter) = inner.borrow_mut().as_mut() {
-            for edit in edits {
-                highlighter.edit_tree(Some(edit), &text);
+            for (edit, intermediate) in edits {
+                highlighter.edit_tree(Some(edit), intermediate);
             }
             (
                 highlighter.tree().cloned(),
@@ -138,7 +138,13 @@ impl InputHighlighter for TreeSitterInputHighlighter {
         window: &mut gpui::Window,
         cx: &mut gpui::Context<EditorState>,
     ) {
-        self.schedule(edit.map(to_tree_sitter_edit), text, folding, window, cx);
+        self.schedule(
+            edit.map(|edit| (to_tree_sitter_edit(edit), text)),
+            text,
+            folding,
+            window,
+            cx,
+        );
     }
 
     fn update_batch(
@@ -150,7 +156,9 @@ impl InputHighlighter for TreeSitterInputHighlighter {
     ) {
         if let Some((_, text)) = edits.last() {
             self.schedule(
-                edits.iter().map(|(edit, _)| to_tree_sitter_edit(*edit)),
+                edits
+                    .iter()
+                    .map(|(edit, text)| (to_tree_sitter_edit(*edit), text)),
                 text,
                 folding,
                 window,

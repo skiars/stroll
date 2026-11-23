@@ -334,6 +334,12 @@ dialogs in a Wayland window after changes to paint order or focus handling.
   A single backward deletion also reports the removed text to the completion
   provider so it can request candidates for a shortened member name.
 
+- External TextMate highlighters retain syntax styles outside edited lines
+  and shift their byte ranges while background tokenization runs. Each edit
+  in a batch uses its own text snapshot. Run
+  `cargo test --release --locked textmate_` to verify comment styles across
+  individual and batched edits and re-tokenization.
+
 - C++ overload names use function captures, and primitive type captures
   recover after declaration macros. Boolean literals `true` and `false` use
   the existing `boolean` capture. The editor maps unaffected semantic token
