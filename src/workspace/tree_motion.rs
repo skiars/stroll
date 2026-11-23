@@ -264,6 +264,7 @@ pub(super) fn tree_list<V: Render, R: Clone + 'static, E: IntoElement>(
     id: &'static str,
     count: usize,
     scroll: &UniformListScrollHandle,
+    horizontal: bool,
     frame: Option<Rc<TreeFrame<R>>>,
     render: impl Fn(usize, RowVisual, &mut App) -> Option<E> + 'static,
 ) -> AnyElement {
@@ -319,6 +320,10 @@ pub(super) fn tree_list<V: Render, R: Clone + 'static, E: IntoElement>(
             range
                 .filter_map(|ix| render(ix, RowVisual::default(), cx))
                 .collect::<Vec<_>>()
+        })
+        .when(horizontal, |mut list| {
+            list.style().restrict_scroll_to_axis = Some(true);
+            list
         })
         .track_scroll(scroll)
         .size_full()

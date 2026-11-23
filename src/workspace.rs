@@ -69,7 +69,7 @@ use gpui_component::{
     input::{Editor, EditorState, Enter, IndentInline, InputEvent, Rope, Search},
     menu::{DropdownMenu, PopupMenuItem},
     resizable::HandleEdge,
-    scroll::{Scrollbar, ScrollbarHandle, thin_scrollbar},
+    scroll::{Scrollbar, ScrollbarAxis, ScrollbarHandle, ScrollbarMode, thin_scrollbar},
     v_flex, window_corner_radii, window_paddings,
 };
 use gpui_kit_assets::IconName;
@@ -807,6 +807,7 @@ pub struct Workspace {
     expanded: BTreeSet<PathBuf>,
     rows: Rc<Vec<TreeRow>>,
     tree_scroll: UniformListScrollHandle,
+    tree_horizontal: file_tree::TreeHorizontalScroll,
     tree_motion: std::cell::RefCell<tree_motion::TreeMotion<TreeRow>>,
     tabs: TabSession,
     source_caret: Option<(u64, crate::session::SourceLocation)>,
@@ -1017,6 +1018,7 @@ impl Workspace {
             expanded: BTreeSet::new(),
             rows: Rc::default(),
             tree_scroll: UniformListScrollHandle::new(),
+            tree_horizontal: Default::default(),
             tree_motion: Default::default(),
             tabs: TabSession::default(),
             source_caret: None,
@@ -1520,6 +1522,7 @@ impl Workspace {
     ) {
         self.dismiss_locator(window, cx);
         self.tree_scroll = UniformListScrollHandle::new();
+        self.tree_horizontal = Default::default();
         self.cancel_file_open();
         self.audio_preview.stop();
         self.dismiss_repository_picker(window, cx);
@@ -1704,6 +1707,7 @@ impl Workspace {
         }
         self.dismiss_locator(window, cx);
         self.tree_scroll = UniformListScrollHandle::new();
+        self.tree_horizontal = Default::default();
         self.cancel_file_open();
         self.dismiss_repository_picker(window, cx);
         self.repository_ui.menu_open = false;
@@ -2069,6 +2073,7 @@ impl Workspace {
         self.cancel_document_navigation(cx);
         self.cancel_file_open();
         self.tree_scroll = UniformListScrollHandle::new();
+        self.tree_horizontal = Default::default();
         if view != WorkspaceView::Docs
             && let Some(doc) = &self.doc
         {
@@ -4302,11 +4307,24 @@ impl Workspace {
                 )
             });
         let rows = frame.as_ref().map_or(rows, |frame| frame.rows.clone());
+        let horizontal =
+            self.config.current().appearance.file_tree_horizontal_scroll && inline.is_none();
+        let content_width = if horizontal {
+            width.max(self.tree_horizontal.content_width(&rows, window, cx))
+        } else {
+            width
+        };
+        let scrollbar_height = if content_width > width {
+            px(10.)
+        } else {
+            px(0.)
+        };
         let list = tree_motion::tree_list(
             cx.entity(),
             "file-tree",
             row_count,
             &self.tree_scroll,
+            horizontal,
             frame,
             move |index, _, cx| {
                 let mut row_index = index;
@@ -4353,14 +4371,14 @@ impl Workspace {
                 let entry_icon = if directory {
                     folder_icons::folder_icon(&entry.path, row.expanded, icon_color, colors)
                 } else if entry.symlink {
-                    icon(IconName::Link, icon_color, 15.).into_any_element()
+                    icon(IconName::Link, icon_color, file_tree::TREE_ICON_SIZE).into_any_element()
                 } else {
                     file_type_icon(
                         repository.as_deref(),
                         &associations,
                         &entry.path,
                         colors,
-                        15.,
+                        file_tree::TREE_ICON_SIZE,
                     )
                     .into_any_element()
                 };
@@ -4370,9 +4388,9 @@ impl Workspace {
                     .relative()
                     .h(tree_motion::ROW_HEIGHT)
                     .w_full()
-                    .gap(px(5.))
+                    .gap(file_tree::TREE_LABEL_GAP)
                     .pl(file_tree::tree_indent(row.depth))
-                    .pr_2()
+                    .pr(file_tree::TREE_END_PADDING)
                     .cursor_pointer()
                     .hover(|style| style.bg(colors.hover))
                     .when(selected, |row| {
@@ -4401,7 +4419,8 @@ impl Workspace {
                     .child(
                         div()
                             .min_w_0()
-                            .truncate()
+                            .when(horizontal, |name| name.whitespace_nowrap().flex_shrink_0())
+                            .when(!horizontal, |name| name.truncate())
                             .text_size(px(file_name_font_size(cx)))
                             .when(dimmed, |name| name.text_color(colors.muted))
                             .when_some(status_color, |name, color| name.text_color(color))
@@ -4582,23 +4601,67 @@ impl Workspace {
                     .flex_1()
                     .min_h_0()
                     .w_full()
-                    .child(if in_workspace {
-                        file_tree::tree_menu(
-                            div().id("workspace-tree-root-menu").size_full().child(list),
-                            None,
-                            root_menu,
-                        )
-                    } else {
-                        list.into_any_element()
-                    })
-                    .children(sticky)
+                    .pb(scrollbar_height)
                     .child(
-                        div().absolute().inset_0().child(
-                            pane_scrollbar(&self.tree_scroll)
-                                .id("workspace-file-tree-scroll")
-                                .viewport_from_layout(),
-                        ),
-                    ),
+                        div()
+                            .relative()
+                            .size_full()
+                            .child(
+                                div()
+                                    .id("workspace-file-tree-viewport")
+                                    .size_full()
+                                    .when(horizontal, |viewport| {
+                                        viewport
+                                            .overflow_x_scroll()
+                                            .restrict_scroll_to_axis()
+                                            .track_scroll(&self.tree_horizontal.handle)
+                                    })
+                                    .child(
+                                        div()
+                                            .relative()
+                                            .w(content_width)
+                                            .h_full()
+                                            .flex_shrink_0()
+                                            // Scale wheel input before it reaches the viewport scroller.
+                                            .when(scrollbar_height > px(0.), |content| {
+                                                content.on_scroll(
+                                                    cx.listener(Self::scroll_tree_with_wheel),
+                                                )
+                                            })
+                                            .child(if in_workspace {
+                                                file_tree::tree_menu(
+                                                    div()
+                                                        .id("workspace-tree-root-menu")
+                                                        .size_full()
+                                                        .child(list),
+                                                    None,
+                                                    root_menu,
+                                                )
+                                            } else {
+                                                list.into_any_element()
+                                            })
+                                            .children(sticky),
+                                    ),
+                            )
+                            .child(
+                                div().absolute().inset_0().child(
+                                    pane_scrollbar(&self.tree_scroll)
+                                        .id("workspace-file-tree-scroll")
+                                        .viewport_from_layout(),
+                                ),
+                            ),
+                    )
+                    .when(scrollbar_height > px(0.), |body| {
+                        body.child(
+                            div().absolute().inset_0().child(
+                                pane_scrollbar(&self.tree_horizontal.handle)
+                                    .id("workspace-file-tree-horizontal-scroll")
+                                    .axis(ScrollbarAxis::Horizontal)
+                                    .mode(ScrollbarMode::Always)
+                                    .viewport_from_layout(),
+                            ),
+                        )
+                    }),
             )
             .child(panel_resize(
                 "workspace-tree-resize",

@@ -629,6 +629,8 @@
   "settings.smooth_scroll_description": "Enable smooth scrolling for the mouse wheel, touchpad, and navigation within content.",
   "settings.file_tree_sticky_scroll": "File Tree Sticky Scroll",
   "settings.file_tree_sticky_scroll_description": "Keep parent folders visible while scrolling the Workspace and Docs file trees.",
+  "settings.file_tree_horizontal_scroll": "File Tree Horizontal Scrolling",
+  "settings.file_tree_horizontal_scroll_description": "Scroll to read long names in the Workspace and Docs file trees. Use the mouse back and forward buttons over the tree to move left and right.",
   "settings.split": "Side by side",
   "settings.system_fallback": "System fallback only",
   "settings.system_monospace_font": "System monospace font",

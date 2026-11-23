@@ -629,6 +629,8 @@
   "settings.smooth_scroll_description": "为鼠标滚轮、触控板和内容区内的定位启用平滑滚动。",
   "settings.file_tree_sticky_scroll": "文件树粘性滚动",
   "settings.file_tree_sticky_scroll_description": "滚动工作区和文档的文件树时，将父目录固定在顶部。",
+  "settings.file_tree_horizontal_scroll": "文件树水平滚动",
+  "settings.file_tree_horizontal_scroll_description": "横向滚动以查看工作区和文档文件树中的长名称。将指针放在树上，用鼠标后退和前进键向左或向右移动。",
   "settings.split": "双栏",
   "settings.system_fallback": "仅系统回退",
   "settings.system_monospace_font": "系统等宽字体",

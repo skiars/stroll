@@ -94,11 +94,27 @@ pub(super) fn overlay(
                 bounds.size.height,
             );
             let omitted_ancestors = rows[pinned.first()?.index].depth > 0;
+            let tree = workspace.clone();
             let mut overlay = v_flex()
                 .relative()
                 .w_full()
                 .bg(colors.bg)
-                .block_mouse_except_scroll();
+                .block_mouse_except_scroll()
+                .capture_any_mouse_down(move |event, window, cx| {
+                    if let MouseButton::Navigate(direction) = event.button {
+                        _ = tree.update(cx, |this, cx| {
+                            if this.scroll_tree_with_side_button(
+                                direction,
+                                event.position,
+                                window,
+                                cx,
+                            ) {
+                                window.prevent_default();
+                                cx.stop_propagation();
+                            }
+                        });
+                    }
+                });
             for (slot, pinned) in pinned.into_iter().enumerate() {
                 let row = &rows[pinned.index];
                 let selected = active.as_ref() == Some(&row.entry.path);

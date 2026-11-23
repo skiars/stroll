@@ -158,6 +158,10 @@ impl Workspace {
             return;
         }
         window.prevent_default();
+        if self.scroll_tree_with_side_button(direction, event.position, window, cx) {
+            cx.stop_propagation();
+            return;
+        }
         self.navigate_source(direction == NavigationDirection::Forward, window, cx);
     }
 

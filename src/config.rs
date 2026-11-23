@@ -105,6 +105,7 @@ pub(crate) struct Appearance {
     pub fallback_font_family: String,
     pub smooth_scroll: bool,
     pub file_tree_sticky_scroll: bool,
+    pub file_tree_horizontal_scroll: bool,
     pub text_rendering: TextRenderingPreference,
 }
 
@@ -120,6 +121,7 @@ impl Default for Appearance {
             fallback_font_family: String::new(),
             smooth_scroll: true,
             file_tree_sticky_scroll: true,
+            file_tree_horizontal_scroll: false,
             text_rendering: TextRenderingPreference::Auto,
         }
     }

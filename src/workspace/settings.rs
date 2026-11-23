@@ -551,6 +551,13 @@ impl Workspace {
         let mut previous_appearance = previous.appearance.clone();
         previous_appearance.ui_font_size = config.appearance.ui_font_size;
         previous_appearance.file_tree_sticky_scroll = config.appearance.file_tree_sticky_scroll;
+        previous_appearance.file_tree_horizontal_scroll =
+            config.appearance.file_tree_horizontal_scroll;
+        if previous.appearance.file_tree_horizontal_scroll
+            != config.appearance.file_tree_horizontal_scroll
+        {
+            self.tree_horizontal = Default::default();
+        }
         if previous_appearance != config.appearance {
             self.apply_appearance(window, cx);
         } else if previous.appearance.ui_font_size != config.appearance.ui_font_size {
@@ -1068,6 +1075,13 @@ impl SettingsPage {
                 }),
             )
             .description(t!("settings.file_tree_sticky_scroll_description").into_owned()),
+            setting_item(
+                t!("settings.file_tree_horizontal_scroll"),
+                self.switch(default.appearance.file_tree_horizontal_scroll, |c| {
+                    &mut c.appearance.file_tree_horizontal_scroll
+                }),
+            )
+            .description(t!("settings.file_tree_horizontal_scroll_description").into_owned()),
         ]);
         #[cfg(any(target_os = "linux", target_os = "windows"))]
         let appearance = appearance.item(

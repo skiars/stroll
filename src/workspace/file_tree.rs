@@ -1,4 +1,4 @@
-use std::io::Write;
+use std::{cell::RefCell, io::Write, rc::Weak};
 
 use gpui_component::{
     input::{Input, InputState},
@@ -11,9 +11,84 @@ use crate::repository::files::{CopyTarget, EntryVersion, FileOperation, valid_na
 const TREE_GUTTER: f32 = 15.;
 const TREE_INDENT: f32 = 14.;
 const MAX_TREE_DEPTH: usize = u16::BITS as usize;
+pub(super) const TREE_ICON_SIZE: f32 = 15.;
+pub(super) const TREE_LABEL_GAP: Pixels = px(5.);
+pub(super) const TREE_END_PADDING: Pixels = px(8.);
+const SIDE_BUTTON_SCROLL_STEP: Pixels = px(24.);
+const HORIZONTAL_WHEEL_SCALE: f32 = 1. / 4.;
 
 pub(super) fn tree_indent(depth: usize) -> Pixels {
     px(TREE_GUTTER + TREE_INDENT * depth.min(MAX_TREE_DEPTH) as f32)
+}
+
+#[derive(Default)]
+pub(super) struct TreeHorizontalScroll {
+    pub(super) handle: ScrollHandle,
+    measured: RefCell<Option<TreeWidth>>,
+}
+
+struct TreeWidth {
+    rows: Weak<Vec<TreeRow>>,
+    font: Font,
+    font_size: Pixels,
+    width: Pixels,
+}
+
+impl TreeHorizontalScroll {
+    pub(super) fn content_width(
+        &self,
+        rows: &Rc<Vec<TreeRow>>,
+        window: &Window,
+        cx: &App,
+    ) -> Pixels {
+        let theme = cx.theme();
+        let mut font = font(theme.font_family.clone());
+        font.fallbacks = theme.font_fallbacks.clone();
+        let font_size = px(file_name_font_size(cx));
+        let rows_key = Rc::downgrade(rows);
+        let mut measured = self.measured.borrow_mut();
+        if let Some(cached) = measured.as_ref()
+            && cached.rows.ptr_eq(&rows_key)
+            && cached.font == font
+            && cached.font_size == font_size
+        {
+            return cached.width;
+        }
+
+        let text_system = window.text_system();
+        let mut run = TextStyle::default().to_run(0);
+        run.font = font.clone();
+        let width = rows
+            .iter()
+            .map(|row| {
+                let name = file_name(&row.entry.path);
+                let label = if row.entry.directory && row.depth > 0 {
+                    // The first sticky row may include a marker for omitted ancestors.
+                    std::borrow::Cow::Owned(format!("…/{name}"))
+                } else {
+                    std::borrow::Cow::Borrowed(name)
+                };
+                run.len = label.len();
+                run.font.weight = FontWeight::NORMAL;
+                let regular = text_system.layout_line(&label, font_size, &[run.clone()], None);
+                run.font.weight = FontWeight::SEMIBOLD;
+                let selected = text_system.layout_line(&label, font_size, &[run.clone()], None);
+                tree_indent(row.depth)
+                    + px(TREE_ICON_SIZE)
+                    + TREE_LABEL_GAP
+                    + regular.width.max(selected.width).ceil()
+                    + TREE_END_PADDING
+            })
+            .max()
+            .unwrap_or(px(0.));
+        *measured = Some(TreeWidth {
+            rows: rows_key,
+            font,
+            font_size,
+            width,
+        });
+        width
+    }
 }
 
 #[derive(Clone, Copy, Default)]
@@ -450,6 +525,76 @@ fn system_menu_for_entry(
 }
 
 impl Workspace {
+    pub(super) fn scroll_tree_with_wheel(
+        &mut self,
+        event: &ScrollEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let delta = event.delta.content_delta().x;
+        if event.is_wheel() && !delta.is_zero() {
+            self.scroll_tree_horizontally(delta * HORIZONTAL_WHEEL_SCALE, window, cx);
+            cx.stop_propagation();
+        }
+    }
+
+    pub(super) fn scroll_tree_with_side_button(
+        &self,
+        direction: NavigationDirection,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let visible = match self.view {
+            WorkspaceView::Editor => self.session.panels.editor_tree,
+            WorkspaceView::Docs => self.session.panels.docs_tree,
+            WorkspaceView::Git => false,
+        };
+        let handle = &self.tree_horizontal.handle;
+        if !self.config.current().appearance.file_tree_horizontal_scroll
+            || !visible
+            || self.standalone.is_some()
+            || self.tree_edit.is_some()
+            || self.confirming_close
+            || self.repository_overlay_open()
+            || self.repository_ui.opening.is_some()
+            || self.locator.open
+            || window.has_active_dialog(cx)
+            || window.has_active_prompt()
+            || handle.max_offset().x <= px(0.)
+            || !handle.bounds().contains(&position)
+        {
+            return false;
+        }
+
+        let step = match direction {
+            NavigationDirection::Back => SIDE_BUTTON_SCROLL_STEP,
+            NavigationDirection::Forward => -SIDE_BUTTON_SCROLL_STEP,
+        };
+        self.scroll_tree_horizontally(step, window, cx);
+        true
+    }
+
+    fn scroll_tree_horizontally(&self, step: Pixels, window: &mut Window, cx: &mut Context<Self>) {
+        let handle = self.tree_horizontal.handle.clone();
+        let smooth_scroll = handle.smooth_scroll();
+        let current = handle.offset();
+        let target = smooth_scroll.target(current, point(step, px(0.)), window);
+        let target = point(target.x.clamp(-handle.max_offset().x, px(0.)), current.y);
+        let view = cx.entity_id();
+        smooth_scroll.animate(current, target, window, cx, move |last, next, _, cx| {
+            if handle.offset() != last {
+                return None;
+            }
+            let next = point(next.x.clamp(-handle.max_offset().x, px(0.)), next.y);
+            if next != last {
+                handle.set_offset(next);
+                cx.notify(view);
+            }
+            Some(next)
+        });
+    }
+
     pub(super) fn reveal_tree_path(&mut self, path: &Path, cx: &mut Context<Self>) {
         let expanded = if self.view == WorkspaceView::Docs {
             &mut self.docs_expanded
@@ -1502,6 +1647,203 @@ mod tests {
             assert!(this.docs_expanded.contains(Path::new("guide")));
             assert!(this.docs_expanded.contains(Path::new("guide/nested")));
         });
+        Ok(())
+    }
+
+    #[::core::prelude::v1::test]
+    fn workspace_and_docs_tree_horizontal_scroll() -> Result<()> {
+        let fixture = tempfile::tempdir()?;
+        let root = fixture.path().join("repo");
+        fs::create_dir_all(root.join("a"))?;
+        for index in 0..26 {
+            fs::write(root.join(format!("a/{index:02}.md")), "# Page\n")?;
+        }
+        let long_path = format!("a/zz-{}.md", "long-file-name-".repeat(6));
+        fs::write(root.join(&long_path), "# Long title\n")?;
+        fs::write(root.join("README.md"), "# Project\n")?;
+        assert!(
+            std::process::Command::new("git")
+                .args(["init", "-qb", "main"])
+                .arg(&root)
+                .status()?
+                .success()
+        );
+
+        let mut cx = TestAppContext::build_with_text_system(
+            TestDispatcher::new(0),
+            None,
+            crate::test_support::text_system(true),
+        );
+        cx.update(gpui_component::init);
+        let store = Arc::new(Store::new(fixture.path().join("state"))?);
+        let config_path = fixture.path().join("config.toml");
+        let config = ConfigFile::load(Some(config_path.clone()));
+        assert!(!config.current().appearance.file_tree_horizontal_scroll);
+        let mut workspace = None;
+        let (_, visual) = cx.add_window_view(|window, cx| {
+            let view = cx
+                .new(|cx| Workspace::with_config(store, config, WorkspaceView::Editor, window, cx));
+            workspace = Some(view.clone());
+            gpui_component::Root::new(view, window, cx)
+        });
+        let workspace = workspace.unwrap();
+        visual.simulate_resize(size(px(900.), px(560.)));
+        visual.update(|window, cx| {
+            window.activate_window();
+            workspace.update(cx, |this, cx| {
+                this.open_repository(Location { root, file: None }, window, cx);
+            });
+        });
+
+        let configure = |visual: &mut VisualTestContext, enabled| {
+            visual.update(|window, cx| {
+                workspace.update(cx, |this, cx| {
+                    let previous = this.config.clone();
+                    let mut config = previous.current().clone();
+                    config.appearance.file_tree_horizontal_scroll = enabled;
+                    this.config.save(config).unwrap();
+                    this.apply_config(&previous, window, cx);
+                    cx.notify();
+                });
+            });
+            settle(visual, &workspace, |_| true);
+        };
+        let offsets = |visual: &mut VisualTestContext| {
+            visual.update(|_, cx| {
+                let this = workspace.read(cx);
+                point(
+                    this.tree_horizontal.handle.offset().x,
+                    this.tree_scroll.0.borrow().base_handle.offset().y,
+                )
+            })
+        };
+        let click_side = |visual: &mut VisualTestContext, position, direction| {
+            let button = MouseButton::Navigate(direction);
+            visual.simulate_mouse_down(position, button, Modifiers::none());
+            visual.simulate_mouse_up(position, button, Modifiers::none());
+        };
+        let scroll = |visual: &mut VisualTestContext, position, delta, source| {
+            visual.simulate_event(ScrollEvent {
+                position,
+                delta,
+                modifiers: Modifiers::none(),
+                touch_phase: TouchPhase::Moved,
+                source,
+            });
+            settle(visual, &workspace, |_| true);
+        };
+
+        for view in [WorkspaceView::Editor, WorkspaceView::Docs] {
+            visual.update(|window, cx| {
+                workspace.update(cx, |this, cx| this.switch_view(view, window, cx));
+            });
+            settle(visual, &workspace, |this| {
+                (view != WorkspaceView::Docs || this.docs_tree_complete)
+                    && this.rows.iter().any(|row| row.entry.path == Path::new("a"))
+            });
+            visual.update(|window, cx| {
+                workspace.update(cx, |this, cx| {
+                    this.toggle_tree_directory("a".into(), window, cx)
+                });
+            });
+            settle(visual, &workspace, |this| {
+                this.rows
+                    .iter()
+                    .any(|row| row.entry.path == Path::new(&long_path))
+            });
+
+            let row_id = "workspace-tree-row:a/00.md";
+            let initial = visual.debug_bounds(row_id).unwrap();
+            let pointer = point(initial.left() + px(80.), initial.center().y);
+            click_side(visual, pointer, NavigationDirection::Forward);
+            assert_eq!(offsets(visual).x, px(0.));
+            assert_eq!(visual.debug_bounds(row_id), Some(initial));
+
+            configure(visual, true);
+            let max =
+                visual.update(|_, cx| workspace.read(cx).tree_horizontal.handle.max_offset().x);
+            assert!(max > SIDE_BUTTON_SCROLL_STEP * 2.);
+            let before = visual.debug_bounds(row_id).unwrap();
+            assert!(before.size.width > initial.size.width);
+
+            visual.update(|_, cx| cx.set_smooth_scrolling(false));
+            click_side(visual, pointer, NavigationDirection::Forward);
+            assert_eq!(offsets(visual), point(-SIDE_BUTTON_SCROLL_STEP, px(0.)));
+            click_side(visual, pointer, NavigationDirection::Back);
+            assert_eq!(offsets(visual), point(px(0.), px(0.)));
+
+            visual.update(|_, cx| cx.set_smooth_scrolling(true));
+            click_side(visual, pointer, NavigationDirection::Forward);
+            let during = offsets(visual).x;
+            assert!(during > -SIDE_BUTTON_SCROLL_STEP && during <= px(0.));
+            for _ in 0..40 {
+                visual.executor().advance_clock(Duration::from_millis(16));
+                visual.update(|window, cx| window.simulate_next_frame(cx));
+            }
+            settle(visual, &workspace, |_| true);
+            assert_eq!(offsets(visual), point(-SIDE_BUTTON_SCROLL_STEP, px(0.)));
+            let after = visual.debug_bounds(row_id).unwrap();
+            assert_eq!(after.left(), before.left() - SIDE_BUTTON_SCROLL_STEP);
+            assert_eq!(after.top(), before.top());
+
+            scroll(
+                visual,
+                pointer,
+                ScrollDelta::Pixels(point(px(0.), -6. * tree_motion::ROW_HEIGHT)),
+                ScrollSource::Pointer,
+            );
+            let pinned_id = "workspace-tree-sticky-row:a";
+            let pinned = visual.debug_bounds(pinned_id).unwrap();
+            let y = offsets(visual).y;
+            assert!(y < px(0.));
+            let pinned_pointer = point(pointer.x, pinned.center().y);
+            visual.update(|_, cx| cx.set_smooth_scrolling(false));
+            click_side(visual, pinned_pointer, NavigationDirection::Back);
+            settle(visual, &workspace, |_| true);
+            assert_eq!(offsets(visual), point(px(0.), y));
+            scroll(
+                visual,
+                pinned_pointer,
+                ScrollDelta::Lines(point(-3., 0.)),
+                ScrollSource::Pointer,
+            );
+            assert_eq!(offsets(visual), point(px(-15.), y));
+            scroll(
+                visual,
+                pinned_pointer,
+                ScrollDelta::Pixels(point(px(-84.), px(0.))),
+                ScrollSource::PreciseWheel,
+            );
+            assert_eq!(offsets(visual), point(px(-36.), y));
+            scroll(
+                visual,
+                pinned_pointer,
+                ScrollDelta::Pixels(point(px(12.), px(0.))),
+                ScrollSource::Pointer,
+            );
+            assert_eq!(offsets(visual), point(-SIDE_BUTTON_SCROLL_STEP, y));
+            assert_eq!(
+                visual.debug_bounds(pinned_id).unwrap().left(),
+                pinned.left()
+            );
+
+            visual.update(|window, cx| {
+                workspace.update(cx, |this, cx| {
+                    this.toggle_tree_directory("a".into(), window, cx)
+                });
+            });
+            settle(visual, &workspace, |this| {
+                this.tree_horizontal.handle.max_offset().x == px(0.)
+            });
+            assert_eq!(offsets(visual).x, px(0.));
+            assert!(
+                ConfigFile::load(Some(config_path.clone()))
+                    .current()
+                    .appearance
+                    .file_tree_horizontal_scroll
+            );
+            configure(visual, false);
+        }
         Ok(())
     }
 

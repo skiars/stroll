@@ -316,6 +316,7 @@ impl GitPanel {
             "git-changed-tree",
             count,
             &self.tree_scroll,
+            false,
             frame,
             move |index, visual, cx| {
                 let file_name_size = file_name_font_size(cx);
