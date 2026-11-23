@@ -832,19 +832,10 @@ pub fn serve_lsp(options: &str) -> Result<()> {
 fn login_environment(
     directory: &std::path::Path,
 ) -> Result<HashMap<std::ffi::OsString, std::ffi::OsString>> {
-    use std::{
-        ffi::OsString,
-        os::unix::ffi::OsStringExt,
-        process::{Command, Stdio},
-    };
-
     let shell = std::env::var_os("SHELL")
         .context("The SSH session did not provide the remote account's default shell")?;
     // Capture startup output separately from the language server's protocol stream.
-    let output = Command::new(&shell)
-        .args(["-lc", r"printf '\0stroll-env\0'; exec env -0"])
-        .current_dir(directory)
-        .stdin(Stdio::null())
+    let output = crate::process::login_shell(&shell, directory)
         .output()
         .context("Could not start the remote account's default login shell")?;
     ensure!(
@@ -852,25 +843,6 @@ fn login_environment(
         "Could not read the remote login shell environment: {}",
         String::from_utf8_lossy(&output.stderr).trim()
     );
-    let marker = b"\0stroll-env\0";
-    let start = output
-        .stdout
-        .windows(marker.len())
-        .position(|part| part == marker)
-        .context("The remote login shell did not return environment variables")?
-        + marker.len();
-    let mut environment = HashMap::new();
-    for entry in output.stdout[start..].split(|&byte| byte == 0) {
-        if let Some(separator) = entry.iter().position(|&byte| byte == b'=') {
-            environment.insert(
-                OsString::from_vec(entry[..separator].to_vec()),
-                OsString::from_vec(entry[separator + 1..].to_vec()),
-            );
-        }
-    }
-    ensure!(
-        environment.contains_key(std::ffi::OsStr::new("PATH")),
-        "The remote login shell did not provide PATH"
-    );
-    Ok(environment)
+    crate::process::parse_login_environment(&output.stdout)
+        .context("Could not read the remote login shell environment")
 }

@@ -10,7 +10,9 @@ use std::{
     },
     path::Path,
     process::{Child, Command, Stdio},
-    ptr, thread,
+    ptr,
+    sync::atomic::{AtomicBool, Ordering},
+    thread,
     time::{Duration, Instant},
 };
 
@@ -47,6 +49,47 @@ pub(crate) fn shell() -> OsString {
         }
     }
     "/bin/sh".into()
+}
+
+#[cfg(feature = "desktop")]
+fn login_environment(
+    shell: &OsStr,
+    directory: &Path,
+    stopping: &AtomicBool,
+) -> Option<std::collections::HashMap<OsString, OsString>> {
+    use std::io::{Read as _, Seek as _};
+
+    let mut output = tempfile::tempfile().ok()?;
+    let mut child = crate::process::login_shell(shell, directory)
+        .stdout(output.try_clone().ok()?)
+        .stderr(Stdio::null())
+        .process_group(0)
+        .spawn()
+        .ok()?;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) if status.success() => break,
+            Ok(Some(_)) => return None,
+            Ok(None) if !stopping.load(Ordering::Relaxed) && Instant::now() < deadline => {
+                thread::sleep(Duration::from_millis(10));
+            }
+            _ => {
+                // The probe owns its process group, including startup commands it spawns.
+                unsafe { libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL) };
+                _ = child.wait();
+                return None;
+            }
+        }
+    }
+    output.rewind().ok()?;
+    let mut bytes = Vec::new();
+    output.take(1024 * 1024).read_to_end(&mut bytes).ok()?;
+    let mut environment = crate::process::parse_login_environment(&bytes).ok()?;
+    for name in ["PWD", "OLDPWD", "SHLVL", "_"] {
+        environment.remove(OsStr::new(name));
+    }
+    Some(environment)
 }
 
 #[cfg(all(feature = "desktop", target_os = "linux"))]
@@ -88,7 +131,19 @@ impl Pty {
         mode: ShellMode,
         root: &Path,
         size: PtySize,
+        stopping: &AtomicBool,
     ) -> io::Result<(Self, File, File)> {
+        let mut command = Command::new(shell);
+        #[cfg(feature = "desktop")]
+        if let ShellMode::Interactive = mode
+            && !stopping.load(Ordering::Relaxed)
+            && let Some(environment) = login_environment(shell, root, stopping)
+        {
+            command.envs(environment);
+        }
+        if stopping.load(Ordering::Relaxed) {
+            return Err(io::ErrorKind::Interrupted.into());
+        }
         let mut master = -1;
         let mut slave = -1;
         let mut initial = winsize(size);
@@ -109,7 +164,6 @@ impl Pty {
         }
         let reader = master.try_clone()?;
         let writer = master.try_clone()?;
-        let mut command = Command::new(shell);
         // The terminal descriptors make a login shell interactive.
         let flag = match mode {
             #[cfg(feature = "desktop")]

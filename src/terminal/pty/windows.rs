@@ -46,6 +46,7 @@ impl Pty {
         _mode: ShellMode,
         root: &Path,
         size: PtySize,
+        _stopping: &std::sync::atomic::AtomicBool,
     ) -> io::Result<(Self, File, File)> {
         let mut handles = Handles {
             console: ptr::null_mut(),

@@ -108,10 +108,10 @@ impl Process {
         let child_pid = pid.clone();
         let process = Self::spawn(events, move |output, stopping| {
             let pty = if let Some(directory) = directory.as_deref().filter(|path| path != &root) {
-                platform::Pty::open(&shell, mode, directory, size)
-                    .or_else(|_| platform::Pty::open(&shell, mode, &root, size))?
+                platform::Pty::open(&shell, mode, directory, size, stopping)
+                    .or_else(|_| platform::Pty::open(&shell, mode, &root, size, stopping))?
             } else {
-                platform::Pty::open(&shell, mode, &root, size)?
+                platform::Pty::open(&shell, mode, &root, size, stopping)?
             };
             #[cfg(all(feature = "desktop", unix))]
             child_pid.store(pty.0.pid(), Ordering::Relaxed);
@@ -418,9 +418,69 @@ fn remote_run(
 
 #[cfg(all(test, unix, feature = "desktop"))]
 mod tests {
-    use std::{fs, path::Path, time::Instant};
+    use std::{fs, os::unix::fs::PermissionsExt as _, path::Path, time::Instant};
 
     use super::*;
+
+    #[test]
+    fn local_terminal_uses_the_login_environment_in_an_interactive_shell() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().canonicalize()?;
+        let shell = root.join("shell");
+        fs::write(
+            &shell,
+            r#"#!/bin/sh
+if [ "$1" = -lc ]; then
+    printf 'Login startup output\n'
+    export PATH="$PWD/tools:$PATH"
+    export STROLL_TERMINAL_TEST_LOGIN=loaded
+    exec /bin/sh -c "$2"
+fi
+[ "$1" = -i ] && [ -t 0 ] || exit 2
+exec /bin/sh "$@"
+"#,
+        )?;
+        fs::set_permissions(&shell, fs::Permissions::from_mode(0o755))?;
+        fs::create_dir(root.join("tools"))?;
+        let tool = root.join("tools/stroll-terminal-path-test");
+        fs::write(
+            &tool,
+            "#!/bin/sh\n[ \"$STROLL_TERMINAL_TEST_LOGIN\" = loaded ]\n",
+        )?;
+        fs::set_permissions(&tool, fs::Permissions::from_mode(0o755))?;
+
+        let (tx, rx) = mpsc::channel();
+        let (output, events) = async_channel::bounded(16);
+        let _process = Process::start_local(
+            shell.into_os_string(),
+            &root,
+            None,
+            PtySize {
+                cols: 80,
+                rows: 24,
+                cell_width: 8,
+                cell_height: 16,
+            },
+            rx,
+            output,
+        )?;
+        tx.send(Command::Input(
+            b"stroll-terminal-path-test; exit $?\n".to_vec(),
+        ))?;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            match events.try_recv() {
+                Ok(Event::Exit(code)) => {
+                    assert_eq!(code, 0);
+                    return Ok(());
+                }
+                Ok(Event::Error(error)) => anyhow::bail!("{error}"),
+                Ok(Event::Output(_)) => continue,
+                Err(_) => thread::sleep(Duration::from_millis(10)),
+            }
+        }
+        anyhow::bail!("Terminal did not exit")
+    }
 
     #[test]
     fn terminal_starts_in_saved_directory_and_falls_back_if_removed() -> anyhow::Result<()> {
