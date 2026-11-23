@@ -215,7 +215,7 @@ fn editor_inlay_hint(text: &Rope, hint: lsp_types::InlayHint) -> Option<InlayHin
 impl HoverProvider for EditorLsp {
     fn code_languages(&self) -> Option<gpui_component::text::CodeLanguages> {
         self.hover_context.as_ref().map_or_else(
-            || crate::language_resources::LanguageResources::installed().code_languages(),
+            || crate::language::resources::LanguageResources::installed().code_languages(),
             |(_, repo, _)| repo.language_resources().code_languages(),
         )
     }

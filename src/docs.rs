@@ -1261,7 +1261,7 @@ impl Render for DocReader {
             .upgrade()
             .and_then(|workspace| workspace.read(cx).document_repository())
             .map_or_else(
-                || crate::language_resources::LanguageResources::installed().code_languages(),
+                || crate::language::resources::LanguageResources::installed().code_languages(),
                 |repo| repo.language_resources().code_languages(),
             );
         let body = TextView::new(&self.text)

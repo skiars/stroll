@@ -1,3 +1,5 @@
+mod builtin;
+
 use std::{
     collections::{HashMap, HashSet},
     fs::File,
@@ -86,6 +88,14 @@ impl Drop for LanguageResources {
 }
 
 impl LanguageResources {
+    pub(crate) fn initialize(cx: &mut gpui::App) {
+        builtin::install(cx);
+    }
+
+    pub(crate) fn builtin_for_path(path: &Path) -> Option<&'static str> {
+        builtin::for_path(path)
+    }
+
     pub(crate) fn for_file<'a>(repo: Option<&'a Repository>, path: &Path) -> &'a Self {
         if let Some(repo) = repo.filter(|_| !path.is_absolute()) {
             repo.language_resources()
@@ -100,6 +110,7 @@ impl LanguageResources {
     }
 
     pub(crate) fn load(repo: Option<&Repository>) -> Self {
+        builtin::register_grammars();
         let mut result = Self::default();
         let mut textmate = TextMate::default();
         let settings_path = Path::new(".stroll.json");
@@ -319,7 +330,9 @@ impl LanguageResources {
     }
 
     pub(crate) fn for_path(&self, path: &Path) -> Option<SharedString> {
-        self.matched_grammar(path).map(|(_, name)| name.clone())
+        self.matched_grammar(path)
+            .map(|(_, name)| name.clone())
+            .or_else(|| Self::builtin_for_path(path).map(Into::into))
     }
 
     pub(crate) fn syntax_for_id(&self, id: &str) -> Option<SharedString> {
@@ -582,10 +595,82 @@ fn valid_name(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gpui::{HighlightStyle, rgb};
+    use gpui_base::input::HighlightStyleResolver;
     use gpui_component::{
         Rope,
         highlighter::{HighlightTheme, SyntaxHighlighter},
     };
+
+    #[gpui::test]
+    fn vue_highlighting_resolves_embedded_syntax(cx: &mut gpui::TestAppContext) {
+        struct Mark(&'static str);
+        impl HighlightStyleResolver for Mark {
+            fn style(&self, name: &str) -> Option<HighlightStyle> {
+                (name == self.0 || name.starts_with(&format!("{}.", self.0))).then_some(
+                    HighlightStyle {
+                        color: Some(rgb(0xffffff).into()),
+                        ..Default::default()
+                    },
+                )
+            }
+        }
+
+        let source = r#"<script>
+let plainJs = 23
+</script>
+<script setup lang="ts">
+const count: number = 42
+</script>
+<script lang="jsx">
+export const jsxElement = <Button />
+</script>
+<script lang="tsx">
+export const render = (visible: boolean) => <div>{visible}</div>
+</script>
+<template>
+  <Panel v-if="count > 1">{{ count + 99 }}</Panel>
+</template>
+<style scoped>
+  .panel { color: red; }
+</style>
+<style lang="scss">
+  $ink: red;
+</style>
+<style lang="less">
+  @accent: blue;
+</style>"#;
+        cx.update(LanguageResources::initialize);
+        let resources = LanguageResources::default();
+        let language = resources.for_path(Path::new("App.vue")).unwrap();
+        assert_eq!(language, "vue");
+        for (language, document) in [
+            (language.as_ref(), source.to_string()),
+            ("markdown", format!("```vue\n{source}\n```")),
+        ] {
+            let mut syntax = SyntaxHighlighter::new(language);
+            assert!(syntax.update(None, &Rope::from(document.as_str()), None));
+            for (token, capture) in [
+                ("let", "keyword"),
+                ("const", "keyword"),
+                ("number", "type"),
+                ("Button", "type"),
+                ("boolean", "type"),
+                ("v-if", "keyword"),
+                ("99", "number"),
+                ("color", "property"),
+                ("$ink", "variable"),
+                ("@accent", "variable"),
+            ] {
+                let offset = document.find(token).unwrap();
+                let ranges = syntax.styles(&(0..document.len()), &Mark(capture));
+                assert!(
+                    ranges.iter().any(|(range, _)| range.contains(&offset)),
+                    "missing {capture} for {token} in {language}: {ranges:?}",
+                );
+            }
+        }
+    }
 
     #[test]
     fn textmate_extension_uses_worktree_scoped_utf8_highlights() -> Result<()> {

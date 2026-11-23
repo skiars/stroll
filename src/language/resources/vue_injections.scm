@@ -1,0 +1,52 @@
+; The complete start tag is used for defaults so a second attribute cannot
+; incorrectly select JavaScript or CSS when an explicit lang is present.
+((script_element (start_tag) @_tag (raw_text) @injection.content)
+ (#not-match? @_tag "\\blang\\s*=")
+ (#set! injection.language "javascript"))
+((script_element
+  (start_tag (attribute (attribute_name) @_key) @_lang)
+  (raw_text) @injection.content)
+ (#eq? @_key "lang")
+ (#set! injection.language "javascript")
+ (#match? @_lang "^lang\\s*=\\s*['\"]?(js|javascript)['\"]?$"))
+((script_element
+  (start_tag (attribute (attribute_name) @_key) @_lang)
+  (raw_text) @injection.content)
+ (#eq? @_key "lang")
+ (#match? @_lang "^lang\\s*=\\s*['\"]?(ts|typescript)['\"]?$")
+ (#set! injection.language "typescript"))
+((script_element
+  (start_tag (attribute (attribute_name) @_key) @_lang)
+  (raw_text) @injection.content)
+ (#eq? @_key "lang")
+ (#match? @_lang "^lang\\s*=\\s*['\"]?(tsx|jsx)['\"]?$")
+ (#set! injection.language "tsx"))
+((style_element (start_tag) @_tag (raw_text) @injection.content)
+ (#not-match? @_tag "\\blang\\s*=")
+ (#set! injection.language "css"))
+((style_element
+  (start_tag (attribute (attribute_name) @_key) @_lang)
+  (raw_text) @injection.content)
+ (#eq? @_key "lang")
+ (#match? @_lang "^lang\\s*=\\s*['\"]?css['\"]?$")
+ (#set! injection.language "css"))
+((interpolation (raw_text) @injection.content)
+ (#set! injection.language "typescript"))
+((directive_attribute (quoted_attribute_value (attribute_value) @injection.content))
+ (#set! injection.language "typescript"))
+((dynamic_directive_inner_value) @injection.content
+ (#set! injection.language "typescript"))
+((style_element
+  (start_tag (attribute (attribute_name) @_key) @_lang)
+  (raw_text) @injection.content)
+ (#eq? @_key "lang")
+ (#match? @_lang "^lang\\s*=\\s*['\"]?scss['\"]?$")
+ (#set! injection.language "scss"))
+((style_element
+  (start_tag (attribute (attribute_name) @_key) @_lang)
+  (raw_text) @injection.content)
+ (#eq? @_key "lang")
+ (#match? @_lang "^lang\\s*=\\s*['\"]?less['\"]?$")
+ (#set! injection.language "less"))
+((directive_attribute (attribute_value) @injection.content)
+ (#set! injection.language "typescript"))

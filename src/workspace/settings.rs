@@ -871,7 +871,7 @@ impl Render for SettingsPage {
             let resources = if let Some(repo) = &workspace.repository {
                 repo.language_resources()
             } else {
-                crate::language_resources::LanguageResources::installed()
+                crate::language::resources::LanguageResources::installed()
             };
             errors.extend(associations.rules().filter_map(|(pattern, language)| {
                 resources.syntax_for_id(language).is_none().then(|| {

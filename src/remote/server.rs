@@ -158,6 +158,7 @@ impl Server {
                             | super::WORKTREE_LSP_VERSION
                             | super::IMAGE_DIFF_VERSION
                             | super::IMAGE_DIFF_RESOURCE_VERSION
+                            | super::BUILTIN_LSP_PROJECT_VERSION
                     ),
                     "SSH workspace protocol version mismatch. Update the remote helper."
                 );
@@ -555,6 +556,14 @@ impl Server {
             Request::ExternalLspRoot(id, file) => {
                 crate::repository::resolve_file(root, file.as_path())?;
                 value(external_server(&id)?.project_root(root, file.as_path()))
+            }
+            Request::BuiltinLspProject(file, excluded) => {
+                crate::repository::resolve_file(root, file.as_path())?;
+                value(crate::language::BuiltinProject::resolve(
+                    root,
+                    file.as_path(),
+                    &excluded,
+                ))
             }
             Request::LspRoot(server, file) => {
                 crate::repository::resolve_file(root, file.as_path())?;

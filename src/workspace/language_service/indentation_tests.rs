@@ -86,3 +86,30 @@ fn workspace_newline_uses_rust_analyzer_paired_brace_indent() -> Result<()> {
         },
     )
 }
+
+#[test]
+fn workspace_uses_builtin_indentation_offline() -> Result<()> {
+    let fixture = tempfile::tempdir()?;
+    let source = "<template>\n  <MyCard></MyCard>\n</template>\n";
+    let caret = source.find("</MyCard>").unwrap();
+    with_source_editor(
+        fixture.path(),
+        "App.vue",
+        "[lsp]\nenabled = false",
+        source,
+        caret,
+        |visual, editor| {
+            visual.simulate_keystrokes("enter");
+            frame(visual);
+            visual.update(|_, cx| {
+                let state = editor.read(cx);
+                let text = state.text().to_string();
+                let inner = text.lines().nth(2).unwrap();
+                assert!(inner.trim().is_empty() && inner.len() > 2, "{text}");
+                assert_eq!(text.lines().nth(3), Some("  </MyCard>"));
+                assert_eq!(state.cursor(), caret + 1 + inner.len());
+            });
+            Ok(())
+        },
+    )
+}

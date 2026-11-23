@@ -81,6 +81,8 @@ struct Connection {
     image_diff_resource: std::sync::OnceLock<bool>,
     #[cfg(feature = "desktop")]
     worktree_lsp: std::sync::OnceLock<bool>,
+    #[cfg(feature = "desktop")]
+    builtin_lsp_project: std::sync::OnceLock<bool>,
     repository_events: crate::git::watch::RepoEvents,
     #[cfg(feature = "desktop")]
     repository_watch: AtomicBool,
@@ -339,6 +341,35 @@ impl SshSession {
         })
     }
 
+    #[cfg(feature = "desktop")]
+    pub(crate) fn builtin_lsp_project(
+        &self,
+        path: &std::path::Path,
+        excluded: Vec<crate::language::LanguageServer>,
+    ) -> Result<Option<crate::language::BuiltinProject>> {
+        use crate::language::{BuiltinProject, LanguageServer};
+
+        let Some((server, language_id)) = LanguageServer::for_path(path) else {
+            return Ok(None);
+        };
+        let path = super::RepoPath::from_local(path)?;
+        let supported = *self.0.builtin_lsp_project.get_or_init(|| {
+            let version = super::BUILTIN_LSP_PROJECT_VERSION;
+            self.call::<u32>(Request::Hello(version)).ok() == Some(version)
+        });
+        if supported {
+            return self.call(Request::BuiltinLspProject(path, excluded));
+        }
+        if !server.supports_legacy_remote() || excluded.contains(&server) {
+            return Ok(None);
+        }
+        Ok(Some(BuiltinProject {
+            server,
+            root: self.call(Request::LspRoot(server, path))?,
+            language_id: language_id.into(),
+        }))
+    }
+
     pub fn failure(&self) -> Option<String> {
         self.0.failure.lock().unwrap().clone()
     }
@@ -421,6 +452,8 @@ impl Connection {
             image_diff_resource: Default::default(),
             #[cfg(feature = "desktop")]
             worktree_lsp: Default::default(),
+            #[cfg(feature = "desktop")]
+            builtin_lsp_project: Default::default(),
             repository_events: Default::default(),
             #[cfg(feature = "desktop")]
             repository_watch: AtomicBool::new(false),
@@ -651,5 +684,101 @@ impl Connection {
             Err(mpsc::TrySendError::Full(call)) => Ok(Err(call.request)),
             Err(error) => bail!(t!("ssh.queue_failed", error = error)),
         }
+    }
+}
+
+#[cfg(all(test, feature = "desktop", unix))]
+mod tests {
+    use super::*;
+    use crate::language::{BuiltinProject, LanguageServer};
+    use std::path::Path;
+
+    #[test]
+    fn builtin_lsp_uses_legacy_root_query_without_closing_the_connection() -> Result<()> {
+        let fixture = tempfile::tempdir()?;
+        let root = fixture.path().canonicalize()?;
+        let app = root.join("app");
+        std::fs::create_dir(&app)?;
+        std::fs::write(app.join("main.ts"), "")?;
+        std::fs::write(app.join("App.vue"), "")?;
+        std::fs::write(
+            app.join("package.json"),
+            r#"{"dependencies":{"vue":"^3.5"}}"#,
+        )?;
+        ensure!(
+            Command::new("git")
+                .arg("-C")
+                .arg(&root)
+                .args(["init", "-q"])
+                .status()?
+                .success()
+        );
+        let target = SshTarget {
+            host: "fixture".into(),
+            port: None,
+            path: root.clone(),
+        };
+        let helper = if let Some(executable) = std::env::var_os("STROLL_TEST_LEGACY_SSH_HELPER") {
+            Command::new(executable)
+        } else {
+            let mut helper = Command::new("python3");
+            helper
+                .args([
+                    "-u",
+                    "-c",
+                    r#"
+import json, struct, sys
+reader, writer = sys.stdin.buffer, sys.stdout.buffer
+version, root = int(sys.argv[1]), sys.argv[2]
+probe_sent = False
+while size := reader.read(4):
+    call = json.loads(reader.read(struct.unpack(">I", size)[0]))
+    request = call["request"]
+    if "Hello" in request:
+        requested = request["Hello"]
+        if requested == version:
+            assert not probe_sent
+            probe_sent = True
+            result = {"Err": "Unsupported protocol version"}
+        else:
+            result = {"Ok": requested}
+    elif request == {"Open": root}:
+        result = {"Ok": {}}
+    elif request == {"LspRoot": ["TypeScript", "app/main.ts"]}:
+        assert probe_sent
+        result = {"Ok": root + "/app"}
+    else:
+        # Old helpers stop reading frames when a request enum cannot be decoded.
+        sys.exit(1)
+    data = json.dumps({"id": call["id"], "result": result}).encode()
+    writer.write(struct.pack(">I", len(data)) + data)
+    writer.flush()
+"#,
+                    &super::super::BUILTIN_LSP_PROJECT_VERSION.to_string(),
+                ])
+                .arg(&root);
+            helper
+        };
+        let ssh = SshSession::connect_test_helper(target, helper)?;
+        ssh.call::<serde_json::Value>(Request::Open(root.clone()))?;
+        let path = Path::new("app/main.ts");
+        assert_eq!(
+            ssh.builtin_lsp_project(path, vec![])?,
+            Some(BuiltinProject {
+                server: LanguageServer::TypeScript,
+                root: root.join("app"),
+                language_id: "typescript".into(),
+            })
+        );
+        assert!(
+            ssh.builtin_lsp_project(Path::new("app/App.vue"), vec![])?
+                .is_none()
+        );
+        assert!(
+            ssh.builtin_lsp_project(path, vec![LanguageServer::TypeScript])?
+                .is_none()
+        );
+        assert_eq!(ssh.call::<u32>(Request::Hello(VERSION))?, VERSION);
+        Ok(())
     }
 }

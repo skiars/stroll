@@ -47,6 +47,7 @@ pub(crate) const WORKSPACE_TRANSFER_VERSION: u32 = 20;
 pub(crate) const WORKTREE_LSP_VERSION: u32 = 21;
 pub(crate) const IMAGE_DIFF_VERSION: u32 = 22;
 pub(crate) const IMAGE_DIFF_RESOURCE_VERSION: u32 = 23;
+pub(crate) const BUILTIN_LSP_PROJECT_VERSION: u32 = 24;
 const MAX_FRAME: usize = 40 * 1024 * 1024;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -288,6 +289,7 @@ pub(crate) enum Request {
     TerminalPoll(u64),
     TerminalClose(u64),
     LspRoot(crate::language::LanguageServer, RepoPath),
+    BuiltinLspProject(RepoPath, Vec<crate::language::LanguageServer>),
     ExternalLspRoot(String, RepoPath),
     WorktreeLspConfig,
     WorktreeLspRoot(crate::language::worktree::ProjectRoots, RepoPath),

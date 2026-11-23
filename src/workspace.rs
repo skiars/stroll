@@ -905,6 +905,7 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        crate::language::resources::LanguageResources::initialize(cx);
         let repository_mode = standalone.is_none();
         Self::bind_git_history_keys(cx);
         Self::bind_source_navigation_keys(cx);
@@ -2991,8 +2992,8 @@ impl Workspace {
         self.repository.clone()
     }
 
-    fn source_resources(&self, path: &Path) -> &crate::language_resources::LanguageResources {
-        crate::language_resources::LanguageResources::for_file(self.repository.as_deref(), path)
+    fn source_resources(&self, path: &Path) -> &crate::language::resources::LanguageResources {
+        crate::language::resources::LanguageResources::for_file(self.repository.as_deref(), path)
     }
 
     fn source_language(&self, path: &Path, source: &Rope) -> SharedString {
@@ -5441,7 +5442,7 @@ fn file_name(path: &Path) -> &str {
 
 fn associated_highlight<'a>(
     associations: &'a crate::config::FileAssociations,
-    resources: &crate::language_resources::LanguageResources,
+    resources: &crate::language::resources::LanguageResources,
     path: &Path,
 ) -> Option<(&'a str, SharedString)> {
     let id = associations.language_for(path)?;
@@ -5506,7 +5507,9 @@ fn language_for(path: &Path) -> &'static str {
         ) => "cpp",
         Some("css") => "css",
         Some("html") => "html",
-        _ => "text",
+        _ => {
+            crate::language::resources::LanguageResources::builtin_for_path(path).unwrap_or("text")
+        }
     }
 }
 

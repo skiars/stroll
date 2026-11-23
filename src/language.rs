@@ -1,4 +1,7 @@
 pub(crate) mod external;
+#[cfg(feature = "desktop")]
+pub(crate) mod resources;
+mod vue;
 pub(crate) mod worktree;
 
 use serde_json::{Value, json};
@@ -26,6 +29,39 @@ pub enum LanguageServer {
     Clangd,
     TypeScript,
     Python,
+    Vue,
+}
+
+#[derive(Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct BuiltinProject {
+    pub(crate) server: LanguageServer,
+    pub(crate) root: PathBuf,
+    pub(crate) language_id: String,
+}
+
+impl BuiltinProject {
+    pub(crate) fn resolve(
+        repository: &Path,
+        file: &Path,
+        excluded: &[LanguageServer],
+    ) -> Option<Self> {
+        let (server, language_id) = LanguageServer::for_path(file)?;
+        if server == LanguageServer::TypeScript
+            && !excluded.contains(&LanguageServer::Vue)
+            && let Some(root) = vue::project_root(repository, file)
+        {
+            return Some(Self {
+                server: LanguageServer::Vue,
+                root,
+                language_id: language_id.into(),
+            });
+        }
+        (!excluded.contains(&server)).then(|| Self {
+            server,
+            root: server.project_root(repository, file),
+            language_id: language_id.into(),
+        })
+    }
 }
 
 #[cfg(feature = "desktop")]
@@ -42,10 +78,17 @@ impl LanguageServer {
             Self::Clangd => "clangd",
             Self::TypeScript => "tsc",
             Self::Python => "pylsp",
+            Self::Vue => "vue-language-server",
         }
     }
 
-    pub(crate) const ALL: [Self; 4] = [Self::Rust, Self::Clangd, Self::TypeScript, Self::Python];
+    pub(crate) const ALL: [Self; 5] = [
+        Self::Rust,
+        Self::Clangd,
+        Self::TypeScript,
+        Self::Python,
+        Self::Vue,
+    ];
 
     pub(crate) fn languages(self) -> &'static [(&'static str, &'static str)] {
         match self {
@@ -74,10 +117,10 @@ impl LanguageServer {
                 (".jsx", "javascriptreact"),
             ],
             Self::Python => &[(".py", "python"), (".pyi", "python")],
+            Self::Vue => &[(".vue", "vue")],
         }
     }
 
-    #[cfg(feature = "desktop")]
     pub fn for_path(path: &Path) -> Option<(Self, &'static str)> {
         let extension = path.extension()?.to_str()?;
         Self::ALL.into_iter().find_map(|server| {
@@ -111,19 +154,40 @@ impl LanguageServer {
         Some((self.default_command(), CommandSource::Path))
     }
 
+    #[cfg(feature = "desktop")]
+    pub(crate) fn local_display_name(self, configured: &str) -> String {
+        if self == Self::Vue {
+            return self.name().to_owned();
+        }
+        let (command, _) = self
+            .local_command(configured)
+            .expect("startup LSP configuration was validated");
+        command.get_program().to_string_lossy().into_owned()
+    }
+
+    #[cfg(feature = "desktop")]
+    pub(crate) fn supports_legacy_remote(self) -> bool {
+        self != Self::Vue
+    }
+
     pub(crate) fn executable_variable(self) -> &'static str {
         match self {
             Self::Rust => "STROLL_RUST_ANALYZER",
             Self::Clangd => "STROLL_CLANGD",
             Self::TypeScript => "STROLL_TYPESCRIPT_LSP",
             Self::Python => "STROLL_PYTHON_LSP",
+            Self::Vue => "STROLL_VUE_NODE",
         }
     }
 
     pub(crate) fn command_for(self, executable: OsString) -> Command {
         let mut command = crate::process::background(executable);
-        if self == Self::TypeScript {
-            command.arg("--stdio");
+        match self {
+            Self::TypeScript => {
+                command.arg("--stdio");
+            }
+            Self::Vue => vue::bridge_args(&mut command),
+            _ => {}
         }
         command
     }
@@ -131,6 +195,7 @@ impl LanguageServer {
     pub(crate) fn default_command(self) -> Command {
         match self {
             Self::TypeScript => typescript_command(if cfg!(windows) { "tsc.cmd" } else { "tsc" }),
+            Self::Vue => self.command_for("node".into()),
             _ => crate::process::background(self.name()),
         }
     }
@@ -161,11 +226,15 @@ impl LanguageServer {
     }
 
     pub fn project_root(self, repository: &Path, file: &Path) -> PathBuf {
+        if self == Self::Vue {
+            return vue::project_root(repository, file).unwrap_or_else(|| repository.to_owned());
+        }
         let markers: &[_] = match self {
             Self::Rust => return repository.to_owned(),
             Self::Clangd => &["compile_commands.json", "compile_flags.txt", ".clangd"],
             Self::TypeScript => &["tsconfig.json", "jsconfig.json", "package.json"],
             Self::Python => &["pyproject.toml", "setup.py"],
+            Self::Vue => unreachable!(),
         };
         // Let rust-analyzer discover the whole Cargo workspace. For other servers,
         // prefer the nearest project configuration, staying inside the repository.
@@ -291,6 +360,56 @@ pub(crate) fn parse_command_line(line: &str) -> Option<Vec<String>> {
 #[cfg(all(test, feature = "desktop"))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn builtin_project_routes_files_with_their_package_and_respects_overrides() -> Result<()> {
+        let fixture = tempfile::tempdir()?;
+        let repository = fixture.path();
+        let app = repository.join("packages/app");
+        let plain = repository.join("packages/plain");
+        std::fs::create_dir_all(app.join("src"))?;
+        std::fs::create_dir_all(&plain)?;
+        std::fs::write(
+            app.join("package.json"),
+            r#"{"devDependencies":{"nuxt":"^4"}}"#,
+        )?;
+        std::fs::write(plain.join("tsconfig.json"), "{}")?;
+
+        let resolve = |path: &str, excluded: &[LanguageServer]| {
+            BuiltinProject::resolve(repository, Path::new(path), excluded)
+        };
+        for (file, language_id) in [
+            ("packages/app/src/App.vue", "vue"),
+            ("packages/app/src/main.ts", "typescript"),
+            ("packages/app/src/View.tsx", "typescriptreact"),
+            ("packages/app/src/init.js", "javascript"),
+        ] {
+            assert_eq!(
+                resolve(file, &[]),
+                Some(BuiltinProject {
+                    server: LanguageServer::Vue,
+                    root: app.clone(),
+                    language_id: language_id.into(),
+                })
+            );
+        }
+        for (file, root, excluded) in [
+            ("packages/plain/main.ts", plain, &[][..]),
+            ("packages/app/src/main.ts", app, &[LanguageServer::Vue]),
+        ] {
+            assert_eq!(
+                resolve(file, excluded),
+                Some(BuiltinProject {
+                    server: LanguageServer::TypeScript,
+                    root,
+                    language_id: "typescript".into(),
+                })
+            );
+        }
+        assert!(resolve("packages/app/src/App.vue", &[LanguageServer::Vue]).is_none());
+        assert!(resolve("packages/plain/main.ts", &[LanguageServer::TypeScript]).is_none());
+        Ok(())
+    }
 
     #[test]
     fn parses_lsp_program_and_arguments() {

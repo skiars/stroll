@@ -691,7 +691,7 @@ impl GitPanel {
     ) {
         let refresh =
             |editor: &Entity<EditorState>, path: &Path, window: &mut Window, cx: &mut App| {
-                let resources = crate::language_resources::LanguageResources::for_file(repo, path);
+                let resources = crate::language::resources::LanguageResources::for_file(repo, path);
                 let language = super::super::associated_highlight(associations, resources, path)
                     .map(|(_, syntax)| syntax)
                     .or_else(|| resources.for_path(path))

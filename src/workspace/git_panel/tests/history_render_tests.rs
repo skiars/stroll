@@ -3274,3 +3274,80 @@ fn commit_list_squashes_rewords_and_resets_with_local_changes() -> Result<()> {
     assert_eq!(git::history(&root)?.changes, status);
     Ok(())
 }
+
+#[::core::prelude::v1::test]
+fn builtin_syntax_is_painted_on_both_sides_of_git_diff() -> Result<()> {
+    use gpui_component::ActiveTheme as _;
+
+    let fixture = tempfile::tempdir()?;
+    let root = fixture.path();
+    git(root, &["init", "-qb", "main"]);
+    git(root, &["config", "user.name", "Reviewer"]);
+    git(root, &["config", "user.email", "reviewer@example.invalid"]);
+    git(root, &["config", "commit.gpgsign", "false"]);
+    let path = root.join("App.vue");
+    let source = |name| {
+        format!("<script setup lang=\"ts\">\nexport const {name}: number = 123\n</script>\n")
+    };
+    fs::write(&path, source("before"))?;
+    git(root, &["add", "App.vue"]);
+    git(root, &["commit", "-qm", "Initial"]);
+    fs::write(&path, source("after"))?;
+
+    let state = tempfile::tempdir()?;
+    let (mut cx, handle, _, panel) = open_history(root, state.path(), None, None)?;
+    let window = handle.into();
+    let keyword = cx.update_window(window, |_, window, cx| {
+        crate::workspace::apply_theme(ThemeMode::Light, cx);
+        window.set_scale_factor(1.);
+        panel.update(cx, |panel, cx| {
+            panel.show_history = false;
+            panel.show_tree = false;
+            panel.split = true;
+            panel.select_worktree(window, cx);
+            cx.notify();
+        });
+        color_bytes(
+            cx.theme()
+                .highlight_theme
+                .style("keyword")
+                .unwrap()
+                .color
+                .unwrap(),
+        )
+    })?;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        cx.run_until_parked();
+        let pending = cx.update_window(window, |_, window, cx| {
+            window.simulate_next_frame(cx);
+            window.draw(cx).clear(cx);
+            !panel.read(cx).diff.read(cx).files().iter().any(|file| {
+                file.patch_source_lines()
+                    .any(|(_, _, line)| line.contains("export const after"))
+            })
+        })?;
+        if !pending {
+            let image = cx.capture_screenshot(window)?;
+            let mut matches = [0, 0];
+            for (x, y, pixel) in image.enumerate_pixels() {
+                if y > 60
+                    && pixel.0[..3]
+                        .iter()
+                        .zip(keyword)
+                        .all(|(a, b)| a.abs_diff(b) <= 12)
+                {
+                    matches[usize::from(x >= image.width() / 2)] += 1;
+                }
+            }
+            if matches.iter().all(|&count| count >= 3) {
+                return Ok(());
+            }
+        }
+        anyhow::ensure!(
+            Instant::now() < deadline,
+            "TypeScript keywords were not painted on both sides of the Git diff"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}

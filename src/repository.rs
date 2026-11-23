@@ -63,7 +63,7 @@ pub struct Repository {
     local_storage_key: Option<Vec<u8>>,
     #[cfg(feature = "desktop")]
     language_resources:
-        std::sync::Arc<std::sync::OnceLock<crate::language_resources::LanguageResources>>,
+        std::sync::Arc<std::sync::OnceLock<crate::language::resources::LanguageResources>>,
     #[cfg(feature = "desktop")]
     pub(crate) worktree_lsp:
         std::sync::Arc<std::sync::RwLock<std::sync::Arc<crate::language::worktree::WorktreeLsp>>>,
@@ -89,9 +89,9 @@ pub struct Entry {
 
 impl Repository {
     #[cfg(feature = "desktop")]
-    pub(crate) fn language_resources(&self) -> &crate::language_resources::LanguageResources {
+    pub(crate) fn language_resources(&self) -> &crate::language::resources::LanguageResources {
         self.language_resources
-            .get_or_init(|| crate::language_resources::LanguageResources::load(Some(self)))
+            .get_or_init(|| crate::language::resources::LanguageResources::load(Some(self)))
     }
 
     pub fn open(path: &Path) -> Result<Self> {

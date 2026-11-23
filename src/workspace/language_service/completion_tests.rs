@@ -82,6 +82,48 @@ pub(super) fn with_workspace_editor(
     fs::write(&config_path, configuration)?;
     let config = ConfigFile::load(Some(config_path));
     let expect_server = config.current().lsp.enabled;
+    with_open_workspace(
+        fixture,
+        config,
+        Location {
+            root,
+            file: Some(file.into()),
+        },
+        |visual, workspace| {
+            wait(visual, "source editor", |visual| {
+                visual.update(|_, cx| {
+                    let workspace = workspace.read(cx);
+                    workspace.active_file().is_some_and(|file| {
+                        !expect_server || (file.language_server.is_some()
+                            && file.server_project.as_ref().is_some_and(|project| {
+                                matches!(
+                                    workspace.language_servers.get(&project.key),
+                                    Some(LanguageService::Session { client, .. }) if client.state() == SessionState::Ready
+                                )
+                            }))
+                    })
+                })
+            })?;
+            let editor = visual.update(|window, cx| {
+                let editor = workspace.read(cx).active_file().unwrap().editor.clone();
+                editor.update(cx, |state, cx| {
+                    state.set_selected_range(caret..caret, cx);
+                    state.focus(window, cx);
+                });
+                editor
+            });
+            frame(visual);
+            body(visual, workspace, &editor)
+        },
+    )
+}
+
+fn with_open_workspace(
+    fixture: &Path,
+    config: ConfigFile,
+    location: Location,
+    body: impl FnOnce(&mut VisualTestContext, &Entity<Workspace>) -> Result<()>,
+) -> Result<()> {
     let store = Arc::new(Store::new(fixture.join("state"))?);
     let mut app = TestAppContext::build_with_text_system(
         TestDispatcher::new(0),
@@ -119,40 +161,10 @@ pub(super) fn with_workspace_editor(
     visual.simulate_resize(size(px(940.), px(580.)));
     visual.update(|window, cx| {
         workspace.update(cx, |workspace, cx| {
-            workspace.open_repository(
-                Location {
-                    root,
-                    file: Some(file.into()),
-                },
-                window,
-                cx,
-            );
+            workspace.open_repository(location, window, cx);
         })
     });
-    wait(visual, "source editor", |visual| {
-        visual.update(|_, cx| {
-            let workspace = workspace.read(cx);
-            workspace.active_file().is_some_and(|file| {
-                !expect_server || (file.language_server.is_some()
-                    && file.server_project.as_ref().is_some_and(|project| {
-                        matches!(
-                            workspace.language_servers.get(&project.key),
-                            Some(LanguageService::Session { client, .. }) if client.state() == SessionState::Ready
-                        )
-                    }))
-            })
-        })
-    })?;
-    let editor = visual.update(|window, cx| {
-        let editor = workspace.read(cx).active_file().unwrap().editor.clone();
-        editor.update(cx, |state, cx| {
-            state.set_selected_range(caret..caret, cx);
-            state.focus(window, cx);
-        });
-        editor
-    });
-    frame(visual);
-    body(visual, &workspace, &editor)
+    body(visual, &workspace)
 }
 
 pub(super) fn frame(visual: &mut VisualTestContext) {
@@ -1292,4 +1304,123 @@ fn workspace_caret_hints_use_the_latest_symbol_and_signature() -> Result<()> {
             Ok(())
         },
     )
+}
+
+#[test]
+#[ignore = "requires an installed Vue project and the npm tools described in docs/language-packs.md"]
+fn workspace_routes_vue_and_typescript_to_the_same_session() -> Result<()> {
+    use anyhow::Context as _;
+    use futures_lite::future::block_on;
+    use gpui_component::Rope;
+
+    use crate::{language::LanguageServer, remote::SshTarget};
+
+    let root = std::path::PathBuf::from(
+        std::env::var_os("STROLL_VUE_TEST_PROJECT")
+            .context("Set STROLL_VUE_TEST_PROJECT to an installed Vue test fixture")?,
+    )
+    .canonicalize()?;
+    let mut locations = vec![root.clone()];
+    if let Ok(host) = std::env::var("STROLL_VUE_TEST_SSH_HOST") {
+        locations.push(format!("ssh://{host}{}", root.display()).into());
+    }
+    for location in locations {
+        let remote = SshTarget::parse(&location)?.is_some();
+        let fixture = tempfile::tempdir()?;
+        let config = ConfigFile::load(Some(fixture.path().join("config.toml")));
+        with_open_workspace(
+            fixture.path(),
+            config,
+            Location {
+                root: location.clone(),
+                file: Some("App.vue".into()),
+            },
+            |visual, workspace| {
+                for file in ["App.vue", "types.ts"] {
+                    if file != "App.vue" {
+                        visual.update(|window, cx| {
+                            workspace.update(cx, |workspace, cx| {
+                                workspace.open_file(file.into(), false, window, cx);
+                            });
+                        });
+                    }
+                    wait(visual, file, |visual| {
+                        visual.update(|_, cx| {
+                            let workspace = workspace.read(cx);
+                            workspace.files.get(Path::new(file)).is_some_and(|file| {
+                                file.language_server.is_some()
+                                    && file.server_project.as_ref().is_some_and(|project| {
+                                        matches!(workspace.language_servers.get(&project.key),
+                                            Some(LanguageService::Session { client, .. })
+                                            if client.state() == SessionState::Ready)
+                                    })
+                            })
+                        })
+                    })?;
+                }
+                let (vue, ts, vue_source, ts_source) = visual.update(|_, cx| {
+                    let workspace = workspace.read(cx);
+                    let vue = &workspace.files[Path::new("App.vue")];
+                    let ts = &workspace.files[Path::new("types.ts")];
+                    let vue_project = vue.server_project.as_ref().unwrap();
+                    let ts_project = ts.server_project.as_ref().unwrap();
+                    assert!(vue_project.key == ts_project.key);
+                    assert_eq!(vue_project.key.server_id(), LanguageServer::Vue.name());
+                    assert_eq!(vue_project.key.root, root);
+                    assert_eq!(vue_project.key.remote, remote);
+                    assert_eq!(vue_project.language_id, "vue");
+                    assert_eq!(ts_project.language_id, "typescript");
+                    (
+                        vue.language_server.as_ref().unwrap().document.clone(),
+                        ts.language_server.as_ref().unwrap().document.clone(),
+                        vue.editor.read(cx).text().clone(),
+                        ts.editor.read(cx).text().clone(),
+                    )
+                });
+                let launcher = location.display();
+                let hover_at = vue_source
+                    .to_string()
+                    .find("{{ formatted")
+                    .context("template expression")?
+                    + 4;
+                let hover = block_on(vue.hover(vue_source.clone(), hover_at))?
+                    .with_context(|| launcher.to_string())?;
+                assert!(
+                    serde_json::to_string(&hover)?.contains("formatted: string"),
+                    "{launcher}: {hover:?}"
+                );
+                let to_ts = vue_source
+                    .to_string()
+                    .find("count.toFixed")
+                    .context("TypeScript use")?
+                    + 1;
+                let links = block_on(vue.definitions(vue_source.clone(), to_ts))?;
+                assert!(
+                    links
+                        .iter()
+                        .any(|link| link.target_uri.as_str().ends_with("/types.ts")),
+                    "{launcher}: {links:?}"
+                );
+                let to_vue = ts_source.to_string().find("= App").context("Vue use")? + 3;
+                let links = block_on(ts.definitions(ts_source.clone(), to_vue))?;
+                assert!(
+                    links
+                        .iter()
+                        .any(|link| link.target_uri.as_str().ends_with("/App.vue")),
+                    "{launcher}: {links:?}"
+                );
+                let edited =
+                    Rope::from(vue_source.to_string().replace("count.toFixed(2)", "count"));
+                let offset = edited.to_string().find("{{ formatted").unwrap() + 4;
+                let hover =
+                    block_on(vue.hover(edited, offset))?.context("hover after unsaved change")?;
+                assert!(
+                    serde_json::to_string(&hover)?.contains("formatted: 42"),
+                    "{launcher}: {hover:?}"
+                );
+                Ok(())
+            },
+        )?;
+    }
+    Ok(())
 }

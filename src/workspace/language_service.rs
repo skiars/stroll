@@ -26,7 +26,7 @@ use gpui_kit_assets::IconName;
 
 use crate::{
     language::{
-        CommandSource,
+        BuiltinProject, CommandSource,
         worktree::{WorktreeLsp, WorktreeServer},
     },
     lsp::{Client, CompletionActivation, EditorLsp, LanguageServer, NewlineServer, SessionState},
@@ -205,25 +205,21 @@ impl ServerProject {
             }
             Err(error) => eprintln!("Could not load external language servers: {error:#}"),
         }
-        let (server, language_id) = LanguageServer::for_path(path)?;
-        if config.is_some_and(|config| config.entry(server.name()).is_some()) {
-            return None;
-        }
+        let excluded = LanguageServer::ALL
+            .into_iter()
+            .filter(|server| config.is_some_and(|config| config.entry(server.name()).is_some()))
+            .collect::<Vec<_>>();
+        let project = match ssh {
+            Some(ssh) => ssh.builtin_lsp_project(path, excluded).ok().flatten(),
+            None => BuiltinProject::resolve(root, path, &excluded),
+        }?;
         Some(Self {
             key: ServerKey {
-                server: ServiceServer::Builtin(server),
-                root: match ssh {
-                    Some(ssh) => ssh
-                        .call(crate::remote::Request::LspRoot(
-                            server,
-                            crate::remote::RepoPath::from_local(path).ok()?,
-                        ))
-                        .ok()?,
-                    None => server.project_root(root, path),
-                },
+                server: ServiceServer::Builtin(project.server),
+                root: project.root,
                 remote: ssh.is_some(),
             },
-            language_id: language_id.into(),
+            language_id: project.language_id.into(),
         })
     }
 }
@@ -848,10 +844,7 @@ impl Workspace {
                 let program = match &project.key.server {
                     ServiceServer::Builtin(server) if ssh.is_some() => server.name().to_owned(),
                     ServiceServer::Builtin(server) => {
-                        let (command, _) = server
-                            .local_command(&self.startup_lsp.server(*server).command)
-                            .expect("startup LSP configuration was validated");
-                        command.get_program().to_string_lossy().into_owned()
+                        server.local_display_name(&self.startup_lsp.server(*server).command)
                     }
                     ServiceServer::External(server) => server.server.command.clone(),
                     ServiceServer::Worktree(server) => server.0.entry.server.command.clone(),

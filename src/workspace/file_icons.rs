@@ -5,7 +5,7 @@ use gpui_component::{Icon, Sizable as _};
 use gpui_kit_assets::IconName;
 
 use crate::{
-    config::FileAssociations, language_resources::LanguageResources, repository::Repository,
+    config::FileAssociations, language::resources::LanguageResources, repository::Repository,
 };
 
 use super::{Palette, associated_highlight, audio_preview, icon, language_for};
