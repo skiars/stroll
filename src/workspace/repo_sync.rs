@@ -131,16 +131,20 @@ impl Workspace {
             self.rebuild_tree();
         }
         if let Some(index) = self.rows.iter().position(|row| row.entry.path == path) {
-            let inset = if self.config.current().appearance.file_tree_sticky_scroll {
-                let viewport = self.tree_scroll.0.borrow().base_handle.bounds();
-                tree_sticky_scroll::row_limit(viewport.size.height).min(self.rows[index].depth)
-            } else {
-                0
-            };
-            self.tree_scroll
-                .scroll_to_item_with_offset(index, ScrollStrategy::Nearest, inset);
+            self.scroll_tree_row_into_view(index);
             cx.notify();
         }
+    }
+
+    pub(super) fn scroll_tree_row_into_view(&self, index: usize) {
+        let inset = if self.config.current().appearance.file_tree_sticky_scroll {
+            let viewport = self.tree_scroll.0.borrow().base_handle.bounds();
+            tree_sticky_scroll::row_limit(viewport.size.height).min(self.rows[index].depth)
+        } else {
+            0
+        };
+        self.tree_scroll
+            .scroll_to_item_with_offset(index, ScrollStrategy::Nearest, inset);
     }
 
     pub(super) fn load_docs_tree(&mut self, window: &mut Window, cx: &mut Context<Self>) {

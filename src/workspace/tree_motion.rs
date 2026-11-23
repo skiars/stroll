@@ -274,7 +274,10 @@ pub(super) fn tree_list<V: Render, R: Clone + 'static, E: IntoElement>(
             && let Some(Some((index, _))) = frame.positions.get(request.item_index)
         {
             handle.scroll_to_item(*index, request.strategy);
-            state.deferred_scroll_to_item = None;
+            // Apply the sticky header inset once the rows return to their uniform heights.
+            if request.offset == 0 {
+                state.deferred_scroll_to_item = None;
+            }
         }
         drop(state);
         let sizes = Rc::new(

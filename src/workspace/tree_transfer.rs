@@ -72,6 +72,20 @@ impl Workspace {
         };
         let context = Some("WorkspaceFileTree && !Input");
         cx.bind_keys([
+            KeyBinding::new("up", file_tree::NavigateTree::Up, context),
+            KeyBinding::new("down", file_tree::NavigateTree::Down, context),
+            KeyBinding::new("left", file_tree::NavigateTree::Left, context),
+            KeyBinding::new("right", file_tree::NavigateTree::Right, context),
+            KeyBinding::new("space", file_tree::OpenTreeFile { preview: true }, context),
+            KeyBinding::new(
+                if cfg!(target_os = "macos") {
+                    "cmd-down"
+                } else {
+                    "enter"
+                },
+                file_tree::OpenTreeFile { preview: false },
+                context,
+            ),
             KeyBinding::new("f2", file_tree::RenameTreeEntry, context),
             #[cfg(target_os = "macos")]
             KeyBinding::new("enter", file_tree::RenameTreeEntry, context),

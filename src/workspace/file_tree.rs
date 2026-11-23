@@ -146,6 +146,21 @@ pub(super) enum TreeAction {
 
 actions!(workspace, [RenameTreeEntry, DeleteTreeEntry, RefreshTree]);
 
+#[derive(Action, Clone, PartialEq)]
+#[action(namespace = workspace, no_json)]
+pub(super) struct OpenTreeFile {
+    pub(super) preview: bool,
+}
+
+#[derive(Action, Clone, Copy, PartialEq)]
+#[action(namespace = workspace, no_json)]
+pub(super) enum NavigateTree {
+    Up,
+    Down,
+    Left,
+    Right,
+}
+
 impl TreeAction {
     fn shortcut_action(self) -> Option<Box<dyn Action>> {
         match self {
@@ -435,6 +450,72 @@ fn system_menu_for_entry(
 }
 
 impl Workspace {
+    pub(super) fn open_tree_file(
+        &mut self,
+        preview: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.tree_focus.is_focused(window)
+            || self.tree_edit.is_some()
+            || self.repository_ui.opening.is_some()
+            || self.confirming_close
+        {
+            return;
+        }
+        let Some(entry) = self.rows.iter().map(|row| &row.entry).find(|entry| {
+            entry.path == self.tree_keyboard_path && !entry.directory && !entry.symlink
+        }) else {
+            return;
+        };
+        let path = entry.path.clone();
+        if audio_preview::is_audio(&path) {
+            self.preview_audio(path, window, cx);
+        } else {
+            self.request_file(path, FileOpen::Tree { preview }, window, cx);
+        }
+    }
+
+    pub(super) fn navigate_tree(
+        &mut self,
+        direction: NavigateTree,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.tree_focus.is_focused(window) || self.tree_edit.is_some() || self.rows.is_empty() {
+            return;
+        }
+
+        let mut visible_path = self
+            .tree_keyboard_path
+            .ancestors()
+            .filter_map(|path| self.rows.iter().position(|row| row.entry.path == path));
+        let target = match visible_path.next() {
+            Some(index) if self.rows[index].entry.path == self.tree_keyboard_path => {
+                let row = &self.rows[index];
+                match direction {
+                    NavigateTree::Up => index.checked_sub(1),
+                    NavigateTree::Down => (index + 1 < self.rows.len()).then_some(index + 1),
+                    NavigateTree::Left if row.expanded => {
+                        self.toggle_tree_directory(row.entry.path.clone(), window, cx);
+                        Some(index)
+                    }
+                    NavigateTree::Left => row.parent,
+                    NavigateTree::Right if row.entry.directory && !row.expanded => {
+                        self.toggle_tree_directory(row.entry.path.clone(), window, cx);
+                        Some(index)
+                    }
+                    NavigateTree::Right => (index + 1 < row.subtree_end).then_some(index + 1),
+                }
+            }
+            ancestor => Some(ancestor.unwrap_or(0)),
+        };
+        if let Some(index) = target {
+            self.scroll_tree_row_into_view(index);
+            self.focus_tree(self.rows[index].entry.path.clone(), window, cx);
+        }
+    }
+
     pub(super) fn tree_key_action(
         &mut self,
         action: TreeAction,
@@ -2246,6 +2327,159 @@ mod tests {
     }
 
     #[::core::prelude::v1::test]
+    fn editor_file_tree_navigates_with_arrow_keys() -> Result<()> {
+        let fixture = tempfile::tempdir()?;
+        let root = fixture.path().join("repo");
+        let nested = root.join("folder/nested");
+        fs::create_dir_all(&nested)?;
+        for index in 0..40 {
+            fs::write(nested.join(format!("{index:02}.txt")), "child\n")?;
+        }
+        fs::write(root.join("folder/z.txt"), "sibling\n")?;
+        fs::write(root.join("notes.txt"), "open file\n")?;
+        assert!(
+            std::process::Command::new("git")
+                .args(["init", "-qb", "main"])
+                .arg(&root)
+                .status()?
+                .success()
+        );
+
+        let mut cx = TestAppContext::build_with_text_system(
+            TestDispatcher::new(0),
+            None,
+            crate::test_support::text_system(true),
+        );
+        cx.update(gpui_component::init);
+        let store = Arc::new(Store::new(fixture.path().join("state"))?);
+        let config = ConfigFile::load(Some(fixture.path().join("config.toml")));
+        let mut workspace = None;
+        let (_, visual) = cx.add_window_view(|window, cx| {
+            let view = cx
+                .new(|cx| Workspace::with_config(store, config, WorkspaceView::Editor, window, cx));
+            workspace = Some(view.clone());
+            gpui_component::Root::new(view, window, cx)
+        });
+        let workspace = workspace.unwrap();
+        visual.simulate_resize(size(px(900.), px(500.)));
+        visual.update(|window, cx| {
+            window.activate_window();
+            workspace.update(cx, |this, cx| {
+                this.open_repository(
+                    Location {
+                        root,
+                        file: Some("notes.txt".into()),
+                    },
+                    window,
+                    cx,
+                );
+            });
+        });
+        settle(visual, &workspace, |this| this.active_file().is_some());
+        visual.simulate_keystrokes("down");
+        visual.update(|window, cx| {
+            workspace.update(cx, |this, cx| {
+                assert!(!this.tree_focus.is_focused(window));
+                assert!(this.tree_keyboard_path.as_os_str().is_empty());
+                this.focus_tree(PathBuf::new(), window, cx);
+            });
+        });
+        settle(visual, &workspace, |_| true);
+
+        let key = |visual: &mut VisualTestContext, keys: &str, selected: &str| {
+            visual.simulate_keystrokes(keys);
+            settle(visual, &workspace, |_| true);
+            visual.update(|window, cx| {
+                let this = workspace.read(cx);
+                assert!(this.tree_focus.is_focused(window));
+                assert_eq!(this.tree_keyboard_path, Path::new(selected), "{keys}");
+                assert_eq!(this.tabs.active(), Some(Path::new("notes.txt")));
+            });
+        };
+        let expanded = |visual: &mut VisualTestContext, path: &str| {
+            visual.update(|_, cx| workspace.read(cx).expanded.contains(Path::new(path)))
+        };
+
+        key(visual, "up up left", "folder");
+        key(visual, "right", "folder");
+        settle(visual, &workspace, |this| {
+            this.rows
+                .iter()
+                .any(|row| row.entry.path == Path::new("folder/nested"))
+        });
+        key(visual, "right", "folder/nested");
+        key(visual, "left", "folder");
+        assert!(expanded(visual, "folder"));
+        key(visual, "right right", "folder/nested");
+        settle(visual, &workspace, |this| {
+            this.rows
+                .iter()
+                .any(|row| row.entry.path == Path::new("folder/nested/00.txt"))
+        });
+        key(visual, "right right", "folder/nested/00.txt");
+        key(visual, "left", "folder/nested");
+        assert!(expanded(visual, "folder/nested"));
+        key(visual, "right", "folder/nested/00.txt");
+
+        let down = vec!["down"; 39].join(" ");
+        key(visual, &down, "folder/nested/39.txt");
+        let row = visual
+            .debug_bounds("workspace-tree-row:folder/nested/39.txt")
+            .unwrap();
+        let viewport = visual.update(|_, cx| {
+            workspace
+                .read(cx)
+                .tree_scroll
+                .0
+                .borrow()
+                .base_handle
+                .bounds()
+        });
+        assert!(row.top() >= viewport.top() && row.bottom() <= viewport.bottom());
+
+        key(visual, "down", "folder/z.txt");
+        key(visual, "up left", "folder/nested");
+        assert!(expanded(visual, "folder/nested"));
+        key(visual, "left", "folder/nested");
+        assert!(!expanded(visual, "folder/nested"));
+        key(visual, "down down down", "notes.txt");
+
+        let sibling = Path::new("folder/z.txt");
+        visual.simulate_keystrokes("up space down");
+        settle(visual, &workspace, |this| {
+            this.tabs.active() == Some(sibling)
+        });
+        visual.update(|window, cx| {
+            let this = workspace.read(cx);
+            assert!(this.tabs.is_preview(sibling));
+            assert_eq!(this.tree_keyboard_path, Path::new("notes.txt"));
+            assert!(this.tree_focus.is_focused(window));
+        });
+
+        let open = if cfg!(target_os = "macos") {
+            "cmd-down"
+        } else {
+            "enter"
+        };
+        visual.simulate_keystrokes("up");
+        visual.simulate_keystrokes(open);
+        settle(visual, &workspace, |this| !this.tabs.is_preview(sibling));
+        visual.update(|window, cx| {
+            let this = workspace.read(cx);
+            assert_eq!(this.tabs.active(), Some(sibling));
+            assert!(
+                this.active_file()
+                    .unwrap()
+                    .editor
+                    .read(cx)
+                    .focus_handle(cx)
+                    .is_focused(window)
+            );
+        });
+        Ok(())
+    }
+
+    #[::core::prelude::v1::test]
     fn file_tree_shortcuts_and_context_menu_hints() -> Result<()> {
         let fixture = tempfile::tempdir()?;
         let root = fixture.path().join("repo");
@@ -2314,9 +2548,16 @@ mod tests {
             });
         });
         settle(visual, &workspace, |_| true);
-        visual.simulate_keystrokes("f2");
+        visual.simulate_keystrokes(if cfg!(target_os = "macos") {
+            "enter"
+        } else {
+            "f2"
+        });
         settle(visual, &workspace, |this| this.tree_edit.is_some());
-        visual.simulate_input("keyboard.txt");
+        visual.simulate_input("keyboard.tt");
+        visual.simulate_keystrokes("left space");
+        visual.simulate_input("x");
+        visual.simulate_keystrokes("left backspace");
         // File tree shortcuts must not intercept editing in the rename input.
         visual.simulate_keystrokes("f2");
         assert!(visual.update(|_, cx| workspace.read(cx).tree_edit.is_some()));

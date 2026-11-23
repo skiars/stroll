@@ -540,6 +540,9 @@ enum FileOpen {
         preview: bool,
         position: Option<SourcePosition>,
     },
+    Tree {
+        preview: bool,
+    },
     Locate(Option<(std::ops::Range<usize>, [u8; 32])>),
     DocumentLink {
         from: crate::session::SourceLocation,
@@ -2560,13 +2563,16 @@ impl Workspace {
                 }
                 | FileOpen::Startup
                 | FileOpen::Restore { from: None } => {}
+                FileOpen::Tree { preview: true }
+                    if matches!(pending, FileOpen::Tree { preview: false }) => {}
                 FileOpen::Select {
                     preview: false,
                     position: None,
                 } => match pending {
                     FileOpen::Select { preview, .. } => *preview = false,
                     FileOpen::Locate(_) => {}
-                    FileOpen::DocumentLink { .. }
+                    FileOpen::Tree { .. }
+                    | FileOpen::DocumentLink { .. }
                     | FileOpen::History { .. }
                     | FileOpen::Startup
                     | FileOpen::Restore { .. } => *pending = request,
@@ -2656,6 +2662,7 @@ impl Workspace {
                             }
                             FileOpen::Startup => this.restore_active_file(window, cx),
                             FileOpen::Select { .. }
+                            | FileOpen::Tree { .. }
                             | FileOpen::Locate(_)
                             | FileOpen::History { .. } => {}
                             FileOpen::DocumentLink { .. } => {
@@ -2696,8 +2703,13 @@ impl Workspace {
                 .files
                 .get(&path)
                 .is_some_and(|file| Some(file.editor.entity_id()) == self.visible_editor);
+        let tree_preview = match &request {
+            FileOpen::Tree { preview } => Some(*preview),
+            _ => None,
+        };
         let (preview, position, location, replay) = match request {
             FileOpen::Select { preview, position } => (preview, position, None, None),
+            FileOpen::Tree { preview } => (preview, None, None, None),
             FileOpen::DocumentLink { line, .. } => (
                 true,
                 line.map(|line| SourcePosition::Lsp(lsp_types::Position::new(line, 0))),
@@ -2718,7 +2730,7 @@ impl Workspace {
             }
             position => position,
         };
-        self.select_file_tab(&path, preview, window, cx);
+        self.select_file_tab(&path, preview, tree_preview, window, cx);
         if let Some(position) = position
             && let Some(file) = self.files.get(&path)
         {
@@ -2909,6 +2921,7 @@ impl Workspace {
         &mut self,
         path: &Path,
         preview: bool,
+        tree_preview: Option<bool>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -2919,7 +2932,12 @@ impl Workspace {
             self.files.remove(&replaced);
             self.remove_image_tab(&replaced, window);
         }
-        self.finish_tab_selection(previous.as_deref(), window, cx);
+        self.finish_tab_selection_with_tree_focus(
+            previous.as_deref(),
+            tree_preview.unwrap_or(self.tree_keyboard_path == path),
+            window,
+            cx,
+        );
     }
 
     fn load_file_buffer(
@@ -3732,6 +3750,21 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.finish_tab_selection_with_tree_focus(
+            previous,
+            self.tabs.active() == Some(self.tree_keyboard_path.as_path()),
+            window,
+            cx,
+        );
+    }
+
+    fn finish_tab_selection_with_tree_focus(
+        &mut self,
+        previous: Option<&Path>,
+        keep_tree_focus: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let active = self.tabs.active();
         let changed = active != previous;
         if changed {
@@ -3749,8 +3782,7 @@ impl Workspace {
             let keep_focus = self.locator.open
                 || self.repository_overlay_open()
                 || self.terminal_focused(window, cx)
-                || (self.tree_focus.is_focused(window)
-                    && active == Some(self.tree_keyboard_path.as_path()));
+                || (keep_tree_focus && self.tree_focus.is_focused(window));
             if let Some(file) = active.and_then(|path| self.files.get_mut(path)) {
                 file.apply_wrap(self.wrap, window, cx);
                 if !keep_focus {
@@ -4375,6 +4407,16 @@ impl Workspace {
             .track_focus(&self.tree_focus)
             .when(in_workspace, |pane| {
                 pane.key_context("WorkspaceFileTree")
+                    .on_action(
+                        cx.listener(|this, action: &file_tree::OpenTreeFile, window, cx| {
+                            this.open_tree_file(action.preview, window, cx);
+                        }),
+                    )
+                    .on_action(
+                        cx.listener(|this, action: &file_tree::NavigateTree, window, cx| {
+                            this.navigate_tree(*action, window, cx);
+                        }),
+                    )
                     .on_action(
                         cx.listener(|this, _: &file_tree::RenameTreeEntry, window, cx| {
                             this.tree_key_action(file_tree::TreeAction::Rename, window, cx);
