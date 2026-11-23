@@ -56,6 +56,9 @@ dialogs in a Wayland window after changes to paint order or focus handling.
   the fixed-height field, and narrow views move the match icons into a popover.
   The baseline-aligned case and whole-word SVGs render 2 px larger than the
   UI font size to keep their letterforms readable.
+- Selected Find controls derive their icon color and fill from the active
+  theme's primary color. The narrow options trigger uses the same styling
+  while any match option is enabled.
 - The editor, Git diff, and Markdown reader mount the same Find panel.
   All three targets use Unicode case-insensitive literal matching. The Markdown
   reader counts and navigates every match in rendered text, and the text view

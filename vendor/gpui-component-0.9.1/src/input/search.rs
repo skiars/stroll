@@ -11,7 +11,7 @@ use gpui::{
 };
 
 use crate::{
-    ActiveTheme, Disableable, ElementExt, Icon, Selectable, Sizable,
+    ActiveTheme, Colorize as _, Disableable, ElementExt, Icon, Selectable, Sizable,
     button::{Button, ButtonVariants},
     h_flex,
     input::{
@@ -617,6 +617,15 @@ fn find_button(
         .tooltip(label)
 }
 
+fn find_selected(button: Button, selected: bool, cx: &App) -> Button {
+    button.selected(selected).when(selected, |button| {
+        let theme = cx.theme();
+        button
+            .bg(theme.primary.mix_oklab(theme.popover, 0.33))
+            .text_color(theme.primary.mix_oklab(theme.foreground, 0.35))
+    })
+}
+
 fn find_field(
     input: Input,
     id: &'static str,
@@ -656,6 +665,7 @@ impl<T: SearchTarget> SearchPanel<T> {
         entity: WeakEntity<Self>,
         size: Pixels,
         icon_size: Pixels,
+        cx: &App,
     ) -> [Button; 3] {
         let case_panel = entity.clone();
         let word_panel = entity.clone();
@@ -668,7 +678,7 @@ impl<T: SearchTarget> SearchPanel<T> {
                 size,
                 letter_icon_size,
             )
-            .selected(!self.session.case_insensitive)
+            .map(|button| find_selected(button, !self.session.case_insensitive, cx))
             .toggled(!self.session.case_insensitive)
             .on_click(move |_, _, cx| {
                 _ = case_panel.update(cx, |panel, cx| {
@@ -683,7 +693,7 @@ impl<T: SearchTarget> SearchPanel<T> {
                 size,
                 letter_icon_size,
             )
-            .selected(self.session.options.whole_word)
+            .map(|button| find_selected(button, self.session.options.whole_word, cx))
             .toggled(self.session.options.whole_word)
             .on_click(move |_, _, cx| {
                 _ = word_panel.update(cx, |panel, cx| {
@@ -698,7 +708,7 @@ impl<T: SearchTarget> SearchPanel<T> {
                 size,
                 icon_size,
             )
-            .selected(self.session.options.regex)
+            .map(|button| find_selected(button, self.session.options.regex, cx))
             .toggled(self.session.options.regex)
             .on_click(move |_, _, cx| {
                 _ = entity.update(cx, |panel, cx| {
@@ -770,12 +780,12 @@ impl<T: SearchTarget> Render for SearchPanel<T> {
                         button_size,
                         icon_size,
                     )
-                    .selected(active),
+                    .map(|button| find_selected(button, active, cx)),
                 )
                 .content(move |_, _, cx| {
                     let buttons = entity
-                        .read_with(cx, |panel, _| {
-                            panel.match_options(entity.clone(), button_size, icon_size)
+                        .read_with(cx, |panel, cx| {
+                            panel.match_options(entity.clone(), button_size, icon_size, cx)
                         })
                         .ok();
                     h_flex()
@@ -789,7 +799,7 @@ impl<T: SearchTarget> Render for SearchPanel<T> {
                 .child(popover)
                 .into_any_element()
         } else {
-            let options = self.match_options(entity, button_size, icon_size);
+            let options = self.match_options(entity, button_size, icon_size, cx);
             let count = if self.advanced { 3 } else { 1 };
             h_flex()
                 .gap(px(2.))
@@ -849,7 +859,7 @@ impl<T: SearchTarget> Render for SearchPanel<T> {
                                 button_size,
                                 icon_size,
                             )
-                            .selected(replace_open)
+                            .map(|button| find_selected(button, replace_open, cx))
                             .toggled(replace_open)
                             .on_click(cx.listener(
                                 |this, _, window, cx| this.toggle_replace_mode(window, cx),
@@ -870,7 +880,7 @@ impl<T: SearchTarget> Render for SearchPanel<T> {
                                 button_size,
                                 icon_size,
                             )
-                            .selected(self.session.in_selection)
+                            .map(|button| find_selected(button, self.session.in_selection, cx))
                             .toggled(self.session.in_selection)
                             .disabled(!scope_available && !self.session.in_selection)
                             .when(scope_missing, |button| button.text_color(danger))

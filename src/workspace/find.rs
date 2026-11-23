@@ -183,7 +183,7 @@ mod tests {
         AppContext as _, Entity, TestAppContext, TestDispatcher, VisualTestContext, px, size,
     };
     use gpui_base::input::EditorState;
-    use gpui_component::{Root, input::Editor};
+    use gpui_component::{ActiveTheme as _, Colorize as _, Root, ThemeMode, input::Editor};
 
     use super::*;
     use crate::{
@@ -319,7 +319,7 @@ mod tests {
 
     #[test]
     fn find_bar_keeps_default_field_geometry_and_folds_options_when_narrow() -> Result<()> {
-        with_file("foo\nbar\n", |visual, _, _| {
+        with_file("foo\nbar\n", |visual, _, editor| {
             let (find, replace) = if cfg!(target_os = "macos") {
                 ("cmd-f", "cmd-shift-f")
             } else {
@@ -361,6 +361,33 @@ mod tests {
             let options = visual
                 .debug_bounds("find-options-trigger")
                 .expect("narrow match options");
+            for mode in [ThemeMode::Light, ThemeMode::Dark] {
+                for case_insensitive in [true, false] {
+                    visual.update(|_, cx| {
+                        crate::workspace::apply_theme(mode, cx);
+                        editor.update(cx, |editor, cx| {
+                            editor.set_find_query(
+                                "foo",
+                                case_insensitive,
+                                SearchOptions::default(),
+                                cx,
+                            );
+                        });
+                    });
+                    frame(visual);
+                    visual.update(|window, cx| {
+                        let theme = cx.theme();
+                        let center = options.center().scale(window.scale_factor());
+                        let fill =
+                            gpui::Background::from(theme.primary.mix_oklab(theme.popover, 0.33));
+                        let selected = window
+                            .painted_quads()
+                            .iter()
+                            .any(|quad| quad.bounds.contains(&center) && quad.background == fill);
+                        assert_eq!(selected, !case_insensitive, "{mode:?}");
+                    });
+                }
+            }
             visual.simulate_click(options.center(), gpui::Modifiers::none());
             frame(visual);
             assert!(visual.debug_bounds("find-options-actions").is_some());
