@@ -17,7 +17,12 @@ use gpui_kit_assets::IconName;
 
 use crate::{docs, paths, tabs::labels};
 
-use super::{FILE_TOOLBAR_HEIGHT, Palette, Workspace, file_type_icon, icon_button};
+use super::{
+    FILE_TOOLBAR_HEIGHT, Palette, TAB_BAR_BUTTON_SIZE, Workspace, file_type_icon,
+    tab_bar_icon_button,
+};
+
+const TAB_BAR_GAP: Pixels = px(6.);
 
 impl Workspace {
     pub(super) fn tab_bar(&self, cx: &Context<Self>, colors: Palette) -> impl IntoElement {
@@ -30,7 +35,7 @@ impl Workspace {
             .w_full()
             .min_w_0()
             .flex_shrink_0()
-            .gap(px(6.))
+            .gap(TAB_BAR_GAP)
             .px_2()
             .bg(colors.bg)
             .children(self.show_file_tree_button(cx))
@@ -100,11 +105,11 @@ impl Workspace {
             .items_center()
             .child(strip)
             .on_prepaint(move |bounds, window, _| {
-                // The trigger uses 28px plus the toolbar gap. Measure against
-                // the space available without it so it can disappear again.
+                // Measure against the space available without the trigger so
+                // it can disappear again when the tabs fit.
                 let full_width = bounds.size.width
                     + if overflow_menu_visible {
-                        px(34.)
+                        TAB_BAR_BUTTON_SIZE + TAB_BAR_GAP
                     } else {
                         px(0.)
                     };
@@ -259,11 +264,12 @@ impl Workspace {
                 cx.notify();
             }))
             .trigger(
-                icon_button(
+                tab_bar_icon_button(
                     "open-files-trigger",
                     IconName::Maximize2,
                     t!("tabs.open_files"),
                 )
+                .debug_selector(|| "open-files-trigger".into())
                 .tooltip_placement(Placement::Bottom),
             )
             .content(move |_, window, cx| {
@@ -757,6 +763,10 @@ mod tests {
             }
         }
         draw(visual);
+        let trigger = visual
+            .debug_bounds("open-files-trigger")
+            .expect("overflow shows the open files trigger");
+        assert_eq!(trigger.size, size(px(22.), px(22.)));
         let scroll = visual.update(|_, cx| workspace.read(cx).tab_scroll.clone());
         let viewport = scroll.bounds();
         let select = visual

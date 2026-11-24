@@ -138,6 +138,7 @@ impl Render for PaneDrag {
 }
 
 const FILE_TOOLBAR_HEIGHT: Pixels = px(36.);
+const TAB_BAR_BUTTON_SIZE: Pixels = px(22.);
 const PANE_RESIZE_GUTTER: Pixels = px(5.);
 const PANE_RESIZE_HIT_WIDTH: Pixels = px(4.);
 const PANE_SHADOW_OPACITY: f32 = 0.09;
@@ -5349,7 +5350,7 @@ impl Workspace {
             .debug_selector(|| "workspace-actions-trigger".into())
             .flex_shrink_0()
             .child(
-                icon_button(
+                tab_bar_icon_button(
                     "workspace-actions",
                     IconName::Ellipsis,
                     t!("workspace.actions"),
@@ -5909,6 +5910,16 @@ pub(crate) fn compact_icon_button(
     icon_button(id, name, label)
         .with_size(px(16.))
         .size(px(24.))
+}
+
+fn tab_bar_icon_button(
+    id: impl Into<ElementId>,
+    icon: impl Into<Icon>,
+    label: impl Into<SharedString>,
+) -> Button {
+    icon_button(id, icon, label)
+        .size(TAB_BAR_BUTTON_SIZE)
+        .icon_size(px(15.))
 }
 
 fn status_button(id: &'static str) -> Button {
