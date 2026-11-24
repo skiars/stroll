@@ -1034,6 +1034,211 @@ fn commit_history_pages_on_scroll_without_moving_the_anchor() -> Result<()> {
 }
 
 #[::core::prelude::v1::test]
+fn clearing_commit_search_restores_history_and_preserves_explicit_picks() -> Result<()> {
+    use std::io::{Seek as _, Write as _};
+
+    let fixture = tempfile::tempdir()?;
+    let root = fixture.path().join("repo");
+    fs::create_dir(&root)?;
+    git(&root, &["init", "-qb", "main"]);
+    let mut history = tempfile::tempfile()?;
+    for index in 0..1920 {
+        let subject = match index {
+            30 => "Buried commit",
+            1820 => "Match oldest",
+            1880 => "Match middle",
+            1900 => "Match latest",
+            _ => "Other commit",
+        };
+        writeln!(
+            history,
+            "commit refs/heads/main\ncommitter Reviewer <reviewer@example.invalid> {} +0000\ndata {}\n{subject}\n",
+            1_700_000_000 + index,
+            subject.len()
+        )?;
+    }
+    history.rewind()?;
+    let status = Command::new("git")
+        .arg("-C")
+        .arg(&root)
+        .args(["fast-import", "--quiet"])
+        .stdin(history)
+        .status()?;
+    assert!(status.success());
+
+    let mut app = TestAppContext::build_with_text_system(
+        TestDispatcher::new(0),
+        None,
+        gpui_platform::current_platform(true).text_system(),
+    );
+    app.update(gpui_component::init);
+    let store = Arc::new(Store::new(fixture.path().join("state"))?);
+    let config = crate::config::ConfigFile::load(Some(fixture.path().join("config.toml")));
+    let (workspace, visual) = app.add_window_view(|window, cx| {
+        Workspace::with_config(store, config, WorkspaceView::Git, window, cx)
+    });
+    let draw = |visual: &mut VisualTestContext| {
+        for _ in 0..3 {
+            visual.run_until_parked();
+            visual.update(|window, cx| window.draw(cx).clear(cx));
+        }
+    };
+    visual.simulate_resize(size(px(1280.), px(760.)));
+    visual.update(|window, cx| {
+        cx.set_reduce_motion(true);
+        workspace.update(cx, |workspace, cx| {
+            workspace.open_repository(Location { root, file: None }, window, cx)
+        });
+    });
+    draw(visual);
+    let panel = visual.update(|_, cx| workspace.read(cx).git.clone().unwrap());
+    let search = |visual: &mut VisualTestContext, query: &str| {
+        let input = visual.debug_bounds("git-commit-search").unwrap().center();
+        visual.simulate_click(input, Modifiers::default());
+        visual.simulate_keystrokes("ctrl-a backspace");
+        if !query.is_empty() {
+            visual.simulate_input(query);
+        }
+        visual.simulate_keystrokes("enter");
+        draw(visual);
+        visual.update(|_, cx| assert_eq!(panel.read(cx).query, query));
+    };
+    let choose = |visual: &mut VisualTestContext, subject, modifiers| {
+        let (oid, position) = visual.update(|_, cx| {
+            let panel = panel.read(cx);
+            let index = panel
+                .commits
+                .iter()
+                .position(|row| row.subject.as_str() == subject)
+                .unwrap();
+            let bounds = panel.history_scroll.bounds_for_item(index + 1).unwrap();
+            (panel.commits[index].oid.clone(), bounds.center())
+        });
+        visual.simulate_click(position, modifiers);
+        draw(visual);
+        oid
+    };
+    let assert_revealed = |visual: &mut VisualTestContext, oid: &SharedString| {
+        visual.update(|_, cx| {
+            let panel = panel.read(cx);
+            let index = panel
+                .commits
+                .iter()
+                .position(|row| &row.oid == oid)
+                .unwrap()
+                + 1;
+            assert!(panel.history_scroll.visible_range().contains(&index));
+            assert_eq!(
+                panel.selection.as_ref().and_then(Selection::focused_commit),
+                Some(oid.as_str())
+            );
+        });
+    };
+    let viewport_position = |visual: &mut VisualTestContext| {
+        visual.update(|_, cx| panel.read(cx).history_view_position().unwrap())
+    };
+
+    visual.update(|window, cx| {
+        panel.read(cx).history_scroll.scroll_to(ListOffset {
+            item_ix: 7,
+            offset_in_item: px(9.),
+        });
+        window.refresh();
+    });
+    draw(visual);
+    let before_search = viewport_position(visual);
+    assert_eq!(before_search.inset, 9.);
+    search(visual, "Other");
+    search(visual, "no matching result");
+    search(visual, "");
+    assert_eq!(viewport_position(visual), before_search);
+
+    search(visual, "Buried");
+    let buried = choose(visual, "Buried commit", Modifiers::default());
+    let input = visual.debug_bounds("git-commit-search").unwrap();
+    visual.simulate_click(
+        point(input.right() - px(20.), input.center().y),
+        Modifiers::default(),
+    );
+    visual.executor().advance_clock(Duration::from_millis(300));
+    draw(visual);
+    visual.update(|_, cx| assert!(panel.read(cx).query.is_empty()));
+    assert_revealed(visual, &buried);
+    visual.update(|_, cx| assert!(panel.read(cx).commits.len() > 31 * git::PAGE_SIZE));
+
+    let shift = Modifiers {
+        shift: true,
+        ..Default::default()
+    };
+    let additive = Modifiers {
+        control: true,
+        ..Default::default()
+    };
+    search(visual, "Match");
+    let oldest = choose(visual, "Match oldest", Modifiers::default());
+    let latest = choose(visual, "Match latest", shift);
+    let middle = visual.update(|_, cx| panel.read(cx).commits[1].oid.clone());
+    search(visual, "");
+    assert_revealed(visual, &latest);
+    visual.update(|_, cx| {
+        let panel = panel.read(cx);
+        let expected = [oldest.clone(), middle.clone(), latest.clone()].into();
+        assert_eq!(panel.history_pick.rows.as_deref(), Some(&expected));
+        assert!(panel.commits.iter().any(|row| row.oid == oldest));
+        assert!(matches!(panel.selection, Some(Selection::Commit(..))));
+    });
+
+    search(visual, "Match");
+    choose(visual, "Match latest", Modifiers::default());
+    choose(visual, "Match middle", additive);
+    choose(visual, "Match oldest", additive);
+    choose(visual, "Match oldest", additive);
+    search(visual, "");
+    assert_revealed(visual, &middle);
+    visual.update(|_, cx| {
+        let expected = [middle, latest].into();
+        assert_eq!(panel.read(cx).history_pick.rows.as_deref(), Some(&expected));
+    });
+
+    // A saved viewport can start on one page and extend into the next.
+    visual.update(|window, cx| {
+        panel.update(cx, |panel, cx| panel.load_commits(true, window, cx));
+    });
+    draw(visual);
+    visual.update(|window, cx| {
+        panel.read(cx).history_scroll.scroll_to(ListOffset {
+            item_ix: git::PAGE_SIZE - 5,
+            offset_in_item: px(9.),
+        });
+        window.refresh();
+    });
+    draw(visual);
+    let before_search = viewport_position(visual);
+    assert_eq!(before_search.inset, 9.);
+    assert_eq!(
+        visual.update(|_, cx| panel.read(cx).commits.len()),
+        2 * git::PAGE_SIZE
+    );
+    search(visual, "Match");
+    choose(visual, "Match latest", Modifiers::default());
+    choose(visual, "Match latest", additive);
+    search(visual, "");
+    assert_eq!(viewport_position(visual), before_search);
+    visual.update(|_, cx| {
+        assert!(
+            panel
+                .read(cx)
+                .history_pick
+                .rows
+                .as_deref()
+                .unwrap()
+                .is_empty()
+        )
+    });
+    Ok(())
+}
+
+#[::core::prelude::v1::test]
 fn commit_history_renders_at_multiple_scales() -> Result<()> {
     let fixture = tempfile::tempdir()?;
     create_history(fixture.path(), None);

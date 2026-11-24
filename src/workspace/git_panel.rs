@@ -276,6 +276,31 @@ struct PaneLayout {
     show_tree: bool,
 }
 
+struct HistoryViewport {
+    position: HistoryPosition,
+    visible_rows: usize,
+}
+
+enum HistoryRestore {
+    Session {
+        position: HistoryPosition,
+        pages: usize,
+    },
+    Search {
+        viewport: HistoryViewport,
+        fallback: Option<HistoryViewport>,
+    },
+}
+
+impl HistoryRestore {
+    fn position(&self) -> &HistoryPosition {
+        match self {
+            Self::Session { position, .. } => position,
+            Self::Search { viewport, .. } => &viewport.position,
+        }
+    }
+}
+
 pub(super) struct GitPanel {
     root: PathBuf,
     repository: Arc<Repository>,
@@ -306,8 +331,8 @@ pub(super) struct GitPanel {
     history_progress: Option<git::HistoryProgress>,
     history_rewrite: Option<git::RewriteRecord>,
     startup_session: Option<GitSession>,
-    restore_history: Option<HistoryPosition>,
-    restore_pages: usize,
+    restore_history: Option<HistoryRestore>,
+    history_before_search: Option<HistoryViewport>,
     history_pane: Entity<GitPane>,
     review_pane: Entity<GitPane>,
     tree_pane: Entity<GitPane>,
@@ -562,7 +587,7 @@ impl GitPanel {
             history_rewrite: None,
             startup_session: session.git.clone(),
             restore_history: None,
-            restore_pages: 0,
+            history_before_search: None,
             history_pane,
             review_pane,
             tree_pane,
@@ -846,6 +871,10 @@ impl GitPanel {
                                 .iter()
                                 .any(|branch| branch.reference == this.branch)
                         {
+                            if this.branch != checkout {
+                                this.history_before_search = None;
+                                this.restore_history = None;
+                            }
                             this.branch = checkout.to_owned();
                         }
                         let mut items = Vec::new();
@@ -879,7 +908,10 @@ impl GitPanel {
                             && items.iter().any(|item| item.value == state.reference)
                         {
                             this.branch.clone_from(&state.reference);
-                            this.restore_history = state.history.clone();
+                            this.restore_history = state
+                                .history
+                                .clone()
+                                .map(|position| HistoryRestore::Session { position, pages: 0 });
                         }
                         let selected = this.branch.clone();
                         this.branches.update(cx, |state, cx| {
@@ -1076,6 +1108,7 @@ impl GitPanel {
         self.history_pick.clear();
         self.branch = branch;
         self.restore_history = None;
+        self.history_before_search = None;
         self.history_scroll.reset(0);
         self.commits = Rc::default();
         self.graph = Rc::default();
@@ -1091,9 +1124,37 @@ impl GitPanel {
         if self.query == query {
             return;
         }
+        if query.is_empty() {
+            let fallback = self.history_before_search.take();
+            self.restore_history = match self.history_pick.finish_search() {
+                Some(oid) => Some(HistoryRestore::Search {
+                    viewport: HistoryViewport {
+                        position: HistoryPosition {
+                            oid: Some(oid.to_string()),
+                            inset: 0.,
+                        },
+                        visible_rows: 1,
+                    },
+                    fallback,
+                }),
+                None => fallback.map(|viewport| HistoryRestore::Search {
+                    viewport,
+                    fallback: None,
+                }),
+            };
+        } else {
+            if self.query.is_empty() {
+                self.history_before_search =
+                    self.history_view_position()
+                        .map(|position| HistoryViewport {
+                            position,
+                            visible_rows: self.history_scroll.visible_range().len(),
+                        });
+            }
+            self.restore_history = None;
+            self.clear_history_selection(window, cx);
+        }
         self.query = query;
-        self.clear_history_selection(window, cx);
-        self.restore_history = None;
         self.history_scroll.reset(0);
         self.commits = Rc::default();
         self.graph = Rc::default();
@@ -1226,20 +1287,25 @@ impl GitPanel {
         cx.notify();
     }
 
-    pub(super) fn session(&self, cx: &App) -> Option<GitSession> {
+    fn history_view_position(&self) -> Option<HistoryPosition> {
+        if let Some(restore) = &self.restore_history {
+            return Some(restore.position().clone());
+        }
         self.history.as_ref()?;
         let top = self.history_scroll.logical_scroll_top();
-        let history = self.restore_history.clone().or_else(|| {
-            let oid = if top.item_ix == 0 {
-                None
-            } else {
-                Some(self.commits.get(top.item_ix - 1)?.oid.to_string())
-            };
-            Some(HistoryPosition {
-                oid,
-                inset: top.offset_in_item.into(),
-            })
-        });
+        let oid = if top.item_ix == 0 {
+            None
+        } else {
+            Some(self.commits.get(top.item_ix - 1)?.oid.to_string())
+        };
+        Some(HistoryPosition {
+            oid,
+            inset: top.offset_in_item.into(),
+        })
+    }
+
+    pub(super) fn session(&self, cx: &App) -> Option<GitSession> {
+        self.history.as_ref()?;
         let selection = self.selection.clone();
         let diff = self
             .loading_session_diff
@@ -1257,7 +1323,7 @@ impl GitPanel {
             query: self.query.clone(),
             diff: diff.filter(|_| !matches!(selection, Some(Selection::CommitRange { .. }))),
             selection: selection.map(Selection::without_commit_range),
-            history,
+            history: self.history_view_position(),
             worktree_directories: self.worktree_directories.clone(),
             worktree_collapsed_files: self
                 .review
@@ -1284,17 +1350,56 @@ impl GitPanel {
         })
     }
 
+    fn ready_history_restore(&self) -> Option<ListOffset> {
+        let restore = self.restore_history.as_ref()?;
+        let position = self.history_position(restore.position())?;
+        if let HistoryRestore::Search { viewport, .. } = restore
+            && self.more
+        {
+            // Keep the list from clamping the saved viewport to the end of a page.
+            let item_count = self.commits.len() + usize::from(self.history.is_some());
+            if item_count - position.item_ix < viewport.visible_rows {
+                return None;
+            }
+            // Batch actions need every selected commit, even those beyond the viewport.
+            if self.history_pick.rows.as_ref().is_some_and(|rows| {
+                self.commits
+                    .iter()
+                    .filter(|row| rows.contains(&row.oid))
+                    .count()
+                    < rows.len()
+            }) {
+                return None;
+            }
+        }
+        Some(position)
+    }
+
     fn continue_history_restore(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         const RESTORE_PAGE_LIMIT: usize = 30;
-        if let Some(saved) = &self.restore_history
-            && self.history_position(saved).is_none()
-        {
-            if self.more && self.restore_pages < RESTORE_PAGE_LIMIT {
-                self.restore_pages += 1;
+        if self.ready_history_restore().is_some() {
+            return;
+        }
+        match &mut self.restore_history {
+            Some(HistoryRestore::Session { pages, .. })
+                if self.more && *pages < RESTORE_PAGE_LIMIT =>
+            {
+                *pages += 1;
                 self.load_commits(true, window, cx);
-            } else {
-                self.restore_history = None;
             }
+            Some(HistoryRestore::Search { .. }) if self.more => {
+                self.load_commits(true, window, cx);
+            }
+            Some(HistoryRestore::Search { fallback, .. }) => {
+                self.restore_history = fallback
+                    .take()
+                    .filter(|viewport| self.history_position(&viewport.position).is_some())
+                    .map(|viewport| HistoryRestore::Search {
+                        viewport,
+                        fallback: None,
+                    });
+            }
+            _ => self.restore_history = None,
         }
     }
 
@@ -1311,10 +1416,7 @@ impl GitPanel {
             self.history_scroll.remeasure();
             self.history_geometry = Some(geometry);
         }
-        let position = self
-            .restore_history
-            .as_ref()
-            .and_then(|saved| self.history_position(saved));
+        let position = self.ready_history_restore();
         let history = self.history.as_ref();
         let commits = self.commits.clone();
         let graph = self.graph.clone();
@@ -1801,6 +1903,11 @@ impl GitPanel {
         cx: &mut Context<Self>,
     ) {
         self.history_pick.clear();
+        if !self.query.is_empty()
+            && let Some(oid) = target
+        {
+            self.history_pick.record_search_pick(oid.into());
+        }
         let current = self.selection.as_ref().filter(|selection| {
             !matches!(selection, Selection::CommitRange { .. })
                 && selection.target_commit() == target

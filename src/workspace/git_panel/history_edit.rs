@@ -15,11 +15,33 @@ pub(super) struct HistoryPick {
     pub rows: Option<Rc<BTreeSet<SharedString>>>,
     anchor: Option<SharedString>,
     cursor: Option<SharedString>,
+    search_picks: Vec<SharedString>,
 }
 
 impl HistoryPick {
     pub(super) fn clear(&mut self) {
         *self = Self::default();
+    }
+
+    pub(super) fn record_search_pick(&mut self, oid: SharedString) {
+        self.search_picks.retain(|picked| picked != &oid);
+        self.search_picks.push(oid);
+    }
+
+    pub(super) fn finish_search(&mut self) -> Option<SharedString> {
+        let target = self.search_picks.pop();
+        self.search_picks.clear();
+        if let Some(oid) = &target {
+            self.cursor = Some(oid.clone());
+            if self.anchor.as_ref().is_some_and(|anchor| {
+                self.rows
+                    .as_ref()
+                    .is_some_and(|rows| !rows.contains(anchor))
+            }) {
+                self.anchor = Some(oid.clone());
+            }
+        }
+        target
     }
 }
 
@@ -176,15 +198,29 @@ impl GitPanel {
             pick.anchor = Some(oid.clone());
         }
         pick.cursor = Some(oid.clone());
-        let target = if !rows.contains(oid) {
-            self.commits
-                .iter()
-                .find(|row| rows.contains(&row.oid))
-                .map(|row| &row.oid)
-                .unwrap_or(oid)
-        } else {
+        let clicked_selected = rows.contains(oid);
+        let target = if clicked_selected {
             oid
+        } else {
+            pick.search_picks
+                .iter()
+                .rev()
+                .find(|picked| rows.contains(*picked))
+                .or_else(|| {
+                    self.commits
+                        .iter()
+                        .find(|row| rows.contains(&row.oid))
+                        .map(|row| &row.oid)
+                })
+                .unwrap_or(oid)
         };
+        let target = target.clone();
+        if !self.query.is_empty() {
+            pick.search_picks.retain(|picked| rows.contains(picked));
+            if !rows.is_empty() {
+                pick.record_search_pick(target.clone());
+            }
+        }
         let target = target.to_string();
         let rows = Rc::new(rows);
         pick.rows = Some(rows.clone());
