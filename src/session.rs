@@ -63,7 +63,6 @@ pub(crate) struct WorktreeSession {
 #[serde(default)]
 pub(crate) struct TerminalSession {
     pub open: bool,
-    pub docs_open: bool,
     pub active: Option<u32>,
     pub tabs: Vec<TerminalTab>,
 }

@@ -1265,9 +1265,9 @@ mod tests {
 
     use gpui::{
         AppContext as _, ClipboardItem, Context, Entity, EntityInputHandler as _, FocusHandle,
-        Focusable as _, Hsla, InteractiveElement as _, IntoElement, KeyBinding, Modifiers,
-        MouseButton, ParentElement as _, Pixels, Render, Styled, TestAppContext, TestDispatcher,
-        VisualTestContext, Window, div, point, px, rgb, size,
+        Focusable as _, Hsla, InteractiveElement as _, IntoElement, KeyBinding, Keystroke,
+        Modifiers, MouseButton, ParentElement as _, Pixels, Render, Styled, TestAppContext,
+        TestDispatcher, VisualTestContext, Window, div, point, px, rgb, size,
     };
     use gpui_component::{ActiveTheme as _, Root};
 
@@ -1275,6 +1275,7 @@ mod tests {
     use crate::{
         config::ConfigFile,
         repository::{Repository, Store},
+        session::EditorPreviewMode,
         workspace::{NextTab, PreviousTab, Workspace, WorkspaceView},
     };
 
@@ -1549,7 +1550,7 @@ mod tests {
     }
 
     #[gpui::test]
-    fn docs_share_terminal_input_and_restore_worktree_tabs(cx: &mut TestAppContext) {
+    fn docs_shortcut_opens_workspace_terminal_and_restores_worktree_tabs(cx: &mut TestAppContext) {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("repo");
         assert!(
@@ -1567,6 +1568,8 @@ mod tests {
             format!("# Commands\n\n```sh\n{snippet}\n```\n"),
         )
         .unwrap();
+        let workspace_path = Path::new("guide.md");
+        fs::write(root.join(workspace_path), "# Workspace guide\n").unwrap();
         fs::create_dir(root.join("examples")).unwrap();
         let store = Arc::new(Store::new(temp.path().join("state")).unwrap());
         let config_path = temp.path().join("config.toml");
@@ -1576,11 +1579,15 @@ mod tests {
             let mut workspace = None;
             let (_, visual) = cx.add_window_view(|window, cx| {
                 let config = ConfigFile::load(Some(config_path.clone()));
-                let view = cx.new(|cx| {
-                    Workspace::with_config(store.clone(), config, WorkspaceView::Docs, window, cx)
-                });
+                let page = saved.view.unwrap_or(WorkspaceView::Docs);
+                let file = (page == WorkspaceView::Docs).then(|| doc_path.into());
+                let view =
+                    cx.new(|cx| Workspace::with_config(store.clone(), config, page, window, cx));
                 view.update(cx, |view, cx| {
-                    view.apply_repository(repo, saved, Some(doc_path.into()), None, window, cx);
+                    view.apply_repository(repo, saved, file, None, window, cx);
+                    // Keep native filesystem events out of the deterministic UI scheduler.
+                    view.repository_watch_pending = false;
+                    view.repository_watch = gpui::Task::ready(());
                     if let Some(panel) = view.current_terminal() {
                         for tab in &panel.tabs {
                             tab.session.update(cx, |session, _| {
@@ -1600,19 +1607,42 @@ mod tests {
         cx.update(|cx| {
             gpui_component::init(cx);
             Workspace::bind_terminal_keys(cx);
-            cx.bind_keys([KeyBinding::new(
-                "ctrl-2",
-                crate::workspace::SwitchWorkspaceView(WorkspaceView::Editor),
-                None,
-            )]);
+            cx.bind_keys([
+                KeyBinding::new(
+                    "ctrl-1",
+                    crate::workspace::SwitchWorkspaceView(WorkspaceView::Docs),
+                    None,
+                ),
+                KeyBinding::new(
+                    "ctrl-2",
+                    crate::workspace::SwitchWorkspaceView(WorkspaceView::Editor),
+                    None,
+                ),
+            ]);
         });
-        let workspace = open_workspace(cx, Default::default());
+        let mut initial = crate::session::WorktreeSession::default();
+        initial.tabs.open(workspace_path.into(), false);
+        initial
+            .editor_previews
+            .insert(workspace_path.into(), EditorPreviewMode::Full);
+        let workspace = open_workspace(cx, initial);
         let mut visual = VisualTestContext::from_window(*cx.windows().last().unwrap(), cx);
         visual.run_until_parked();
         let repo = Repository::open(&root).unwrap();
+        assert!(visual.debug_bounds("terminal-toolbar").is_none());
+        let copy = visual
+            .debug_bounds("docs-copy-code")
+            .expect("document code block is visible");
+        visual.simulate_click(copy.center(), Modifiers::none());
+        let copied = visual.update(|_, cx| cx.read_from_clipboard().unwrap().text().unwrap());
+        assert_eq!(copied.trim_end(), snippet);
+
         let (session, commands) = visual.update(|window, cx| {
+            window.dispatch_keystroke(Keystroke::parse("ctrl-`").unwrap(), cx);
             workspace.update(cx, |view, cx| {
-                view.show_terminal(window, cx);
+                assert_eq!(view.view, WorkspaceView::Editor);
+                assert_eq!(view.tabs.active(), Some(workspace_path));
+                assert!(view.terminal_focused(window, cx));
                 let session = view.current_terminal().unwrap().tabs[0].session.clone();
                 let (command_tx, commands) = mpsc::channel();
                 session.update(cx, |session, _| {
@@ -1632,28 +1662,14 @@ mod tests {
                     #[cfg(unix)]
                     session.last_directory.replace(Some(root.join("examples")));
                 });
-                view.hide_terminal(window, cx);
                 (session, commands)
             })
         });
+        visual.run_until_parked();
         visual.update(|window, cx| window.draw(cx).clear(cx));
-        let copy = visual
-            .debug_bounds("docs-copy-code")
-            .expect("document code block is visible");
-        visual.simulate_click(copy.center(), Modifiers::none());
-        let copied = visual.update(|_, cx| cx.read_from_clipboard().unwrap().text().unwrap());
-        assert_eq!(copied.trim_end(), snippet);
-        assert!(
-            !commands
-                .try_iter()
-                .any(|command| matches!(command, Command::Input(_)))
-        );
-
-        assert!(visual.debug_bounds("document-terminal").is_none());
-        visual.simulate_keystrokes("ctrl-`");
+        assert!(visual.debug_bounds("terminal-toolbar").is_some());
         visual.update(|window, cx| {
             let view = workspace.read(cx);
-            assert_eq!(view.view, WorkspaceView::Docs);
             assert!(view.terminal_focused(window, cx));
         });
         #[cfg(target_os = "macos")]
@@ -1678,42 +1694,54 @@ mod tests {
                 view.current_terminal_mut().unwrap().maximized = true;
             });
         });
-        visual.simulate_keystrokes("ctrl-2");
+        visual.simulate_keystrokes("ctrl-1");
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+        assert!(visual.debug_bounds("terminal-toolbar").is_none());
+        assert!(visual.debug_bounds("docs-copy-code").is_some());
         assert!(
             !commands
                 .try_iter()
                 .any(|command| matches!(command, Command::Input(_)))
         );
         visual.update(|window, cx| {
+            let view = workspace.read(cx);
+            assert_eq!(view.view, WorkspaceView::Docs);
+            assert!(!view.terminal_focused(window, cx));
+            assert_eq!(view.current_terminal().unwrap().tabs[0].session, session);
+        });
+        visual.simulate_keystrokes("ctrl-2");
+        visual.run_until_parked();
+        let reader_focus = visual.update(|window, cx| {
+            let view = workspace.read(cx);
+            assert_eq!(view.view, WorkspaceView::Editor);
+            assert!(!view.terminal_maximized());
+            assert!(view.terminal_open());
+            assert_eq!(view.current_terminal().unwrap().tabs[0].session, session);
+            let reader = view.active_markdown_preview().unwrap().clone();
+            reader.update(cx, |reader, cx| reader.focus_content(window, cx));
+            window.focused(cx).unwrap()
+        });
+        visual.simulate_keystrokes("ctrl-` ctrl-`");
+        visual.update(|window, cx| {
+            assert!(!workspace.read(cx).terminal_open());
+            assert!(reader_focus.is_focused(window));
+        });
+
+        visual.simulate_keystrokes("ctrl-`");
+        visual.update(|window, cx| {
             workspace.update(cx, |view, cx| {
-                assert_eq!(view.view, WorkspaceView::Editor);
-                assert!(!view.terminal_maximized());
-                assert!(!view.terminal_open());
-                view.show_terminal(window, cx);
-                assert!(view.terminal_open());
-                assert_eq!(view.current_terminal().unwrap().tabs[0].session, session);
-                view.switch_view(WorkspaceView::Docs, window, cx);
-                assert_eq!(view.current_terminal().unwrap().tabs[0].session, session);
                 view.create_terminal(window, cx);
                 view.close_active_terminal(window, cx);
                 view.create_terminal(window, cx);
                 assert_eq!(view.current_terminal().unwrap().tabs[1].number, 3);
-                view.doc
-                    .as_ref()
-                    .unwrap()
-                    .update(cx, |doc, cx| doc.focus_content(window, cx));
-                assert!(!view.terminal_focused(window, cx));
-                view.toggle_terminal_shortcut(&crate::workspace::ToggleTerminal, window, cx);
-                assert!(!view.terminal_open());
-                assert!(!view.terminal_focused(window, cx));
+                view.switch_view(WorkspaceView::Docs, window, cx);
                 view.flush_session(cx).unwrap();
             });
         });
-        let saved = store.session(&repo).unwrap();
+        let mut saved = store.session(&repo).unwrap();
         assert_eq!(saved.view, Some(WorkspaceView::Docs));
         let terminal = saved.terminal.as_ref().unwrap();
         assert!(terminal.open);
-        assert!(!terminal.docs_open);
         assert_eq!(terminal.active, Some(3));
         assert_eq!(
             terminal
@@ -1730,8 +1758,13 @@ mod tests {
             Some(Path::new("examples"))
         );
 
+        let mut legacy = serde_json::to_value(terminal).unwrap();
+        legacy["docs_open"] = true.into();
+        saved.terminal = Some(serde_json::from_value(legacy).unwrap());
         let reopened = open_workspace(cx, saved);
         let mut visual = VisualTestContext::from_window(*cx.windows().last().unwrap(), cx);
+        visual.run_until_parked();
+        assert!(visual.debug_bounds("terminal-toolbar").is_none());
         visual.update(|_, cx| {
             let view = reopened.read(cx);
             assert!(!view.terminal_open());
@@ -1747,7 +1780,8 @@ mod tests {
         visual.simulate_keystrokes("ctrl-`");
         visual.update(|window, cx| {
             let view = reopened.read(cx);
-            assert_eq!(view.view, WorkspaceView::Docs);
+            assert_eq!(view.view, WorkspaceView::Editor);
+            assert_eq!(view.tabs.active(), Some(workspace_path));
             assert!(view.terminal_focused(window, cx));
             reopened.update(cx, |view, cx| view.flush_session(cx).unwrap());
         });
@@ -1757,7 +1791,7 @@ mod tests {
         visual.run_until_parked();
         visual.update(|window, cx| {
             let view = visible.read(cx);
-            assert_eq!(view.view, WorkspaceView::Docs);
+            assert_eq!(view.view, WorkspaceView::Editor);
             assert!(view.terminal_open());
             assert!(!view.terminal_focused(window, cx));
             let panel = view.current_terminal().unwrap();

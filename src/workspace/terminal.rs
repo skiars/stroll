@@ -83,8 +83,7 @@ pub(super) struct Terminals {
 struct Panel {
     root: PathBuf,
     saved: Option<TerminalSession>,
-    editor_open: bool,
-    docs_open: bool,
+    open: bool,
     maximized: bool,
     focus: FocusHandle,
     resizer_focus: FocusHandle,
@@ -100,8 +99,7 @@ impl Panel {
         Self {
             root: repo.root.clone(),
             saved: None,
-            editor_open: false,
-            docs_open: false,
+            open: false,
             maximized: false,
             focus: cx.focus_handle(),
             resizer_focus: cx.focus_handle().tab_stop(true),
@@ -113,27 +111,10 @@ impl Panel {
         }
     }
 
-    fn is_open(&self, view: WorkspaceView) -> bool {
-        match view {
-            WorkspaceView::Editor => self.editor_open,
-            WorkspaceView::Docs => self.docs_open,
-            WorkspaceView::Git => false,
-        }
-    }
-
-    fn set_open(&mut self, view: WorkspaceView, open: bool) {
-        match view {
-            WorkspaceView::Editor => self.editor_open = open,
-            WorkspaceView::Docs => self.docs_open = open,
-            WorkspaceView::Git => {}
-        }
-    }
-
     fn snapshot(&self, restore_scrollback: bool, cx: &App) -> Option<TerminalSession> {
         let active = self.tabs.get(self.active)?.number;
         Some(TerminalSession {
-            open: self.editor_open,
-            docs_open: self.docs_open,
+            open: self.open,
             active: Some(active),
             tabs: self
                 .tabs
@@ -242,27 +223,28 @@ impl Workspace {
             .get_mut(self.repository.as_ref()?.storage_key())
     }
 
+    fn visible_terminal(&self) -> Option<&Panel> {
+        self.current_terminal()
+            .filter(|panel| self.view == WorkspaceView::Editor && panel.open)
+    }
+
     pub(super) fn terminal_focused(&self, window: &Window, cx: &App) -> bool {
-        matches!(self.view, WorkspaceView::Editor | WorkspaceView::Docs)
-            && self.current_terminal().is_some_and(|panel| {
-                panel.is_open(self.view)
-                    && (panel.focus.contains_focused(window, cx)
-                        || panel.tabs[panel.active]
-                            .session
-                            .read(cx)
-                            .focus
-                            .is_focused(window))
-            })
+        self.visible_terminal().is_some_and(|panel| {
+            panel.focus.contains_focused(window, cx)
+                || panel.tabs[panel.active]
+                    .session
+                    .read(cx)
+                    .focus
+                    .is_focused(window)
+        })
     }
 
     pub(super) fn terminal_maximized(&self) -> bool {
-        self.current_terminal()
-            .is_some_and(|panel| panel.is_open(self.view) && panel.maximized)
+        self.visible_terminal().is_some_and(|panel| panel.maximized)
     }
 
     pub(super) fn terminal_open(&self) -> bool {
-        self.current_terminal()
-            .is_some_and(|panel| panel.is_open(self.view))
+        self.visible_terminal().is_some()
     }
 
     pub(super) fn terminal_view_changed(&mut self) {
@@ -346,10 +328,7 @@ impl Workspace {
             .iter()
             .position(|tab| Some(tab.number) == saved.active)
             .unwrap_or(0);
-        if !panel.tabs.is_empty() {
-            panel.editor_open = saved.open;
-            panel.docs_open = saved.docs_open;
-        }
+        panel.open = !panel.tabs.is_empty() && saved.open;
         self.terminals.panels.insert(key, panel);
     }
 
@@ -375,9 +354,7 @@ impl Workspace {
         {
             return;
         }
-        if self.view == WorkspaceView::Docs {
-            self.toggle_terminal_menu(window, cx);
-        } else if self.terminal_focused(window, cx) {
+        if self.terminal_focused(window, cx) {
             self.hide_terminal(window, cx);
         } else {
             self.show_terminal(window, cx);
@@ -402,7 +379,7 @@ impl Workspace {
         let Some(repo) = self.repository.clone() else {
             return;
         };
-        if self.view == WorkspaceView::Git {
+        if self.view != WorkspaceView::Editor {
             self.switch_view(WorkspaceView::Editor, window, cx);
         }
         let previous_focus = window
@@ -419,7 +396,7 @@ impl Workspace {
         if panel.tabs.is_empty() {
             self.create_terminal(window, cx);
         } else {
-            panel.set_open(self.view, true);
+            panel.open = true;
             focus_session(&panel.tabs[panel.active].session, window, cx);
             cx.notify();
         }
@@ -452,7 +429,7 @@ impl Workspace {
         panel.next_number = number.checked_add(1).unwrap_or(1);
         panel.active = panel.tabs.len();
         panel.tabs.push(tab);
-        panel.set_open(self.view, true);
+        panel.open = true;
         cx.notify();
     }
 
@@ -489,8 +466,7 @@ impl Workspace {
                     SessionEvent::StatusChanged => cx.notify(),
                     SessionEvent::OpenFile { path, position } => {
                         let Some(repo) = this.repository.as_ref().filter(|repo| {
-                            repo.storage_key() == key
-                                && matches!(this.view, WorkspaceView::Editor | WorkspaceView::Docs)
+                            repo.storage_key() == key && this.view == WorkspaceView::Editor
                         }) else {
                             return;
                         };
@@ -501,20 +477,15 @@ impl Workspace {
                             return;
                         }
                         match terminal_file_key(repo, path) {
-                            Ok(path) => {
-                                if this.view == WorkspaceView::Docs {
-                                    this.switch_view(WorkspaceView::Editor, window, cx);
-                                }
-                                this.request_file(
-                                    path,
-                                    FileOpen::Select {
-                                        preview: false,
-                                        position: Some(SourcePosition::Terminal(*position)),
-                                    },
-                                    window,
-                                    cx,
-                                );
-                            }
+                            Ok(path) => this.request_file(
+                                path,
+                                FileOpen::Select {
+                                    preview: false,
+                                    position: Some(SourcePosition::Terminal(*position)),
+                                },
+                                window,
+                                cx,
+                            ),
                             Err(error) => this.show_error(error, window, cx),
                         }
                     }
@@ -549,13 +520,12 @@ impl Workspace {
             self.terminals.retired.push(process);
         }
         if panel.tabs.is_empty() {
-            panel.editor_open = false;
-            panel.docs_open = false;
+            panel.open = false;
             panel.maximized = false;
             panel.active = 0;
             let previous = panel.previous_focus.take();
             if take_focus {
-                self.restore_terminal_focus(previous, window, cx);
+                self.focus_workspace_content(previous, window, cx);
             }
         } else {
             if index < panel.active || panel.active == panel.tabs.len() {
@@ -585,40 +555,14 @@ impl Workspace {
     }
 
     fn hide_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let view = self.view;
-        if let Some(panel) = self
-            .current_terminal_mut()
-            .filter(|panel| panel.is_open(view))
+        if self.view == WorkspaceView::Editor
+            && let Some(panel) = self.current_terminal_mut().filter(|panel| panel.open)
         {
-            panel.set_open(view, false);
+            panel.open = false;
             panel.maximized = false;
             let previous = panel.previous_focus.take();
-            self.restore_terminal_focus(previous, window, cx);
+            self.focus_workspace_content(previous, window, cx);
             cx.notify();
-        }
-    }
-
-    fn restore_terminal_focus(
-        &self,
-        previous: Option<FocusHandle>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if self.view == WorkspaceView::Editor
-            && let Some(file) = self.active_file()
-        {
-            file.editor
-                .update(cx, |editor, cx| editor.focus(window, cx));
-        } else if let Some(previous) =
-            previous.filter(|previous| self.focus.contains(previous, window))
-        {
-            previous.focus(window, cx);
-        } else if self.view == WorkspaceView::Docs
-            && let Some(doc) = &self.doc
-        {
-            doc.update(cx, |doc, cx| doc.focus_content(window, cx));
-        } else {
-            self.focus.focus(window, cx);
         }
     }
 
@@ -699,9 +643,7 @@ impl Workspace {
         colors: Palette,
         cx: &Context<Self>,
     ) -> Option<AnyElement> {
-        let panel = self
-            .current_terminal()
-            .filter(|panel| panel.is_open(self.view))?;
+        let panel = self.visible_terminal()?;
         let dark = cx.theme().mode == gpui_component::ThemeMode::Dark;
         let background = rgb(if dark { 0x17191f } else { 0xffffff });
         let active = &panel.tabs[panel.active];
@@ -921,12 +863,11 @@ impl Workspace {
     pub(super) fn terminal_column(
         &self,
         column: Div,
-        id: &'static str,
         maximum: Pixels,
         cx: &Context<Self>,
     ) -> Stateful<Div> {
         column
-            .id(id)
+            .id("workspace-editor-column")
             .on_drag_move(
                 cx.listener(move |this, event: &DragMoveEvent<ResizeDrag>, _, cx| {
                     if let Some(resize) = &this.terminals.resizing {

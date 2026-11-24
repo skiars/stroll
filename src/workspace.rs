@@ -3975,28 +3975,8 @@ impl Workspace {
                 || self.repository_overlay_open()
                 || self.terminal_focused(window, cx)
                 || (keep_tree_focus && self.tree_focus.is_focused(window));
-            if let Some(file) = self
-                .active_file()
-                .filter(|_| self.active_editor_preview_mode() != EditorPreviewMode::Full)
-            {
-                if !keep_focus {
-                    file.editor
-                        .update(cx, |editor, cx| editor.focus(window, cx));
-                }
-            } else if !keep_focus {
-                if active.is_some_and(|path| {
-                    self.images.contains_key(path)
-                        || (PreviewKind::for_path(path) == Some(PreviewKind::Svg)
-                            && self.active_editor_preview_mode() == EditorPreviewMode::Full)
-                }) {
-                    self.image_viewer_focus.focus(window, cx);
-                } else if self.active_editor_preview_mode() == EditorPreviewMode::Full
-                    && let Some(doc) = self.active_markdown_preview()
-                {
-                    doc.update(cx, |doc, cx| doc.focus_content(window, cx));
-                } else {
-                    self.focus.focus(window, cx);
-                }
+            if !keep_focus {
+                self.focus_workspace_content(None, window, cx);
             }
             if active.is_some() {
                 self.reveal_active_tab();
@@ -4005,6 +3985,30 @@ impl Workspace {
             self.watch_editor_git(window, cx);
         }
         cx.notify();
+    }
+
+    fn focus_workspace_content(
+        &self,
+        fallback: Option<FocusHandle>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let reading = self.active_editor_preview_mode() == EditorPreviewMode::Full;
+        if let Some(file) = self.active_file().filter(|_| !reading) {
+            file.editor
+                .update(cx, |editor, cx| editor.focus(window, cx));
+        } else if self.tabs.active().is_some_and(|path| {
+            self.images.contains_key(path)
+                || (reading && PreviewKind::for_path(path) == Some(PreviewKind::Svg))
+        }) {
+            self.image_viewer_focus.focus(window, cx);
+        } else if reading && let Some(doc) = self.active_markdown_preview() {
+            doc.update(cx, |doc, cx| doc.focus_content(window, cx));
+        } else if let Some(fallback) = fallback.filter(|focus| self.focus.contains(focus, window)) {
+            fallback.focus(window, cx);
+        } else {
+            self.focus.focus(window, cx);
+        }
     }
 
     fn reveal_active_tab(&self) {
@@ -5039,7 +5043,6 @@ impl Workspace {
             } else {
                 main.children(terminal)
             },
-            "workspace-editor-column",
             maximum,
             cx,
         )
@@ -5315,7 +5318,7 @@ impl Workspace {
                         row.child(self.sidebar(tree_width.min(tree_limit), window, cx, colors))
                     })
                     .child(if docs {
-                        self.file_drop_area(self.docs_column(window, cx, colors), cx, colors)
+                        self.file_drop_area(self.docs_content(window, cx, colors), cx, colors)
                             .into_any_element()
                     } else {
                         self.file_drop_area(self.content(window, cx, colors), cx, colors)
@@ -5415,22 +5418,6 @@ impl Workspace {
                     },
                 ),
             )
-    }
-
-    fn docs_column(&self, window: &Window, cx: &Context<Self>, colors: Palette) -> Stateful<Div> {
-        let maximum = terminal::maximum_height(window);
-        let column = v_flex()
-            .relative()
-            .flex_1()
-            .min_w_0()
-            .min_h_0()
-            .h_full()
-            .child(
-                self.docs_content(window, cx, colors)
-                    .when(self.terminal_maximized(), |content| content.invisible()),
-            )
-            .children(self.terminal_panel(maximum, colors, cx));
-        self.terminal_column(column, "workspace-docs-column", maximum, cx)
     }
 
     fn docs_content(&self, window: &Window, cx: &Context<Self>, colors: Palette) -> Stateful<Div> {
