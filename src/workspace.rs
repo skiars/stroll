@@ -279,6 +279,7 @@ pub(crate) struct Palette {
     pub(crate) elevated: Hsla,
     titlebar: Hsla,
     nav_track: Hsla,
+    nav_selected: Hsla,
     pub(crate) soft: Hsla,
     pub(crate) hover: Hsla,
     pub(crate) border: Hsla,
@@ -391,6 +392,11 @@ impl Palette {
                 0x15161a
             })
             .into(),
+            nav_selected: if mode.is_dark() {
+                rgb(0x383838).into()
+            } else {
+                elevated
+            },
             soft,
             hover,
             border,
@@ -5528,7 +5534,7 @@ fn topbar_segment(id: &'static str, active: bool, colors: Palette) -> Button {
         .selected(active)
         .when(active, |button| {
             button
-                .bg(colors.elevated)
+                .bg(colors.nav_selected)
                 .text_color(colors.accent)
                 .shadow_xs()
         })
