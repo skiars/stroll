@@ -16,7 +16,8 @@ use anyhow::{Context as _, Result, ensure};
 use futures_channel::oneshot;
 use gpui::{
     App, AppContext as _, Entity, EntityId, Global, Image, ImageAssetLoader, ImageCacheError,
-    ImageSource, RenderImage, SharedString, SvgRenderer, WeakEntity, Window,
+    ImageContent, ImageFormat as GpuiImageFormat, ImageSource, ParsedSvg, RenderImage,
+    SharedString, SvgRenderer, WeakEntity, Window,
 };
 use gpui_component::text::data_url_image;
 use image::{
@@ -60,7 +61,7 @@ const RETRY_DELAY: Duration = Duration::from_secs(30);
 const MAX_REDIRECTS: usize = 5;
 const IMAGE_ACCEPT: &str = "image/*";
 
-type LoadedImage = std::result::Result<Arc<RenderImage>, ImageCacheError>;
+type LoadedImage = std::result::Result<ImageContent, ImageCacheError>;
 
 #[derive(Clone, PartialEq, Eq, Hash)]
 enum ImageRequest {
@@ -98,10 +99,21 @@ impl DocumentImages {
     pub(super) fn preview_source(&self, uri: &SharedString, cx: &mut App) -> Option<ImageSource> {
         let request = self.request(uri, true)?;
         let display = if matches!(request, ImageRequest::Online { .. }) {
+            if let Some((Ok(ImageContent::Svg(svg, _)), _)) = self
+                .display
+                .read(cx)
+                .results
+                .get(&self.request(uri, false)?)
+            {
+                return Some(online_svg(svg.clone(), true).into());
+            }
             DisplayedImages::new(cx)
         } else {
             if let Some((Ok(image), _)) = self.display.read(cx).results.get(&request) {
-                return Some(ImageSource::Render(image.clone()));
+                return Some(match image {
+                    ImageContent::Raster(image) => ImageSource::Render(image.clone()),
+                    ImageContent::Svg(..) => image.clone().into(),
+                });
             }
             self.display.clone()
         };
@@ -160,26 +172,20 @@ fn request_source(
     block: Option<usize>,
     preview: bool,
 ) -> ImageSource {
-    if preview {
-        ImageSource::Custom(Arc::new(move |window, cx| {
-            use_image(&request, remote.as_ref(), &display, None, true, window, cx)
-        }))
-    } else {
-        ImageSource::deferred(move |visible, window, cx| {
-            use_image(
-                &request,
-                remote.as_ref(),
-                &display,
-                block,
-                visible,
-                window,
-                cx,
-            )
-        })
-    }
+    ImageSource::deferred_content(move |visible, window, cx| {
+        use_image(
+            &request,
+            remote.as_ref(),
+            &display,
+            block,
+            visible || preview,
+            window,
+            cx,
+        )
+    })
 }
 
-// Decoded pixels are owned by the open reader for layout and painting. The
+// Decoded rasters and SVG trees are owned by the open reader. The
 // shared cache stores the original image files, including across app launches.
 #[derive(Default)]
 pub(super) struct DisplayedImages {
@@ -199,7 +205,7 @@ impl DisplayedImages {
                 let images = std::mem::take(&mut images.results);
                 cx.defer(move |cx| {
                     for (result, _) in images.into_values() {
-                        if let Ok(image) = result
+                        if let Ok(ImageContent::Raster(image)) = result
                             && Arc::strong_count(&image) == 1
                         {
                             cx.drop_image(image, None);
@@ -411,10 +417,8 @@ fn use_image(
             Some(
                 cx.background_executor()
                     .spawn(async move {
-                        let image = data_url_image(&uri)
-                            .context("Invalid embedded image")?
-                            .to_image_data(svg)?;
-                        Ok((image, None))
+                        let image = data_url_image(&uri).context("Invalid embedded image")?;
+                        Ok((decode_known_format(&image, &svg)?, None))
                     })
                     .await,
             )
@@ -432,7 +436,13 @@ fn use_image(
                     ImageRequest::Local(path) => {
                         let path = canonical_local_file(&path)?;
                         let bytes = read_local_resource(&path, true, cache.as_ref())?;
-                        ImageAssetLoader::decode(&bytes, &svg)?
+                        if image::guess_format(&bytes).is_ok() {
+                            ImageContent::Raster(ImageAssetLoader::decode(&bytes, &svg)?)
+                        } else {
+                            ImageContent::svg(Arc::new(
+                                svg.parse_svg(&bytes).map_err(anyhow::Error::from)?,
+                            ))
+                        }
                     }
                     ImageRequest::Remote { path, .. } => {
                         let format =
@@ -453,7 +463,7 @@ fn use_image(
                         };
                         let Some(bytes) = bytes else { return Ok(None) };
                         ssh_bytes = Some(bytes.len());
-                        Image::from_bytes(format, bytes).to_image_data(svg)?
+                        decode_known_format(&Image::from_bytes(format, bytes), &svg)?
                     }
                     ImageRequest::Embedded(_) => unreachable!(),
                 };
@@ -499,7 +509,7 @@ fn use_image(
                     cx.notify(view);
                 }
             }
-            if !displayed && let Some(Ok((image, _))) = fetched {
+            if !displayed && let Some(Ok((ImageContent::Raster(image), _))) = fetched {
                 cx.drop_image(image, None);
             }
             for view in pending.waiting_views.drain() {
@@ -537,7 +547,7 @@ fn load_image(
     agent: &Agent,
     svg: &SvgRenderer,
     original: bool,
-) -> Result<Arc<RenderImage>> {
+) -> Result<ImageContent> {
     let downloaded = download(url.clone(), agent, MAX_DOWNLOAD_BYTES, cache)?;
     let image = decode(&downloaded.bytes, svg, original)?;
     if let (Some(cache), Some((key, version))) = (cache, downloaded.index) {
@@ -750,12 +760,25 @@ fn is_public(ip: IpAddr) -> bool {
     }
 }
 
-fn decode(bytes: &[u8], svg: &SvgRenderer, original: bool) -> Result<Arc<RenderImage>> {
+fn decode_known_format(image: &Image, svg: &SvgRenderer) -> Result<ImageContent> {
+    if image.format() == GpuiImageFormat::Svg {
+        Ok(ImageContent::svg(Arc::new(svg.parse_svg(image.bytes())?)))
+    } else {
+        Ok(ImageContent::Raster(image.to_image_data(svg.clone())?))
+    }
+}
+
+fn online_svg(svg: Arc<ParsedSvg>, original: bool) -> ImageContent {
+    let max = if original { 4096 } else { MAX_RENDER_DIMENSION };
+    let dimensions = svg.size();
+    let scale = (max as f32 / f32::from(dimensions.width.max(dimensions.height))).min(1.);
+    ImageContent::Svg(svg, dimensions.map(|extent| extent * scale))
+}
+
+fn decode(bytes: &[u8], svg: &SvgRenderer, original: bool) -> Result<ImageContent> {
     let Ok(format) = image::guess_format(bytes) else {
-        return Ok(svg.render_standalone_svg(
-            str::from_utf8(bytes)?,
-            if original { 4096 } else { MAX_RENDER_DIMENSION },
-        )?);
+        let parsed = svg.parse_standalone_svg(str::from_utf8(bytes)?)?;
+        return Ok(online_svg(Arc::new(parsed), original));
     };
     ensure!(
         matches!(
@@ -795,7 +818,9 @@ fn decode(bytes: &[u8], svg: &SvgRenderer, original: bool) -> Result<Arc<RenderI
     for pixel in image.chunks_exact_mut(4) {
         pixel.swap(0, 2);
     }
-    Ok(Arc::new(RenderImage::new([Frame::new(image)])))
+    Ok(ImageContent::Raster(Arc::new(RenderImage::new([
+        Frame::new(image),
+    ]))))
 }
 
 #[cfg(test)]
@@ -822,7 +847,9 @@ mod tests {
         ] {
             let mut bytes = Cursor::new(Vec::new());
             raster.write_to(&mut bytes, format)?;
-            let image = decode(bytes.get_ref(), &svg, false)?;
+            let ImageContent::Raster(image) = decode(bytes.get_ref(), &svg, false)? else {
+                anyhow::bail!("expected a raster image");
+            };
             assert_eq!(image.as_bytes(0).unwrap().len(), 8 * 4 * 4);
             assert!(
                 image.as_bytes(0).unwrap()[2] > 200,
@@ -833,15 +860,22 @@ mod tests {
         let badge = br#"<svg xmlns="http://www.w3.org/2000/svg" width="3440" height="4">
             <rect width="3440" height="4" fill="red"/>
         </svg>"#;
-        let image = decode(badge, &svg, false)?;
-        assert_eq!(image.as_bytes(0).unwrap().len(), 1720 * 2 * 4);
-        let original = decode(badge, &svg, true)?;
-        assert_eq!(original.as_bytes(0).unwrap().len(), 3440 * 4 * 4);
+        for (original, width) in [(false, 1720.), (true, 3440.)] {
+            let ImageContent::Svg(parsed, layout) = decode(badge, &svg, original)? else {
+                anyhow::bail!("expected a parsed SVG");
+            };
+            assert_eq!(f32::from(parsed.size().width), 3440.);
+            assert_eq!(f32::from(layout.width), width);
+        }
         let raster = DynamicImage::ImageRgba8(RgbaImage::new(2048, 32));
         let mut bytes = Cursor::new(Vec::new());
         raster.write_to(&mut bytes, ImageFormat::Png)?;
-        assert_eq!(decode(bytes.get_ref(), &svg, false)?.size(0).width.0, 1720);
-        assert_eq!(decode(bytes.get_ref(), &svg, true)?.size(0).width.0, 2048);
+        for (original, width) in [(false, 1720), (true, 2048)] {
+            let ImageContent::Raster(image) = decode(bytes.get_ref(), &svg, original)? else {
+                anyhow::bail!("expected a raster image");
+            };
+            assert_eq!(image.size(0).width.0, width);
+        }
         assert!(decode(b"<html>not an image</html>", &svg, false).is_err());
         Ok(())
     }
@@ -856,7 +890,15 @@ mod tests {
             </svg>"#,
             file.path().display()
         );
-        let image = decode(svg.as_bytes(), &SvgRenderer::new(Arc::new(())), false)?;
+        let renderer = SvgRenderer::new(Arc::new(()));
+        let ImageContent::Svg(parsed, _) = decode(svg.as_bytes(), &renderer, false)? else {
+            anyhow::bail!("expected a parsed SVG");
+        };
+        let dimension = gpui::DevicePixels(2);
+        let image = renderer.render_parsed(
+            &parsed,
+            gpui::SvgSize::ExactSize(gpui::size(dimension, dimension)),
+        )?;
         assert_eq!(image.as_bytes(0).unwrap(), &[0; 16]);
         Ok(())
     }
@@ -988,8 +1030,12 @@ mod tests {
         let first = load_image(&url, Some(&cache), &agent, &svg, false)?;
         let reopened = ResourceCache::new(directory.path().to_owned());
         let second = load_image(&url, Some(&reopened), &agent, &svg, false)?;
-        assert_ne!(first.id, second.id);
-        assert_eq!(second.as_bytes(0).unwrap().len(), 8 * 4 * 4);
+        let (ImageContent::Svg(first, _), ImageContent::Svg(second, layout)) = (first, second)
+        else {
+            anyhow::bail!("expected two parsed SVG trees");
+        };
+        assert!(!Arc::ptr_eq(&first, &second));
+        assert_eq!(layout, gpui::size(gpui::px(8.), gpui::px(4.)));
         load_image(&url, Some(&reopened), &agent, &svg, false)?;
         assert_eq!(calls.load(Ordering::Relaxed), 2);
         assert_eq!(cache.count_contents(), 1);
@@ -1099,10 +1145,15 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         };
         let second_image = app.read(|cx| second_display.read(cx).results[&request].0.clone())?;
+        let (ImageContent::Svg(loaded, layout), ImageContent::Svg(second_image, _)) =
+            (loaded, second_image)
+        else {
+            anyhow::bail!("expected a shared parsed SVG");
+        };
         assert!(Arc::ptr_eq(&loaded, &second_image));
         first.draw();
         second.draw();
-        assert_eq!(loaded.as_bytes(0).unwrap().len(), 8 * 4 * 4);
+        assert_eq!(layout, gpui::size(gpui::px(8.), gpui::px(4.)));
         assert_eq!(calls.load(Ordering::Relaxed), 1);
         Ok(())
     }

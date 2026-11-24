@@ -4360,8 +4360,6 @@ dependencies = [
 [[package]]
 name = "merman-render"
 version = "0.9.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3cf1f994f9fe91cd7f5e0fbb4f7c9982585813c79aacad50d9351a23ee4d1520"
 dependencies = [
  "base64 0.23.1",
  "cssparser",

@@ -1,16 +1,17 @@
+mod mermaid;
+
 use rust_i18n::t;
 
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex},
-    time::Duration,
 };
 
 use anyhow::{Context, Result, ensure};
 use gpui::{
-    App, Asset, DevicePixels, Image, ImageFormat, IntoElement, ObjectFit, ParentElement as _,
-    RenderImage, SharedString, Size, Styled, StyledImage as _, SvgSize, WeakEntity, Window, canvas,
-    div, img, px, size,
+    App, Image, ImageContent, ImageFormat, InteractiveElement as _, IntoElement, ObjectFit,
+    ParentElement as _, ParsedSvg, SharedString, Styled, StyledImage as _, WeakEntity, Window,
+    canvas, div, img, px,
 };
 use gpui_component::{
     ActiveTheme, ThemeMode, h_flex,
@@ -18,13 +19,6 @@ use gpui_component::{
     text::{
         InlineElement, InlineRenderContext, MarkdownExtensions, MarkdownNode, MarkdownParseContext,
         MarkdownPlugin, markdown_ast::Node,
-    },
-};
-use merman::{
-    OperationControl, RenderOutput, RenderRequest, Renderer, SvgEnvironment, SvgRequest,
-    svg::{
-        HostTheme, HostThemePreset, Presentation, PresentationProfile, RenderResourcePolicy,
-        SvgPipeline,
     },
 };
 use ratex_layout::{LayoutOptions, layout, to_display_list};
@@ -62,67 +56,29 @@ impl GraphicKind {
 }
 
 #[derive(Clone)]
-struct Picture {
-    image: Arc<Image>,
+struct Picture<T = Arc<Image>> {
+    image: T,
     width: f32,
     height: f32,
     baseline: f32,
+    reflowable: bool,
 }
 
 const MATH_FONT_SIZE: f32 = 16.;
 
-enum FormulaRaster {}
-
-impl Asset for FormulaRaster {
-    type Source = (Arc<Image>, Size<DevicePixels>);
-    type Output = Option<Arc<RenderImage>>;
-
-    fn load(
-        source: Self::Source,
-        cx: &mut App,
-    ) -> impl Future<Output = Self::Output> + Send + 'static {
-        let renderer = cx.svg_renderer();
-        async move {
-            let (image, dimensions) = source;
-            let svg = renderer.parse_svg(image.bytes()).ok()?;
-            renderer
-                .render_parsed(&svg, SvgSize::ExactSize(dimensions))
-                .ok()
-        }
-    }
-}
-
-impl Picture {
-    fn math_element(&self, scale: f32) -> impl IntoElement + use<> {
-        let image = self.image.clone();
-        canvas(
-            |_, _, _| (),
-            move |bounds, (), window, cx| {
-                let width = f32::from(bounds.size.width * window.scale_factor());
-                let height = f32::from(bounds.size.height * window.scale_factor());
-                let limit = (8192. / width.max(height))
-                    .min((16_000_000. / (width * height)).sqrt())
-                    .min(1.);
-                let dimensions = size(
-                    DevicePixels((width * limit).round().max(1.) as i32),
-                    DevicePixels((height * limit).round().max(1.) as i32),
-                );
-                if let Some(Some(raster)) =
-                    window.use_asset::<FormulaRaster>(&(image, dimensions), cx)
-                {
-                    _ = window.paint_image(bounds, bounds, Default::default(), raster, 0, false);
-                }
-            },
-        )
-        .w(px(self.width * scale))
-        .h(px(self.height * scale))
+impl Picture<Arc<ParsedSvg>> {
+    fn element(&self, scale: f32) -> gpui::Img {
+        img(ImageContent::svg(self.image.clone()))
+            .w(px(self.width * scale))
+            .h(px(self.height * scale))
+            .object_fit(ObjectFit::Fill)
     }
 }
 
 #[derive(Clone)]
 enum GraphicState {
     Pending,
-    Ready(Result<Picture, SharedString>),
+    Ready(Result<Picture<Arc<ParsedSvg>>, SharedString>),
     LimitReached,
 }
 
@@ -131,11 +87,14 @@ struct GraphicRequest {
     kind: GraphicKind,
     source: SharedString,
     dark: bool,
+    reflowed: bool,
+    diagram_fonts: Option<mermaid::DiagramFonts>,
 }
 
 #[derive(Default)]
 struct GeneratedGraphics {
     images: HashMap<GraphicRequest, GraphicState>,
+    diagram_widths: HashMap<usize, f32>,
     pending: usize,
     reader: Option<WeakEntity<DocReader>>,
 }
@@ -202,6 +161,13 @@ impl Graphics {
         if generated.pending >= 2 || generated.images.contains_key(request) {
             return;
         }
+        if request.diagram_fonts.is_some() {
+            generated.images.retain(|key, state| {
+                key.diagram_fonts.is_none()
+                    || key.diagram_fonts == request.diagram_fonts
+                    || matches!(state, GraphicState::Pending)
+            });
+        }
         generated
             .images
             .insert(request.clone(), GraphicState::Pending);
@@ -210,20 +176,40 @@ impl Graphics {
 
         let graphics = Arc::downgrade(self);
         let request = request.clone();
+        let text_system = request
+            .diagram_fonts
+            .as_ref()
+            .map(|_| cx.text_system().clone());
+        let renderer = cx.svg_renderer();
         cx.spawn(async move |cx| {
             let work = request.clone();
             let picture = cx
                 .background_executor()
                 .spawn(async move {
                     let picture = match work.kind {
-                        GraphicKind::Diagram => diagram(&work.source, work.dark),
+                        GraphicKind::Diagram => mermaid::diagram_with_fonts(
+                            &work.source,
+                            work.dark,
+                            work.reflowed,
+                            work.diagram_fonts.zip(text_system),
+                        ),
                         _ => formula(
                             &work.source,
                             work.dark,
                             work.kind == GraphicKind::InlineMath,
                         ),
                     };
-                    picture.map_err(|error| format!("{error:#}").into())
+                    picture
+                        .and_then(|picture| {
+                            Ok(Picture {
+                                image: Arc::new(renderer.parse_svg(picture.image.bytes())?),
+                                width: picture.width,
+                                height: picture.height,
+                                baseline: picture.baseline,
+                                reflowable: picture.reflowable,
+                            })
+                        })
+                        .map_err(|error| format!("{error:#}").into())
                 })
                 .await;
             if let Some(graphics) = graphics.upgrade() {
@@ -245,6 +231,38 @@ impl Graphics {
             }
         })
         .detach();
+    }
+
+    fn diagram_width(&self, offset: usize) -> f32 {
+        self.generated
+            .lock()
+            .unwrap()
+            .diagram_widths
+            .get(&offset)
+            .copied()
+            .unwrap_or_default()
+    }
+
+    fn observe_diagram_width(&self, offset: usize, width: f32, window: &Window, cx: &mut App) {
+        let reader = {
+            let mut generated = self.generated.lock().unwrap();
+            if generated
+                .diagram_widths
+                .get(&offset)
+                .is_some_and(|old| (old - width).abs() < 0.5)
+            {
+                return;
+            }
+            generated.diagram_widths.insert(offset, width);
+            generated.reader.clone()
+        };
+        if let Some(reader) = reader {
+            window.defer(cx, move |_, cx| {
+                _ = reader.update(cx, |reader, cx| {
+                    reader.refresh_graphic_layout(&[offset], cx)
+                });
+            });
+        }
     }
 
     fn placeholder(
@@ -291,13 +309,125 @@ struct GraphicPlugin {
 }
 
 impl GraphicPlugin {
-    fn request(&self, node: &MarkdownNode, cx: &App) -> GraphicRequest {
+    fn request(&self, node: &MarkdownNode, window: &Window, cx: &App) -> GraphicRequest {
         GraphicRequest {
             kind: self.kind,
             source: node.as_text().to_owned().into(),
             dark: cx.theme().mode == ThemeMode::Dark,
+            reflowed: false,
+            diagram_fonts: (self.kind == GraphicKind::Diagram)
+                .then(|| mermaid::DiagramFonts::inherit(window, cx)),
         }
     }
+
+    fn render_diagram(
+        &self,
+        node: &MarkdownNode,
+        request: GraphicRequest,
+        cx: &App,
+    ) -> gpui::AnyElement {
+        let offset = node.source_range().map_or(0, |range| range.start);
+        let available = self.graphics.diagram_width(offset);
+        let mut next = None;
+        let picture = match self.graphics.state(&request) {
+            GraphicState::Pending => {
+                next = Some(request);
+                div().h(px(24.)).into_any_element()
+            }
+            GraphicState::Ready(Ok(original)) => {
+                let reflowed = if mermaid::should_reflow(available, &original) {
+                    let request = GraphicRequest {
+                        reflowed: true,
+                        ..request
+                    };
+                    match self.graphics.state(&request) {
+                        GraphicState::Ready(Ok(picture)) => Some(picture),
+                        GraphicState::Pending => {
+                            next = Some(request);
+                            None
+                        }
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+                let (picture, scale) = mermaid::fit(available, original, reflowed);
+                let width = picture.width * scale;
+                let height = picture.height * scale;
+                let image = div().flex_shrink_0().child(
+                    picture
+                        .element(scale)
+                        .id(("document-mermaid-raster", offset)),
+                );
+                let image = if width <= available + 0.5 {
+                    image.mx_auto()
+                } else {
+                    image
+                };
+                div()
+                    .flex()
+                    .w_full()
+                    .min_w_0()
+                    .h(px(height + if width > available + 0.5 { 8. } else { 0. }))
+                    .overflow_x_content_scrollbar()
+                    .id(("document-mermaid-scroll", offset))
+                    .child(image)
+                    .into_any_element()
+            }
+            state => graphic_error(node.as_text(), state, cx).into_any_element(),
+        };
+        let graphics = self.graphics.clone();
+        let measure = canvas(
+            |_, _, _| (),
+            move |bounds, (), window, cx| {
+                if !bounds.intersect(&window.content_mask().bounds).is_empty() {
+                    graphics.observe_diagram_width(
+                        offset,
+                        f32::from(bounds.size.width),
+                        window,
+                        cx,
+                    );
+                    if let Some(request) = &next {
+                        graphics.request(request, cx);
+                    }
+                }
+            },
+        )
+        .absolute()
+        .top_0()
+        .left_0()
+        .size_full();
+        div()
+            .relative()
+            .w_full()
+            .min_w_0()
+            .child(picture)
+            .child(measure)
+            .into_any_element()
+    }
+}
+
+fn graphic_error(source: &str, state: GraphicState, cx: &App) -> impl IntoElement {
+    let error = match state {
+        GraphicState::Ready(Err(error)) => error,
+        _ => t!("docs.graphics_limit").into(),
+    };
+    div()
+        .w_full()
+        .text_sm()
+        .text_color(cx.theme().muted_foreground)
+        .child(
+            div()
+                .font_weight(gpui::FontWeight::SEMIBOLD)
+                .child(t!("docs.render_failed")),
+        )
+        .child(div().mt_1().child(error))
+        .child(
+            div()
+                .mt_2()
+                .font_family(crate::workspace::ui_code_font(cx))
+                .child(source.to_owned()),
+        )
 }
 
 impl MarkdownPlugin for GraphicPlugin {
@@ -319,15 +449,16 @@ impl MarkdownPlugin for GraphicPlugin {
     }
 
     fn render(&self, node: &MarkdownNode, window: &mut Window, cx: &mut App) -> impl IntoElement {
-        let source = node.as_text();
-        let theme = cx.theme();
-        let request = self.request(node, cx);
+        let request = self.request(node, window, cx);
+        if self.kind == GraphicKind::Diagram {
+            return self.render_diagram(node, request, cx);
+        }
         let inner = match self.graphics.state(&request) {
             GraphicState::Pending => self
                 .graphics
                 .placeholder(request, 48., 24.)
                 .into_any_element(),
-            GraphicState::Ready(Ok(picture)) if self.kind == GraphicKind::DisplayMath => {
+            GraphicState::Ready(Ok(picture)) => {
                 let font_size = window.text_style().font_size.to_pixels(window.rem_size());
                 let scale = f32::from(font_size) / MATH_FONT_SIZE;
                 div()
@@ -344,77 +475,29 @@ impl MarkdownPlugin for GraphicPlugin {
                         div()
                             .mx_auto()
                             .flex_shrink_0()
-                            .child(picture.math_element(scale)),
+                            .child(picture.element(scale)),
                     )
                     .into_any_element()
             }
-            GraphicState::Ready(Ok(picture)) => div()
-                .w_full()
-                .min_w_0()
-                .h(px(picture.height + 8.))
-                // Document graphics are content: keep a standard-width
-                // scrollbar visible rather than fading it out.
-                .overflow_x_content_scrollbar()
-                .id((
-                    "document-graphic",
-                    node.source_range().map_or(0, |range| range.start),
-                ))
-                .child(
-                    img(picture.image.clone())
-                        .flex_shrink_0()
-                        .w(px(picture.width))
-                        .h(px(picture.height))
-                        .object_fit(ObjectFit::Contain),
-                )
-                .into_any_element(),
-            result => {
-                let error = match result {
-                    GraphicState::Ready(Err(error)) => error,
-                    _ => t!("docs.graphics_limit").into(),
-                };
-                div()
-                    .w_full()
-                    .text_sm()
-                    .text_color(theme.muted_foreground)
-                    .child(
-                        div()
-                            .font_weight(gpui::FontWeight::SEMIBOLD)
-                            .child(t!("docs.render_failed")),
-                    )
-                    .child(div().mt_1().child(error))
-                    .child(
-                        div()
-                            .mt_2()
-                            .font_family(crate::workspace::ui_code_font(cx))
-                            .child(source.to_owned()),
-                    )
-                    .into_any_element()
-            }
+            state => graphic_error(node.as_text(), state, cx).into_any_element(),
         };
-        let container = h_flex().w_full().min_w_0().justify_center();
-        if self.kind == GraphicKind::DisplayMath {
-            // Display math is typography, not a figure: no panel chrome, the
-            // formula sits directly on the reading surface.
-            container.child(inner)
-        } else {
-            container
-                .p_3()
-                .rounded(px(10.))
-                .border_1()
-                .border_color(theme.border)
-                .bg(theme.muted)
-                .child(inner)
-        }
+        // Display math sits directly on the reading surface.
+        h_flex()
+            .w_full()
+            .min_w_0()
+            .justify_center()
+            .child(inner)
+            .into_any_element()
     }
 
     fn render_inline(
         &self,
         node: &MarkdownNode,
         context: &InlineRenderContext,
-        _: &mut Window,
+        window: &mut Window,
         cx: &mut App,
     ) -> Option<InlineElement> {
-        let request = self.request(node, cx);
+        let request = self.request(node, window, cx);
         let font_size = f32::from(context.font_size());
         match self.graphics.state(&request) {
             GraphicState::Pending => Some(
@@ -424,7 +507,7 @@ impl MarkdownPlugin for GraphicPlugin {
             GraphicState::Ready(Ok(picture)) => {
                 let scale = font_size / MATH_FONT_SIZE;
                 Some(
-                    InlineElement::new(picture.math_element(scale))
+                    InlineElement::new(picture.element(scale))
                         .with_baseline(px(picture.baseline * scale)),
                 )
             }
@@ -467,44 +550,7 @@ fn formula(source: &str, dark: bool, inline: bool) -> Result<Picture> {
         width,
         height,
         baseline: (list.height * f64::from(MATH_FONT_SIZE) + padding) as f32,
-    })
-}
-
-fn diagram(source: &str, dark: bool) -> Result<Picture> {
-    let theme = if dark {
-        HostThemePreset::EditorDark
-    } else {
-        HostThemePreset::EditorLight
-    };
-    let presentation = Presentation::new()
-        .with_profile(PresentationProfile::MermanModern)
-        .with_theme(HostTheme::from_preset(theme))
-        .resolve();
-    let renderer =
-        Renderer::new().with_engine(presentation.materialize_engine(merman::Engine::new()));
-    let request = SvgRequest {
-        environment: SvgEnvironment::deterministic()
-            .with_resource_policy(RenderResourcePolicy::interactive()),
-        pipeline: Some(SvgPipeline::resvg_safe()),
-        presentation: presentation.render_policy(),
-        ..SvgRequest::default()
-    };
-    let output = renderer.render(RenderRequest::svg(
-        source,
-        OperationControl::new().with_deadline(Duration::from_secs(2)),
-        request,
-    ))?;
-    let RenderOutput::Svg(Some(output)) = output else {
-        anyhow::bail!(t!("docs.no_mermaid"));
-    };
-    let (svg, _) = output.into_parts();
-    let (width, height) = svg_size(&svg)?;
-    let scale = (440. / height).min(1.);
-    Ok(Picture {
-        image: Arc::new(Image::from_bytes(ImageFormat::Svg, svg.into_bytes())),
-        width: width * scale,
-        height: height * scale,
-        baseline: 0.,
+        reflowable: false,
     })
 }
 
@@ -552,7 +598,7 @@ mod tests {
         let mut count = 0;
         for block in source.split("```mermaid\n").skip(1) {
             let (source, _) = block.split_once("\n```").unwrap();
-            let image = diagram(source, false).unwrap().image;
+            let image = mermaid::diagram(source, false, false).unwrap().image;
             image.to_image_data(rasterizer.clone()).unwrap();
             count += 1;
         }

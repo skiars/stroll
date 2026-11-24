@@ -2160,6 +2160,7 @@ while header := reader.read(4):
                     Axis::Horizontal => {
                         (px(5.9)..=px(8.1)).contains(&bounds.size.height)
                             && bounds.size.width >= px(18.)
+                            && viewport.contains(&bounds.center())
                     }
                     Axis::Vertical => {
                         (bounds.size.width - px(6.)).abs() < px(0.1)
@@ -2249,7 +2250,12 @@ while header := reader.read(4):
             .1
             .split_once("\n\n## ")
             .unwrap()
-            .0;
+            .0
+            .replacen(
+                "```mermaid\n",
+                "```mermaid\n---\nconfig:\n  layout: elk\n---\n",
+                1,
+            );
         let formula = format!("$$\n{}z\n$$", "x+".repeat(110));
         let table = format!(
             "|{}|\n|{}|\n|{}|",
@@ -2259,7 +2265,7 @@ while header := reader.read(4):
         );
         let code = format!("```text\n{}\n```", "0123456789".repeat(40));
         for (kind, block) in [
-            ("Mermaid", diagram),
+            ("Mermaid", diagram.as_str()),
             ("formula", formula.as_str()),
             ("table", table.as_str()),
             ("code", code.as_str()),
@@ -2283,7 +2289,7 @@ while header := reader.read(4):
                     cx,
                 )
             });
-            visual.simulate_resize(size(px(1400.), px(540.)));
+            visual.simulate_resize(size(px(530.), px(540.)));
             draw_scroll_test_frame(visual);
             let list = visual.update(|_, cx| reader.read(cx).text.read(cx).list_state().clone());
             let viewport = list.viewport_bounds();
@@ -2776,6 +2782,467 @@ while header := reader.read(4):
         });
         draw(visual);
         confirm_anchor(visual, &reopened);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[gpui::test]
+    fn mermaid_reader_reflows_and_restores_its_horizontal_layout(cx: &mut TestAppContext) {
+        let (reader, visual) = cx.add_window_view(|window, cx| {
+            gpui_component::init(cx);
+            DocReader::new(
+                PathBuf::new(),
+                "review.md".into(),
+                PreparedDocument::new(
+                    "# Workflow\n\n```mermaid\nflowchart LR\nA[Receive] --> B[Review] --> C[Approve] --> D[Record] --> E[Publish] --> F[Notify]\n```\n".into(),
+                )
+                .unwrap(),
+                None,
+                WeakEntity::new_invalid(),
+                window,
+                cx,
+            )
+        });
+        let mut heights = Vec::new();
+        for width in [860., 470., 860., 470.] {
+            visual.simulate_resize(size(px(width), px(900.)));
+            for _ in 0..6 {
+                draw_scroll_test_frame(visual);
+            }
+            heights.push(visual.update(|_, cx| {
+                reader
+                    .read(cx)
+                    .text
+                    .read(cx)
+                    .list_state()
+                    .bounds_for_item(1)
+                    .unwrap()
+                    .size
+                    .height
+            }));
+        }
+        assert!(heights[1] > heights[0] + px(120.), "{heights:?}");
+        assert!(heights[1] > px(440.), "{heights:?}");
+        assert_eq!(heights[0], heights[2]);
+        assert_eq!(heights[1], heights[3]);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[gpui::test]
+    fn mermaid_reader_scrolls_each_wide_diagram_to_its_own_edges(cx: &mut TestAppContext) {
+        let fixture = include_str!("../tests/fixtures/mermaid-layout.md");
+        let (_, chain) = fixture.split_once("## Wide horizontal chain\n\n").unwrap();
+        let (chain, _) = chain.split_once("\n\n## ").unwrap();
+        let wide = chain.replacen(
+            "flowchart LR",
+            "---\nconfig:\n  layout: elk\n---\nflowchart LR",
+            1,
+        );
+        let shorter = wide.replace("    F --> G[Update catalog]\n", "");
+        let source = format!("# Wide diagrams\n\n{wide}\n\n## Second diagram\n\n{shorter}\n");
+        let (reader, visual) = cx.add_window_view(|window, cx| {
+            gpui_component::init(cx);
+            cx.set_reduce_motion(true);
+            cx.set_smooth_scrolling(false);
+            DocReader::new(
+                PathBuf::new(),
+                "mermaid-layout.md".into(),
+                PreparedDocument::new(source).unwrap(),
+                None,
+                WeakEntity::new_invalid(),
+                window,
+                cx,
+            )
+        });
+        visual.simulate_resize(size(px(530.), px(420.)));
+        draw_scroll_test_frame(visual);
+        visual
+            .executor()
+            .advance_clock(std::time::Duration::from_millis(100));
+        draw_scroll_test_frame(visual);
+        let raster_jobs = visual.update(|_, cx| svg_raster_stats(cx).0);
+        assert!(raster_jobs >= 2);
+        let list = visual.update(|_, cx| reader.read(cx).text.read(cx).list_state().clone());
+        let blocks = [1, 3].map(|index| list.bounds_for_item(index).unwrap());
+        let thumb = |visual: &mut VisualTestContext, index: usize| {
+            document_scroll_thumb(visual, Axis::Horizontal, blocks[index]).unwrap()
+        };
+        let scroll = |visual: &mut VisualTestContext, index: usize, lines: f32| {
+            visual.simulate_event(ScrollEvent {
+                position: blocks[index].center(),
+                delta: ScrollDelta::Lines(point(0., lines)),
+                source: ScrollSource::Pointer,
+                touch_phase: TouchPhase::Moved,
+                modifiers: Modifiers {
+                    shift: true,
+                    ..Default::default()
+                },
+            });
+            draw_scroll_test_frame(visual);
+        };
+
+        let initial = [thumb(visual, 0), thumb(visual, 1)];
+        assert!(initial[0].size.width < initial[1].size.width);
+        let mut expected = initial;
+        for index in [0, 1] {
+            scroll(visual, index, -1000.);
+            let end = thumb(visual, index);
+            assert!(end.left() > initial[index].left() + px(15.));
+            let left_inset = initial[index].left() - blocks[index].left();
+            let right_inset = blocks[index].right() - end.right();
+            assert!(
+                (left_inset - right_inset).abs() <= px(1.),
+                "{end:?}, {:?}",
+                blocks[index]
+            );
+            assert_eq!(thumb(visual, 1 - index), expected[1 - index]);
+            expected[index] = end;
+            scroll(visual, index, -1000.);
+            assert_eq!(thumb(visual, index), end);
+        }
+        for index in [0, 1] {
+            scroll(visual, index, 1000.);
+            assert_eq!(thumb(visual, index), initial[index]);
+            assert_eq!(thumb(visual, 1 - index), expected[1 - index]);
+            expected[index] = initial[index];
+        }
+        assert_eq!(list.scroll_px_offset_for_scrollbar().y, px(0.));
+
+        let mut frames = Vec::new();
+        for frame in 0..80 {
+            let started = std::time::Instant::now();
+            visual.simulate_event(ScrollEvent {
+                position: blocks[frame % 2].center(),
+                delta: ScrollDelta::Pixels(point(
+                    px(if frame % 20 < 10 { -31.5 } else { 31.5 }),
+                    px(0.),
+                )),
+                source: ScrollSource::Pointer,
+                touch_phase: TouchPhase::Moved,
+                modifiers: Modifiers::default(),
+            });
+            visual.update(|window, cx| window.draw(cx).clear(cx));
+            frames.push(started.elapsed());
+            if frame == 8 {
+                assert!(thumb(visual, 0).left() > initial[0].left());
+            }
+            visual
+                .executor()
+                .advance_clock(std::time::Duration::from_millis(16));
+        }
+        draw_scroll_test_frame(visual);
+        assert_eq!(visual.update(|_, cx| svg_raster_stats(cx).0), raster_jobs);
+        frames.sort_unstable();
+        println!(
+            "Mermaid horizontal scroll: {} frames, draw P95 {:.3} ms, 0 new rasters",
+            frames.len(),
+            frames[75].as_secs_f64() * 1000.
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn mermaid_reader_renders_light_and_dark_offscreen() -> Result<()> {
+        use gpui_component::ThemeMode;
+        use gpui_wgpu::WgpuHeadlessRenderer;
+
+        let mut app = HeadlessAppContext::with_platform(
+            gpui_platform::current_platform(true).text_system(),
+            Arc::new(gpui_kit_assets::AllAssets),
+            || Ok(Some(Box::new(WgpuHeadlessRenderer::new()?))),
+        );
+        let output = std::env::var_os("STROLL_MERMAID_SCREENSHOTS").map(PathBuf::from);
+        let fixture = include_str!("../tests/fixtures/mermaid-layout.md");
+        let (flowcharts, _) = fixture.split_once("\n## Wide horizontal chain").unwrap();
+        let (_, state) = fixture
+            .split_once("## State diagram with parallel transitions")
+            .unwrap();
+        let (state, _) = state.split_once("\n## Sequence diagram").unwrap();
+        let state = format!("# State diagram with parallel transitions{state}");
+        for (mode, name, node_color) in [
+            (ThemeMode::Light, "light", [244, 246, 251]),
+            (ThemeMode::Dark, "dark", [39, 43, 56]),
+        ] {
+            app.update(|cx| {
+                gpui_component::init(cx);
+                crate::workspace::apply_theme(mode, cx);
+            });
+            for (case, source, width, height) in [
+                ("layout", flowcharts, 690., 1330.),
+                ("state", state.as_str(), 520., 350.),
+            ] {
+                let window = app.open_window(size(px(width), px(height)), |window, cx| {
+                    cx.new(|cx| {
+                        DocReader::new(
+                            PathBuf::new(),
+                            "mermaid-layout.md".into(),
+                            PreparedDocument::new(source.into()).unwrap(),
+                            None,
+                            WeakEntity::new_invalid(),
+                            window,
+                            cx,
+                        )
+                    })
+                })?;
+                for _ in 0..8 {
+                    app.run_until_parked();
+                    app.update_window(window.into(), |_, window, cx| window.draw(cx).clear(cx))?;
+                }
+                let screenshot = app.capture_screenshot(window.into())?;
+                if let Some(directory) = &output {
+                    screenshot.save(directory.join(format!("mermaid-{case}-{name}.png")))?;
+                }
+                let node_pixels = screenshot
+                    .pixels()
+                    .filter(|pixel| {
+                        pixel.0[..3]
+                            .iter()
+                            .zip(node_color)
+                            .all(|(&actual, expected)| actual.abs_diff(expected) <= 2)
+                    })
+                    .count();
+                assert!(node_pixels > 1500, "{case} {name}: {node_pixels}");
+
+                if case == "state" {
+                    let overflows = app.update_window(window.into(), |_, window, _| {
+                        let scale = window.scale_factor();
+                        window.painted_quads().iter().any(|quad| {
+                            let size = quad.bounds.size;
+                            (5.9..=8.1).contains(&(size.height.as_f32() / scale))
+                                && size.width.as_f32() / scale >= 18.
+                        })
+                    })?;
+                    assert!(
+                        !overflows,
+                        "{case} {name}: expected wrapping to fit the graph"
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn document_svg_rasters_match_display_scale_offscreen() -> Result<()> {
+        use gpui_component::ThemeMode;
+        use gpui_wgpu::WgpuHeadlessRenderer;
+        use std::{
+            thread,
+            time::{Duration, Instant},
+        };
+
+        let mut app = HeadlessAppContext::with_platform(
+            gpui_platform::current_platform(true).text_system(),
+            Arc::new(gpui_kit_assets::AllAssets),
+            || Ok(Some(Box::new(WgpuHeadlessRenderer::new()?))),
+        );
+        app.update(|cx| {
+            gpui_component::init(cx);
+            crate::workspace::apply_theme(ThemeMode::Light, cx);
+        });
+        let fixture = include_str!("../tests/fixtures/mermaid-layout.md");
+        let (_, chart) = fixture.split_once("```mermaid").unwrap();
+        let (chart, _) = chart.split_once("```").unwrap();
+        let source = format!(
+            "# Mermaid\n\n```mermaid{chart}```\n\n## SVG image\n\n<img src=\"tall-image.svg\" alt=\"SVG with labels\" width=\"344\" />\n",
+        );
+        let output = std::env::var_os("STROLL_DOCUMENT_DPI_SCREENSHOTS").map(PathBuf::from);
+
+        for (name, dpi, svg_width) in [("100", 1., 344), ("125", 1.25, 430), ("200", 2., 688)] {
+            let window = app.open_window(size(px(570.), px(1230.)), |window, cx| {
+                cx.new(|cx| {
+                    DocReader::new(
+                        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                            .join("tests/fixtures/markdown-scroll"),
+                        "comparison.md".into(),
+                        PreparedDocument::new(source.clone()).unwrap(),
+                        None,
+                        WeakEntity::new_invalid(),
+                        window,
+                        cx,
+                    )
+                })
+            })?;
+            app.simulate_scale_factor_change(window.into(), dpi)?;
+
+            let start = Instant::now();
+            loop {
+                app.run_until_parked();
+                app.advance_clock(Duration::from_millis(16));
+                let images = app.update_window(window.into(), |_, window, cx| {
+                    window.draw(cx).clear(cx);
+                    window.painted_images().to_vec()
+                })?;
+                if images.len() == 2
+                    && images.iter().all(|image| {
+                        image.bounds.size.width.0 == image.tile.bounds.size.width.0 as f32
+                            && image.bounds.size.height.0 == image.tile.bounds.size.height.0 as f32
+                    })
+                {
+                    assert!(
+                        images
+                            .iter()
+                            .any(|image| image.tile.bounds.size.width.0 == svg_width)
+                    );
+                    break;
+                }
+                assert!(
+                    start.elapsed() < Duration::from_secs(5),
+                    "{dpi}: {images:?}"
+                );
+                thread::sleep(Duration::from_millis(5));
+            }
+            let screenshot = app.capture_screenshot(window.into())?;
+            assert!((screenshot.width() as f32 - 570. * dpi).abs() <= 1.);
+            assert!((screenshot.height() as f32 - 1230. * dpi).abs() <= 1.);
+            assert!(
+                screenshot
+                    .pixels()
+                    .any(|pixel| pixel.0[..3] == [0x27, 0x53, 0x6b])
+            );
+            assert!(
+                screenshot
+                    .pixels()
+                    .any(|pixel| pixel.0[..3] == [244, 246, 251])
+            );
+            if let Some(output) = &output {
+                screenshot.save(output.join(format!("document-{name}.png")))?;
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn document_svg_rasters_wait_for_resize_to_settle() -> Result<()> {
+        use std::{
+            thread,
+            time::{Duration, Instant},
+        };
+
+        let fixture = include_str!("../tests/fixtures/mermaid-layout.md");
+        let (_, chart) = fixture.split_once("```mermaid").unwrap();
+        let (chart, _) = chart.split_once("```").unwrap();
+        let source = format!(
+            "# Mermaid\n\n```mermaid{chart}```\n\n## SVG image\n\n<img src=\"tall-image.svg\" alt=\"SVG with labels\" style=\"width: 80%\" />\n",
+        );
+        let mut app = HeadlessAppContext::with_platform(
+            gpui_platform::current_platform(true).text_system(),
+            Arc::new(gpui_kit_assets::AllAssets),
+            || Ok(None),
+        );
+        let window = app
+            .open_window(size(px(530.), px(900.)), |window, cx| {
+                gpui_component::init(cx);
+                cx.new(|cx| {
+                    DocReader::new(
+                        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                            .join("tests/fixtures/markdown-scroll"),
+                        "comparison.md".into(),
+                        PreparedDocument::new(source).unwrap(),
+                        None,
+                        WeakEntity::new_invalid(),
+                        window,
+                        cx,
+                    )
+                })
+            })?
+            .into();
+        app.simulate_scale_factor_change(window, 1.25)?;
+
+        let draw = |app: &mut HeadlessAppContext, width: Option<f32>| {
+            app.update_window(window, |_, window, cx| {
+                if let Some(width) = width {
+                    window.resize(size(px(width), px(900.)));
+                    window.bounds_changed(cx);
+                }
+                window.draw(cx).clear(cx);
+                let mut images = window.painted_images().to_vec();
+                images.sort_by(|a, b| a.bounds.top().0.total_cmp(&b.bounds.top().0));
+                images
+            })
+        };
+        let exact = |images: &[PolychromeSprite]| {
+            images.len() == 2
+                && images.iter().all(|image| {
+                    image.bounds.size.width.0 == image.tile.bounds.size.width.0 as f32
+                        && image.bounds.size.height.0 == image.tile.bounds.size.height.0 as f32
+                })
+        };
+        let settle = |app: &mut HeadlessAppContext| -> Result<Vec<PolychromeSprite>> {
+            let started = Instant::now();
+            loop {
+                app.run_until_parked();
+                app.advance_clock(Duration::from_millis(100));
+                let images = draw(app, None)?;
+                if exact(&images) {
+                    return Ok(images);
+                }
+                assert!(
+                    started.elapsed() < Duration::from_secs(5),
+                    "SVG rasters did not settle: {images:?}"
+                );
+                thread::sleep(Duration::from_millis(5));
+            }
+        };
+        settle(&mut app)?;
+
+        // Measure with real font metrics since Mermaid's fitting interval
+        // depends on the intrinsic width of its labels.
+        let mut trace = Vec::<(f32, [f32; 2])>::new();
+        let mut drag_widths = None;
+        for width in (350..=830).step_by(30).map(|width| width as f32) {
+            draw(&mut app, Some(width))?;
+            let images = draw(&mut app, None)?;
+            if images.len() != 2 {
+                continue;
+            }
+            let widths = [images[0].bounds.size.width.0, images[1].bounds.size.width.0];
+            if let Some((old_width, old_images)) = trace.last()
+                && width - old_width == 30.
+                && widths[0] - old_images[0] >= 24.
+                && widths[1] - old_images[1] >= 18.
+            {
+                drag_widths = Some((old_width + 3., width - 3.));
+                break;
+            }
+            trace.push((width, widths));
+        }
+        let (start_width, end_width) =
+            drag_widths.unwrap_or_else(|| panic!("no resize range shared by both SVGs: {trace:?}"));
+        draw(&mut app, Some(start_width))?;
+        let initial = settle(&mut app)?;
+        let warm = app.update(|cx| svg_raster_stats(cx).0);
+        let mut timings = Vec::new();
+        for frame in 1..=60 {
+            let started = Instant::now();
+            let width = start_width + (end_width - start_width) * frame as f32 / 60.;
+            let images = draw(&mut app, Some(width))?;
+            timings.push(started.elapsed());
+            assert_eq!(images.len(), 2, "blank raster during resize");
+            app.advance_clock(Duration::from_millis(16));
+            while app.background_executor().tick() {}
+        }
+        assert_eq!(app.update(|cx| svg_raster_stats(cx).0), warm);
+        assert!(!exact(&draw(&mut app, None)?));
+
+        let final_images = settle(&mut app)?;
+        let changed = final_images
+            .iter()
+            .zip(&initial)
+            .filter(|(after, before)| after.tile.bounds.size != before.tile.bounds.size)
+            .count();
+        let (completed, bytes, _) = app.update(|cx| svg_raster_stats(cx));
+        assert_eq!(changed, 2, "both types of SVG should resize");
+        assert_eq!(completed - warm, changed);
+        assert!(bytes <= 64 * 1024 * 1024);
+        timings.sort_unstable();
+        println!(
+            "Continuous resize: {} frames, draw P95 {:.3} ms, 0 raster jobs during drag, {changed} after settling",
+            timings.len(),
+            timings[56].as_secs_f64() * 1000.
+        );
+        Ok(())
     }
 
     #[cfg(target_os = "linux")]
