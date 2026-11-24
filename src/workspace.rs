@@ -4899,7 +4899,22 @@ impl Workspace {
             .or_else(|| self.source_resources(path).display_name_for_path(path))
             .unwrap_or_else(|| language_for(path).into());
         let progress = self.language_service_progress(file, status_size, colors, cx);
-        // Every text/button in this row goes through `baseline_aligned`,
+        let (wrap_icon, wrap_label, wrap_tooltip, wrap_color) = if file.wrap {
+            (
+                include_bytes!("workspace/icons/wrap-on.svg").as_slice(),
+                t!("workspace.wrap_on"),
+                t!("workspace.disable_wrap"),
+                colors.accent,
+            )
+        } else {
+            (
+                include_bytes!("workspace/icons/wrap-off.svg").as_slice(),
+                t!("workspace.wrap_off"),
+                t!("workspace.enable_wrap"),
+                colors.muted,
+            )
+        };
+        // Text in this row goes through `baseline_aligned`,
         // so new status content with a different size still shares the
         // row's baseline without forcing one font size everywhere.
         h_flex()
@@ -4953,11 +4968,6 @@ impl Workspace {
                         baseline_aligned(cx, status_size, status_size, "UTF-8")
                             .debug_selector(|| "status-file-encoding".into()),
                     )
-                    .child(
-                        baseline_aligned(cx, status_size, status_size, line_ending)
-                            .min_w(px(status_size * 3.))
-                            .debug_selector(|| format!("status-file-line-ending: {line_ending}")),
-                    )
                     .when(self.loading_file.is_some(), |bar| {
                         bar.child(baseline_aligned(
                             cx,
@@ -4979,31 +4989,45 @@ impl Workspace {
                     .child(
                         h_flex()
                             .debug_selector(|| "status-file-controls".into())
-                            .gap(px(4.))
+                            .gap_3()
                             .child(
-                                baseline_aligned(
-                                    cx,
-                                    status_size,
-                                    status_size,
-                                    status_button("editor-wrap")
-                                        .min_w(px(58.))
-                                        .label_size(px(status_size))
-                                        .toggled(file.wrap)
-                                        .label(if file.wrap {
-                                            t!("workspace.wrap_on")
-                                        } else {
-                                            t!("workspace.wrap_off")
-                                        })
-                                        .tooltip(if file.wrap {
-                                            t!("workspace.disable_wrap")
-                                        } else {
-                                            t!("workspace.enable_wrap")
-                                        })
-                                        .on_click(cx.listener(|this, _, window, cx| {
-                                            this.toggle_wrap(&ToggleWrap, window, cx);
-                                        })),
-                                )
-                                .flex_shrink_0(),
+                                h_flex()
+                                    .gap(px(4.))
+                                    .child(
+                                        baseline_aligned(cx, status_size, status_size, line_ending)
+                                            .debug_selector(|| {
+                                                format!("status-file-line-ending: {line_ending}")
+                                            }),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex_shrink_0()
+                                            .debug_selector(|| "status-editor-wrap".into())
+                                            .child(
+                                                quiet_button("editor-wrap")
+                                                    .with_size(px(22.))
+                                                    .size(px(22.))
+                                                    .p_0()
+                                                    .icon_size(px(14.))
+                                                    .icon(
+                                                        Icon::default()
+                                                            .data(wrap_icon)
+                                                            .text_color(wrap_color),
+                                                    )
+                                                    .toggled(file.wrap)
+                                                    .accessibility_label(wrap_label)
+                                                    .tooltip(wrap_tooltip)
+                                                    .on_click(cx.listener(
+                                                        |this, _, window, cx| {
+                                                            this.toggle_wrap(
+                                                                &ToggleWrap,
+                                                                window,
+                                                                cx,
+                                                            );
+                                                        },
+                                                    )),
+                                            ),
+                                    ),
                             )
                             .when(
                                 self.standalone.is_none() || file.server_project.is_some(),
@@ -6385,11 +6409,31 @@ mod layout_tests {
         let path = visual.debug_bounds("status-file-path").unwrap();
         let language = visual.debug_bounds("status-file-language").unwrap();
         let encoding = visual.debug_bounds("status-file-encoding").unwrap();
-        let ending = visual.debug_bounds("status-file-line-ending: LF").unwrap();
         let controls = visual.debug_bounds("status-file-controls").unwrap();
-        for [left, right] in [path, position, language, encoding, ending, controls].array_windows()
-        {
+        for [left, right] in [path, position, language, encoding, controls].array_windows() {
             assert!(left.right() <= right.left());
+        }
+
+        let check_status_group = |visual: &mut VisualTestContext, ending| {
+            let ending = visual.debug_bounds(ending).unwrap();
+            let wrap_button = visual.debug_bounds("status-editor-wrap").unwrap();
+            let lsp = visual.debug_bounds("status-language-service").unwrap();
+            assert!((wrap_button.left() - ending.right() - px(4.)).abs() <= px(1.));
+            let section_gap = visual.update(|window, _| window.rem_size() * 0.75);
+            assert!((lsp.left() - wrap_button.right() - section_gap).abs() <= px(1.));
+            wrap_button
+        };
+        let wrap_button = check_status_group(visual, "status-file-line-ending: LF");
+        assert_eq!(wrap_button.size, size(px(22.), px(22.)));
+        for wrap in [false, true] {
+            visual.simulate_click(wrap_button.center(), Modifiers::none());
+            draw(visual);
+            assert_eq!(visual.debug_bounds("status-editor-wrap"), Some(wrap_button));
+            visual.update(|_, cx| {
+                let file = workspace.read(cx).active_file().unwrap();
+                assert_eq!(file.wrap, wrap);
+                assert_eq!(file.editor.read(cx).projected_wrap_rows(1) > 1, wrap);
+            });
         }
 
         for (file, ending) in [
@@ -6403,7 +6447,7 @@ mod layout_tests {
                 });
             });
             draw(visual);
-            assert!(visual.debug_bounds(ending).is_some());
+            check_status_group(visual, ending);
             assert!(
                 visual
                     .debug_bounds("status-file-position: Ln 1:1")
