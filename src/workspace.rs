@@ -3607,7 +3607,7 @@ impl Workspace {
             } else {
                 Ok(())
             };
-            Ok::<_, anyhow::Error>((document, text, result))
+            Ok::<_, anyhow::Error>((document, text, dirty, result))
         });
         self.saving.insert(path.clone());
         cx.spawn_in(window, async move |this, cx| {
@@ -3618,7 +3618,7 @@ impl Workspace {
                 // conflict can surface on the very first save. It then belongs
                 // to the prompt, not to an error toast next to a dialog.
                 let mut conflicted = false;
-                let result = result.and_then(|(document, text, result)| {
+                let result = result.and_then(|(document, text, wrote, result)| {
                     let repo = this.repository.as_ref();
                     if let Some(file) = this.files.get_mut(&path) {
                         file.document = document;
@@ -3640,7 +3640,9 @@ impl Workspace {
                         file.saved = text.clone();
                         file.dirty = file.committed != file.saved;
                         file.pending_draft = true;
-                        file.revision += 1;
+                        if wrote {
+                            file.revision += 1;
+                        }
                         if let Some(server) = &file.language_server {
                             server.document.saved(text);
                         }
@@ -3651,7 +3653,7 @@ impl Workspace {
                             this.store.discard_draft(repo, &path)?;
                         }
                     }
-                    Ok(())
+                    Ok(wrote)
                 });
                 if conflicted {
                     if this.tabs.active() == Some(&path) {
@@ -3667,9 +3669,9 @@ impl Workspace {
                     this.prompt_conflict(path, window, cx);
                 } else {
                     match result {
-                        Ok(()) => {
-                            if !path.is_absolute() {
-                                this.refresh_git_after_change(&path, window, cx);
+                        Ok(wrote) => {
+                            if wrote && !path.is_absolute() {
+                                this.refresh_git_after_save(&path, window, cx);
                             }
                             if this.standalone.is_some()
                                 && (this

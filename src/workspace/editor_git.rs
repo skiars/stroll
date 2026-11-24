@@ -444,6 +444,7 @@ impl Workspace {
             .git
             .changes
             .as_ref()
+            .filter(|_| !file.git.stale)
             .map(|changes| changes.version.clone());
         if cached.is_some() {
             self.refresh_editor_git_marks(&path, window, cx);
@@ -476,7 +477,6 @@ impl Workspace {
                     .await;
                 let new = result.ok().flatten();
                 if let Some(changes) = new {
-                    last = Some(changes.version.clone());
                     if this
                         .update_in(cx, |workspace, window, cx| {
                             if workspace.view != WorkspaceView::Editor
@@ -491,9 +491,15 @@ impl Workspace {
                             let Some(file) = workspace.files.get_mut(&path) else {
                                 return;
                             };
-                            let pending = file.git.pending_hunk.take();
-                            file.git.stale =
+                            let stale =
                                 changes.version.disk != Some(file.document.draft_baseline());
+                            // The watcher can read the new file before the save updates the buffer baseline.
+                            if stale && workspace.saving.contains(&path) {
+                                return;
+                            }
+                            last = Some(changes.version.clone());
+                            let pending = file.git.pending_hunk.take();
+                            file.git.stale = stale;
                             let next = pending
                                 .filter(|_| !file.git.stale)
                                 .and_then(|location| location.find(&changes));
@@ -526,13 +532,21 @@ impl Workspace {
         });
     }
 
-    pub(super) fn refresh_git_after_change(
+    pub(super) fn refresh_git_after_save(
         &mut self,
         path: &Path,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.invalidate_editor_git(path, window, cx);
+        if let Some(file) = self.files.get_mut(path) {
+            // Keep the painted marks until a diff for the newly saved baseline is ready.
+            file.git.clear_hunk(&file.editor, cx);
+            file.git.stale = true;
+            file.git.draft_marks = Task::ready(());
+        }
+        if self.view == WorkspaceView::Editor && self.tabs.active() == Some(path) {
+            self.watch_editor_git(window, cx);
+        }
         if let Some(panel) = &self.git {
             panel.update(cx, |panel, cx| {
                 panel.invalidate_source_inlay_hints(path, cx);
@@ -892,7 +906,7 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> Option<usize> {
         let file = self.files.get_mut(path)?;
-        let changes = file.git.changes.as_ref()?;
+        let changes = file.git.changes.as_ref().filter(|_| !file.git.stale)?;
         let (patch, block) = editor_hunks(changes).nth(action)?;
         let mut deleted = patch.deleted_lines(block)?.into_iter();
         let line = hunk_line(changes, patch.layer, block);
@@ -1127,6 +1141,16 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if !self.files.get(&path).is_some_and(|file| {
+            !file.git.stale
+                && file
+                    .git
+                    .changes
+                    .as_ref()
+                    .is_some_and(|changes| changes.version == edit.version)
+        }) {
+            return;
+        }
         if edit.action == FileAction::Restore {
             self.restore_buffer_hunk(path, edit, window, cx);
             return;
@@ -1582,6 +1606,143 @@ fn editing_below_an_inline_hunk_preserves_the_source_viewport() -> Result<()> {
 mod tests {
     use super::*;
     use std::process::Command;
+
+    #[::core::prelude::v1::test]
+    fn save_keeps_git_marks_visible_until_the_new_diff_is_ready() -> Result<()> {
+        let fixture = tempfile::tempdir()?;
+        let root = fixture.path().join("repo");
+        fs::create_dir(&root)?;
+        let path = PathBuf::from("review.txt");
+        let git = |args: &[&str]| -> Result<()> {
+            let output = Command::new("git").current_dir(&root).args(args).output()?;
+            anyhow::ensure!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            Ok(())
+        };
+        git(&["init", "-q"])?;
+        let tail: String = (1..120).map(|line| format!("line {line}\n")).collect();
+        let head = format!("original\n{tail}");
+        let disk = root.join(&path);
+        fs::write(&disk, &head)?;
+        git(&["add", "review.txt"])?;
+        git(&[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-qm",
+            "initial",
+        ])?;
+        fs::write(&disk, format!("changed\n{tail}"))?;
+
+        let store = Arc::new(Store::new(fixture.path().join("state"))?);
+        let config = ConfigFile::load(Some(fixture.path().join("config.toml")));
+        let mut app = TestAppContext::build_with_text_system(
+            TestDispatcher::new(0),
+            None,
+            crate::test_support::text_system(true),
+        );
+        app.update(gpui_component::init);
+        let mut workspace = None;
+        let (_, visual) = app.add_window_view(|window, cx| {
+            let view = cx
+                .new(|cx| Workspace::with_config(store, config, WorkspaceView::Editor, window, cx));
+            workspace = Some(view.clone());
+            gpui_component::Root::new(view, window, cx)
+        });
+        let workspace = workspace.unwrap();
+        visual.simulate_resize(size(px(1150.), px(760.)));
+        visual.update(|window, cx| {
+            workspace.update(cx, |workspace, cx| {
+                workspace.open_repository(
+                    Location {
+                        root,
+                        file: Some(path.clone()),
+                    },
+                    window,
+                    cx,
+                );
+            });
+        });
+        visual.run_until_parked();
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+        let bounds = visual.debug_bounds("workspace-editor").unwrap();
+        let paint = |visual: &mut VisualTestContext| {
+            visual.update(|window, cx| {
+                window.draw(cx).clear(cx);
+                let color = Palette::for_mode(cx.theme().mode).accent;
+                let quads = window.painted_quads();
+                let mut left = false;
+                let mut right = false;
+                for quad in quads {
+                    if quad.background.as_solid() != Some(color) {
+                        continue;
+                    }
+                    let quad = quad
+                        .bounds
+                        .map(|value| px(value.as_f32() / window.scale_factor()));
+                    if quad.top() < bounds.top() || quad.bottom() > bounds.bottom() {
+                        continue;
+                    }
+                    left |= quad.left() >= bounds.left()
+                        && quad.right() <= bounds.left() + GIT_GUTTER_WIDTH;
+                    right |= quad.left() >= bounds.right() - px(20.)
+                        && quad.right() <= bounds.right()
+                        && quad.size.width == px(3.);
+                }
+                (left, right)
+            })
+        };
+        let edit_first_line = |visual: &mut VisualTestContext, old: &str, new: &str| {
+            visual.update(|window, cx| {
+                let editor = workspace.read(cx).files[&path].editor.clone();
+                editor.update(cx, |editor, cx| {
+                    editor.edit_ranges(&[(0..old.len(), new.to_string())], window, cx);
+                });
+            });
+        };
+        let save_and_paint = |visual: &mut VisualTestContext| {
+            let mut frames = vec![paint(visual)];
+            let mut waited_for_diff = false;
+            visual.update(|window, cx| window.dispatch_action(Box::new(SaveFile), cx));
+            while visual.executor().tick() {
+                let markers = paint(visual);
+                if frames.last() != Some(&markers) {
+                    frames.push(markers);
+                }
+                visual.update(|_, cx| {
+                    if workspace.read(cx).files[&path].git.stale {
+                        waited_for_diff = true;
+                        workspace.update(cx, |workspace, cx| {
+                            workspace.toggle_editor_git(&path, 0, cx);
+                            assert!(workspace.files[&path].git.selected.is_none());
+                        });
+                    }
+                });
+            }
+            (frames, waited_for_diff)
+        };
+
+        let visible = (true, true);
+        edit_first_line(visual, "changed", "also changed");
+        assert_eq!(save_and_paint(visual), (vec![visible], true));
+        assert_eq!(fs::read_to_string(&disk)?, format!("also changed\n{tail}"));
+        assert_eq!(save_and_paint(visual), (vec![visible], false));
+
+        edit_first_line(visual, "also changed", "original");
+        assert_eq!(
+            save_and_paint(visual),
+            (vec![visible, (false, false)], true)
+        );
+        assert_eq!(fs::read_to_string(&disk)?, head);
+        Ok(())
+    }
 
     #[::core::prelude::v1::test]
     fn hunk_toolbar_paints_over_deferred_annotations_in_both_themes() {
