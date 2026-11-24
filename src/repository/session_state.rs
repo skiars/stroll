@@ -28,7 +28,9 @@ macro_rules! session_fields {
             editor_tree_expanded,
             docs_tree_expanded,
             terminal,
-            commit_draft
+            commit_draft,
+            editor_markdown_split,
+            editor_svg_split
         )
     };
 }
@@ -166,6 +168,12 @@ impl Store {
             }
             if session.editor_preview != previous.editor_preview {
                 current.editor_preview = session.editor_preview;
+            }
+            if session.editor_markdown_split != previous.editor_markdown_split {
+                current.editor_markdown_split = session.editor_markdown_split;
+            }
+            if session.editor_svg_split != previous.editor_svg_split {
+                current.editor_svg_split = session.editor_svg_split;
             }
             write_standalone(&tx, path, &current)?;
             tx.commit()?;

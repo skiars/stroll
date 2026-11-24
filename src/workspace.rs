@@ -1766,6 +1766,8 @@ impl Workspace {
             session.source_history = std::mem::take(&mut self.session.source_history);
             session.file_wraps = std::mem::take(&mut self.session.file_wraps);
             session.editor_previews = std::mem::take(&mut self.session.editor_previews);
+            session.editor_markdown_split = self.session.editor_markdown_split;
+            session.editor_svg_split = self.session.editor_svg_split;
         }
         session.source_history.normalize();
         self.source_caret = None;
@@ -2665,9 +2667,12 @@ impl Workspace {
             }
             return;
         }
+        let is_svg = PreviewKind::for_path(&path) == Some(PreviewKind::Svg);
         if self.loading_file.is_none()
             && self.tabs.active() == Some(&path)
-            && (self.files.contains_key(&path) || self.active_image_tab().is_some())
+            && (self.files.contains_key(&path)
+                || (self.active_image_tab().is_some()
+                    && (!is_svg || self.editor_preview_mode(&path) == EditorPreviewMode::Full)))
             && let FileOpen::Select {
                 preview,
                 position: None,
@@ -2689,7 +2694,7 @@ impl Workspace {
         }
         if self.repository.is_some()
             && crate::image_viewer::is_image(&path)
-            && (PreviewKind::for_path(&path) != Some(PreviewKind::Svg) || request.is_image_browse())
+            && (!is_svg || request.is_image_browse())
         {
             if !self.images.contains_key(&path) {
                 self.load_image_tab(path.clone(), window, cx);
@@ -5482,6 +5487,9 @@ impl Workspace {
 
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if !cx.has_active_drag() {
+            self.editor_previews.split_drag = None;
+        }
         self.refresh_active_editor_preview(window, cx);
         self.visible_editor = if self.view == WorkspaceView::Editor
             && !self.terminal_maximized()
@@ -5560,6 +5568,11 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::source_back))
             .on_action(cx.listener(Self::source_forward))
             .capture_any_mouse_down(cx.listener(Self::source_mouse_down))
+            .capture_any_mouse_up(cx.listener(Self::finish_editor_preview_resize))
+            .on_mouse_up_out(
+                MouseButton::Left,
+                cx.listener(Self::finish_editor_preview_resize),
+            )
             .when(self.view == WorkspaceView::Editor && !switching, |view| {
                 view.on_action(cx.listener(|this, _: &FindNextMatch, window, cx| {
                     this.navigate_find_match(false, window, cx);

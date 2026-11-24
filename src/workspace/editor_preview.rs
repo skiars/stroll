@@ -1,6 +1,12 @@
 use super::*;
 use crate::session::EditorPreviewMode;
+use gpui_base::InteractiveElementExt as _;
 use std::borrow::Cow;
+
+const DEFAULT_SPLIT_FRACTION: f32 = 0.5;
+const MIN_SPLIT_FRACTION: f32 = 0.25;
+const MAX_SPLIT_FRACTION: f32 = 0.75;
+const DIVIDER_HIT_PADDING: Pixels = px(5.);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum PreviewKind {
@@ -30,9 +36,9 @@ impl PreviewKind {
 impl EditorPreviewMode {
     fn next(self) -> Self {
         match self {
-            Self::Source => Self::Split,
-            Self::Split => Self::Full,
-            Self::Full => Self::Source,
+            Self::Full => Self::Split,
+            Self::Split => Self::Source,
+            Self::Source => Self::Full,
         }
     }
 
@@ -43,13 +49,31 @@ impl EditorPreviewMode {
             Self::Full => t!("editor_preview.full"),
         }
     }
+
+    fn icon(self) -> (&'static [u8], &'static str) {
+        // Draw the frame and symbol together so they scale from the same origin.
+        match self {
+            Self::Source => (
+                include_bytes!("icons/editor-preview-source.svg"),
+                "editor-preview-icon-source",
+            ),
+            Self::Split => (
+                include_bytes!("icons/editor-preview-split.svg"),
+                "editor-preview-icon-split",
+            ),
+            Self::Full => (
+                include_bytes!("icons/editor-preview-full.svg"),
+                "editor-preview-icon-full",
+            ),
+        }
+    }
 }
 
 #[derive(Default)]
 pub(super) struct EditorPreviews {
     markdown: HashMap<PathBuf, MarkdownPreview>,
     pub(super) svg_source_errors: HashMap<PathBuf, SharedString>,
-    split_fraction: Option<f32>,
+    pub(super) split_drag: Option<(PreviewKind, f32)>,
 }
 
 struct MarkdownPreview {
@@ -58,8 +82,11 @@ struct MarkdownPreview {
     _task: Task<()>,
 }
 
-#[derive(Clone, Copy)]
-struct PreviewDivider;
+#[derive(Clone)]
+struct PreviewDivider {
+    kind: PreviewKind,
+    offset: Rc<Cell<Pixels>>,
+}
 
 impl Render for PreviewDivider {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
@@ -68,6 +95,46 @@ impl Render for PreviewDivider {
 }
 
 impl Workspace {
+    fn editor_preview_split_fraction(&self, kind: PreviewKind) -> f32 {
+        let saved = match kind {
+            PreviewKind::Markdown => self.session.editor_markdown_split,
+            PreviewKind::Svg => self.session.editor_svg_split,
+        };
+        self.editor_previews
+            .split_drag
+            .filter(|(dragged, _)| *dragged == kind)
+            .map(|(_, fraction)| fraction)
+            .or(saved)
+            .unwrap_or(DEFAULT_SPLIT_FRACTION)
+            .clamp(MIN_SPLIT_FRACTION, MAX_SPLIT_FRACTION)
+    }
+
+    fn set_editor_preview_split_fraction(&mut self, kind: PreviewKind, fraction: f32) {
+        let split = match kind {
+            PreviewKind::Markdown => &mut self.session.editor_markdown_split,
+            PreviewKind::Svg => &mut self.session.editor_svg_split,
+        };
+        let value = (fraction != DEFAULT_SPLIT_FRACTION).then_some(fraction);
+        if *split != value {
+            *split = value;
+            self.session_revision += 1;
+        }
+    }
+
+    pub(super) fn finish_editor_preview_resize(
+        &mut self,
+        event: &MouseUpEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if event.button == MouseButton::Left
+            && let Some((kind, fraction)) = self.editor_previews.split_drag.take()
+        {
+            self.set_editor_preview_split_fraction(kind, fraction);
+            cx.notify();
+        }
+    }
+
     pub(super) fn editor_preview_mode(&self, path: &Path) -> EditorPreviewMode {
         self.session
             .editor_previews
@@ -170,38 +237,14 @@ impl Workspace {
             (EditorPreviewMode::Full, true) => rgb(0xcc9bff),
         }
         .into();
-        let next = mode.next();
         let path = path.to_owned();
-        let glyph = div()
-            .flex_none()
-            .size(px(18.))
-            .border_1()
-            .border_color(color)
-            .rounded(px(2.))
-            .flex()
-            .items_center()
-            .justify_center()
-            .debug_selector(move || match mode {
-                EditorPreviewMode::Source => "editor-preview-icon-source".into(),
-                EditorPreviewMode::Split => "editor-preview-icon-split".into(),
-                EditorPreviewMode::Full => "editor-preview-icon-full".into(),
-            })
-            .child(match mode {
-                EditorPreviewMode::Source => icon(IconName::Code, color, 12.).into_any_element(),
-                EditorPreviewMode::Split => div().h_full().w(px(1.)).bg(color).into_any_element(),
-                EditorPreviewMode::Full => icon(IconName::Eye, color, 12.).into_any_element(),
-            });
+        let (art, selector) = mode.icon();
+        let glyph = Icon::default().data(art).text_color(color);
         Some(
-            quiet_button("editor-preview-mode")
-                .size(px(28.))
-                .p_0()
-                .accessibility_label(t!(
-                    "editor_preview.button",
-                    current = mode.label(),
-                    next = next.label()
-                ))
-                .tooltip(t!("editor_preview.switch", mode = next.label()))
-                .child(glyph)
+            icon_button("editor-preview-mode", glyph, mode.label())
+                .icon_size(px(16.))
+                .tooltip_placement(Placement::Bottom)
+                .debug_selector(move || selector.into())
                 .on_click(cx.listener(move |this, _, window, cx| {
                     if this.tabs.active() != Some(&path) {
                         return;
@@ -223,7 +266,7 @@ impl Workspace {
                         this.show_error(error, window, cx);
                     }
                     if kind == PreviewKind::Svg
-                        && next == EditorPreviewMode::Source
+                        && next != EditorPreviewMode::Full
                         && !this.files.contains_key(&path)
                     {
                         this.request_file(
@@ -402,8 +445,11 @@ impl Workspace {
         if mode == EditorPreviewMode::Source {
             return source;
         }
-        let preview = match PreviewKind::for_path(path) {
-            Some(PreviewKind::Markdown) => {
+        let Some(kind) = PreviewKind::for_path(path) else {
+            return source;
+        };
+        let preview = match kind {
+            PreviewKind::Markdown => {
                 match self
                     .editor_previews
                     .markdown
@@ -418,7 +464,7 @@ impl Workspace {
                     ),
                 }
             }
-            Some(PreviewKind::Svg) => self.images.get(path).map_or_else(
+            PreviewKind::Svg => self.images.get(path).map_or_else(
                 || {
                     Self::preview_status(
                         t!("editor_preview.rendering").into_owned().into(),
@@ -427,7 +473,6 @@ impl Workspace {
                 },
                 |image| self.image_tab_content(path, image, cx, colors),
             ),
-            None => return source,
         };
         if mode == EditorPreviewMode::Full {
             return v_flex()
@@ -439,37 +484,38 @@ impl Workspace {
                 .child(preview)
                 .into_any_element();
         }
+        let fraction = self.editor_preview_split_fraction(kind);
         h_flex()
             .id("editor-preview-split")
             .debug_selector(|| "editor-preview-split".into())
+            .relative()
             .flex_1()
             .min_h_0()
             .min_w_0()
             .overflow_hidden()
             .on_drag_move(
-                cx.listener(|this, event: &DragMoveEvent<PreviewDivider>, _, cx| {
+                cx.listener(move |this, event: &DragMoveEvent<PreviewDivider>, _, cx| {
+                    let drag = event.drag(cx);
                     let width = f32::from(event.bounds.size.width);
-                    if width > 0. {
-                        let offset = f32::from(event.event.position.x - event.bounds.left());
-                        this.editor_previews.split_fraction =
-                            Some((offset / width).clamp(0.25, 0.75));
+                    if drag.kind == kind && width > 0. {
+                        let offset =
+                            event.event.position.x - event.bounds.left() - drag.offset.get();
+                        let fraction = (f32::from(offset) / width)
+                            .clamp(MIN_SPLIT_FRACTION, MAX_SPLIT_FRACTION);
+                        this.editor_previews.split_drag = Some((kind, fraction));
                         cx.notify();
                     }
                 }),
             )
             .child(
                 v_flex()
-                    .w(relative(self.editor_previews.split_fraction.unwrap_or(0.5)))
+                    .w(relative(fraction))
+                    .flex_none()
                     .h_full()
                     .min_w_0()
                     .min_h_0()
                     .overflow_hidden()
                     .child(source),
-            )
-            .child(
-                pane_resize_handle("editor-preview-divider", Axis::Horizontal, true)
-                    .with_hit_padding(px(4.), px(4.))
-                    .on_drag_from_press(PreviewDivider, |drag, _, _, cx| cx.new(|_| *drag)),
             )
             .child(
                 v_flex()
@@ -481,7 +527,41 @@ impl Workspace {
                     .overflow_hidden()
                     .child(preview),
             )
+            .child(Self::editor_preview_divider(kind, fraction, cx))
             .into_any_element()
+    }
+
+    fn editor_preview_divider(
+        kind: PreviewKind,
+        fraction: f32,
+        cx: &Context<Self>,
+    ) -> impl IntoElement {
+        // Anchor the resize handle at the boundary, above both panes.
+        div()
+            .debug_selector(|| "editor-preview-divider-anchor".into())
+            .absolute()
+            .left(relative(fraction))
+            .top_0()
+            .bottom_0()
+            .w(px(1.))
+            .child(
+                pane_resize_handle("editor-preview-divider", Axis::Horizontal, true)
+                    .with_hit_padding(DIVIDER_HIT_PADDING, DIVIDER_HIT_PADDING)
+                    .on_drag_from_press(
+                        PreviewDivider {
+                            kind,
+                            offset: Rc::default(),
+                        },
+                        |drag, position, _, cx| {
+                            drag.offset.set(position.x - DIVIDER_HIT_PADDING);
+                            cx.new(|_| drag.clone())
+                        },
+                    )
+                    .on_double_click(cx.listener(move |this, _, _, cx| {
+                        this.set_editor_preview_split_fraction(kind, DEFAULT_SPLIT_FRACTION);
+                        cx.notify();
+                    })),
+            )
     }
 
     pub(super) fn preview_status(message: SharedString, color: Hsla) -> AnyElement {
@@ -589,8 +669,77 @@ mod tests {
         }
     }
 
+    #[track_caller]
+    fn assert_split_layout(visual: &mut VisualTestContext, fraction: f32) {
+        let split = visual.debug_bounds("editor-preview-split").unwrap();
+        let preview = visual.debug_bounds("editor-preview-pane").unwrap();
+        let line = visual
+            .debug_bounds("editor-preview-divider-anchor")
+            .unwrap();
+        assert_eq!(line.left(), preview.left());
+        assert_eq!(line.size.height, split.size.height);
+        let expected = split.left() + split.size.width * fraction;
+        assert!(
+            (line.left() - expected).abs() <= px(1.),
+            "divider at {}, expected {expected} for fraction {fraction}",
+            line.left()
+        );
+    }
+
+    fn drag_split(visual: &mut VisualTestContext, workspace: &Entity<Workspace>, fraction: f32) {
+        let split = visual.debug_bounds("editor-preview-split").unwrap();
+        let line = visual
+            .debug_bounds("editor-preview-divider-anchor")
+            .unwrap();
+        // Grab just beside the line, away from the middle grip.
+        let from = point(line.left() + px(4.), split.top() + px(30.));
+        let to = point(split.left() + split.size.width * fraction + px(4.), from.y);
+        let saved = visual.update(|_, cx| {
+            let session = &workspace.read(cx).session;
+            (session.editor_markdown_split, session.editor_svg_split)
+        });
+        visual.simulate_event(MouseDownEvent {
+            button: MouseButton::Left,
+            position: from,
+            click_count: 1,
+            ..Default::default()
+        });
+        for position in [point(from.x + (to.x - from.x) * 0.5, from.y), to] {
+            visual.simulate_event(MouseMoveEvent {
+                position,
+                pressed_button: Some(MouseButton::Left),
+                ..Default::default()
+            });
+        }
+        settle(visual, workspace, |_, _| true);
+        assert_split_layout(
+            visual,
+            fraction.clamp(MIN_SPLIT_FRACTION, MAX_SPLIT_FRACTION),
+        );
+        visual.update(|_, cx| {
+            let session = &workspace.read(cx).session;
+            assert_eq!(
+                (session.editor_markdown_split, session.editor_svg_split),
+                saved
+            );
+        });
+        visual.simulate_event(MouseUpEvent {
+            button: MouseButton::Left,
+            position: to,
+            click_count: 1,
+            ..Default::default()
+        });
+        settle(visual, workspace, |this, _| {
+            this.editor_previews.split_drag.is_none()
+        });
+        assert_split_layout(
+            visual,
+            fraction.clamp(MIN_SPLIT_FRACTION, MAX_SPLIT_FRACTION),
+        );
+    }
+
     #[::core::prelude::v1::test]
-    fn editor_preview_cycles_renders_drafts_and_saves_per_tab_modes() -> Result<()> {
+    fn editor_preview_cycles_renders_drafts_and_saves_modes_and_splits() -> Result<()> {
         let fixture = tempfile::tempdir()?;
         let root = fixture.path().join("repo");
         fs::create_dir(&root)?;
@@ -639,22 +788,26 @@ mod tests {
                 this.apply_repository(repo.clone(), Default::default(), None, None, window, cx);
             });
         });
-        let open = |visual: &mut VisualTestContext, path: &Path| {
+        let open = |visual: &mut VisualTestContext, workspace: &Entity<Workspace>, path: &Path| {
             visual.update(|window, cx| {
                 workspace.update(cx, |this, cx| {
                     this.open_file(path.to_owned(), false, window, cx);
                 });
             });
-            settle(visual, &workspace, |this, _| {
+            settle(visual, workspace, |this, _| {
                 this.tabs.active() == Some(path)
             });
         };
-        let click_mode = |visual: &mut VisualTestContext, icon: &'static str| {
-            let button = visual.debug_bounds(icon).expect("preview icon");
-            assert_eq!(button.size.width, button.size.height);
-            visual.simulate_click(button.center(), Modifiers::default());
-            settle(visual, &workspace, |_, _| true);
-        };
+        let click_mode =
+            |visual: &mut VisualTestContext, workspace: &Entity<Workspace>, icon: &'static str| {
+                let button = visual.debug_bounds(icon).expect("preview icon");
+                let actions = visual.debug_bounds("workspace-actions-trigger").unwrap();
+                assert_eq!(button.size, size(px(28.), px(28.)));
+                assert_eq!(button.size, actions.size);
+                assert_eq!(button.center().y, actions.center().y);
+                visual.simulate_click(button.center(), Modifiers::default());
+                settle(visual, workspace, |_, _| true);
+            };
         let edit = |visual: &mut VisualTestContext, value: &str| {
             visual.update(|window, cx| {
                 let editor = workspace.read(cx).active_file().unwrap().editor.clone();
@@ -664,12 +817,27 @@ mod tests {
             });
         };
 
-        open(&mut visual, first);
+        open(&mut visual, &workspace, first);
         let icon = visual.debug_bounds("editor-preview-icon-source").unwrap();
         let actions = visual.debug_bounds("workspace-actions-trigger").unwrap();
         assert!(icon.right() <= actions.left());
         assert!(visual.debug_bounds("editor-preview-pane").is_none());
-        click_mode(&mut visual, "editor-preview-icon-source");
+        assert!(
+            visual
+                .debug_bounds("editor-preview-divider-anchor")
+                .is_none()
+        );
+        click_mode(&mut visual, &workspace, "editor-preview-icon-source");
+        assert!(visual.debug_bounds("editor-preview-full").is_some());
+        assert!(
+            visual
+                .debug_bounds("editor-preview-divider-anchor")
+                .is_none()
+        );
+        assert!(visual.debug_bounds("workspace-editor").is_none());
+        click_mode(&mut visual, &workspace, "editor-preview-icon-full");
+        assert_split_layout(&mut visual, 0.5);
+        drag_split(&mut visual, &workspace, 0.60);
         let source = visual.debug_bounds("workspace-editor").unwrap();
         let preview = visual.debug_bounds("editor-preview-pane").unwrap();
         assert!(source.right() <= preview.left());
@@ -730,21 +898,56 @@ mod tests {
         );
         assert_eq!(fs::read_to_string(root.join(first))?, saved_markdown);
 
-        open(&mut visual, second);
+        open(&mut visual, &workspace, second);
         assert!(visual.debug_bounds("editor-preview-icon-split").is_some());
-        open(&mut visual, first);
-        click_mode(&mut visual, "editor-preview-icon-split");
-        assert!(visual.debug_bounds("editor-preview-full").is_some());
-        assert!(visual.debug_bounds("workspace-editor").is_none());
-        click_mode(&mut visual, "editor-preview-icon-full");
+        assert_split_layout(&mut visual, 0.60);
+        open(&mut visual, &workspace, first);
+        click_mode(&mut visual, &workspace, "editor-preview-icon-split");
+        assert!(visual.debug_bounds("editor-preview-icon-source").is_some());
         assert!(visual.debug_bounds("workspace-editor").is_some());
         assert!(visual.debug_bounds("editor-preview-full").is_none());
-        open(&mut visual, second);
+        open(&mut visual, &workspace, second);
         assert!(visual.debug_bounds("editor-preview-icon-split").is_some());
+        assert_split_layout(&mut visual, 0.60);
 
-        open(&mut visual, svg);
+        open(&mut visual, &workspace, svg);
         assert!(visual.debug_bounds("editor-preview-icon-source").is_some());
-        click_mode(&mut visual, "editor-preview-icon-source");
+        visual.update(|window, cx| {
+            workspace.update(cx, |this, cx| {
+                this.remove_tab(svg, window, cx);
+                this.request_file(svg.to_owned(), FileOpen::ImageBrowse, window, cx);
+            });
+        });
+        settle(&mut visual, &workspace, |this, _| {
+            this.tabs.active() == Some(svg)
+                && this.active_editor_preview_mode() == EditorPreviewMode::Full
+        });
+        assert!(visual.update(|_, cx| workspace.read(cx).active_file().is_none()));
+        click_mode(&mut visual, &workspace, "editor-preview-icon-full");
+        settle(&mut visual, &workspace, |this, _| {
+            this.active_file().is_some_and(|file| file.path == svg)
+        });
+        assert_split_layout(&mut visual, 0.5);
+        drag_split(&mut visual, &workspace, 0.90);
+        let grip = visual
+            .debug_bounds("editor-preview-divider-anchor")
+            .unwrap()
+            .center();
+        visual.simulate_event(MouseDownEvent {
+            button: MouseButton::Left,
+            position: grip,
+            click_count: 2,
+            ..Default::default()
+        });
+        visual.simulate_event(MouseUpEvent {
+            button: MouseButton::Left,
+            position: grip,
+            click_count: 2,
+            ..Default::default()
+        });
+        settle(&mut visual, &workspace, |_, _| true);
+        assert_split_layout(&mut visual, 0.5);
+        drag_split(&mut visual, &workspace, 0.35);
         settle(&mut visual, &workspace, |this, _| {
             this.active_image_tab()
                 .is_some_and(|(_, image)| image.has_image())
@@ -762,15 +965,21 @@ mod tests {
             this.active_image_tab()
                 .is_some_and(|(_, image)| image.has_image() && !image.has_svg_error())
         });
-        click_mode(&mut visual, "editor-preview-icon-split");
+        click_mode(&mut visual, &workspace, "editor-preview-icon-split");
+        click_mode(&mut visual, &workspace, "editor-preview-icon-source");
         assert!(visual.debug_bounds("editor-preview-full").is_some());
+        assert!(
+            visual
+                .debug_bounds("editor-preview-divider-anchor")
+                .is_none()
+        );
 
-        open(&mut visual, plain);
+        open(&mut visual, &workspace, plain);
         assert!(visual.debug_bounds("editor-preview-icon-source").is_none());
         assert!(visual.debug_bounds("editor-preview-icon-split").is_none());
         assert!(visual.debug_bounds("editor-preview-icon-full").is_none());
         visual.update(|_, cx| workspace.update(cx, |this, cx| this.flush_session(cx)))?;
-        let fresh_store = Store::new(state)?;
+        let fresh_store = Arc::new(Store::new(state)?);
         let session = fresh_store.session(&repo)?;
         assert_eq!(session.editor_previews[first], EditorPreviewMode::Source);
         assert_eq!(session.editor_previews[second], EditorPreviewMode::Split);
@@ -783,12 +992,71 @@ mod tests {
             fresh_store.editor_preview_preference("svg")?,
             EditorPreviewMode::Full
         );
+
+        let mut reopened = None;
+        let (_, mut visual) = cx.add_window_view(|window, cx| {
+            let config = ConfigFile::load(Some(fixture.path().join("config.toml")));
+            let view = cx.new(|cx| {
+                Workspace::with_config(fresh_store, config, WorkspaceView::Editor, window, cx)
+            });
+            view.update(cx, |this, cx| {
+                this.apply_repository(repo, session, None, None, window, cx);
+            });
+            reopened = Some(view.clone());
+            gpui_component::Root::new(view, window, cx)
+        });
+        let reopened = reopened.unwrap();
+        visual.simulate_resize(size(px(1120.), px(600.)));
+        open(&mut visual, &reopened, second);
+        assert_split_layout(&mut visual, 0.60);
+        open(&mut visual, &reopened, svg);
+        click_mode(&mut visual, &reopened, "editor-preview-icon-full");
+        assert_split_layout(&mut visual, 0.35);
+        Ok(())
+    }
+
+    #[::core::prelude::v1::test]
+    fn editor_preview_symbols_are_centered_at_toolbar_scales() -> Result<()> {
+        let renderer = SvgRenderer::new(Arc::new(()));
+        for mode in [
+            EditorPreviewMode::Source,
+            EditorPreviewMode::Split,
+            EditorPreviewMode::Full,
+        ] {
+            let (art, _) = mode.icon();
+            let svg = renderer.parse_svg(art)?;
+            for side in [16, 20, 24, 32] {
+                let extent = DevicePixels(side as i32);
+                let image =
+                    renderer.render_parsed(&svg, SvgSize::ExactSize(size(extent, extent)))?;
+                let pixels = image.as_bytes(0).unwrap();
+                let center = side as f32 / 2.;
+                let mut ink = 0.;
+                let mut offset = point(0., 0.);
+                // Sample the center of the image to measure the symbol without the frame.
+                let inset = side / 5;
+                for y in inset..side - inset {
+                    for x in inset..side - inset {
+                        let alpha = f32::from(pixels[(y * side + x) * 4 + 3]);
+                        ink += alpha;
+                        offset.x += (x as f32 + 0.5 - center) * alpha;
+                        offset.y += (y as f32 + 0.5 - center) * alpha;
+                    }
+                }
+                assert!(ink > 0., "{mode:?} at {side}px has no visible symbol");
+                let offset = point(offset.x / ink, offset.y / ink);
+                assert!(
+                    offset.x.abs() < 0.35 && offset.y.abs() < 0.35,
+                    "{mode:?} at {side}px is offset by {offset:?}"
+                );
+            }
+        }
         Ok(())
     }
 
     #[cfg(target_os = "linux")]
     #[::core::prelude::v1::test]
-    fn editor_preview_paints_svg_in_the_full_tab_offscreen() -> Result<()> {
+    fn editor_preview_paints_svg_and_split_divider_offscreen() -> Result<()> {
         use gpui_wgpu::WgpuHeadlessRenderer;
 
         let fixture = tempfile::tempdir()?;
@@ -846,6 +1114,40 @@ mod tests {
         let screenshot = app.capture_screenshot(window.into())?;
         let center = screenshot.get_pixel(screenshot.width() / 2, screenshot.height() / 2);
         assert_eq!(*center, image::Rgba([204, 40, 120, 255]));
+
+        app.update(|cx| {
+            workspace.update(cx, |this, cx| {
+                let active = this.tabs.active().unwrap().to_owned();
+                this.set_editor_preview_mode(&active, EditorPreviewMode::Split);
+                cx.notify();
+            });
+        });
+        for (mode, line_color) in [
+            (ThemeMode::Light, [228, 228, 223, 255]),
+            (ThemeMode::Dark, [46, 47, 54, 255]),
+        ] {
+            app.update(|cx| apply_theme(mode, cx));
+            app.run_until_parked();
+            let line = app.update_window(window.into(), |_, window, cx| {
+                window.draw(cx).clear(cx);
+                let scale = window.scale_factor();
+                window
+                    .painted_quads()
+                    .into_iter()
+                    .find(|quad| {
+                        quad.background.as_solid() == Some(cx.theme().border)
+                            && quad.bounds.size.width.0 == scale
+                            && quad.bounds.size.height.0 > 300. * scale
+                    })
+                    .expect("the divider paints a full-height theme border at rest")
+                    .bounds
+            })?;
+            let screenshot = app.capture_screenshot(window.into())?;
+            let x = line.center().x.0 as u32;
+            for y in [line.top().0 + 10., line.center().y.0, line.bottom().0 - 10.] {
+                assert_eq!(*screenshot.get_pixel(x, y as u32), image::Rgba(line_color));
+            }
+        }
         Ok(())
     }
 }

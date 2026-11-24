@@ -99,6 +99,8 @@ impl Workspace {
                 this.set_standalone_session_baseline(&path, &session);
                 this.session.view = session.view;
                 this.session.panels = session.panels;
+                this.session.editor_markdown_split = session.editor_markdown_split;
+                this.session.editor_svg_split = session.editor_svg_split;
                 if let Some(position) = session.file_position {
                     this.session.files.insert(path.clone(), position);
                 }

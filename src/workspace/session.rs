@@ -243,6 +243,8 @@ impl Workspace {
                     file_position: self.session.files.get(path).copied(),
                     document_position: self.session.documents.get(path).copied(),
                     editor_preview: self.session.editor_previews.get(path).copied(),
+                    editor_markdown_split: self.session.editor_markdown_split,
+                    editor_svg_split: self.session.editor_svg_split,
                     ..Default::default()
                 },
             });

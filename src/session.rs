@@ -36,6 +36,10 @@ pub(crate) struct WorktreeSession {
     pub file_wraps: BTreeMap<PathBuf, bool>,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub editor_previews: BTreeMap<PathBuf, EditorPreviewMode>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub editor_markdown_split: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub editor_svg_split: Option<f32>,
     pub source_history: SourceHistory,
     pub document: Option<PathBuf>,
     pub documents: BTreeMap<PathBuf, DocumentPosition>,
@@ -300,4 +304,8 @@ pub(crate) struct StandaloneSession {
     pub file_wrap: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub editor_preview: Option<EditorPreviewMode>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub editor_markdown_split: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub editor_svg_split: Option<f32>,
 }
