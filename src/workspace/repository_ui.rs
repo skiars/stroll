@@ -41,8 +41,8 @@ use crate::repository::{
 
 use super::{
     CloseRepositoryPicker, CompleteRepositoryPath, NextRepositoryPath, OpenRepository, Palette,
-    PreviousRepositoryPath, Workspace, action_button, compact_icon_button, icon, icon_button,
-    quiet_button, text_base_size, topbar_segment, topbar_segments,
+    PreviousRepositoryPath, RepositoryOpen, Workspace, action_button, compact_icon_button, icon,
+    icon_button, quiet_button, text_base_size, topbar_segment, topbar_segments,
 };
 
 const REPOSITORY_PICKER_SCROLL_GUTTER: Pixels = px(11.);
@@ -1412,11 +1412,13 @@ impl Workspace {
 
     pub(super) fn reconnect_ssh(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(repo) = &self.repository {
-            self.open_repository(
+            self.open_repository_inner(
                 Location {
                     root: repo.root.clone(),
                     file: None,
                 },
+                None,
+                RepositoryOpen::Remembered,
                 window,
                 cx,
             );

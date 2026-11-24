@@ -195,9 +195,12 @@ impl Session {
             directory,
             scrollback,
         } = tab;
-        let directory = directory
-            .filter(|_| ssh.is_none())
-            .map(|path| root.join(path));
+        let root = Self::directory_root(root);
+        let directory = if ssh.is_some() {
+            directory
+        } else {
+            directory.map(|path| root.join(path))
+        };
         let name = Path::new(&shell)
             .file_stem()
             .unwrap_or(&shell)
@@ -257,7 +260,7 @@ impl Session {
         Self {
             focus,
             label,
-            root: root.to_owned(),
+            root,
             shell,
             last_directory: RefCell::new(directory),
             last_scrollback: RefCell::new(
@@ -303,6 +306,7 @@ impl Session {
     }
 
     pub(super) fn relocate_root(&mut self, root: &Path) {
+        let root = Self::directory_root(root);
         let directory = self.last_directory.get_mut();
         if let Some(relative) = directory
             .as_deref()
@@ -310,12 +314,25 @@ impl Session {
         {
             *directory = Some(root.join(relative));
         }
-        self.root = root.to_owned();
+        self.root = root;
     }
 
-    pub(super) fn working_directory(&self) -> Option<PathBuf> {
+    fn directory_root(root: &Path) -> PathBuf {
+        crate::remote::SshTarget::parse(root)
+            .ok()
+            .flatten()
+            .map_or_else(|| root.to_owned(), |target| target.path)
+    }
+
+    pub(super) fn snapshot_directory(&self) -> Option<PathBuf> {
         if self.ssh.is_some() {
-            return None;
+            if let Some(path) = self.process.as_ref().and_then(Process::working_directory) {
+                let path = path
+                    .strip_prefix(&self.root)
+                    .map_or(path.clone(), Path::to_owned);
+                self.last_directory.replace(Some(path));
+            }
+            return self.last_directory.borrow().clone();
         }
         #[cfg(unix)]
         let reported = self.process.as_ref().and_then(Process::working_directory);
@@ -324,7 +341,10 @@ impl Session {
         if let Some(path) = reported.filter(|path| path.is_absolute() && path.to_str().is_some()) {
             self.last_directory.replace(Some(path));
         }
-        self.last_directory.borrow().clone()
+        self.last_directory.borrow().as_ref().map(|path| {
+            path.strip_prefix(&self.root)
+                .map_or_else(|_| path.clone(), Path::to_owned)
+        })
     }
 
     pub(super) fn scrollback_snapshot(&self, enabled: bool) -> Arc<str> {
@@ -455,7 +475,13 @@ impl Session {
             );
             self.emulator = Some(emulator);
             let process = match &self.ssh {
-                Some(ssh) => Process::start_remote(ssh.clone(), size, commands, output),
+                Some(ssh) => Process::start_remote(
+                    ssh.clone(),
+                    self.last_directory.borrow().clone(),
+                    size,
+                    commands,
+                    output,
+                ),
                 None => Process::start_local(
                     self.shell.clone(),
                     &self.root,

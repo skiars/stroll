@@ -6,6 +6,7 @@ pub(crate) mod resources;
 mod selection;
 mod session_state;
 mod state;
+pub(crate) mod worktree_identity;
 #[cfg(feature = "desktop")]
 mod worktree_state;
 #[cfg(feature = "desktop")]
@@ -339,14 +340,14 @@ impl Repository {
         if uri.scheme() != "file" {
             return None;
         }
-        if let Some(ssh) = &self.ssh {
+        if let Some(target) = SshTarget::parse(&self.root).ok().flatten() {
             if uri.host().is_some() {
                 return None;
             }
             let path = percent_encoding::percent_decode_str(uri.path())
                 .decode_utf8()
                 .ok()?;
-            let root = ssh.target().path.to_str()?;
+            let root = target.path.to_str()?;
             let relative = path
                 .strip_prefix(root.trim_end_matches('/'))?
                 .strip_prefix('/')?;

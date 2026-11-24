@@ -3276,6 +3276,118 @@ fn commit_list_squashes_rewords_and_resets_with_local_changes() -> Result<()> {
 }
 
 #[::core::prelude::v1::test]
+#[ignore = "requires a disposable loopback SSH server running stroll-remote"]
+fn ssh_amend_uses_the_published_history_confirmation() -> Result<()> {
+    let authority = std::env::var("STROLL_TEST_SSH_WORKTREE_AUTHORITY")?;
+    let fixture = tempfile::tempdir()?;
+    let root = fixture.path().join("repo");
+    fs::create_dir(&root)?;
+    git(&root, &["init", "-qb", "main"]);
+    git(&root, &["config", "user.name", "Reviewer"]);
+    git(&root, &["config", "user.email", "reviewer@example.invalid"]);
+    git(&root, &["config", "commit.gpgsign", "false"]);
+    fs::write(root.join("tracked.txt"), "Original text\n")?;
+    git(&root, &["add", "tracked.txt"]);
+    git(&root, &["commit", "-qm", "Initial"]);
+    git(&root, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+    let original = git::head(&root)?.unwrap();
+    let remote = PathBuf::from(format!("ssh://{authority}{}", root.display()));
+    let store = Arc::new(Store::new(fixture.path().join("state"))?);
+    let config = crate::config::ConfigFile::load(Some(fixture.path().join("config.toml")));
+    let mut cx = TestAppContext::build_with_text_system(
+        TestDispatcher::new(0),
+        None,
+        crate::test_support::text_system(true),
+    );
+    cx.update(gpui_component::init);
+    let mut workspace = None;
+    let (_, visual) = cx.add_window_view(|window, cx| {
+        let view =
+            cx.new(|cx| Workspace::with_config(store, config, WorkspaceView::Git, window, cx));
+        workspace = Some(view.clone());
+        Root::new(view, window, cx)
+    });
+    let workspace = workspace.unwrap();
+    visual.simulate_resize(size(px(1280.), px(760.)));
+    visual.update(|window, cx| {
+        cx.set_reduce_motion(true);
+        workspace.update(cx, |workspace, cx| {
+            workspace.open_repository(
+                Location {
+                    root: remote,
+                    file: None,
+                },
+                window,
+                cx,
+            );
+        });
+    });
+    let wait = |visual: &mut VisualTestContext,
+                description: &str,
+                ready: &mut dyn FnMut(&mut VisualTestContext) -> bool|
+     -> Result<()> {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            visual.executor().advance_clock(Duration::from_millis(50));
+            visual.run_until_parked();
+            visual.update(|window, cx| window.draw(cx).clear(cx));
+            if ready(visual) {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                let errors = visual.update(|_, cx| {
+                    let workspace = workspace.read(cx);
+                    let panel = workspace.git.as_ref().map(|panel| panel.read(cx));
+                    format!(
+                        "open={:?}, history={:?}, operation={:?}",
+                        workspace.repository_ui.error,
+                        panel.and_then(|panel| panel.history_error.as_ref()),
+                        panel.and_then(|panel| panel.stage_error.as_ref()),
+                    )
+                });
+                anyhow::bail!("Timed out waiting for {description}: {errors}");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    };
+    wait(visual, "SSH Git panel", &mut |visual| {
+        visual.update(|_, cx| {
+            workspace.read(cx).git.as_ref().is_some_and(|panel| {
+                let panel = panel.read(cx);
+                panel.editable_tip().is_some() && matches!(panel.commit_state, Some(Ok(_)))
+            })
+        })
+    })?;
+    visual.update(|window, cx| {
+        let panel = workspace.read(cx).git.clone().unwrap();
+        panel.update(cx, |panel, cx| {
+            let tip = panel.editable_tip().unwrap();
+            let state = panel.commit_state.clone().unwrap().unwrap();
+            panel.start_history_edit(
+                git::HistoryEdit::Amend(tip, state, "Updated title".into()),
+                window,
+                cx,
+            );
+        });
+    });
+    wait(visual, "published history confirmation", &mut |visual| {
+        visual
+            .debug_bounds("git-history-published-confirmation")
+            .is_some()
+    })?;
+    assert_eq!(git::head(&root)?.as_deref(), Some(original.as_str()));
+    let button = visual.debug_bounds("git-history-edit-apply").unwrap();
+    visual.simulate_click(button.center(), Modifiers::default());
+    wait(visual, "amended commit", &mut |_| {
+        git::head(&root).is_ok_and(|head| head.as_ref() != Some(&original))
+    })?;
+    let head = git::head(&root)?.unwrap();
+    assert_eq!(git::commit(&root, &head)?.subject, "Updated title");
+    cx.quit();
+    Ok(())
+}
+
+#[::core::prelude::v1::test]
 fn builtin_syntax_is_painted_on_both_sides_of_git_diff() -> Result<()> {
     use gpui_component::ActiveTheme as _;
 

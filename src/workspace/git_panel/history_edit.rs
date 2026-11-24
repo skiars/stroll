@@ -654,19 +654,22 @@ impl GitPanel {
                     panel.notify_rewrite(record.clone(), window, cx);
                 }
                 if let Err(error) = &result
-                    && progress
-                        .as_ref()
-                        .is_none_or(|progress| progress.conflicts.is_empty())
+                    && !matches!(&progress, Ok(Some(progress)) if !progress.conflicts.is_empty())
                 {
                     panel.report_operation_error(anyhow::anyhow!(error.to_string()), window, cx);
                 }
-                let entered = progress.as_ref().is_some_and(|next| {
-                    panel
-                        .history_progress
-                        .as_ref()
-                        .is_none_or(|old| old.saved != next.saved)
-                });
-                panel.history_progress = progress;
+                let entered = if let Ok(progress) = progress {
+                    let entered = progress.as_ref().is_some_and(|next| {
+                        panel
+                            .history_progress
+                            .as_ref()
+                            .is_none_or(|old| old.saved != next.saved)
+                    });
+                    panel.history_progress = progress;
+                    entered
+                } else {
+                    false
+                };
                 if let Some(mode) = if entered {
                     Some(Mode::All)
                 } else if completed {

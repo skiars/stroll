@@ -31,8 +31,8 @@ use crate::{
         worktree::{WorktreeLsp, WorktreeServer},
     },
     lsp::{
-        Client, CompletionActivation, EditorLsp, LanguageServer, LocalProcess, NewlineServer,
-        ProcessMemory, SessionState,
+        Client, CompletionActivation, EditorLsp, LanguageProcess, LanguageServer, NewlineServer,
+        ProcessMemory, RemoteProcess, SessionState,
     },
     paths,
     symbols::LocalSymbols,
@@ -238,7 +238,7 @@ pub(super) enum LanguageService {
 }
 
 pub(super) struct LanguageServicePanel {
-    memory: Option<(LocalProcess, ProcessMemory)>,
+    memory: Option<(LanguageProcess, ProcessMemory)>,
     _poll_memory: Option<Task<()>>,
 }
 
@@ -334,7 +334,10 @@ impl Workspace {
                         server.0.entry.server.lsp_options(),
                     ),
                 };
-                let command = ssh.language_command(repository, key.root.clone(), target)?;
+                let ssh = ssh.clone();
+                let project = key.root.clone();
+                let process = RemoteProcess::new(ssh.clone());
+                let monitor = process.clone();
                 let uri = crate::remote::file_uri(
                     key.root
                         .to_str()
@@ -343,8 +346,9 @@ impl Workspace {
                 Client::start_with_uri(
                     move || {
                         wait_for_exit();
-                        Ok(command)
+                        ssh.language_command(repository, project, target, monitor.prepare())
                     },
+                    process,
                     uri,
                     options,
                 )
@@ -712,13 +716,13 @@ impl Workspace {
         }
     }
 
-    fn language_memory_process(&self) -> Option<LocalProcess> {
+    fn language_memory_process(&self) -> Option<LanguageProcess> {
         if self.terminal_maximized() {
             return None;
         }
         let project = self.active_file()?.server_project.as_ref()?;
         match self.language_servers.get(&project.key)? {
-            LanguageService::Session { client, .. } => client.local_process(),
+            LanguageService::Session { client, .. } => client.memory_process(),
             _ => None,
         }
     }
@@ -729,43 +733,43 @@ impl Workspace {
     }
 
     fn open_language_service_panel(&mut self, cx: &mut Context<Self>) {
-        let sample_locally = ProcessMemory::SUPPORTED
-            && self.startup_lsp.enabled
-            && self
-                .repository
-                .as_ref()
-                .is_none_or(|repo| repo.ssh.is_none());
-        let poll = sample_locally.then(|| {
-            cx.spawn(async move |this, cx| {
-                loop {
-                    let Ok(process) = this.read_with(cx, |this, _| this.language_memory_process())
-                    else {
-                        return;
-                    };
-                    if let Some(process) = process {
-                        let sampler = process.clone();
-                        let sample = cx.background_spawn(async move { sampler.sample() }).await;
-                        if this
-                            .update(cx, |this, cx| {
-                                if this.language_memory_process().as_ref() == Some(&process)
-                                    && let Some(panel) = &mut this.lsp_panel
-                                {
-                                    let memory = sample.map(|sample| (process, sample));
-                                    if panel.memory != memory {
-                                        panel.memory = memory;
-                                        cx.notify();
-                                    }
-                                }
-                            })
-                            .is_err()
-                        {
+        let remotely = self
+            .repository
+            .as_ref()
+            .is_some_and(|repo| repo.ssh.is_some());
+        let poll =
+            (self.startup_lsp.enabled && (ProcessMemory::SUPPORTED || remotely)).then(|| {
+                cx.spawn(async move |this, cx| {
+                    loop {
+                        let Ok(process) =
+                            this.read_with(cx, |this, _| this.language_memory_process())
+                        else {
                             return;
+                        };
+                        if let Some(process) = process {
+                            let sampler = process.clone();
+                            let sample = cx.background_spawn(async move { sampler.sample() }).await;
+                            if this
+                                .update(cx, |this, cx| {
+                                    if this.language_memory_process().as_ref() == Some(&process)
+                                        && let Some(panel) = &mut this.lsp_panel
+                                    {
+                                        let memory = sample.map(|sample| (process, sample));
+                                        if panel.memory != memory {
+                                            panel.memory = memory;
+                                            cx.notify();
+                                        }
+                                    }
+                                })
+                                .is_err()
+                            {
+                                return;
+                            }
                         }
+                        cx.background_executor().timer(Duration::from_secs(2)).await;
                     }
-                    cx.background_executor().timer(Duration::from_secs(2)).await;
-                }
-            })
-        });
+                })
+            });
         self.lsp_panel = Some(LanguageServicePanel {
             memory: None,
             _poll_memory: poll,

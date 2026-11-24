@@ -31,9 +31,12 @@ impl MarkdownLinks {
         } else {
             let repository = self.repository.as_ref()?;
             match &repository.ssh {
-                Some(ssh) => {
+                Some(_) => {
                     let relative = crate::remote::RepoPath::from_local(&path).ok()?;
-                    let root = ssh.target().path.to_str()?.trim_end_matches('/');
+                    let target = crate::remote::SshTarget::parse(&repository.root)
+                        .ok()
+                        .flatten()?;
+                    let root = target.path.to_str()?.trim_end_matches('/');
                     Url::parse(
                         &crate::remote::file_uri(&format!("{root}/{}", relative.as_str())).ok()?,
                     )

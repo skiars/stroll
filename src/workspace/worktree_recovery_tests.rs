@@ -40,11 +40,27 @@ fn new_workspace<'a>(
 
 #[::core::prelude::v1::test]
 fn moved_and_deleted_worktrees_restore_the_expected_workspace() -> Result<()> {
+    worktree_recovery(None)
+}
+
+#[::core::prelude::v1::test]
+#[ignore = "requires a disposable loopback SSH server running stroll-remote"]
+fn moved_and_deleted_ssh_worktrees_restore_the_expected_workspace() -> Result<()> {
+    worktree_recovery(Some(&std::env::var("STROLL_TEST_SSH_WORKTREE_AUTHORITY")?))
+}
+
+fn worktree_recovery(ssh_authority: Option<&str>) -> Result<()> {
     let fixture = tempfile::tempdir()?;
     let root = fixture.path().join("main");
     let original = fixture.path().join("original");
     let moved = fixture.path().join("moved");
     let moved_again = fixture.path().join("moved again");
+    let locator = |root: &Path| {
+        ssh_authority.map_or_else(
+            || root.to_owned(),
+            |authority| PathBuf::from(format!("ssh://{authority}{}", root.display())),
+        )
+    };
     fs::create_dir(&root)?;
     let git = |args: &[&str]| -> Result<()> {
         let result = Command::new("git").current_dir(&root).args(args).output()?;
@@ -80,7 +96,7 @@ fn moved_and_deleted_worktrees_restore_the_expected_workspace() -> Result<()> {
     ])?;
 
     let store = Arc::new(Store::new(fixture.path().join("state"))?);
-    let main = Repository::open(&root)?;
+    let main = Repository::open(&locator(&root))?;
     store.save_session(
         &main,
         &WorktreeSession {
@@ -90,7 +106,7 @@ fn moved_and_deleted_worktrees_restore_the_expected_workspace() -> Result<()> {
         },
     )?;
     let draft = "unsaved review text\n";
-    let mut linked = Repository::open(&original)?;
+    let mut linked = Repository::open(&locator(&original))?;
     assert!(store.bind_worktree(&mut linked)?.is_none());
     let mut tabs = crate::tabs::TabSession::default();
     tabs.open(path.to_owned(), false);
@@ -120,7 +136,7 @@ fn moved_and_deleted_worktrees_restore_the_expected_workspace() -> Result<()> {
             view.update(cx, |workspace, cx| {
                 workspace.open_repository(
                     Location {
-                        root: root.to_owned(),
+                        root: locator(root),
                         file: None,
                     },
                     window,
@@ -132,13 +148,12 @@ fn moved_and_deleted_worktrees_restore_the_expected_workspace() -> Result<()> {
     let has_draft = |visual: &mut VisualTestContext, view: &Entity<Workspace>, root: &Path| {
         visual.update(|_, cx| {
             let workspace = view.read(cx);
-            workspace
-                .repository
-                .as_ref()
-                .is_some_and(|repo| root.canonicalize().is_ok_and(|root| repo.root == root))
-                && workspace
-                    .active_file()
-                    .is_some_and(|file| file.editor.read(cx).text() == draft)
+            workspace.repository.as_ref().is_some_and(|repo| {
+                root.canonicalize()
+                    .is_ok_and(|root| repo.root == locator(&root))
+            }) && workspace
+                .active_file()
+                .is_some_and(|file| file.editor.read(cx).text() == draft)
         })
     };
 
@@ -200,7 +215,7 @@ fn moved_and_deleted_worktrees_restore_the_expected_workspace() -> Result<()> {
         original.to_str().unwrap(),
         "review",
     ])?;
-    let mut replacement = Repository::open(&original)?;
+    let mut replacement = Repository::open(&locator(&original))?;
     assert!(store.bind_worktree(&mut replacement)?.is_some());
     assert!(!store.has_draft(&replacement, path));
     open(visual, &workspace, &original);

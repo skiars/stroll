@@ -36,6 +36,86 @@ pub(crate) enum FileOperation {
     },
 }
 
+#[derive(Serialize, Deserialize)]
+pub(crate) enum ImportEntry {
+    Directory,
+    File { executable: bool },
+}
+
+pub(crate) struct WorkspaceImport {
+    destination: crate::remote::RepoPath,
+    staging: tempfile::TempDir,
+}
+
+impl WorkspaceImport {
+    pub(crate) fn new(root: &Path, destination: crate::remote::RepoPath) -> Result<Self> {
+        let target = operation_path(root, destination.as_path())?;
+        check_destination(&target)?;
+        let mut staging = tempfile::Builder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            staging.permissions(fs::Permissions::from_mode(0o700));
+        }
+        Ok(Self {
+            destination,
+            staging: staging.tempdir_in(target.parent().context(t!("storage.no_parent"))?)?,
+        })
+    }
+
+    fn path(&self, path: &Path) -> Result<PathBuf> {
+        ensure!(
+            path.starts_with("entry"),
+            t!("workspace.tree_invalid_destination")
+        );
+        operation_path(self.staging.path(), path)
+    }
+
+    pub(crate) fn create(&self, path: &Path, entry: ImportEntry) -> Result<()> {
+        let path = self.path(path)?;
+        match entry {
+            ImportEntry::Directory => fs::create_dir(path)?,
+            ImportEntry::File { executable } => {
+                let file = File::create_new(path)?;
+                #[cfg(unix)]
+                if executable {
+                    use std::os::unix::fs::PermissionsExt as _;
+                    let mut permissions = file.metadata()?.permissions();
+                    permissions.set_mode(permissions.mode() | 0o100);
+                    file.set_permissions(permissions)?;
+                }
+                #[cfg(not(unix))]
+                let _ = (file, executable);
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn write(&self, path: &Path, offset: u64, bytes: &[u8]) -> Result<()> {
+        ensure!(
+            bytes.len() <= COPY_CHUNK,
+            "Invalid workspace import chunk size"
+        );
+        let path = self.path(path)?;
+        let metadata = path.symlink_metadata()?;
+        ensure!(
+            metadata.is_file() && !is_link(&metadata) && metadata.len() == offset,
+            t!("workspace.tree_entry_changed")
+        );
+        OpenOptions::new()
+            .append(true)
+            .open(path)?
+            .write_all(bytes)?;
+        Ok(())
+    }
+
+    pub(crate) fn publish(self, root: &Path) -> Result<()> {
+        let target = operation_path(root, self.destination.as_path())?;
+        check_destination(&target)?;
+        rename_no_replace(&self.staging.path().join("entry"), &target)
+    }
+}
+
 fn entry_kind(path: &Path) -> Result<(fs::Metadata, EntryVersion)> {
     let metadata = path.symlink_metadata()?;
     let kind = metadata.file_type();
@@ -211,7 +291,6 @@ impl Repository {
         destination: &Path,
         move_entry: bool,
     ) -> Result<Option<PathBuf>> {
-        ensure!(self.ssh.is_none(), t!("storage.no_local_path"));
         ensure!(source.is_absolute(), t!("common.path_outside_repo"));
         let parent = source
             .parent()
@@ -221,6 +300,15 @@ impl Repository {
             .file_name()
             .context(t!("workspace.tree_invalid_name"))?;
         let source = parent.join(name);
+        if let Some(ssh) = &self.ssh {
+            ensure!(
+                ssh.supports_workspace_import(),
+                t!("workspace.tree_import_requires_helper")
+            );
+            ensure!(!move_entry, t!("workspace.tree_import_copy_only"));
+            import_over_ssh(ssh, &source, destination)?;
+            return Ok(None);
+        }
         let relative = source.strip_prefix(&self.root).ok();
         if let Some(relative) = relative {
             operation_path(&self.root, relative)?;
@@ -285,6 +373,68 @@ impl Repository {
     }
 }
 
+#[cfg(feature = "desktop")]
+fn import_over_ssh(
+    ssh: &crate::remote::SshSession,
+    source: &Path,
+    destination: &Path,
+) -> Result<()> {
+    use crate::remote::{Bytes, RepoPath, Request};
+
+    let id = ssh.call(Request::BeginImport(RepoPath::from_local(destination)?))?;
+    let result = copy_tree(
+        source,
+        Path::new("entry"),
+        &|path| {
+            ssh.call(Request::ImportEntry(
+                id,
+                RepoPath::from_local(path)?,
+                ImportEntry::Directory,
+            ))
+        },
+        &|path, mut input, metadata| {
+            #[cfg(unix)]
+            let executable = {
+                use std::os::unix::fs::PermissionsExt as _;
+                metadata.permissions().mode() & 0o100 != 0
+            };
+            #[cfg(not(unix))]
+            let executable = {
+                let _ = metadata;
+                false
+            };
+            let path = RepoPath::from_local(path)?;
+            ssh.call::<()>(Request::ImportEntry(
+                id,
+                path.clone(),
+                ImportEntry::File { executable },
+            ))?;
+            let mut offset = 0;
+            let mut buffer = vec![0; COPY_CHUNK];
+            loop {
+                let size = input.read(&mut buffer)?;
+                if size == 0 {
+                    break;
+                }
+                ssh.call::<()>(Request::ImportChunk(
+                    id,
+                    path.clone(),
+                    offset,
+                    Bytes(buffer[..size].to_vec()),
+                ))?;
+                offset += size as u64;
+            }
+            ensure!(offset == metadata.len(), t!("workspace.tree_entry_changed"));
+            Ok(())
+        },
+    );
+    if result.is_err() {
+        _ = ssh.call::<()>(Request::FinishImport(id, false));
+        return result;
+    }
+    ssh.call(Request::FinishImport(id, true))
+}
+
 fn transfer_entry(
     source: &Path,
     destination: &Path,
@@ -297,11 +447,7 @@ fn transfer_entry(
         source != destination && !(metadata.is_dir() && destination.starts_with(source)),
         t!("workspace.tree_invalid_destination")
     );
-    match destination.symlink_metadata() {
-        Ok(_) => anyhow::bail!(t!("workspace.tree_destination_exists")),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error.into()),
-    }
+    check_destination(destination)?;
     if move_entry {
         return rename_no_replace(source, destination);
     }
@@ -316,7 +462,34 @@ fn transfer_entry(
     rename_no_replace(&staged, destination)
 }
 
+fn check_destination(path: &Path) -> Result<()> {
+    match path.symlink_metadata() {
+        Ok(_) => anyhow::bail!(t!("workspace.tree_destination_exists")),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
 fn copy_entry(source: &Path, destination: &Path) -> Result<()> {
+    copy_tree(
+        source,
+        destination,
+        &|path| Ok(fs::create_dir(path)?),
+        &|path, mut input, metadata| {
+            let mut output = File::create_new(path)?;
+            std::io::copy(&mut input, &mut output)?;
+            output.set_permissions(metadata.permissions())?;
+            Ok(())
+        },
+    )
+}
+
+fn copy_tree(
+    source: &Path,
+    destination: &Path,
+    create_directory: &impl Fn(&Path) -> Result<()>,
+    copy_file: &impl Fn(&Path, File, &fs::Metadata) -> Result<()>,
+) -> Result<()> {
     let (metadata, version) = entry_kind(source)?;
     ensure!(!is_link(&metadata), t!("workspace.tree_unsupported"));
     if metadata.is_dir() {
@@ -324,7 +497,7 @@ fn copy_entry(source: &Path, destination: &Path) -> Result<()> {
             source.canonicalize()? == source,
             t!("common.path_outside_repo")
         );
-        fs::create_dir(destination)?;
+        create_directory(destination)?;
         for entry in fs::read_dir(source)? {
             let entry = entry?;
             let name = entry.file_name();
@@ -332,7 +505,12 @@ fn copy_entry(source: &Path, destination: &Path) -> Result<()> {
                 name.to_str().is_some_and(valid_name),
                 t!("workspace.tree_invalid_name")
             );
-            copy_entry(&entry.path(), &destination.join(name))?;
+            copy_tree(
+                &entry.path(),
+                &destination.join(name),
+                create_directory,
+                copy_file,
+            )?;
         }
     } else {
         ensure!(metadata.is_file(), t!("workspace.tree_unsupported"));
@@ -343,14 +521,12 @@ fn copy_entry(source: &Path, destination: &Path) -> Result<()> {
             use std::os::unix::fs::OpenOptionsExt as _;
             options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
         }
-        let mut input = options.open(source)?;
+        let input = options.open(source)?;
         ensure!(
             input.metadata()?.is_file(),
             t!("workspace.tree_unsupported")
         );
-        let mut output = File::create_new(destination)?;
-        std::io::copy(&mut input, &mut output)?;
-        output.set_permissions(metadata.permissions())?;
+        copy_file(destination, input, &metadata)?;
     }
     ensure!(
         entry_kind(source)?.1 == version,

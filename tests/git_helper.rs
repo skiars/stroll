@@ -113,6 +113,284 @@ fn comparison() -> Value {
     json!({ "Worktree": { "mode": "All", "base": null } })
 }
 
+#[test]
+fn helper_edits_commit_history_and_requires_confirmation_for_published_commits() {
+    let repo = fixture();
+    let root = repo.path();
+    git(root, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+    let mut helper = Helper::start();
+    assert_eq!(helper.ok(json!({"Hello": 25})), 25);
+    helper.ok(json!({"OpenWorkspace": root}));
+    let history = helper.ok(json!("History"));
+    let tip = json!({"branch": history["checkout"], "oid": history["head"]});
+    let state = helper.ok(json!("CommitState"));
+    assert_eq!(
+        helper.ok(json!({"HistoryAmendMessage": [tip, state]})),
+        "initial"
+    );
+    let discarded_plan = helper.ok(json!({"HistoryEditPlan": [tip, [tip["oid"]]]}));
+    let edit = json!({"Amend": [tip, state, "New title"]});
+    assert_eq!(
+        helper.ok(json!({"EditHistory": [edit, false]})),
+        "PublishedHistory"
+    );
+    assert_eq!(helper.ok(json!("History"))["head"], tip["oid"]);
+
+    let completed = helper.ok(json!({"EditHistory": [edit, true]}));
+    let head = &completed["Completed"][0];
+    let rewrite = &completed["Completed"][1];
+    assert_ne!(*head, tip["oid"]);
+    assert_eq!(helper.ok(json!({"Commit": head}))["subject"], "New title");
+    assert_eq!(
+        helper.ok(json!({"HistoryRewriteRecord": [tip["branch"], head]})),
+        *rewrite
+    );
+    assert!(
+        helper
+            .call(json!({"EditHistory": [{"Rebase": discarded_plan}, true]}))
+            .get("Err")
+            .is_some()
+    );
+    helper.ok(json!({"EditHistory": [{"UndoRewrite": rewrite}, false]}));
+    assert_eq!(helper.ok(json!("History"))["head"], tip["oid"]);
+    assert_eq!(
+        std::fs::read_to_string(root.join("a.txt")).unwrap(),
+        "one\nTWO\nthree\n"
+    );
+}
+
+#[test]
+fn helper_can_resume_a_cherry_pick_after_reconnecting() {
+    let repo = fixture();
+    let root = repo.path();
+    let connect = || {
+        let mut helper = Helper::start();
+        helper.ok(json!({"OpenWorkspace": root}));
+        helper
+    };
+    let mut helper = connect();
+    let base = helper.ok(json!("History"))["head"].clone();
+    git(root, &["switch", "-qc", "source"]);
+    git(root, &["add", "a.txt"]);
+    git(root, &["commit", "-qm", "source"]);
+    let source = helper.ok(json!("History"))["head"].clone();
+    git(root, &["switch", "-q", "main"]);
+    std::fs::write(root.join("a.txt"), "one\nother\nthree\n").unwrap();
+    git(root, &["add", "a.txt"]);
+    git(root, &["commit", "-qm", "main"]);
+    let history = helper.ok(json!("History"));
+    let tip = json!({"branch": history["checkout"], "oid": history["head"]});
+    assert_eq!(helper.ok(json!({"CanCherryPick": [tip, [source]]})), true);
+    assert!(
+        helper
+            .call(json!({"EditHistory": [{"CherryPick": [tip, [source]]}, false]}))
+            .get("Err")
+            .is_some()
+    );
+    drop(helper);
+
+    let mut helper = connect();
+    let progress = helper.ok(json!("HistoryEditProgress"));
+    assert_eq!(progress["commit"], source);
+    assert_eq!(progress["conflicts"], json!(["a.txt"]));
+    assert_eq!(helper.ok(json!("RecoverHistoryBackup")), false);
+    std::fs::write(root.join("a.txt"), "resolved\n").unwrap();
+    helper.ok(json!({"EditHistory": [{"Resume": [progress, {"Stage": "a.txt"}]}, false]}));
+    let progress = helper.ok(json!("HistoryEditProgress"));
+    assert_eq!(progress["conflicts"], json!([]));
+    let completed = helper.ok(json!({"EditHistory": [{"Resume": [progress, "Continue"]}, false]}));
+    assert!(helper.ok(json!("HistoryEditProgress")).is_null());
+    let head = &completed["Completed"][0];
+    let tip = json!({"branch": "refs/heads/main", "oid": head});
+    let reset = helper.ok(json!({"HistoryResetPlan": [tip, base]}));
+    assert_eq!(reset["removed"], 2);
+    assert_eq!(
+        std::fs::read_to_string(root.join("b with space.txt")).unwrap(),
+        "alpha\nBETA\n"
+    );
+}
+
+#[test]
+fn helper_finds_a_moved_or_removed_linked_worktree_by_its_identity() {
+    let repo = fixture();
+    let root = repo.path().canonicalize().unwrap();
+    let checkouts = tempfile::tempdir().unwrap();
+    let original = checkouts.path().join("original");
+    let moved = checkouts.path().join("moved worktree");
+    git(
+        &root,
+        &[
+            "worktree",
+            "add",
+            "-qb",
+            "review",
+            original.to_str().unwrap(),
+        ],
+    );
+
+    let mut helper = Helper::start();
+    assert_eq!(helper.ok(json!({"Hello": 29})), 29);
+    let repository = helper.ok(json!({"OpenWorkspace": original}));
+    let identity = helper.ok(json!("WorktreeIdentity"));
+    let locate = json!({"LocateWorktree": {
+        "root": original,
+        "common": repository["common_dir"],
+        "id": identity["id"]
+    }});
+    assert_eq!(helper.ok(locate.clone())["root"], json!(original));
+    git(
+        &root,
+        &[
+            "worktree",
+            "move",
+            original.to_str().unwrap(),
+            moved.to_str().unwrap(),
+        ],
+    );
+    let location = helper.ok(locate.clone());
+    assert_eq!(location["root"], json!(moved));
+    assert_eq!(location["branch"], "review");
+    assert_eq!(location["same_worktree"], true);
+
+    let mut reopened = Helper::start();
+    assert_eq!(reopened.ok(locate.clone()), location);
+    reopened.ok(json!({"OpenWorkspace": moved}));
+    assert_eq!(reopened.ok(json!("WorktreeIdentity")), identity);
+    git(&root, &["worktree", "remove", moved.to_str().unwrap()]);
+    let location = reopened.ok(locate);
+    assert_eq!(location["root"], json!(root));
+    assert_eq!(location["same_worktree"], false);
+    assert_eq!(
+        reopened.ok(json!({"WorktreeMarker": [identity["admin"], identity["id"]]})),
+        false
+    );
+}
+
+#[test]
+fn helper_imports_a_tree_without_publishing_partial_files() {
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    use std::fs;
+
+    let repo = fixture();
+    let root = repo.path();
+    let mut helper = Helper::start();
+    assert_eq!(helper.ok(json!({"Hello": 27})), 27);
+    helper.ok(json!({"OpenWorkspace": root}));
+    let id = helper.ok(json!({"BeginImport": "imported tree"}));
+    helper.ok(json!({"ImportEntry": [id, "entry", "Directory"]}));
+    let path = "entry/source.bin";
+    helper.ok(json!({"ImportEntry": [id, path, {"File": {"executable": false}}]}));
+    let bytes = vec![0xff; 1024 * 1024];
+    assert!(
+        helper
+            .call(json!({"ImportChunk": [id, path, 1, "YQ=="]}))
+            .get("Err")
+            .is_some()
+    );
+    helper.ok(json!({"ImportChunk": [id, path, 0, STANDARD.encode(&bytes)]}));
+    helper.ok(json!({"ImportChunk": [id, path, bytes.len(), "YQ=="]}));
+    assert!(!root.join("imported tree").exists());
+    helper.ok(json!({"FinishImport": [id, true]}));
+    let expected = [bytes.as_slice(), b"a"].concat();
+    assert_eq!(
+        fs::read(root.join("imported tree/source.bin")).unwrap(),
+        expected
+    );
+
+    let id = helper.ok(json!({"BeginImport": "collision.txt"}));
+    helper.ok(json!({"ImportEntry": [id, "entry", {"File": {"executable": false}}]}));
+    fs::write(root.join("collision.txt"), "created externally").unwrap();
+    assert!(
+        helper
+            .call(json!({"FinishImport": [id, true]}))
+            .get("Err")
+            .is_some()
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("collision.txt")).unwrap(),
+        "created externally"
+    );
+
+    let id = helper.ok(json!({"BeginImport": "aborted"}));
+    helper.ok(json!({"ImportEntry": [id, "entry", "Directory"]}));
+    assert!(
+        helper
+            .call(json!({"ImportEntry": [id, "entry/.git", "Directory"]}))
+            .get("Err")
+            .is_some()
+    );
+    helper.ok(json!({"FinishImport": [id, false]}));
+    assert!(!root.join("aborted").exists());
+    assert!(
+        fs::read_dir(root)
+            .unwrap()
+            .flatten()
+            .all(|entry| { !entry.file_name().to_string_lossy().starts_with(".tmp") })
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn helper_samples_only_the_registered_language_server() {
+    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+    use std::{
+        fs,
+        os::unix::fs::PermissionsExt as _,
+        thread,
+        time::{Duration, Instant},
+    };
+
+    let repo = fixture();
+    let root = repo.path().canonicalize().unwrap();
+    let shell = root.join("test-login-shell");
+    fs::write(
+        &shell,
+        "#!/bin/sh\nprintf '\\0stroll-env\\0PATH=%s\\0STROLL_RUST_ANALYZER=%s\\0' \"$PATH\" \"$TEST_LSP_SERVER\"\n",
+    )
+    .unwrap();
+    fs::set_permissions(&shell, fs::Permissions::from_mode(0o755)).unwrap();
+    let executable = root.join("test-language-server");
+    fs::write(&executable, "#!/bin/sh\nread command\n").unwrap();
+    fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let mut helper = Helper::start();
+    assert_eq!(helper.ok(json!({"Hello": 28})), 28);
+    helper.ok(json!({"OpenWorkspace": root}));
+    let registration = helper.ok(json!("RegisterLspMemory"));
+    let query = json!({"LspMemory": registration[0]});
+    assert!(helper.ok(query.clone()).is_null());
+    let options = URL_SAFE_NO_PAD.encode(
+        json!({
+            "repository": root, "project": root, "server": "Rust", "memory": registration[1],
+        })
+        .to_string(),
+    );
+    let mut process = Command::new(env!("CARGO_BIN_EXE_stroll-remote"))
+        .args(["--lsp", &options])
+        .env("SHELL", shell)
+        .env("TEST_LSP_SERVER", executable)
+        .stdin(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while helper.ok(query.clone())["bytes"]
+        .as_u64()
+        .is_none_or(|bytes| bytes == 0)
+    {
+        assert!(process.try_wait().unwrap().is_none());
+        assert!(
+            Instant::now() < deadline,
+            "Language server memory was unavailable"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+    drop(process.stdin.take());
+    process.wait().unwrap();
+    assert!(helper.ok(query.clone()).is_null());
+    helper.ok(json!({"ReleaseLspMemory": registration[0]}));
+    assert!(helper.ok(query).is_null());
+}
+
 #[cfg(unix)]
 #[test]
 fn helper_opens_a_login_shell_on_a_pty() {
@@ -153,6 +431,59 @@ fn helper_opens_a_login_shell_on_a_pty() {
         assert!(Instant::now() < deadline, "Terminal did not exit");
         thread::sleep(Duration::from_millis(10));
     }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn helper_reports_and_restores_the_terminal_directory() {
+    use std::{
+        fs, thread,
+        time::{Duration, Instant},
+    };
+
+    let repo = fixture();
+    let root = repo.path().canonicalize().unwrap();
+    let start = root.join("start");
+    let changed = root.join("changed");
+    fs::create_dir(&start).unwrap();
+    fs::create_dir(&changed).unwrap();
+    let mut helper = Helper::start_with(
+        Command::new(env!("CARGO_BIN_EXE_stroll-remote")).env("SHELL", "/bin/sh"),
+    );
+    assert_eq!(helper.ok(json!({"Hello": 26})), 26);
+    helper.ok(json!({"OpenWorkspace": root}));
+    let size = json!({"cols": 80, "rows": 24, "cell_width": 8, "cell_height": 16});
+    let terminal = helper.ok(json!({"TerminalOpenAt": [size, "start"]}));
+    let directory = |helper: &mut Helper, terminal: &Value, expected: &Path| {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let events = helper.ok(json!({"TerminalPoll": terminal}));
+            let events = events.as_array().unwrap();
+            assert!(
+                events.iter().all(|event| event.get("Error").is_none()),
+                "{events:?}"
+            );
+            if events
+                .iter()
+                .any(|event| event["Directory"] == json!(expected))
+            {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "The terminal did not report {expected:?}"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+    };
+    directory(&mut helper, &terminal, &start);
+    helper.ok(json!({"TerminalInput": [terminal, "Y2QgLi4vY2hhbmdlZAo="]})); // cd ../changed
+    directory(&mut helper, &terminal, &changed);
+    helper.ok(json!({"TerminalClose": terminal}));
+
+    let terminal = helper.ok(json!({"TerminalOpenAt": [size, "missing"]}));
+    directory(&mut helper, &terminal, &root);
+    helper.ok(json!({"TerminalClose": terminal}));
 }
 
 #[test]

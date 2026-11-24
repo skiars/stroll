@@ -140,11 +140,17 @@ impl Workspace {
 
     pub(super) fn tree_paste_available(&self, cx: &App) -> bool {
         self.tree_clipboard_available(cx)
-            && (self
-                .repository
-                .as_ref()
-                .is_some_and(|repo| repo.ssh.is_none())
-                || self.tree_clipboard.is_some())
+            && (self.tree_clipboard.is_some()
+                || (native_clipboard_available(cx) && self.can_import_external()))
+    }
+
+    fn can_import_external(&self) -> bool {
+        self.tree_transfer_available()
+            && self.repository.as_ref().is_some_and(|repo| {
+                repo.ssh
+                    .as_ref()
+                    .is_none_or(|ssh| ssh.supports_workspace_import())
+            })
     }
 
     pub(super) fn focus_tree(
@@ -180,7 +186,13 @@ impl Workspace {
             return;
         }
         let repo = self.repository.as_ref().unwrap();
-        if repo.ssh.is_some() {
+        if let Some(ssh) = &repo.ssh {
+            if ssh.supports_workspace_import()
+                && native_clipboard_available(cx)
+                && read_native_clipboard(cx).is_some_and(|item| item.file_list().is_some())
+            {
+                write_native_clipboard(None, cx);
+            }
             self.tree_clipboard = Some(TreeClipboard {
                 path: entry.path.clone(),
                 cut,
@@ -227,7 +239,29 @@ impl Workspace {
         if !self.tree_paste_available(cx) {
             return;
         }
-        if self.repository.as_ref().unwrap().ssh.is_some() {
+        let remote = self.repository.as_ref().unwrap().ssh.is_some();
+        if self.can_import_external() && native_clipboard_available(cx) {
+            let clipboard = read_native_clipboard(cx);
+            if let Some((paths, cut)) = clipboard.as_ref().and_then(ClipboardItem::file_list) {
+                if remote && (cut || force_move) {
+                    toast::error(window, cx, t!("workspace.tree_import_copy_only"));
+                    return;
+                }
+                self.run_tree_transfer(
+                    paths.paths().iter().cloned().map(Source::Local).collect(),
+                    directory,
+                    cut || force_move,
+                    Some(Paste::Native {
+                        paths: paths.clone(),
+                        cut,
+                    }),
+                    window,
+                    cx,
+                );
+                return;
+            }
+        }
+        if remote {
             if let Some(item) = self.tree_clipboard.clone() {
                 self.run_tree_transfer(
                     vec![Source::Worktree(item.path.clone())],
@@ -237,25 +271,10 @@ impl Workspace {
                     window,
                     cx,
                 );
-            }
-        } else {
-            let item = read_native_clipboard(cx);
-            let Some((paths, cut)) = item.as_ref().and_then(ClipboardItem::file_list) else {
-                toast::info(window, cx, t!("workspace.tree_clipboard_empty"));
                 return;
-            };
-            self.run_tree_transfer(
-                paths.paths().iter().cloned().map(Source::Local).collect(),
-                directory,
-                cut || force_move,
-                Some(Paste::Native {
-                    paths: paths.clone(),
-                    cut,
-                }),
-                window,
-                cx,
-            );
+            }
         }
+        toast::info(window, cx, t!("workspace.tree_clipboard_empty"));
     }
 
     fn tree_drop(
@@ -294,12 +313,7 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.tree_transfer_available()
-            && self
-                .repository
-                .as_ref()
-                .is_some_and(|repo| repo.ssh.is_none())
-        {
+        if self.can_import_external() {
             self.run_tree_transfer(
                 paths.paths().iter().cloned().map(Source::Local).collect(),
                 directory,
@@ -487,12 +501,7 @@ pub(super) fn tree_drop_target(
                 if let Some(drag) = value.downcast_ref::<TreeDrag>() {
                     this.accepts_tree_drag(drag, &target)
                 } else {
-                    value.downcast_ref::<ExternalPaths>().is_some()
-                        && this.tree_transfer_available()
-                        && this
-                            .repository
-                            .as_ref()
-                            .is_some_and(|repo| repo.ssh.is_none())
+                    value.downcast_ref::<ExternalPaths>().is_some() && this.can_import_external()
                 }
             })
             .unwrap_or(false)

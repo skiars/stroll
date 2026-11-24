@@ -34,6 +34,7 @@ use lsp_types::{
 use serde_json::{Value, json};
 use url::Url;
 
+pub(crate) use crate::process_memory::ProcessMemory;
 use actions::ActionSnapshot;
 pub(crate) use completion::CompletionActivation;
 pub(crate) use editor::{
@@ -41,7 +42,7 @@ pub(crate) use editor::{
     editor_diagnostics, editor_inlay_hints, editor_position, semantic_style_key,
 };
 pub(crate) use indentation::{Newline, NewlineServer};
-pub(crate) use process_memory::{LocalProcess, ProcessMemory};
+pub(crate) use process_memory::{LanguageProcess, LocalProcess, RemoteProcess};
 use transport::Transport;
 
 const INITIALIZE_TIMEOUT: Duration = Duration::from_secs(12);
@@ -80,6 +81,7 @@ struct ClientHandle {
     state_changes: async_channel::Receiver<()>,
     progress: ActiveProgress,
     local_process: Option<LocalProcess>,
+    remote_process: Option<RemoteProcess>,
     next_document: AtomicU64,
     stopped: async_channel::Receiver<()>,
     actions: Arc<Mutex<actions::Capabilities>>,
@@ -119,15 +121,16 @@ impl Client {
         options: ServerOptions,
     ) -> Result<Self> {
         let uri = file_uri(&root)?;
-        Self::start_session(command, Some(root), uri, options)
+        Self::start_session(command, Some(root), None, uri, options)
     }
 
     pub(crate) fn start_with_uri(
         command: impl FnOnce() -> Result<Command> + Send + 'static,
+        process: RemoteProcess,
         uri: String,
         options: ServerOptions,
     ) -> Result<Self> {
-        Self::start_session(command, None, uri, options)
+        Self::start_session(command, None, Some(process), uri, options)
     }
 
     pub(crate) fn stopped(&self) -> async_channel::Receiver<()> {
@@ -137,6 +140,7 @@ impl Client {
     fn start_session(
         command: impl FnOnce() -> Result<Command> + Send + 'static,
         cwd: Option<PathBuf>,
+        remote_process: Option<RemoteProcess>,
         uri: String,
         options: ServerOptions,
     ) -> Result<Self> {
@@ -157,6 +161,7 @@ impl Client {
             state_changes,
             progress: progress.clone(),
             local_process: local_process.clone(),
+            remote_process: remote_process.clone(),
             next_document: AtomicU64::new(0),
             stopped,
             actions: actions.clone(),
@@ -218,6 +223,9 @@ impl Client {
                 *state.lock().unwrap() = final_state;
                 progress.lock().unwrap().clear();
                 _ = changed.try_send(());
+                if let Some(process) = remote_process {
+                    process.release();
+                }
                 drop(running);
             })?;
         Ok(Self(Arc::new(handle)))
@@ -251,15 +259,24 @@ impl Client {
         self.0.state_changes.clone()
     }
 
-    pub(crate) fn local_process(&self) -> Option<LocalProcess> {
-        let process = self.0.local_process.as_ref()?;
-        if matches!(self.state(), SessionState::Starting | SessionState::Ready)
-            && process.is_running()
-        {
-            Some(process.clone())
-        } else {
-            None
+    pub(crate) fn memory_process(&self) -> Option<LanguageProcess> {
+        if !matches!(self.state(), SessionState::Starting | SessionState::Ready) {
+            return None;
         }
+        if let Some(process) = self
+            .0
+            .remote_process
+            .as_ref()
+            .filter(|process| process.is_running())
+        {
+            return Some(LanguageProcess::Remote(process.clone()));
+        }
+        let process = self
+            .0
+            .local_process
+            .as_ref()
+            .filter(|process| process.is_running())?;
+        Some(LanguageProcess::Local(process.clone()))
     }
 
     pub(crate) fn progress(&self) -> Option<ServerProgress> {

@@ -12,7 +12,9 @@ use anyhow::{Context, Result, ensure};
 use rust_i18n::t;
 use serde::{Deserialize, Serialize};
 
-use super::{Backend, capture_repository, command, commit_state, head, object_id, read, text};
+#[cfg(feature = "desktop")]
+use super::Backend;
+use super::{capture_repository, command, commit_state, head, object_id, read, text};
 use super::{operations::OperationLock, repo::git_dir};
 use backup::BackupPhase;
 pub(crate) use rewrite::{RewriteKind, RewriteRecord};
@@ -23,7 +25,7 @@ pub(crate) struct HistoryTip {
     pub oid: String,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum HistoryAction {
     Pick,
     Reword,
@@ -32,7 +34,7 @@ pub(crate) enum HistoryAction {
     Drop,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct HistoryEntry {
     pub oid: String,
     pub subject: String,
@@ -40,7 +42,7 @@ pub(crate) struct HistoryEntry {
     pub action: HistoryAction,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 pub(crate) struct HistoryPlan {
     pub tip: HistoryTip,
     pub base: Option<String>,
@@ -68,7 +70,7 @@ pub(crate) fn valid_message(message: &str) -> bool {
     !message.trim().is_empty() && !message.contains('\0')
 }
 
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 pub(crate) enum HistoryEdit {
     Rebase(HistoryPlan),
     Amend(HistoryTip, super::CommitState, String),
@@ -105,7 +107,7 @@ impl HistoryEdit {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum ResetMode {
     #[default]
     Soft,
@@ -114,7 +116,7 @@ pub(crate) enum ResetMode {
     Hard,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 pub(crate) struct ResetPlan {
     tip: HistoryTip,
     pub target: String,
@@ -144,7 +146,7 @@ struct Owner {
     rewrite: Option<RewriteKind>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct HistoryProgress {
     owner: Owner,
     pub commit: Option<String>,
@@ -153,6 +155,7 @@ pub(crate) struct HistoryProgress {
     pub saved: Option<SavedChanges>,
 }
 
+#[cfg(feature = "desktop")]
 impl HistoryProgress {
     pub fn is_cherry_pick(&self) -> bool {
         self.owner.operation.is_cherry_pick()
@@ -169,14 +172,14 @@ impl HistoryProgress {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct SavedChanges {
     pub reference: String,
     pub can_restore: bool,
     pub completed_cherry_picks: Option<usize>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 pub(crate) enum HistoryResolution {
     Continue,
     Abort,
@@ -185,25 +188,39 @@ pub(crate) enum HistoryResolution {
     KeepBackup,
 }
 
+#[derive(Serialize, Deserialize)]
+pub(crate) enum HistoryEditReply {
+    Completed(Option<String>, Option<RewriteRecord>),
+    PublishedHistory,
+}
+
+#[cfg(feature = "desktop")]
 impl Backend {
     pub(crate) fn supports_history_edit(&self) -> bool {
-        self.ssh.is_none()
+        self.ssh
+            .as_ref()
+            .is_none_or(|ssh| ssh.supports_history_edit())
     }
 
     pub(crate) fn can_cherry_pick(&self, tip: &HistoryTip, targets: &[String]) -> Result<bool> {
-        ensure!(self.supports_history_edit(), t!("git.history_edit_local"));
-        check_tip(&self.root, tip)?;
-        Ok(cherry_pick_order(&self.root, tip, targets)?.is_some())
+        self.history_edit_call(
+            crate::remote::Request::CanCherryPick(tip.clone(), targets.to_vec()),
+            |root| can_cherry_pick(root, tip, targets),
+        )
     }
 
     pub(crate) fn history_plan(&self, tip: HistoryTip, targets: &[String]) -> Result<HistoryPlan> {
-        ensure!(self.supports_history_edit(), t!("git.history_edit_local"));
-        prepare(&self.root, tip, targets)
+        self.history_edit_call(
+            crate::remote::Request::HistoryEditPlan(tip.clone(), targets.to_vec()),
+            |root| prepare_history_plan(root, tip, targets),
+        )
     }
 
     pub(crate) fn reset_plan(&self, tip: HistoryTip, target: &str) -> Result<ResetPlan> {
-        ensure!(self.supports_history_edit(), t!("git.history_edit_local"));
-        prepare_reset(&self.root, tip, target)
+        self.history_edit_call(
+            crate::remote::Request::HistoryResetPlan(tip.clone(), target.to_owned()),
+            |root| prepare_history_reset(root, tip, target),
+        )
     }
 
     pub(crate) fn amend_message(
@@ -211,13 +228,10 @@ impl Backend {
         tip: &HistoryTip,
         expected: &super::CommitState,
     ) -> Result<String> {
-        ensure!(self.supports_history_edit(), t!("git.history_edit_local"));
-        check_amend(&self.root, tip, expected)?;
-        let message = read(
-            &self.root,
-            ["show", "-s", "--no-notes", "--format=%B", &tip.oid, "--"],
-        )?;
-        Ok(text(&message).trim_end_matches('\n').to_owned())
+        self.history_edit_call(
+            crate::remote::Request::HistoryAmendMessage(tip.clone(), expected.clone()),
+            |root| amend_message(root, tip, expected),
+        )
     }
 
     pub(crate) fn rewrite_record(
@@ -225,27 +239,29 @@ impl Backend {
         branch: Option<&str>,
         oid: Option<&str>,
     ) -> Option<RewriteRecord> {
-        if !self.supports_history_edit() {
-            return None;
-        }
-        rewrite::record_for(&self.root, branch?, oid?)
+        let (branch, oid) = (branch?, oid?);
+        self.history_edit_call(
+            crate::remote::Request::HistoryRewriteRecord(branch.to_owned(), oid.to_owned()),
+            |root| Ok(rewrite_record(root, branch, oid)),
+        )
+        .ok()
+        .flatten()
     }
 
     pub(crate) fn recover_history_backup(&self) -> Result<bool> {
         if !self.supports_history_edit() {
             return Ok(false);
         }
-        let result = recover_backup(&self.root);
-        if !matches!(result, Ok(false)) {
-            self.invalidate();
-        }
-        result
+        self.history_edit_call(crate::remote::Request::RecoverHistoryBackup, recover_backup)
     }
 
-    pub(crate) fn history_progress(&self) -> Option<HistoryProgress> {
-        self.supports_history_edit()
-            .then(|| progress(&self.root))
-            .flatten()
+    pub(crate) fn history_progress(&self) -> Result<Option<HistoryProgress>> {
+        if !self.supports_history_edit() {
+            return Ok(None);
+        }
+        self.history_edit_call(crate::remote::Request::HistoryEditProgress, |root| {
+            Ok(history_edit_progress(root))
+        })
     }
 
     pub(crate) fn edit_history(
@@ -260,24 +276,80 @@ impl Backend {
         edit: HistoryEdit,
         confirmed: bool,
     ) -> Result<(Option<String>, Option<RewriteRecord>)> {
-        ensure!(self.supports_history_edit(), t!("git.history_edit_local"));
-        let recording = edit.recording_tip().cloned();
-        let result = execute_history_edit(&self.root, edit, confirmed);
-        self.invalidate();
-        result?;
-        let head = head(&self.root)?;
-        let record = recording.and_then(|tip| {
-            let after = head.as_deref().filter(|head| *head != tip.oid)?;
-            self.rewrite_record(Some(&tip.branch), Some(after))
-        });
-        Ok((head, record))
+        let reply = self.history_edit_call(
+            crate::remote::Request::EditHistory(edit.clone(), confirmed),
+            |root| run_history_edit(root, edit, confirmed),
+        )?;
+        match reply {
+            HistoryEditReply::Completed(head, record) => Ok((head, record)),
+            HistoryEditReply::PublishedHistory => Err(PublishedHistory.into()),
+        }
     }
+
+    fn history_edit_call<T: serde::de::DeserializeOwned>(
+        &self,
+        request: crate::remote::Request,
+        local: impl FnOnce(&Path) -> Result<T>,
+    ) -> Result<T> {
+        match &self.ssh {
+            Some(ssh) => {
+                ensure!(ssh.supports_history_edit(), t!("git.upgrade_history_edit"));
+                ssh.call(request)
+            }
+            None => local(&self.root),
+        }
+    }
+}
+
+pub(crate) fn can_cherry_pick(root: &Path, tip: &HistoryTip, targets: &[String]) -> Result<bool> {
+    check_tip(root, tip)?;
+    Ok(cherry_pick_order(root, tip, targets)?.is_some())
+}
+
+pub(crate) fn amend_message(
+    root: &Path,
+    tip: &HistoryTip,
+    expected: &super::CommitState,
+) -> Result<String> {
+    check_amend(root, tip, expected)?;
+    let message = read(
+        root,
+        ["show", "-s", "--no-notes", "--format=%B", &tip.oid, "--"],
+    )?;
+    Ok(text(&message).trim_end_matches('\n').to_owned())
+}
+
+pub(crate) fn rewrite_record(root: &Path, branch: &str, oid: &str) -> Option<RewriteRecord> {
+    rewrite::record_for(root, branch, oid)
+}
+
+pub(crate) fn run_history_edit(
+    root: &Path,
+    edit: HistoryEdit,
+    confirmed: bool,
+) -> Result<HistoryEditReply> {
+    let recording = edit.recording_tip().cloned();
+    let result = execute_history_edit(root, edit, confirmed);
+    super::session_for(root).invalidate();
+    if result
+        .as_ref()
+        .is_err_and(|error| error.is::<PublishedHistory>())
+    {
+        return Ok(HistoryEditReply::PublishedHistory);
+    }
+    result?;
+    let head = head(root)?;
+    let record = recording.and_then(|tip| {
+        let after = head.as_deref().filter(|head| *head != tip.oid)?;
+        rewrite_record(root, &tip.branch, after)
+    });
+    Ok(HistoryEditReply::Completed(head, record))
 }
 
 fn check_tip(root: &Path, tip: &HistoryTip) -> Result<()> {
     ensure!(
         object_id(&tip.oid) && tip.branch.starts_with("refs/heads/"),
-        t!("git.history_edit_local")
+        t!("git.history_edit_checkout")
     );
     let checkout = fs::read_to_string(git_dir(root).join("HEAD"))?;
     ensure!(
@@ -359,7 +431,11 @@ fn ready(root: &Path, tip: &HistoryTip) -> Result<super::CommitState> {
     Ok(state)
 }
 
-fn prepare_reset(root: &Path, tip: HistoryTip, target: &str) -> Result<ResetPlan> {
+pub(crate) fn prepare_history_reset(
+    root: &Path,
+    tip: HistoryTip,
+    target: &str,
+) -> Result<ResetPlan> {
     ready(root, &tip)?;
     ensure!(
         object_id(target) && target != tip.oid,
@@ -411,7 +487,7 @@ fn check_published_range(
 }
 
 fn reset(root: &Path, plan: ResetPlan, mode: ResetMode, confirmed: bool) -> Result<()> {
-    let current = prepare_reset(root, plan.tip, &plan.target)?;
+    let current = prepare_history_reset(root, plan.tip, &plan.target)?;
     check_published_range(
         root,
         &current.tip.oid,
@@ -511,7 +587,11 @@ fn take_entry(root: &Path, tip: &HistoryTip, oldest: &str) -> Result<HistoryPlan
     })
 }
 
-fn prepare(root: &Path, tip: HistoryTip, targets: &[String]) -> Result<HistoryPlan> {
+pub(crate) fn prepare_history_plan(
+    root: &Path,
+    tip: HistoryTip,
+    targets: &[String],
+) -> Result<HistoryPlan> {
     ready(root, &tip)?;
     ensure!(
         !targets.is_empty() && targets.iter().all(|oid| object_id(oid)),
@@ -604,7 +684,7 @@ fn active_commit(root: &Path, owner: &Owner) -> Option<Option<String>> {
     }
 }
 
-fn progress(root: &Path) -> Option<HistoryProgress> {
+pub(crate) fn history_edit_progress(root: &Path) -> Option<HistoryProgress> {
     let backup = backup::load(root).ok().flatten();
     let owner = backup
         .as_ref()
@@ -713,7 +793,15 @@ fn clear_operation(root: &Path) -> Result<()> {
     backup::forget(root)
 }
 
-fn recover_backup(root: &Path) -> Result<bool> {
+pub(crate) fn recover_backup(root: &Path) -> Result<bool> {
+    let result = restore_backup(root);
+    if !matches!(result, Ok(false)) {
+        super::session_for(root).invalidate();
+    }
+    result
+}
+
+fn restore_backup(root: &Path) -> Result<bool> {
     if !backup::load(root)?.is_some_and(|backup| backup.phase == BackupPhase::Ready) {
         return Ok(false);
     }
@@ -924,7 +1012,7 @@ fn amend(
     rewrite::record_success(root, &tip, RewriteKind::Amend)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "desktop"))]
 fn edit_history(root: &Path, edit: HistoryEdit) -> Result<()> {
     execute_history_edit(root, edit, false)
 }
@@ -938,7 +1026,7 @@ fn execute_history_edit(root: &Path, edit: HistoryEdit, confirmed: bool) -> Resu
         }
         HistoryEdit::UndoRewrite(record) => rewrite::undo(root, record, confirmed),
         HistoryEdit::Undo(tip) => {
-            let plan = prepare(root, tip.clone(), std::slice::from_ref(&tip.oid))?;
+            let plan = prepare_history_plan(root, tip.clone(), std::slice::from_ref(&tip.oid))?;
             let parent = plan.base.context(t!("git.history_edit_no_parent"))?;
             check_published_range(root, &tip.oid, Some(&parent), 1, confirmed)?;
             apply_reset(root, &tip, &parent, ResetMode::Soft)
@@ -991,7 +1079,7 @@ fn execute_history_edit(root: &Path, edit: HistoryEdit, confirmed: bool) -> Resu
             settle(root, &owner, capture_repository(git).map(|_| ()))
         }
         HistoryEdit::Resume(expected, action) => {
-            let current = progress(root).context(t!("git.history_edit_stale"))?;
+            let current = history_edit_progress(root).context(t!("git.history_edit_stale"))?;
             ensure!(
                 current.owner == expected.owner
                     && current.commit == expected.commit
@@ -1058,7 +1146,7 @@ fn execute_history_edit(root: &Path, edit: HistoryEdit, confirmed: bool) -> Resu
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "desktop"))]
 mod tests {
     use super::*;
 
@@ -1099,7 +1187,7 @@ mod tests {
         }
 
         fn plan(&self, start: &str) -> Result<HistoryPlan> {
-            prepare(&self.root, self.tip()?, &[start.to_owned()])
+            prepare_history_plan(&self.root, self.tip()?, &[start.to_owned()])
         }
     }
 
@@ -1195,7 +1283,7 @@ mod tests {
         );
         assert_eq!(repo.tip()?.oid, base);
         assert_eq!(fs::read_to_string(repo.root.join("artifact"))?, "local\n");
-        assert!(backend.history_progress().is_none());
+        assert!(backend.history_progress()?.is_none());
 
         fs::remove_file(repo.root.join("artifact"))?;
         backend.edit_history(HistoryEdit::CherryPick(repo.tip()?, vec![source]))?;
@@ -1213,7 +1301,7 @@ mod tests {
         );
         assert_eq!(repo.tip()?, after_removal);
         assert_eq!(fs::read_to_string(repo.root.join("artifact"))?, "local\n");
-        assert!(backend.history_progress().is_none());
+        assert!(backend.history_progress()?.is_none());
 
         fs::remove_file(repo.root.join("artifact"))?;
         backend.edit_history(HistoryEdit::UndoRewrite(record))?;
@@ -1249,7 +1337,7 @@ mod tests {
         for abort in [true, false] {
             assert!(backend.edit_history(pick.clone()).is_err());
             let paused = backend
-                .history_progress()
+                .history_progress()?
                 .context("missing paused cherry-pick")?;
             assert!(paused.is_cherry_pick());
             assert!(!paused.stopped_before_pick);
@@ -1276,7 +1364,7 @@ mod tests {
                 assert_eq!(fs::read_to_string(repo.root.join("shared"))?, "resolved\n");
                 backend.edit_history(HistoryEdit::UndoRewrite(record))?;
             }
-            assert!(backend.history_progress().is_none());
+            assert!(backend.history_progress()?.is_none());
             assert_eq!(repo.tip()?.oid, current);
             assert_eq!(repo.git(["rev-parse", "source"])?, source);
             assert_eq!(super::super::worktree_status(&repo.root)?, status);
@@ -1347,7 +1435,7 @@ mod tests {
             })
             .is_err()
         );
-        let failed = progress(&repo.root).context("missing saved changes")?;
+        let failed = history_edit_progress(&repo.root).context("missing saved changes")?;
         assert_eq!(failed.conflicts, ["tracked"]);
         let saved = failed.saved.context("missing legacy backup")?;
         assert_eq!(saved.completed_cherry_picks, Some(1));
@@ -1383,7 +1471,7 @@ mod tests {
             assert_ne!(repo.tip()?.oid, current);
             assert_eq!(repo.git(["log", "-1", "--format=%s"])?, "First");
             let paused = backend
-                .history_progress()
+                .history_progress()?
                 .context("missing paused cherry-pick sequence")?;
             assert_eq!(paused.commit.as_deref(), Some(conflict.as_str()));
             assert_eq!(paused.conflicts, ["shared"]);
@@ -1414,7 +1502,7 @@ mod tests {
             assert_eq!(fs::read_to_string(repo.root.join("untracked"))?, "keep\n");
             assert!(!repo.root.join("first").exists());
             assert!(!repo.root.join("last").exists());
-            assert!(backend.history_progress().is_none());
+            assert!(backend.history_progress()?.is_none());
         }
         Ok(())
     }
@@ -1441,7 +1529,7 @@ mod tests {
             assert!(edit_history(&repo.root, HistoryEdit::Rebase(plan.clone())).is_err());
             let backend = Backend::new(repo.root.clone(), None);
             let paused = backend
-                .history_progress()
+                .history_progress()?
                 .context("missing paused rebase")?;
             let backup = backup::load(&repo.root)?.unwrap();
             assert!(
@@ -1481,7 +1569,7 @@ mod tests {
                     paused.clone(),
                     HistoryResolution::Stage("shared".into()),
                 ))?;
-                assert!(backend.history_progress().unwrap().conflicts.is_empty());
+                assert!(backend.history_progress()?.unwrap().conflicts.is_empty());
                 let (_, record) = backend
                     .edit_history(HistoryEdit::Resume(paused, HistoryResolution::Continue))?;
                 assert_eq!(record.unwrap().kind, RewriteKind::Rebase);
@@ -1495,7 +1583,7 @@ mod tests {
                 fs::read_to_string(repo.root.join("local-before"))?,
                 "untracked before rebase\n"
             );
-            assert!(backend.history_progress().is_none());
+            assert!(backend.history_progress()?.is_none());
         }
         assert_eq!(head(&primary)?, Some(shared));
         Ok(())
@@ -1529,7 +1617,7 @@ mod tests {
             repo.git(["for-each-ref", "refs/worktree/stroll/history-backups"])?
                 .is_empty()
         );
-        assert!(progress(&repo.root).is_none());
+        assert!(history_edit_progress(&repo.root).is_none());
         Ok(())
     }
 
@@ -1546,7 +1634,7 @@ mod tests {
         plan.entries[0].message = "New message".into();
         let result = edit_history(&repo.root, HistoryEdit::Rebase(plan));
         if result.is_err() {
-            let saved = progress(&repo.root).unwrap().saved.unwrap();
+            let saved = history_edit_progress(&repo.root).unwrap().saved.unwrap();
             assert_eq!(
                 repo.git(["show", &format!("{}^3:local", saved.reference)])?,
                 "ignored user contents"
@@ -1572,7 +1660,7 @@ mod tests {
         let mut plan = repo.plan(&first)?;
         plan.entries[0].action = HistoryAction::Drop;
         assert!(edit_history(&repo.root, HistoryEdit::Rebase(plan)).is_err());
-        let paused = progress(&repo.root).context("expected rebase conflict")?;
+        let paused = history_edit_progress(&repo.root).context("expected rebase conflict")?;
         assert!(paused.owner.operation == Operation::Rebase && paused.saved.is_none());
         assert_eq!(paused.commit.as_deref(), Some(second.as_str()));
         assert!(!repo.root.join("local").exists());
@@ -1583,13 +1671,13 @@ mod tests {
         assert_eq!(repo.tip()?.oid, second);
         assert_eq!(fs::read_to_string(repo.root.join("tracked"))?, "draft\n");
         assert_eq!(fs::read_to_string(repo.root.join("local"))?, "local\n");
-        assert!(progress(&repo.root).is_none());
+        assert!(history_edit_progress(&repo.root).is_none());
 
         let mut plan = repo.plan(&second)?;
         plan.entries[0].action = HistoryAction::Drop;
         assert!(edit_history(&repo.root, HistoryEdit::Rebase(plan)).is_err());
         assert_eq!(repo.tip()?.oid, first);
-        let failed = progress(&repo.root).context("expected saved changes")?;
+        let failed = history_edit_progress(&repo.root).context("expected saved changes")?;
         let saved = failed.saved.as_ref().unwrap();
         assert!(!saved.can_restore);
         assert!(!recover_backup(&repo.root)?);
@@ -1635,7 +1723,13 @@ mod tests {
         repo.git(["commit", "--amend", "-qm", "Squashed"])?;
         let rewritten = repo.tip()?;
         fs::remove_dir_all(directory(&repo.root))?;
-        assert!(progress(&repo.root).unwrap().saved.unwrap().can_restore);
+        assert!(
+            history_edit_progress(&repo.root)
+                .unwrap()
+                .saved
+                .unwrap()
+                .can_restore
+        );
         repo.git(["switch", "--detach", "-q"])?;
         assert!(!recover_backup(&repo.root)?);
         assert!(!repo.root.join("local/draft").exists());
@@ -1655,7 +1749,7 @@ mod tests {
         );
         assert!(repo.git(["for-each-ref", &saved])?.is_empty());
         assert!(!recover_backup(&repo.root)?);
-        assert!(progress(&repo.root).is_none());
+        assert!(history_edit_progress(&repo.root).is_none());
         Ok(())
     }
 
@@ -1674,7 +1768,7 @@ mod tests {
             repo.git(["add", "local"])?;
             fs::write(repo.root.join("local"), "unstaged\n")?;
             fs::write(repo.root.join("untracked"), "untracked\n")?;
-            let plan = prepare_reset(&repo.root, repo.tip()?, &base)?;
+            let plan = prepare_history_reset(&repo.root, repo.tip()?, &base)?;
             assert_eq!(plan.removed, 1);
             repo.git(["update-ref", "refs/remotes/origin/main", &tip])?;
             assert!(edit_history(&repo.root, HistoryEdit::Reset(plan.clone(), mode)).is_err());
@@ -1713,7 +1807,7 @@ mod tests {
         let base = repo.change("tracked", "base\n", "Base")?;
         let tip = repo.change("tracked", "tip\n", "Tip")?;
         fs::write(repo.root.join("tracked"), "draft\n")?;
-        let plan = prepare_reset(&repo.root, repo.tip()?, &base)?;
+        let plan = prepare_history_reset(&repo.root, repo.tip()?, &base)?;
         assert!(edit_history(&repo.root, HistoryEdit::Reset(plan, ResetMode::Keep)).is_err());
         assert_eq!(repo.tip()?.oid, tip);
         assert_eq!(fs::read_to_string(repo.root.join("tracked"))?, "draft\n");
@@ -1853,7 +1947,7 @@ mod tests {
             fs::read_to_string(nested.join("file"))?,
             "independent work\n"
         );
-        assert!(progress(&repo.root).is_none());
+        assert!(history_edit_progress(&repo.root).is_none());
         Ok(())
     }
 }

@@ -18,6 +18,8 @@ mod locator;
 pub mod lsp;
 mod paths;
 mod process;
+#[cfg(any(feature = "desktop", target_os = "linux"))]
+mod process_memory;
 #[path = "terminal/pty.rs"]
 mod pty;
 pub mod remote;

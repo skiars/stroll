@@ -3,7 +3,7 @@ use rust_i18n::t;
 use std::{
     ffi::OsString,
     io::{self, Read, Write},
-    path::Path,
+    path::{Path, PathBuf},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -22,8 +22,10 @@ mod platform;
 
 pub(crate) use platform::shell;
 
-#[cfg(all(feature = "desktop", unix))]
-use std::{path::PathBuf, sync::atomic::AtomicU32};
+#[cfg(feature = "desktop")]
+use std::sync::Mutex;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use std::sync::atomic::AtomicU32;
 
 #[derive(Clone, Copy)]
 pub(crate) enum ShellMode {
@@ -55,8 +57,10 @@ pub(crate) struct Process {
     stop: Arc<AtomicBool>,
     events: async_channel::Sender<Event>,
     worker: Option<JoinHandle<()>>,
-    #[cfg(all(feature = "desktop", unix))]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     pid: Option<Arc<AtomicU32>>,
+    #[cfg(feature = "desktop")]
+    remote_directory: Option<Arc<Mutex<Option<PathBuf>>>>,
 }
 
 impl Process {
@@ -64,11 +68,12 @@ impl Process {
         shell: OsString,
         mode: ShellMode,
         root: &Path,
+        directory: Option<&Path>,
         size: PtySize,
         commands: mpsc::Receiver<Command>,
         events: async_channel::Sender<Event>,
     ) -> io::Result<Self> {
-        Self::start_in(shell, mode, root, None, size, commands, events)
+        Self::start_in(shell, mode, root, directory, size, commands, events)
     }
 
     #[cfg(feature = "desktop")]
@@ -102,9 +107,9 @@ impl Process {
     ) -> io::Result<Self> {
         let root = root.to_owned();
         let directory = directory.map(Path::to_owned);
-        #[cfg(all(feature = "desktop", unix))]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         let pid = Arc::new(AtomicU32::new(0));
-        #[cfg(all(feature = "desktop", unix))]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         let child_pid = pid.clone();
         let process = Self::spawn(events, move |output, stopping| {
             let pty = if let Some(directory) = directory.as_deref().filter(|path| path != &root) {
@@ -113,14 +118,14 @@ impl Process {
             } else {
                 platform::Pty::open(&shell, mode, &root, size, stopping)?
             };
-            #[cfg(all(feature = "desktop", unix))]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             child_pid.store(pty.0.pid(), Ordering::Relaxed);
             let result = run(pty, size, commands, output, stopping);
-            #[cfg(all(feature = "desktop", unix))]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             child_pid.store(0, Ordering::Relaxed);
             result
         })?;
-        #[cfg(all(feature = "desktop", unix))]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         let process = {
             let mut process = process;
             process.pid = Some(pid);
@@ -129,24 +134,48 @@ impl Process {
         Ok(process)
     }
 
-    #[cfg(all(feature = "desktop", unix))]
     pub(crate) fn working_directory(&self) -> Option<PathBuf> {
-        let pid = self.pid.as_ref()?.load(Ordering::Relaxed);
-        (pid != 0)
-            .then(|| platform::working_directory(pid))
-            .flatten()
+        #[cfg(feature = "desktop")]
+        if let Some(directory) = &self.remote_directory {
+            return directory.lock().unwrap().clone();
+        }
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            let pid = self.pid.as_ref()?.load(Ordering::Relaxed);
+            (pid != 0)
+                .then(|| platform::working_directory(pid))
+                .flatten()
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        None
     }
 
     #[cfg(feature = "desktop")]
     pub(crate) fn start_remote(
         ssh: crate::remote::SshSession,
+        directory: Option<PathBuf>,
         size: PtySize,
         commands: mpsc::Receiver<Command>,
         events: async_channel::Sender<Event>,
     ) -> io::Result<Self> {
-        Self::spawn(events, move |output, stopping| {
-            remote_run(ssh, size, commands, output, stopping).map_err(io::Error::other)
-        })
+        use crate::remote::{Request, TERMINAL_DIRECTORY_VERSION};
+
+        let reported = Arc::new(Mutex::new(None));
+        let current = reported.clone();
+        let mut process = Self::spawn(events, move |output, stopping| {
+            let supports_directory = ssh
+                .call::<u32>(Request::Hello(TERMINAL_DIRECTORY_VERSION))
+                .is_ok_and(|version| version == TERMINAL_DIRECTORY_VERSION);
+            let request = if supports_directory {
+                Request::TerminalOpenAt(size, directory)
+            } else {
+                Request::TerminalOpen(size)
+            };
+            let id = ssh.call(request).map_err(io::Error::other)?;
+            remote_run(ssh, id, &current, commands, output, stopping).map_err(io::Error::other)
+        })?;
+        process.remote_directory = Some(reported);
+        Ok(process)
     }
 
     fn spawn(
@@ -178,8 +207,10 @@ impl Process {
             stop,
             events,
             worker: Some(worker),
-            #[cfg(all(feature = "desktop", unix))]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             pid: None,
+            #[cfg(feature = "desktop")]
+            remote_directory: None,
         })
     }
 
@@ -342,7 +373,8 @@ fn write_input(mut writer: impl Write, commands: mpsc::Receiver<Vec<u8>>) {
 #[cfg(feature = "desktop")]
 fn remote_run(
     ssh: crate::remote::SshSession,
-    size: PtySize,
+    id: u64,
+    directory: &Mutex<Option<PathBuf>>,
     commands: mpsc::Receiver<Command>,
     output: &async_channel::Sender<Event>,
     stopping: &AtomicBool,
@@ -355,7 +387,6 @@ fn remote_run(
     const CHECK_INTERVAL: Duration = Duration::from_millis(10);
     const POLL_INTERVAL: Duration = Duration::from_millis(20);
 
-    let id: u64 = ssh.call(Request::TerminalOpen(size))?;
     let result = (|| {
         // The SSH writer and remote terminal worker both process requests in order.
         let mut pending = VecDeque::<PendingCall>::new();
@@ -379,6 +410,7 @@ fn remote_run(
                         }
                         TerminalEvent::Exit(code) => return Ok(Some(code)),
                         TerminalEvent::Error(error) => anyhow::bail!("{error}"),
+                        TerminalEvent::Directory(path) => *directory.lock().unwrap() = Some(path),
                     }
                 }
             }

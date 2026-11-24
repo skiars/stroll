@@ -48,6 +48,11 @@ pub(crate) const WORKTREE_LSP_VERSION: u32 = 21;
 pub(crate) const IMAGE_DIFF_VERSION: u32 = 22;
 pub(crate) const IMAGE_DIFF_RESOURCE_VERSION: u32 = 23;
 pub(crate) const BUILTIN_LSP_PROJECT_VERSION: u32 = 24;
+pub(crate) const HISTORY_EDIT_VERSION: u32 = 25;
+pub(crate) const TERMINAL_DIRECTORY_VERSION: u32 = 26;
+pub(crate) const WORKSPACE_IMPORT_VERSION: u32 = 27;
+pub(crate) const LSP_MEMORY_VERSION: u32 = 28;
+pub(crate) const WORKTREE_IDENTITY_VERSION: u32 = 29;
 const MAX_FRAME: usize = 40 * 1024 * 1024;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -211,6 +216,13 @@ pub(crate) enum Request {
     Open(PathBuf),
     OpenWorkspace(PathBuf),
     Worktrees,
+    WorktreeIdentity,
+    WorktreeMarker(PathBuf, String),
+    LocateWorktree {
+        root: PathBuf,
+        common: PathBuf,
+        id: String,
+    },
     Exists(RepoPath),
     Openable(Vec<Option<String>>),
     Read(RepoPath, bool),
@@ -245,6 +257,10 @@ pub(crate) enum Request {
     EntryVersion(RepoPath),
     FileOperation(RepoPath, crate::repository::files::FileOperation),
     ReadCopyChunk(RepoPath, crate::repository::files::EntryVersion, u64),
+    BeginImport(RepoPath),
+    ImportEntry(u64, RepoPath, crate::repository::files::ImportEntry),
+    ImportChunk(u64, RepoPath, u64, Bytes),
+    FinishImport(u64, bool),
     History,
     Commits(String, String, usize),
     Commit(String),
@@ -283,7 +299,16 @@ pub(crate) enum Request {
     EditWithHistory(git::FileEdit),
     ReplayGitHistory(u64, bool),
     RestoreHistoryText(u64, bool),
+    CanCherryPick(git::HistoryTip, Vec<String>),
+    HistoryEditPlan(git::HistoryTip, Vec<String>),
+    HistoryResetPlan(git::HistoryTip, String),
+    HistoryAmendMessage(git::HistoryTip, git::CommitState),
+    HistoryRewriteRecord(String, String),
+    HistoryEditProgress,
+    RecoverHistoryBackup,
+    EditHistory(git::HistoryEdit, bool),
     TerminalOpen(pty::PtySize),
+    TerminalOpenAt(pty::PtySize, Option<PathBuf>),
     TerminalInput(u64, Bytes),
     TerminalResize(u64, pty::PtySize),
     TerminalPoll(u64),
@@ -295,11 +320,15 @@ pub(crate) enum Request {
     WorktreeLspRoot(crate::language::worktree::ProjectRoots, RepoPath),
     LspEditTime,
     LspEditTarget(RepoPath, std::time::SystemTime),
+    RegisterLspMemory,
+    LspMemory(u64),
+    ReleaseLspMemory(u64),
 }
 
 #[derive(Serialize, Deserialize)]
 pub(crate) enum TerminalEvent {
     Output(Bytes),
+    Directory(PathBuf),
     Exit(u32),
     Error(String),
 }
@@ -357,6 +386,8 @@ pub(crate) struct LspLaunch {
     pub repository: PathBuf,
     pub project: PathBuf,
     pub server: LspTarget,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory: Option<PathBuf>,
 }
 
 #[cfg(feature = "desktop")]
@@ -366,11 +397,13 @@ impl SshSession {
         repository: PathBuf,
         project: PathBuf,
         server: LspTarget,
+        memory: Option<PathBuf>,
     ) -> Result<std::process::Command> {
         let options = LspLaunch {
             repository,
             project,
             server,
+            memory,
         };
         let encoded =
             base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(serde_json::to_vec(&options)?);

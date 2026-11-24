@@ -71,6 +71,8 @@ struct Connection {
     #[cfg(feature = "desktop")]
     git_history: AtomicBool,
     #[cfg(feature = "desktop")]
+    history_edit: AtomicBool,
+    #[cfg(feature = "desktop")]
     blame: AtomicBool,
     batch: AtomicBool,
     #[cfg(feature = "desktop")]
@@ -94,6 +96,10 @@ struct Connection {
     workspace_files: AtomicBool,
     #[cfg(feature = "desktop")]
     workspace_transfer: AtomicBool,
+    #[cfg(feature = "desktop")]
+    workspace_import: AtomicBool,
+    #[cfg(feature = "desktop")]
+    worktree_identity: AtomicBool,
     #[cfg(feature = "desktop")]
     lsp_edits: AtomicBool,
     failure: Arc<Mutex<Option<String>>>,
@@ -244,6 +250,21 @@ impl SshSession {
     #[cfg(feature = "desktop")]
     pub fn supports_git_history(&self) -> bool {
         self.0.git_history.load(Ordering::Relaxed)
+    }
+
+    #[cfg(feature = "desktop")]
+    pub(crate) fn supports_history_edit(&self) -> bool {
+        self.0.history_edit.load(Ordering::Relaxed)
+    }
+
+    #[cfg(feature = "desktop")]
+    pub(crate) fn supports_workspace_import(&self) -> bool {
+        self.0.workspace_import.load(Ordering::Relaxed)
+    }
+
+    #[cfg(feature = "desktop")]
+    pub(crate) fn supports_worktree_identity(&self) -> bool {
+        self.0.worktree_identity.load(Ordering::Relaxed)
     }
 
     #[cfg(feature = "desktop")]
@@ -442,6 +463,8 @@ impl Connection {
             #[cfg(feature = "desktop")]
             git_history: AtomicBool::new(false),
             #[cfg(feature = "desktop")]
+            history_edit: AtomicBool::new(false),
+            #[cfg(feature = "desktop")]
             blame: AtomicBool::new(false),
             batch: AtomicBool::new(false),
             #[cfg(feature = "desktop")]
@@ -461,6 +484,10 @@ impl Connection {
             workspace_files: AtomicBool::new(false),
             #[cfg(feature = "desktop")]
             workspace_transfer: AtomicBool::new(false),
+            #[cfg(feature = "desktop")]
+            workspace_import: AtomicBool::new(false),
+            #[cfg(feature = "desktop")]
+            worktree_identity: AtomicBool::new(false),
             #[cfg(feature = "desktop")]
             lsp_edits: AtomicBool::new(false),
             #[cfg(feature = "desktop")]
@@ -589,6 +616,11 @@ impl Connection {
                     .call::<u32>(Request::Hello(version))
                     .is_ok_and(|reply| reply == version);
             connection.git_history.store(supported, Ordering::Relaxed);
+            let version = super::HISTORY_EDIT_VERSION;
+            let supported = connection
+                .call::<u32>(Request::Hello(version))
+                .is_ok_and(|reply| reply == version);
+            connection.history_edit.store(supported, Ordering::Relaxed);
             let version = super::WORKSPACE_FILES_VERSION;
             let supported = connection
                 .call::<u32>(Request::Hello(version))
@@ -603,6 +635,21 @@ impl Connection {
                     .is_ok_and(|reply| reply == version);
             connection
                 .workspace_transfer
+                .store(supported, Ordering::Relaxed);
+            let version = super::WORKSPACE_IMPORT_VERSION;
+            let supported = supported
+                && connection
+                    .call::<u32>(Request::Hello(version))
+                    .is_ok_and(|reply| reply == version);
+            connection
+                .workspace_import
+                .store(supported, Ordering::Relaxed);
+            let version = super::WORKTREE_IDENTITY_VERSION;
+            let supported = connection
+                .call::<u32>(Request::Hello(version))
+                .is_ok_and(|reply| reply == version);
+            connection
+                .worktree_identity
                 .store(supported, Ordering::Relaxed);
             let version = super::LSP_EDITS_VERSION;
             let supported = connection

@@ -28,7 +28,7 @@ impl RewriteKind {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct RewriteRecord {
     pub kind: RewriteKind,
     pub(super) before: String,

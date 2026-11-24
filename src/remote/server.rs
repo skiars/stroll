@@ -8,6 +8,7 @@ use std::{
         mpsc,
     },
     thread,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, ensure};
@@ -19,13 +20,15 @@ use crate::{
     git,
     language::worktree::WorktreeLsp,
     pty,
-    repository::{Repository, RepositoryInfo, write_checked},
+    repository::{Repository, RepositoryInfo, files::WorkspaceImport, write_checked},
 };
 
 #[derive(Default)]
 struct Server {
     repository: RwLock<Option<Arc<Repository>>>,
     mutations: Mutex<()>,
+    imports: Mutex<HashMap<u64, WorkspaceImport>>,
+    next_import: AtomicU64,
     documents: Mutex<Option<(u64, crate::repository::files::DocumentScan)>>,
     watch: Mutex<Option<git::watch::RepoWatcher>>,
     watch_replies: Option<mpsc::SyncSender<Reply>>,
@@ -33,6 +36,39 @@ struct Server {
     terminals: Mutex<HashMap<u64, Terminal>>,
     next_terminal: AtomicU64,
     lsp_snapshot: Mutex<Option<LspSnapshot>>,
+    #[cfg(target_os = "linux")]
+    lsp_memory: Mutex<HashMap<u64, tempfile::TempDir>>,
+    #[cfg(target_os = "linux")]
+    next_lsp_memory: AtomicU64,
+}
+
+#[cfg(target_os = "linux")]
+const LSP_MEMORY_PREFIX: &str = "stroll-lsp-memory-";
+
+#[cfg(target_os = "linux")]
+fn publish_lsp_process(directory: &Path) -> Result<()> {
+    use std::{io::Write as _, os::unix::fs::MetadataExt as _};
+
+    let metadata = directory.symlink_metadata()?;
+    // SAFETY: geteuid only reads the effective user ID.
+    let uid = unsafe { libc::geteuid() };
+    ensure!(
+        directory.parent() == Some(std::env::temp_dir().canonicalize()?.as_path())
+            && directory
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with(LSP_MEMORY_PREFIX))
+            && metadata.is_dir()
+            && metadata.uid() == uid
+            && metadata.mode() & 0o077 == 0,
+        "Invalid language server memory registration"
+    );
+    let process = crate::process_memory::ProcessIdentity::current()
+        .context("The language server process could not be identified")?;
+    let mut file = tempfile::NamedTempFile::new_in(directory)?;
+    file.write_all(&serde_json::to_vec(&process)?)?;
+    file.persist_noclobber(directory.join("pid"))?;
+    Ok(())
 }
 
 #[derive(Deserialize, Serialize)]
@@ -123,15 +159,24 @@ impl LspSnapshot {
 }
 
 struct Terminal {
-    _process: pty::Process,
+    process: pty::Process,
     commands: mpsc::Sender<pty::Command>,
     events: async_channel::Receiver<pty::Event>,
+    directory: Option<TerminalDirectory>,
+}
+
+struct TerminalDirectory {
+    next_sample: Instant,
+    last: Option<PathBuf>,
 }
 
 impl Server {
     fn request(&self, request: Request) -> Result<Value> {
         match request {
             Request::Hello(version) => {
+                if cfg!(target_os = "linux") && version == super::LSP_MEMORY_VERSION {
+                    return value(version);
+                }
                 ensure!(
                     matches!(
                         version,
@@ -159,10 +204,23 @@ impl Server {
                             | super::IMAGE_DIFF_VERSION
                             | super::IMAGE_DIFF_RESOURCE_VERSION
                             | super::BUILTIN_LSP_PROJECT_VERSION
+                            | super::HISTORY_EDIT_VERSION
+                            | super::TERMINAL_DIRECTORY_VERSION
+                            | super::WORKSPACE_IMPORT_VERSION
+                            | super::WORKTREE_IDENTITY_VERSION
                     ),
                     "SSH workspace protocol version mismatch. Update the remote helper."
                 );
                 return value(version);
+            }
+            Request::LocateWorktree {
+                ref root,
+                ref common,
+                ref id,
+            } => {
+                return value(crate::repository::worktree_identity::locate(
+                    root, common, id,
+                )?);
             }
             Request::Browse { path, base } => {
                 let directory = browse_path(&path, base.as_deref())?;
@@ -257,7 +315,8 @@ impl Server {
             | Request::Open(_)
             | Request::OpenWorkspace(_)
             | Request::Browse { .. }
-            | Request::Complete { .. } => unreachable!(),
+            | Request::Complete { .. }
+            | Request::LocateWorktree { .. } => unreachable!(),
             Request::TreeDirectories(paths) => {
                 value(crate::repository::files::scan_directories(root, paths)?)
             }
@@ -287,6 +346,53 @@ impl Server {
             Request::LspEditTarget(path, before) => value(
                 crate::repository::files::lsp_edit_target(root, path.as_path(), before)?,
             ),
+            #[cfg(target_os = "linux")]
+            Request::RegisterLspMemory => {
+                use std::os::unix::fs::PermissionsExt as _;
+
+                let mut processes = self.lsp_memory.lock().unwrap();
+                ensure!(
+                    processes.len() < 128,
+                    "Too many language server memory registrations"
+                );
+                let directory = tempfile::Builder::new()
+                    .prefix(LSP_MEMORY_PREFIX)
+                    .permissions(std::fs::Permissions::from_mode(0o700))
+                    .tempdir_in(std::env::temp_dir().canonicalize()?)?;
+                let id = self.next_lsp_memory.fetch_add(1, Ordering::Relaxed);
+                let path = directory.path().to_owned();
+                processes.insert(id, directory);
+                value((id, path))
+            }
+            #[cfg(target_os = "linux")]
+            Request::LspMemory(id) => {
+                use std::{io::Read as _, os::unix::fs::OpenOptionsExt as _};
+
+                let processes = self.lsp_memory.lock().unwrap();
+                let memory = processes.get(&id).and_then(|directory| {
+                    let mut file = std::fs::File::options()
+                        .read(true)
+                        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+                        .open(directory.path().join("pid"))
+                        .ok()?
+                        .take(256);
+                    let mut bytes = Vec::new();
+                    file.read_to_end(&mut bytes).ok()?;
+                    let process: crate::process_memory::ProcessIdentity =
+                        serde_json::from_slice(&bytes).ok()?;
+                    process.sample()
+                });
+                value(memory)
+            }
+            #[cfg(target_os = "linux")]
+            Request::ReleaseLspMemory(id) => {
+                self.lsp_memory.lock().unwrap().remove(&id);
+                value(())
+            }
+            #[cfg(not(target_os = "linux"))]
+            Request::RegisterLspMemory | Request::LspMemory(_) | Request::ReleaseLspMemory(_) => {
+                anyhow::bail!("Language server memory sampling is unavailable")
+            }
             Request::EntryVersion(path) => value(repo.entry_version(path.as_path())?),
             Request::FileOperation(path, operation) => {
                 let _guard = self.mutations.lock().unwrap();
@@ -299,7 +405,43 @@ impl Server {
                 &version,
                 offset,
             )?)),
+            Request::BeginImport(destination) => {
+                let mut imports = self.imports.lock().unwrap();
+                ensure!(imports.len() < 8, "Too many active workspace imports");
+                let upload = WorkspaceImport::new(root, destination)?;
+                let id = self.next_import.fetch_add(1, Ordering::Relaxed);
+                imports.insert(id, upload);
+                value(id)
+            }
+            Request::ImportEntry(id, path, entry) => {
+                let imports = self.imports.lock().unwrap();
+                let upload = imports.get(&id).context("The workspace import is closed")?;
+                value(upload.create(path.as_path(), entry)?)
+            }
+            Request::ImportChunk(id, path, offset, bytes) => {
+                let imports = self.imports.lock().unwrap();
+                let upload = imports.get(&id).context("The workspace import is closed")?;
+                value(upload.write(path.as_path(), offset, &bytes.0)?)
+            }
+            Request::FinishImport(id, publish) => {
+                let _guard = self.mutations.lock().unwrap();
+                let upload = self.imports.lock().unwrap().remove(&id);
+                if publish {
+                    upload
+                        .context("The workspace import is closed")?
+                        .publish(root)?;
+                    session.invalidate();
+                }
+                value(())
+            }
             Request::Worktrees => value(repo.worktrees()?),
+            Request::WorktreeIdentity => value(crate::repository::worktree_identity::identity(
+                root,
+                &repo.common_dir,
+            )?),
+            Request::WorktreeMarker(admin, id) => value(
+                crate::repository::worktree_identity::has_marker(&repo.common_dir, &admin, &id)?,
+            ),
             Request::Exists(path) => value(repo.exists(path.as_path())),
             Request::Openable(paths) => value(git::openable(root, &paths)),
             Request::LocatorPaths => value(crate::repository::worktree_paths(root)?),
@@ -487,15 +629,53 @@ impl Server {
                 session.invalidate();
                 value(result?)
             }
-            Request::TerminalOpen(size) => {
+            Request::CanCherryPick(tip, targets) => {
+                value(git::can_cherry_pick(root, &tip, &targets)?)
+            }
+            Request::HistoryEditPlan(tip, targets) => {
+                value(git::prepare_history_plan(root, tip, &targets)?)
+            }
+            Request::HistoryResetPlan(tip, target) => {
+                value(git::prepare_history_reset(root, tip, &target)?)
+            }
+            Request::HistoryAmendMessage(tip, expected) => {
+                value(git::amend_message(root, &tip, &expected)?)
+            }
+            Request::HistoryRewriteRecord(branch, oid) => {
+                value(git::rewrite_record(root, &branch, &oid))
+            }
+            Request::HistoryEditProgress => {
+                let _guard = self.mutations.lock().unwrap();
+                value(git::history_edit_progress(root))
+            }
+            Request::RecoverHistoryBackup => {
+                let _guard = self.mutations.lock().unwrap();
+                value(git::recover_backup(root)?)
+            }
+            Request::EditHistory(edit, confirmed) => {
+                let _guard = self.mutations.lock().unwrap();
+                value(git::run_history_edit(root, edit, confirmed)?)
+            }
+            Request::TerminalOpen(size) | Request::TerminalOpenAt(size, _) => {
                 let mut terminals = self.terminals.lock().unwrap();
                 ensure!(terminals.len() < 32, "Remote terminal limit reached");
+                let (start, directory) = if let Request::TerminalOpenAt(_, start) = request {
+                    let start = start.map(|path| root.join(path));
+                    let directory = TerminalDirectory {
+                        next_sample: Instant::now(),
+                        last: None,
+                    };
+                    (start, Some(directory))
+                } else {
+                    (None, None)
+                };
                 let (commands, requests) = mpsc::channel();
                 let (output, events) = async_channel::bounded(16);
                 let process = pty::Process::start(
                     pty::shell(),
                     pty::ShellMode::Login,
                     root,
+                    start.as_deref(),
                     size,
                     requests,
                     output,
@@ -504,9 +684,10 @@ impl Server {
                 terminals.insert(
                     id,
                     Terminal {
-                        _process: process,
+                        process,
                         commands,
                         events,
+                        directory,
                     },
                 );
                 value(id)
@@ -525,7 +706,7 @@ impl Server {
             Request::TerminalPoll(id) => {
                 let mut terminals = self.terminals.lock().unwrap();
                 let terminal = terminals
-                    .get(&id)
+                    .get_mut(&id)
                     .context("The remote terminal is closed")?;
                 let mut events = Vec::new();
                 let mut exited = false;
@@ -547,6 +728,19 @@ impl Server {
                 }
                 if exited {
                     terminals.remove(&id);
+                } else if let Some(directory) = &mut terminal.directory
+                    && Instant::now() >= directory.next_sample
+                {
+                    directory.next_sample = Instant::now() + Duration::from_millis(500);
+                    if let Some(path) = terminal
+                        .process
+                        .working_directory()
+                        .filter(|path| path.is_absolute() && path.to_str().is_some())
+                        && directory.last.as_ref() != Some(&path)
+                    {
+                        directory.last = Some(path.clone());
+                        events.push(TerminalEvent::Directory(path));
+                    }
                 }
                 value(events)
             }
@@ -655,6 +849,7 @@ pub fn serve() -> Result<()> {
         while let Ok(Some(call)) = read_frame::<Call>(&mut input) {
             let queue = match call.request {
                 Request::TerminalOpen(_)
+                | Request::TerminalOpenAt(..)
                 | Request::TerminalInput(..)
                 | Request::TerminalResize(..)
                 | Request::TerminalPoll(_)
@@ -810,6 +1005,11 @@ pub fn serve_lsp(options: &str) -> Result<()> {
     {
         use std::os::unix::process::CommandExt;
 
+        #[cfg(target_os = "linux")]
+        if let Some(path) = &options.memory {
+            // Memory reporting is optional and must not prevent the language server from starting.
+            let _ = publish_lsp_process(path);
+        }
         let error = command.exec();
         Err(error).with_context(|| {
             format!(

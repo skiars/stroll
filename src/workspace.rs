@@ -1194,39 +1194,51 @@ impl Workspace {
                 resolved = root != location.root;
                 location.root = root;
             }
-            let restore_view = resolved || open == RepositoryOpen::Recovery;
+            let mut restore_view = resolved || open == RepositoryOpen::Recovery;
             if let Some(repo) =
                 cached.filter(|repo| repo.ssh.as_ref().is_some_and(|ssh| ssh.failure().is_none()))
             {
-                let session = opening_store.session_for_open(&repo)?;
-                if repo.ssh.as_ref().is_some_and(|ssh| ssh.failure().is_none()) {
-                    return Ok(Some(((*repo).clone(), Some(session), None, restore_view)));
+                let available = repo.worktree_state.clone().is_none_or(|mut state| {
+                    opening_store
+                        .check_worktree_location(&mut state, repo.ssh.as_ref())
+                        .is_ok_and(|replacement| replacement.is_none())
+                });
+                if available {
+                    let session = opening_store.session_for_open(&repo)?;
+                    if repo.ssh.as_ref().is_some_and(|ssh| ssh.failure().is_none()) {
+                        return Ok(Some(((*repo).clone(), Some(session), None, restore_view)));
+                    }
                 }
             }
 
             let mut repo = if let Some(target) = crate::remote::SshTarget::parse(&location.root)? {
-                match ssh {
+                let mut path = target.path.clone();
+                let ssh = match ssh {
                     Some(ssh)
                         if ssh.target().authority() == target.authority()
                             && ssh.failure().is_none() =>
                     {
-                        Repository::open_ssh(ssh, target.path)?
+                        ssh
                     }
-                    _ => Repository::open(&location.root)?,
+                    _ => crate::remote::SshSession::connect(target)?,
+                };
+                if open == RepositoryOpen::Remembered
+                    && let Some(replacement) =
+                        opening_store.resolve_saved_ssh_worktree(&location.root, &ssh)?
+                {
+                    restore_view |= replacement != path;
+                    path = replacement;
                 }
+                Repository::open_ssh(ssh, path)?
             } else {
                 Repository::open(&location.root)?
             };
-            let archived = if repo.ssh.is_none() {
-                match opening_store.bind_worktree(&mut repo) {
-                    Ok(archived) => archived,
-                    Err(error) => {
-                        eprintln!("Could not identify worktree: {error:#}");
-                        None
-                    }
+            let archived = match opening_store.bind_worktree(&mut repo) {
+                Ok(archived) => archived,
+                Err(error) => {
+                    eprintln!("Could not identify worktree: {error:#}");
+                    None
                 }
-            } else {
-                None
             };
             if open == RepositoryOpen::Recovery
                 && opening_current.as_ref().is_none_or(|current| {
@@ -1404,7 +1416,7 @@ impl Workspace {
         cx.notify();
     }
 
-    fn watch_local_worktree(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn watch_worktree(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.worktree_watch = Task::ready(());
         if let Some(repo) = self.repository.clone()
             && let Some(mut state) = repo.worktree_state.clone()
@@ -1414,16 +1426,13 @@ impl Workspace {
                 loop {
                     cx.background_executor().timer(Duration::from_secs(1)).await;
                     let store = store.clone();
+                    let ssh = repo.ssh.clone();
                     let (updated, replacement) = cx
                         .background_spawn(async move {
-                            let replacement = if state.still_at_root() {
-                                if let Err(error) = store.update_worktree_branch(&mut state) {
-                                    eprintln!("Could not remember worktree branch: {error:#}");
-                                }
-                                None
-                            } else {
-                                state.replacement().ok().flatten()
-                            };
+                            let replacement = store
+                                .check_worktree_location(&mut state, ssh.as_ref())
+                                .ok()
+                                .flatten();
                             (state, replacement)
                         })
                         .await;
@@ -1466,7 +1475,7 @@ impl Workspace {
             self.repository_watch_pending = false;
             self.watch_repository(window, cx);
         }
-        self.watch_local_worktree(window, cx);
+        self.watch_worktree(window, cx);
         let ssh = self.repository.as_ref().and_then(|repo| repo.ssh.clone());
         if ssh.is_none() && self.recent_ssh_repositories.is_empty() {
             return;
@@ -1698,6 +1707,7 @@ impl Workspace {
             .or_else(|| self.repository.clone());
         if let Some(previous) = previous.filter(|previous| {
             previous.root != repo.root
+                && !previous.same_worktree(&repo)
                 && previous
                     .ssh
                     .as_ref()

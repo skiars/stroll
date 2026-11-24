@@ -791,7 +791,7 @@ impl GitPanel {
                     }
                 }
                 let counts = worktree_counts(&history.changes);
-                let progress = backend.history_progress();
+                let progress = backend.history_progress()?;
                 let rewrite = if previous_tip.as_ref().is_some_and(|(branch, oid)| {
                     branch == &history.checkout && oid == &history.head
                 }) {

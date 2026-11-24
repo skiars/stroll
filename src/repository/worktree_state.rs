@@ -1,8 +1,4 @@
-use std::{
-    fs,
-    io::{ErrorKind, Write as _},
-    path::{Path, PathBuf},
-};
+use std::path::{Path, PathBuf};
 
 use anyhow::{Result, anyhow};
 use rusqlite::{Connection, OptionalExtension as _, params};
@@ -11,10 +7,12 @@ use serde::{Deserialize, Serialize};
 
 use super::{
     Repository, Store,
-    selection::{Worktree, common_dir, local_worktrees, path_from_git},
+    selection::local_worktrees,
+    worktree_identity::{
+        self, LocatedWorktree, WorktreeIdentity, branch, find_main, linked_admin, marker,
+    },
 };
-
-const MARKER: &str = "stroll-worktree-id";
+use crate::remote::{Request, SshSession, SshTarget};
 
 #[derive(Clone, Serialize, Deserialize)]
 pub(crate) struct WorktreeState {
@@ -24,6 +22,8 @@ pub(crate) struct WorktreeState {
     admin: PathBuf,
     branch: Option<String>,
     state_id: String,
+    #[serde(default)]
+    remote_marker: Option<String>,
 }
 
 impl WorktreeState {
@@ -35,7 +35,7 @@ impl WorktreeState {
         self.state_id = archived.state_id;
     }
 
-    pub(crate) fn still_at_root(&self) -> bool {
+    fn still_at_root(&self) -> bool {
         self.is_at(&self.root)
     }
 
@@ -43,64 +43,37 @@ impl WorktreeState {
         marker(&self.admin).ok().flatten().as_ref() == Some(&self.id)
             && linked_admin(root).as_deref() == Some(&self.admin)
     }
-}
 
-fn linked_admin(root: &Path) -> Option<PathBuf> {
-    let bytes = fs::read(root.join(".git")).ok()?;
-    let bytes = bytes.strip_prefix(b"gitdir: ")?;
-    let bytes = bytes.strip_suffix(b"\n").unwrap_or(bytes);
-    let bytes = bytes.strip_suffix(b"\r").unwrap_or(bytes);
-    root.join(path_from_git(bytes).ok()?).canonicalize().ok()
-}
+    fn marker_exists(&self, ssh: Option<&SshSession>) -> Result<bool> {
+        if let (Some(ssh), Some(id)) = (ssh, &self.remote_marker) {
+            return ssh.call(Request::WorktreeMarker(self.admin.clone(), id.clone()));
+        }
+        Ok(marker(&self.admin)?.as_ref() == Some(&self.id))
+    }
 
-fn branch(admin: &Path) -> Option<String> {
-    let head = fs::read_to_string(admin.join("HEAD")).ok()?;
-    Some(head.trim_end().strip_prefix("ref: refs/heads/")?.to_owned())
-}
-
-fn valid_id(id: &str) -> bool {
-    id.strip_prefix("stroll-").is_some_and(|suffix| {
-        suffix.len() == 24 && suffix.bytes().all(|byte| byte.is_ascii_alphanumeric())
-    })
-}
-
-fn marker(admin: &Path) -> Result<Option<String>> {
-    match fs::read_to_string(admin.join(MARKER)) {
-        Ok(id) if valid_id(&id) => Ok(Some(id)),
-        Ok(_) => Err(anyhow!("Invalid worktree identity in {}", admin.display())),
-        Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(error.into()),
+    fn locate_remote(&self, ssh: &SshSession) -> Result<Option<LocatedWorktree>> {
+        let Some(id) = &self.remote_marker else {
+            return Ok(None);
+        };
+        let Some(root) = SshTarget::parse(&self.root)? else {
+            return Ok(None);
+        };
+        let Some(common) = SshTarget::parse(&self.common_dir)? else {
+            return Ok(None);
+        };
+        if root.authority() != ssh.target().authority() || common.authority() != root.authority() {
+            return Ok(None);
+        }
+        ssh.call(Request::LocateWorktree {
+            root: root.path,
+            common: common.path,
+            id: id.clone(),
+        })
     }
 }
 
 pub(super) fn worktree_id(root: &Path) -> Option<String> {
     marker(&linked_admin(root)?).ok().flatten()
-}
-
-fn ensure_marker(admin: &Path) -> Result<String> {
-    if let Some(id) = marker(admin)? {
-        return Ok(id);
-    }
-    let mut file = tempfile::Builder::new()
-        .prefix("stroll-")
-        .rand_bytes(24)
-        .tempfile_in(admin)?;
-    let id = file
-        .path()
-        .file_name()
-        .and_then(|name| name.to_str())
-        .filter(|id| valid_id(id))
-        .ok_or_else(|| anyhow!("Could not generate a worktree identity"))?
-        .to_owned();
-    file.write_all(id.as_bytes())?;
-    file.as_file().sync_all()?;
-    match file.persist_noclobber(admin.join(MARKER)) {
-        Ok(_) => Ok(id),
-        Err(error) if error.error.kind() == ErrorKind::AlreadyExists => {
-            marker(admin)?.ok_or_else(|| error.into())
-        }
-        Err(error) => Err(error.into()),
-    }
 }
 
 pub(super) fn write_worktree(db: &Connection, state: &WorktreeState) -> Result<()> {
@@ -130,8 +103,11 @@ impl Store {
         })
     }
 
-    pub(crate) fn update_worktree_branch(&self, state: &mut WorktreeState) -> Result<()> {
-        let branch = branch(&state.admin);
+    fn update_worktree_branch(
+        &self,
+        state: &mut WorktreeState,
+        branch: Option<String>,
+    ) -> Result<()> {
         if branch != state.branch {
             let mut updated = state.clone();
             updated.branch = branch;
@@ -156,12 +132,28 @@ impl Store {
     }
 
     pub(crate) fn bind_worktree(&self, repo: &mut Repository) -> Result<Option<WorktreeState>> {
-        let Some(admin) = linked_admin(&repo.root).filter(|admin| admin != &repo.common_dir) else {
+        let identity = if let Some(ssh) = &repo.ssh {
+            if !ssh.supports_worktree_identity() {
+                return Ok(None);
+            }
+            ssh.call::<Option<WorktreeIdentity>>(Request::WorktreeIdentity)?
+        } else {
+            worktree_identity::identity(&repo.root, &repo.common_dir)?
+        };
+        let Some(WorktreeIdentity {
+            id: marker,
+            admin,
+            branch,
+        }) = identity
+        else {
             return Ok(None);
         };
-        let id = ensure_marker(&admin)?;
+        let id = if let Some(ssh) = &repo.ssh {
+            format!("{}\0{marker}", ssh.target().authority())
+        } else {
+            marker.clone()
+        };
         let mut recorded = self.read_worktree_state(&id)?;
-        let branch = branch(&admin);
         if let Some(state) = &mut recorded {
             state.root.clone_from(&repo.root);
             state.common_dir.clone_from(&repo.common_dir);
@@ -178,22 +170,83 @@ impl Store {
             .find(|state| {
                 branch.is_some()
                     && state.branch == branch
-                    && matches!(marker(&state.admin), Ok(id) if id.as_ref() != Some(&state.id))
+                    && matches!(state.marker_exists(repo.ssh.as_ref()), Ok(false))
                     && !records.iter().any(|other| {
                         other.storage_key() == state.storage_key()
-                            && marker(&other.admin).ok().flatten().as_ref() == Some(&other.id)
+                            && other
+                                .marker_exists(repo.ssh.as_ref())
+                                .unwrap_or(repo.ssh.is_some())
                     })
             })
             .cloned();
+        // Keep existing path-keyed SSH drafts on first use. An already bound key
+        // may belong to an older checkout that the user can restore explicitly.
+        let state_id = repo
+            .remote_identity
+            .as_ref()
+            .filter(|key| !records.iter().any(|state| &state.state_id == *key))
+            .cloned()
+            .unwrap_or_else(|| id.clone());
         repo.worktree_state = Some(WorktreeState {
-            state_id: id.clone(),
+            state_id,
             id,
             root: repo.root.clone(),
             common_dir: repo.common_dir.clone(),
             admin,
             branch,
+            remote_marker: repo.ssh.as_ref().map(|_| marker),
         });
         Ok(archived)
+    }
+
+    pub(crate) fn check_worktree_location(
+        &self,
+        state: &mut WorktreeState,
+        ssh: Option<&SshSession>,
+    ) -> Result<Option<PathBuf>> {
+        if let Some(ssh) = ssh {
+            let Some(location) = state.locate_remote(ssh)? else {
+                return Err(anyhow!(t!(
+                    "repository.directory_not_found",
+                    path = crate::paths::display(&state.root)
+                )));
+            };
+            let root = ssh.target().locator(&location.root);
+            if root != state.root {
+                return Ok(Some(root));
+            }
+            self.update_worktree_branch(state, location.branch)?;
+        } else if state.still_at_root() {
+            self.update_worktree_branch(state, branch(&state.admin))?;
+        } else {
+            return state.replacement();
+        }
+        Ok(None)
+    }
+
+    pub(crate) fn resolve_saved_ssh_worktree(
+        &self,
+        root: &Path,
+        ssh: &SshSession,
+    ) -> Result<Option<PathBuf>> {
+        if !ssh.supports_worktree_identity() {
+            return Ok(None);
+        }
+        let Some((_, Some(id))) = self.saved_repository(root)? else {
+            return Ok(None);
+        };
+        let Some(state) = self.read_worktree_state(&id)? else {
+            return Ok(None);
+        };
+        state
+            .locate_remote(ssh)?
+            .map(|location| Some(location.root))
+            .ok_or_else(|| {
+                anyhow!(t!(
+                    "repository.directory_not_found",
+                    path = crate::paths::display(root)
+                ))
+            })
     }
 
     pub(crate) fn resolve_saved_worktree(&self, root: &Path) -> Result<Option<PathBuf>> {
@@ -229,15 +282,6 @@ fn main_worktree(common: &Path) -> Result<Option<PathBuf>> {
         return Ok(None);
     }
     Ok(find_main(local_worktrees(common)?, common))
-}
-
-fn find_main(trees: Vec<Worktree>, common: &Path) -> Option<PathBuf> {
-    trees
-        .into_iter()
-        .find(|tree| {
-            tree.main && tree.available && common_dir(&tree.root).is_ok_and(|dir| dir == common)
-        })
-        .map(|tree| tree.root)
 }
 
 impl WorktreeState {

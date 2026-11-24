@@ -303,7 +303,7 @@ impl RecentRepository {
                 .iter()
                 .position(|(root, saved_id)| {
                     saved_id
-                        .filter(|_| tree.available)
+                        .filter(|_| tree.available && !remote)
                         .map_or(tree.root == **root, |saved_id| {
                             id.as_ref() == Some(saved_id)
                         })

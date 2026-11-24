@@ -2935,7 +2935,6 @@ mod tests {
                 root.join("source.txt").is_file()
             });
             assert_eq!(fs::read_to_string(root.join("source.txt"))?, "on disk");
-            return Ok(());
         }
 
         let target = visual

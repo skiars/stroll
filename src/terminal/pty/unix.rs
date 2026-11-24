@@ -92,12 +92,12 @@ fn login_environment(
     Some(environment)
 }
 
-#[cfg(all(feature = "desktop", target_os = "linux"))]
+#[cfg(target_os = "linux")]
 pub(super) fn working_directory(pid: u32) -> Option<std::path::PathBuf> {
     std::fs::read_link(format!("/proc/{pid}/cwd")).ok()
 }
 
-#[cfg(all(feature = "desktop", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 pub(super) fn working_directory(pid: u32) -> Option<std::path::PathBuf> {
     let mut info = MaybeUninit::<libc::proc_vnodepathinfo>::uninit();
     let size = std::mem::size_of::<libc::proc_vnodepathinfo>() as libc::c_int;
@@ -121,7 +121,6 @@ pub(super) fn working_directory(pid: u32) -> Option<std::path::PathBuf> {
 }
 
 impl Pty {
-    #[cfg(feature = "desktop")]
     pub(super) fn pid(&self) -> u32 {
         self.child.as_ref().unwrap().id()
     }
