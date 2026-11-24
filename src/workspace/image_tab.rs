@@ -11,6 +11,8 @@ const FIT_MARGIN: Pixels = px(16.);
 pub(super) struct ImageTab {
     loaded: Option<Result<ImageData, SharedString>>,
     task: Task<()>,
+    svg_source: Option<Rope>,
+    svg_error: Option<SharedString>,
     viewport: Rc<Cell<Bounds<Pixels>>>,
     zoom: Option<f32>,
     zoom_scroll: ZoomScroll,
@@ -76,6 +78,8 @@ impl ImageTab {
         Self {
             loaded: None,
             task: Task::ready(()),
+            svg_source: None,
+            svg_error: None,
             viewport: Rc::default(),
             zoom: None,
             zoom_scroll: ZoomScroll::default(),
@@ -98,6 +102,16 @@ impl ImageTab {
     #[cfg(test)]
     pub(super) fn zoom(&self) -> Option<f32> {
         self.zoom
+    }
+
+    #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+    pub(super) fn has_image(&self) -> bool {
+        matches!(self.loaded, Some(Ok(_)))
+    }
+
+    #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+    pub(super) fn has_svg_error(&self) -> bool {
+        self.svg_error.is_some()
     }
 
     pub(super) fn release(&mut self, window: &mut Window) {
@@ -179,42 +193,114 @@ impl Workspace {
         window: &Window,
         cx: &mut Context<Self>,
     ) {
-        let (Some(repo), Some(format)) = (self.repository.clone(), image_viewer::format(&path))
-        else {
+        if PreviewKind::for_path(&path) == Some(PreviewKind::Svg) && self.files.contains_key(&path)
+        {
+            return;
+        }
+        self.load_image_tab_with_source(path, None, window, cx);
+    }
+
+    pub(super) fn refresh_svg_image_tab(
+        &mut self,
+        path: PathBuf,
+        source: Rope,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self
+            .images
+            .get(&path)
+            .and_then(|tab| tab.svg_source.as_ref())
+            != Some(&source)
+        {
+            self.load_image_tab_with_source(path, Some(source), window, cx);
+        }
+    }
+
+    fn load_image_tab_with_source(
+        &mut self,
+        path: PathBuf,
+        svg_source: Option<Rope>,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(format) = image_viewer::format(&path) else {
             return;
         };
+        let repo = self.repository.clone();
+        if repo.is_none() && !path.is_absolute() {
+            return;
+        }
         let source = path.clone();
         let renderer = cx.svg_renderer();
-        let load = cx.background_spawn(async move {
-            let cache = ResourceCache::for_desktop();
-            let bytes = repo.read_workspace_image(&source, true, cache.as_ref())?;
-            let image = Image::from_bytes(format, bytes).to_image_data(renderer)?;
-            let dimensions = image.size(0);
-            anyhow::ensure!(
-                dimensions.width.0 > 0 && dimensions.height.0 > 0,
-                t!("image.open_failed")
-            );
-            let transparent = (0..image.frame_count())
-                .filter_map(|index| image.as_bytes(index))
-                .any(|bytes| bytes.chunks_exact(4).any(|pixel| pixel[3] < 255));
-            Ok::<_, anyhow::Error>(ImageData { image, transparent })
-        });
+        let from_editor = svg_source.is_some();
+        let updating = from_editor && self.images.contains_key(&path);
+        let snapshot = svg_source.clone();
         let key = path.clone();
         let task = cx.spawn_in(window, async move |this, cx| {
-            let result = load.await;
+            if updating {
+                cx.background_executor()
+                    .timer(Duration::from_millis(120))
+                    .await;
+            }
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    let bytes = if let Some(text) = snapshot {
+                        text.to_string().into_bytes()
+                    } else {
+                        let cache = ResourceCache::for_desktop();
+                        if let Some(repo) = repo {
+                            repo.read_workspace_image(&source, true, cache.as_ref())?
+                        } else {
+                            crate::repository::resources::read_local_resource(
+                                &source,
+                                true,
+                                cache.as_ref(),
+                            )?
+                        }
+                    };
+                    let image = Image::from_bytes(format, bytes).to_image_data(renderer)?;
+                    let dimensions = image.size(0);
+                    anyhow::ensure!(
+                        dimensions.width.0 > 0 && dimensions.height.0 > 0,
+                        t!("image.open_failed")
+                    );
+                    let transparent = (0..image.frame_count())
+                        .filter_map(|index| image.as_bytes(index))
+                        .any(|bytes| bytes.chunks_exact(4).any(|pixel| pixel[3] < 255));
+                    Ok::<_, anyhow::Error>(ImageData { image, transparent })
+                })
+                .await
+                .map_err(|error| SharedString::from(format!("{error:#}")));
             _ = this.update_in(cx, |this, window, cx| {
                 if let Some(tab) = this.images.get_mut(&key) {
-                    tab.release(window);
-                    tab.loaded = Some(result.map_err(|error| format!("{error:#}").into()));
+                    match result {
+                        Err(error) if from_editor && matches!(tab.loaded, Some(Ok(_))) => {
+                            tab.svg_error = Some(error);
+                        }
+                        result => {
+                            tab.release(window);
+                            tab.loaded = Some(result);
+                            tab.svg_error = None;
+                        }
+                    }
                     cx.notify();
                 }
             });
         });
-        self.images.entry(path).or_insert_with(ImageTab::new).task = task;
+        let tab = self.images.entry(path).or_insert_with(ImageTab::new);
+        tab.svg_source = svg_source;
+        tab.task = task;
     }
 
     pub(super) fn active_image_tab(&self) -> Option<(&Path, &ImageTab)> {
         let path = self.tabs.active()?;
+        if PreviewKind::for_path(path) == Some(PreviewKind::Svg)
+            && self.editor_preview_mode(path) == EditorPreviewMode::Source
+        {
+            return None;
+        }
         Some((path, self.images.get(path)?))
     }
 
@@ -238,6 +324,7 @@ impl Workspace {
                 let stroke = &event.keystroke;
                 if !this.image_viewer_focus.is_focused(window)
                     || stroke.modifiers != Modifiers::default()
+                    || this.active_editor_preview_mode() == EditorPreviewMode::Split
                 {
                     return;
                 }
@@ -467,6 +554,21 @@ impl Workspace {
                 .child(image_element),
         )
         .child(controls)
+        .when_some(tab.svg_error.as_ref(), |pane, error| {
+            pane.child(
+                div()
+                    .debug_selector(|| "editor-svg-preview-error".into())
+                    .absolute()
+                    .bottom_0()
+                    .left_0()
+                    .right_0()
+                    .px_3()
+                    .py_1()
+                    .bg(colors.bg)
+                    .text_color(colors.warning)
+                    .child(error.clone()),
+            )
+        })
         .into_any_element()
     }
 
@@ -531,7 +633,7 @@ impl Workspace {
         };
         if let Some(entries) = repo.children.get(parent) {
             if let Some(next) = adjacent_image(entries, current, forward) {
-                self.open_file(next, true, window, cx);
+                self.request_file(next, FileOpen::ImageBrowse, window, cx);
             }
             return;
         }
@@ -559,7 +661,7 @@ impl Workspace {
                             .as_ref()
                             .is_some_and(|active| Arc::ptr_eq(active, &repo))
                     {
-                        this.open_file(next, true, window, cx);
+                        this.request_file(next, FileOpen::ImageBrowse, window, cx);
                     }
                 });
             }

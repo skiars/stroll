@@ -38,6 +38,7 @@ impl Workspace {
             .when(more, |bar| {
                 bar.child(self.open_files_popover(labels, cx, colors))
             })
+            .children(self.editor_preview_button(cx))
             .child(self.workspace_actions(cx))
     }
 

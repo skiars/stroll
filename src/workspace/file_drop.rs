@@ -195,6 +195,7 @@ impl Workspace {
                     this.capture_active_file_position(cx);
                     let previous = this.tabs.active().map(ToOwned::to_owned);
                     for path in editor_paths {
+                        this.remember_editor_preview(&path);
                         this.tabs.open(path, false);
                     }
                     this.finish_tab_selection(previous.as_deref(), window, cx);

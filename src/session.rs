@@ -17,6 +17,15 @@ pub enum WorkspaceView {
     Git,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum EditorPreviewMode {
+    #[default]
+    Source,
+    Split,
+    Full,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub(crate) struct WorktreeSession {
@@ -25,6 +34,8 @@ pub(crate) struct WorktreeSession {
     pub files: BTreeMap<PathBuf, FilePosition>,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub file_wraps: BTreeMap<PathBuf, bool>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub editor_previews: BTreeMap<PathBuf, EditorPreviewMode>,
     pub source_history: SourceHistory,
     pub document: Option<PathBuf>,
     pub documents: BTreeMap<PathBuf, DocumentPosition>,
@@ -287,4 +298,6 @@ pub(crate) struct StandaloneSession {
     pub document_position: Option<DocumentPosition>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub file_wrap: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub editor_preview: Option<EditorPreviewMode>,
 }

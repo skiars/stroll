@@ -567,10 +567,11 @@ impl Workspace {
                 theme.control_font_size = size;
             });
         }
-        if previous.docs != config.docs
-            && let Some(doc) = &self.doc
-        {
-            doc.update(cx, |reader, cx| reader.set_typography(config.docs, cx));
+        if previous.docs != config.docs {
+            if let Some(doc) = &self.doc {
+                doc.update(cx, |reader, cx| reader.set_typography(config.docs, cx));
+            }
+            self.update_preview_typography(config.docs, cx);
         }
         if previous.editor.font_family != config.editor.font_family {
             self.editor_font = Self::configured_editor_font(config, cx);

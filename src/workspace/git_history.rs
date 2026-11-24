@@ -240,6 +240,7 @@ impl Workspace {
             });
             if this.view == WorkspaceView::Git && !this.tabs.paths().iter().any(|tab| tab == &path)
             {
+                this.remember_editor_preview(&path);
                 this.tabs.open_in_background(path);
                 this.capture_session(cx);
             }
@@ -307,6 +308,7 @@ impl Workspace {
             }
             if this.view == WorkspaceView::Git && !this.tabs.paths().iter().any(|tab| tab == &path)
             {
+                this.remember_editor_preview(&path);
                 this.tabs.open_in_background(path);
                 this.capture_session(cx);
             }

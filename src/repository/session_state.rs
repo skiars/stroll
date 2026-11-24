@@ -10,7 +10,7 @@ use crate::{session::WorktreeSession, tabs::TabSession};
 #[cfg(feature = "desktop")]
 use {
     super::{DraftRelocation, WindowGeometry, WindowSlot},
-    crate::session::{StandaloneSession, TerminalSession},
+    crate::session::{EditorPreviewMode, StandaloneSession, TerminalSession},
     rusqlite::{OptionalExtension as _, TransactionBehavior},
     std::path::Path,
 };
@@ -99,6 +99,13 @@ impl Store {
             write_positions(
                 &tx,
                 key,
+                "editor_preview",
+                &previous.editor_previews,
+                &session.editor_previews,
+            )?;
+            write_positions(
+                &tx,
+                key,
                 "document",
                 &previous.documents,
                 &session.documents,
@@ -156,6 +163,9 @@ impl Store {
             }
             if session.document_position != previous.document_position {
                 current.document_position = session.document_position;
+            }
+            if session.editor_preview != previous.editor_preview {
+                current.editor_preview = session.editor_preview;
             }
             write_standalone(&tx, path, &current)?;
             tx.commit()?;
@@ -231,6 +241,39 @@ impl Store {
             Ok(())
         })
     }
+
+    #[cfg(feature = "desktop")]
+    pub(crate) fn editor_preview_preference(&self, format: &str) -> Result<EditorPreviewMode> {
+        self.with_state(|db| {
+            let value: Option<Vec<u8>> = db
+                .query_row(
+                    "SELECT value FROM editor_preview_preferences WHERE format = ?1",
+                    [format],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            Ok(value
+                .map(|value| serde_json::from_slice(&value))
+                .transpose()?
+                .unwrap_or_default())
+        })
+    }
+
+    #[cfg(feature = "desktop")]
+    pub(crate) fn save_editor_preview_preference(
+        &self,
+        format: &str,
+        mode: EditorPreviewMode,
+    ) -> Result<()> {
+        self.with_state(|db| {
+            db.execute(
+                "INSERT INTO editor_preview_preferences VALUES (?1, ?2)
+                 ON CONFLICT(format) DO UPDATE SET value = excluded.value",
+                params![format, serde_json::to_vec(&mode)?],
+            )?;
+            Ok(())
+        })
+    }
 }
 
 #[cfg(feature = "desktop")]
@@ -280,6 +323,7 @@ fn read_worktree_session(db: &Connection, key: &[u8]) -> Result<WorktreeSession>
     }
     session.files = read_positions(db, key, "file")?;
     session.file_wraps = read_positions(db, key, "file_wrap")?;
+    session.editor_previews = read_positions(db, key, "editor_preview")?;
     session.documents = read_positions(db, key, "document")?;
     Ok(session)
 }

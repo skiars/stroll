@@ -17,7 +17,7 @@ pub(super) fn show(
         _ = reader.update(cx, |doc, cx| {
             let menu = PopupMenu::build(window, cx, |mut menu, _, _| {
                 if let Some(link) = link {
-                    menu = doc.link_menu(menu, link);
+                    menu = doc.link_menu(menu, link, &reader);
                 }
                 if let Some(image) = image {
                     let items = doc.image_menu_items(image, &reader);
@@ -62,11 +62,18 @@ impl DocReader {
         });
     }
 
-    fn link_menu(&self, mut menu: PopupMenu, link: SharedString) -> PopupMenu {
+    fn link_menu(
+        &self,
+        mut menu: PopupMenu,
+        link: SharedString,
+        reader: &WeakEntity<Self>,
+    ) -> PopupMenu {
         let open = match destination(&self.path, &link) {
             Some(Destination::Local { path, fragment }) => {
                 let label = if path == self.path && fragment.is_some() {
                     t!("docs.jump_to_section")
+                } else if self.editor_preview {
+                    t!("docs.open_in_workspace")
                 } else if self.standalone && path != self.path {
                     t!("docs.open_in_window")
                 } else if is_markdown(&path) {
@@ -74,7 +81,7 @@ impl DocReader {
                 } else {
                     t!("docs.open_in_workspace")
                 };
-                Some(self.open_local_item(label, link.clone()))
+                Some(self.open_local_item(label, link.clone(), reader))
             }
             Some(Destination::External(url)) => {
                 let label = if url.scheme() == "mailto" {
@@ -120,7 +127,11 @@ impl DocReader {
         let label = match destination(&self.path, &image) {
             Some(Destination::Local { path, .. }) => {
                 if !self.standalone && crate::image_viewer::is_image(&path) {
-                    items.push(self.open_local_item(t!("docs.open_in_workspace"), image.clone()));
+                    items.push(self.open_local_item(
+                        t!("docs.open_in_workspace"),
+                        image.clone(),
+                        reader,
+                    ));
                 }
                 t!("docs.copy_image_path")
             }
@@ -140,14 +151,29 @@ impl DocReader {
         items
     }
 
-    fn open_local_item(&self, label: impl Into<SharedString>, link: SharedString) -> PopupMenuItem {
-        let workspace = self.workspace.clone();
-        let path = self.path.clone();
-        PopupMenuItem::new(label).on_click(move |_, window, cx| {
-            _ = workspace.update(cx, |workspace, cx| {
-                workspace.follow_document_link(&path, &link, window, cx);
-            });
-        })
+    fn open_local_item(
+        &self,
+        label: impl Into<SharedString>,
+        link: SharedString,
+        reader: &WeakEntity<Self>,
+    ) -> PopupMenuItem {
+        let item = PopupMenuItem::new(label);
+        if self.editor_preview {
+            let reader = reader.clone();
+            item.on_click(move |_, window, cx| {
+                _ = reader.update(cx, |reader, cx| {
+                    reader.follow_preview_link(&link, window, cx);
+                });
+            })
+        } else {
+            let workspace = self.workspace.clone();
+            let path = self.path.clone();
+            item.on_click(move |_, window, cx| {
+                _ = workspace.update(cx, |workspace, cx| {
+                    workspace.follow_document_link(&path, &link, window, cx);
+                });
+            })
+        }
     }
 }
 

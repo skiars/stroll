@@ -1196,6 +1196,7 @@ impl Workspace {
             }
         }
         self.tabs.remap(&map);
+        self.remap_editor_previews(&map);
         if let Some(history) = self.source_history_mut() {
             history.remap(&map);
         }
@@ -1271,6 +1272,7 @@ impl Workspace {
             }
             self.remove_image_tab(&path, window);
             self.tabs.close(&path);
+            self.forget_editor_preview(&path);
             self.session.files.remove(&path);
             self.session.file_wraps.remove(&path);
             if let Err(error) = self.store.discard_draft(repo, &path) {

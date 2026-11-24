@@ -5,7 +5,7 @@ use rusqlite::{Connection, TransactionBehavior};
 
 use super::Store;
 
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 
 impl Store {
     pub(super) fn with_state<T>(
@@ -34,15 +34,21 @@ impl Store {
         db.busy_timeout(Duration::from_secs(3))?;
         let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let version: i64 = tx.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        match version {
-            0 => {
-                tx.execute_batch(include_str!("state.sql"))?;
-                tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
-            }
-            version => ensure!(
-                version == SCHEMA_VERSION,
-                "Unsupported application state version {version}"
-            ),
+        ensure!(
+            (0..=SCHEMA_VERSION).contains(&version),
+            "Unsupported application state version {version}"
+        );
+        if version == 0 {
+            tx.execute_batch(include_str!("state.sql"))?;
+        }
+        if version < 2 {
+            tx.execute_batch(
+                "CREATE TABLE editor_preview_preferences (
+                    format TEXT PRIMARY KEY NOT NULL,
+                    value BLOB NOT NULL
+                )",
+            )?;
+            tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         }
         tx.commit()?;
         Ok(db)

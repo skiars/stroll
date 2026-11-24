@@ -231,6 +231,11 @@ impl DisplayedImages {
     pub(super) fn take_changed_blocks(&mut self) -> HashSet<usize> {
         std::mem::take(&mut self.changed)
     }
+
+    pub(super) fn clear_block_tracking(&mut self) {
+        self.blocks.get_mut().clear();
+        self.changed.clear();
+    }
 }
 
 fn ssh_budget_error() -> ImageCacheError {

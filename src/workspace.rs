@@ -7,6 +7,7 @@ mod config_watch;
 mod documents;
 mod edit_history;
 mod editor_git;
+mod editor_preview;
 mod file_drop;
 mod file_icons;
 mod file_tabs;
@@ -43,6 +44,7 @@ mod worktree_recovery_tests;
 
 pub use window_bounds::{repository_window_bounds, standalone_window_bounds};
 
+use editor_preview::{EditorPreviews, PreviewKind};
 use file_icons::file_type_icon;
 use git_panel::GitPanel;
 use language_service::{
@@ -83,7 +85,7 @@ use crate::{
     lsp::{self, EditorLsp},
     paths,
     repository::{Document, Entry, Location, Repository, Store, WindowGeometry, WindowSlot},
-    session::{FilePosition, SourceLocation, WorktreeSession},
+    session::{EditorPreviewMode, FilePosition, SourceLocation, WorktreeSession},
     tabs::TabSession,
 };
 
@@ -555,6 +557,7 @@ enum FileOpen {
     Tree {
         preview: bool,
     },
+    ImageBrowse,
     Locate(Option<(std::ops::Range<usize>, [u8; 32])>),
     DocumentLink {
         from: crate::session::SourceLocation,
@@ -568,6 +571,15 @@ enum FileOpen {
     Restore {
         from: Option<SourceLocation>,
     },
+}
+
+impl FileOpen {
+    fn is_image_browse(&self) -> bool {
+        matches!(
+            self,
+            Self::ImageBrowse | Self::DocumentLink { line: None, .. }
+        )
+    }
 }
 
 enum SourcePosition {
@@ -857,6 +869,7 @@ pub struct Workspace {
     image_viewer_focus: FocusHandle,
     image_preview_return_focus: Option<FocusHandle>,
     images: HashMap<PathBuf, image_tab::ImageTab>,
+    editor_previews: EditorPreviews,
     audio_preview: audio_preview::AudioPreview,
     review_loads: HashMap<PathBuf, Vec<ReviewBufferCallback>>,
     saving: BTreeSet<PathBuf>,
@@ -1063,6 +1076,7 @@ impl Workspace {
             image_viewer_focus: cx.focus_handle(),
             image_preview_return_focus: None,
             images: HashMap::new(),
+            editor_previews: EditorPreviews::default(),
             audio_preview: audio_preview::AudioPreview::default(),
             review_loads: HashMap::new(),
             saving: BTreeSet::new(),
@@ -1751,6 +1765,7 @@ impl Workspace {
             session.worktree_lsp_trusted = self.session.worktree_lsp_trusted;
             session.source_history = std::mem::take(&mut self.session.source_history);
             session.file_wraps = std::mem::take(&mut self.session.file_wraps);
+            session.editor_previews = std::mem::take(&mut self.session.editor_previews);
         }
         session.source_history.normalize();
         self.source_caret = None;
@@ -1769,6 +1784,7 @@ impl Workspace {
         for (_, mut image) in self.images.drain() {
             image.release(window);
         }
+        self.editor_previews = EditorPreviews::default();
         self.audio_preview.stop();
         self.review_loads.clear();
         self.language_servers.clear();
@@ -2639,6 +2655,7 @@ impl Workspace {
                     FileOpen::Select { preview, .. } => *preview = false,
                     FileOpen::Locate(_) => {}
                     FileOpen::Tree { .. }
+                    | FileOpen::ImageBrowse
                     | FileOpen::DocumentLink { .. }
                     | FileOpen::History { .. }
                     | FileOpen::Startup
@@ -2650,7 +2667,7 @@ impl Workspace {
         }
         if self.loading_file.is_none()
             && self.tabs.active() == Some(&path)
-            && (self.files.contains_key(&path) || self.images.contains_key(&path))
+            && (self.files.contains_key(&path) || self.active_image_tab().is_some())
             && let FileOpen::Select {
                 preview,
                 position: None,
@@ -2670,7 +2687,10 @@ impl Workspace {
             self.select_loaded_file(path, request, window, cx);
             return;
         }
-        if self.repository.is_some() && crate::image_viewer::is_image(&path) {
+        if self.repository.is_some()
+            && crate::image_viewer::is_image(&path)
+            && (PreviewKind::for_path(&path) != Some(PreviewKind::Svg) || request.is_image_browse())
+        {
             if !self.images.contains_key(&path) {
                 self.load_image_tab(path.clone(), window, cx);
             }
@@ -2698,21 +2718,36 @@ impl Workspace {
                 };
                 match result {
                     Ok((buffer, project)) => {
+                        this.editor_previews.svg_source_errors.remove(&path);
                         if !this.files.contains_key(&path) {
                             this.install_file(&path, buffer, project, window, cx);
                         }
                         this.select_loaded_file(path, request, window, cx);
                     }
                     Err(error) => {
+                        let missing = error.chain().any(|cause| {
+                            cause
+                                .downcast_ref::<std::io::Error>()
+                                .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+                        });
                         if let FileOpen::History { index, .. } = &request
-                            && error.chain().any(|cause| {
-                                cause.downcast_ref::<std::io::Error>().is_some_and(|error| {
-                                    error.kind() == std::io::ErrorKind::NotFound
-                                })
-                            })
+                            && missing
                         {
                             this.skip_missing_source(&path, *index, window, cx);
                             cx.notify();
+                            return;
+                        }
+                        if !missing && PreviewKind::for_path(&path) == Some(PreviewKind::Svg) {
+                            this.editor_previews.svg_source_errors.insert(
+                                path.clone(),
+                                t!(
+                                    "editor_preview.svg_source_failed",
+                                    detail = format!("{error:#}")
+                                )
+                                .into_owned()
+                                .into(),
+                            );
+                            this.select_loaded_file(path, request, window, cx);
                             return;
                         }
                         match request {
@@ -2724,12 +2759,14 @@ impl Workspace {
                                     .is_none_or(|ssh| ssh.failure().is_none())
                                 {
                                     this.tabs.close(&path);
+                                    this.forget_editor_preview(&path);
                                     this.restore_active_file_from_view(from, window, cx);
                                 }
                             }
                             FileOpen::Startup => this.restore_active_file(window, cx),
                             FileOpen::Select { .. }
                             | FileOpen::Tree { .. }
+                            | FileOpen::ImageBrowse
                             | FileOpen::Locate(_)
                             | FileOpen::History { .. } => {}
                             FileOpen::DocumentLink { .. } => {
@@ -2774,9 +2811,12 @@ impl Workspace {
             FileOpen::Tree { preview } => Some(*preview),
             _ => None,
         };
+        let open_as_image =
+            request.is_image_browse() && PreviewKind::for_path(&path) == Some(PreviewKind::Svg);
         let (preview, position, location, replay) = match request {
             FileOpen::Select { preview, position } => (preview, position, None, None),
             FileOpen::Tree { preview } => (preview, None, None, None),
+            FileOpen::ImageBrowse => (true, None, None, None),
             FileOpen::DocumentLink { line, .. } => (
                 true,
                 line.map(|line| SourcePosition::Lsp(lsp_types::Position::new(line, 0))),
@@ -2797,6 +2837,18 @@ impl Workspace {
             }
             position => position,
         };
+        self.remember_editor_preview(&path);
+        if open_as_image {
+            self.set_editor_preview_mode(&path, EditorPreviewMode::Full);
+        } else if (position.is_some()
+            || location.is_some()
+            || replay
+                .as_ref()
+                .is_some_and(|(_, position)| position.is_some()))
+            && self.editor_preview_mode(&path) == EditorPreviewMode::Full
+        {
+            self.set_editor_preview_mode(&path, EditorPreviewMode::Split);
+        }
         self.select_file_tab(&path, preview, tree_preview, window, cx);
         if let Some(position) = position
             && let Some(file) = self.files.get(&path)
@@ -2998,6 +3050,7 @@ impl Workspace {
         if let Some(replaced) = self.tabs.open(path.to_owned(), preview) {
             self.files.remove(&replaced);
             self.remove_image_tab(&replaced, window);
+            self.forget_editor_preview(&replaced);
         }
         self.finish_tab_selection_with_tree_focus(
             previous.as_deref(),
@@ -3894,6 +3947,9 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if let Some(path) = self.tabs.active().map(Path::to_owned) {
+            self.remember_editor_preview(&path);
+        }
         let active = self.tabs.active();
         let changed = active != previous;
         if changed {
@@ -3912,15 +3968,28 @@ impl Workspace {
                 || self.repository_overlay_open()
                 || self.terminal_focused(window, cx)
                 || (keep_tree_focus && self.tree_focus.is_focused(window));
-            if let Some(file) = active.and_then(|path| self.files.get_mut(path)) {
+            if let Some(file) = self
+                .active_file()
+                .filter(|_| self.active_editor_preview_mode() != EditorPreviewMode::Full)
+            {
                 if !keep_focus {
                     file.editor
                         .update(cx, |editor, cx| editor.focus(window, cx));
                 }
-            } else if !keep_focus && active.is_some_and(|path| self.images.contains_key(path)) {
-                self.image_viewer_focus.focus(window, cx);
             } else if !keep_focus {
-                self.focus.focus(window, cx);
+                if active.is_some_and(|path| {
+                    self.images.contains_key(path)
+                        || (PreviewKind::for_path(path) == Some(PreviewKind::Svg)
+                            && self.active_editor_preview_mode() == EditorPreviewMode::Full)
+                }) {
+                    self.image_viewer_focus.focus(window, cx);
+                } else if self.active_editor_preview_mode() == EditorPreviewMode::Full
+                    && let Some(doc) = self.active_markdown_preview()
+                {
+                    doc.update(cx, |doc, cx| doc.focus_content(window, cx));
+                } else {
+                    self.focus.focus(window, cx);
+                }
             }
             if active.is_some() {
                 self.reveal_active_tab();
@@ -4026,6 +4095,7 @@ impl Workspace {
         self.tabs.close(path);
         self.files.remove(path);
         self.remove_image_tab(path, window);
+        self.forget_editor_preview(path);
     }
 
     fn confirm_tab_close(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
@@ -4307,6 +4377,10 @@ impl Workspace {
             }
         } else if self.view == WorkspaceView::Docs {
             if let Some(doc) = &self.doc {
+                doc.update(cx, |doc, cx| doc.find(window, cx));
+            }
+        } else if self.active_editor_preview_mode() == EditorPreviewMode::Full {
+            if let Some(doc) = self.active_markdown_preview() {
                 doc.update(cx, |doc, cx| doc.find(window, cx));
             }
         } else if let Some(file) = self.active_file() {
@@ -4773,7 +4847,9 @@ impl Workspace {
         let mut terminal = self.terminal_panel(maximum, colors, cx);
         let maximized = self.terminal_maximized();
         let mut main = v_flex().relative().flex_1().min_w_0().min_h_0().h_full();
-        if let Some((path, image)) = self.active_image_tab() {
+        if let Some((path, image)) = self.active_image_tab()
+            && PreviewKind::for_path(path) != Some(PreviewKind::Svg)
+        {
             main = main
                 .when(self.standalone.is_none(), |main| {
                     main.child(self.tab_bar(cx, colors))
@@ -4788,102 +4864,122 @@ impl Workspace {
                 .filter(|_| !file.missing)
                 .map(|server| Arc::downgrade(&server.document));
             let locked = self.file_editor_locked(file);
+            let source =
+                editor_scroll_viewport(&file.editor, editor_background, !self.locator.open)
+                    .debug_selector(|| "workspace-editor".into())
+                    .capture_any_mouse_down(cx.listener(Self::begin_source_click))
+                    .on_mouse_up(MouseButton::Left, cx.listener(Self::end_source_click))
+                    .on_mouse_up_out(MouseButton::Left, cx.listener(Self::end_source_click))
+                    .on_action(cx.listener(Self::close_editor_git_hunk))
+                    .on_action(cx.listener(|this, _: &ClearCommitMarkers, _, cx| {
+                        this.clear_editor_commit_markers(cx);
+                    }))
+                    .on_action(cx.listener(Self::show_signature_help))
+                    .capture_key_down(cx.listener(Self::dismiss_signature_help))
+                    .capture_action(cx.listener(|this, action: &Enter, window, cx| {
+                        if !action.secondary && !action.shift {
+                            this.block_pending_completion_acceptance(window, cx);
+                        }
+                    }))
+                    .capture_action(cx.listener(|this, _: &IndentInline, window, cx| {
+                        this.block_pending_completion_acceptance(window, cx);
+                    }))
+                    .flex_1()
+                    .min_h_0()
+                    .w_full()
+                    .child(
+                        Editor::new(&file.editor)
+                            .text_size(px(self.config.current().editor.font_size as f32))
+                            .line_height(relative(self.config.current().editor.line_height as f32))
+                            .font_family(self.editor_font_family(cx))
+                            .appearance(false)
+                            .bordered(false)
+                            .readonly(locked)
+                            .size_full()
+                            .aria_label(name)
+                            .map(|editor| {
+                                let workspace = cx.weak_entity();
+                                editor.extend_context_menu(move |menu, _, app| {
+                                    let menu = if language_server
+                                        .as_ref()
+                                        .and_then(|document| document.upgrade())
+                                        .is_some_and(|document| document.supports_references())
+                                    {
+                                        menu.menu_with_icon(
+                                            t!("lsp.find_references"),
+                                            IconName::Search,
+                                            Box::new(FindReferences),
+                                        )
+                                    } else {
+                                        menu
+                                    };
+                                    if workspace
+                                        .read_with(app, |workspace, _| {
+                                            workspace.commit_markers.active()
+                                        })
+                                        .unwrap_or(false)
+                                    {
+                                        menu.menu(
+                                            t!("git.editor_clear_commit_markers"),
+                                            Box::new(ClearCommitMarkers),
+                                        )
+                                    } else {
+                                        menu
+                                    }
+                                })
+                            }),
+                    )
+                    .children(file.caret_hints.popup(&file.editor, window, cx))
+                    .when(!maximized, |pane| {
+                        pane.children(editor_git::blame::hint(
+                            file,
+                            cx.weak_entity(),
+                            px(self.config.current().editor.font_size as f32),
+                            self.editor_font_family(cx),
+                            colors,
+                            cx,
+                        ))
+                    })
+                    .when(file.missing, |pane| {
+                        pane.child(
+                            div()
+                                .absolute()
+                                .top_0()
+                                .right_0()
+                                .px_2()
+                                .text_sm()
+                                .text_color(colors.warning)
+                                .child(t!("workspace.tree_file_missing")),
+                        )
+                    })
+                    .into_any_element();
             main = main
                 .when(self.standalone.is_none(), |main| {
                     main.child(self.tab_bar(cx, colors))
                 })
-                .child(
-                    editor_scroll_viewport(&file.editor, editor_background, !self.locator.open)
-                        .debug_selector(|| "workspace-editor".into())
-                        .capture_any_mouse_down(cx.listener(Self::begin_source_click))
-                        .on_mouse_up(MouseButton::Left, cx.listener(Self::end_source_click))
-                        .on_mouse_up_out(MouseButton::Left, cx.listener(Self::end_source_click))
-                        .on_action(cx.listener(Self::close_editor_git_hunk))
-                        .on_action(cx.listener(|this, _: &ClearCommitMarkers, _, cx| {
-                            this.clear_editor_commit_markers(cx);
-                        }))
-                        .on_action(cx.listener(Self::show_signature_help))
-                        .capture_key_down(cx.listener(Self::dismiss_signature_help))
-                        .capture_action(cx.listener(|this, action: &Enter, window, cx| {
-                            if !action.secondary && !action.shift {
-                                this.block_pending_completion_acceptance(window, cx);
-                            }
-                        }))
-                        .capture_action(cx.listener(|this, _: &IndentInline, window, cx| {
-                            this.block_pending_completion_acceptance(window, cx);
-                        }))
-                        .flex_1()
-                        .min_h_0()
-                        .w_full()
-                        .child(
-                            Editor::new(&file.editor)
-                                .text_size(px(self.config.current().editor.font_size as f32))
-                                .line_height(relative(
-                                    self.config.current().editor.line_height as f32,
-                                ))
-                                .font_family(self.editor_font_family(cx))
-                                .appearance(false)
-                                .bordered(false)
-                                .readonly(locked)
-                                .size_full()
-                                .aria_label(name)
-                                .map(|editor| {
-                                    let workspace = cx.weak_entity();
-                                    editor.extend_context_menu(move |menu, _, app| {
-                                        let menu = if language_server
-                                            .as_ref()
-                                            .and_then(|document| document.upgrade())
-                                            .is_some_and(|document| document.supports_references())
-                                        {
-                                            menu.menu_with_icon(
-                                                t!("lsp.find_references"),
-                                                IconName::Search,
-                                                Box::new(FindReferences),
-                                            )
-                                        } else {
-                                            menu
-                                        };
-                                        if workspace
-                                            .read_with(app, |workspace, _| {
-                                                workspace.commit_markers.active()
-                                            })
-                                            .unwrap_or(false)
-                                        {
-                                            menu.menu(
-                                                t!("git.editor_clear_commit_markers"),
-                                                Box::new(ClearCommitMarkers),
-                                            )
-                                        } else {
-                                            menu
-                                        }
-                                    })
-                                }),
-                        )
-                        .children(file.caret_hints.popup(&file.editor, window, cx))
-                        .when(!maximized, |pane| {
-                            pane.children(editor_git::blame::hint(
-                                file,
-                                cx.weak_entity(),
-                                px(self.config.current().editor.font_size as f32),
-                                self.editor_font_family(cx),
-                                colors,
-                                cx,
-                            ))
-                        })
-                        .when(file.missing, |pane| {
-                            pane.child(
-                                div()
-                                    .absolute()
-                                    .top_0()
-                                    .right_0()
-                                    .px_2()
-                                    .text_sm()
-                                    .text_color(colors.warning)
-                                    .child(t!("workspace.tree_file_missing")),
-                            )
-                        }),
-                )
+                .child(self.editor_tab_body(path, source, cx, colors))
                 .children(if maximized { None } else { terminal.take() });
+        } else if let Some(path) = self.tabs.active()
+            && PreviewKind::for_path(path) == Some(PreviewKind::Svg)
+        {
+            let source = self
+                .editor_previews
+                .svg_source_errors
+                .get(path)
+                .map_or_else(
+                    || {
+                        Self::preview_status(
+                            t!("workspace.opening_file").into_owned().into(),
+                            colors.muted,
+                        )
+                    },
+                    |error| Self::preview_status(error.clone(), colors.warning),
+                );
+            main = main
+                .when(self.standalone.is_none(), |main| {
+                    main.child(self.tab_bar(cx, colors))
+                })
+                .child(self.editor_tab_body(path, source, cx, colors));
         } else {
             main = main
                 .when(
@@ -5219,11 +5315,16 @@ impl Workspace {
                             .into_any_element()
                     }),
             )
-            .when(!docs && !self.terminal_maximized(), |body| {
-                body.when_some(self.active_file(), |body, file| {
-                    body.child(self.status_bar(file, window, cx, colors))
-                })
-            })
+            .when(
+                !docs
+                    && !self.terminal_maximized()
+                    && self.active_editor_preview_mode() != EditorPreviewMode::Full,
+                |body| {
+                    body.when_some(self.active_file(), |body, file| {
+                        body.child(self.status_bar(file, window, cx, colors))
+                    })
+                },
+            )
     }
 
     /// The menu at the right edge of the tab bar.
@@ -5381,7 +5482,11 @@ impl Workspace {
 
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        self.visible_editor = if self.view == WorkspaceView::Editor && !self.terminal_maximized() {
+        self.refresh_active_editor_preview(window, cx);
+        self.visible_editor = if self.view == WorkspaceView::Editor
+            && !self.terminal_maximized()
+            && self.active_editor_preview_mode() != EditorPreviewMode::Full
+        {
             self.active_file().map(|file| file.editor.entity_id())
         } else {
             None

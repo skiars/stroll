@@ -990,6 +990,7 @@ impl Workspace {
             if let Some((buffer, project)) = &target.buffer {
                 self.install_file(path, buffer.clone(), project.clone(), window, cx);
             }
+            self.remember_editor_preview(path);
             self.tabs.open_in_background(path.clone());
         }
         for (path, target) in &plan.targets {

@@ -10,6 +10,7 @@ use std::{
 use anyhow::{Context as _, Result};
 #[cfg(test)]
 use core::prelude::v1::test;
+use futures_channel::oneshot;
 use gpui::{prelude::FluentBuilder as _, *};
 use gpui_base::{CheckboxIndicator, CheckboxIndicatorColors, CheckboxState};
 use gpui_component::{
@@ -181,6 +182,12 @@ pub struct PreparedDocument {
 }
 
 impl PreparedDocument {
+    pub(crate) fn from_editor(source: String, remote: Option<RemoteResources>) -> Result<Self> {
+        let mut document = Self::new(source)?;
+        document.remote = remote;
+        Ok(document)
+    }
+
     pub(crate) fn has_fragment(&self, fragment: &str) -> bool {
         self.html_anchors.contains_key(fragment)
             || heading_index(&self.headings, fragment).is_some()
@@ -527,6 +534,7 @@ pub struct DocReader {
     show_outline: Option<bool>,
     outline_width: Pixels,
     standalone: bool,
+    editor_preview: bool,
     outline_was_visible: bool,
     outline_scroll: ScrollHandle,
     selected_heading: Option<usize>,
@@ -622,6 +630,122 @@ impl DocReader {
         self.standalone = standalone;
     }
 
+    pub(crate) fn set_editor_preview(&mut self, standalone: bool) {
+        self.editor_preview = true;
+        self.standalone = standalone;
+        self.show_outline = Some(false);
+    }
+
+    pub(crate) fn editor_preview_parsed(&self, cx: &App) -> bool {
+        self.text.read(cx).rendered_text().source() == self.document.source.as_ref()
+    }
+
+    pub(crate) fn wait_for_editor_preview_parse(
+        &self,
+        cx: &mut App,
+    ) -> Option<(Subscription, oneshot::Receiver<()>)> {
+        if self.editor_preview_parsed(cx) {
+            return None;
+        }
+        let source = self.document.source.clone();
+        let (ready, parsed) = oneshot::channel();
+        let mut ready = Some(ready);
+        let subscription = cx.observe(&self.text, move |text, cx| {
+            if text.read(cx).rendered_text().source() == source.as_ref()
+                && let Some(ready) = ready.take()
+            {
+                _ = ready.send(());
+            }
+        });
+        Some((subscription, parsed))
+    }
+
+    pub(crate) fn inherit_editor_preview(
+        &mut self,
+        previous: &Entity<Self>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let previous = previous.read(cx);
+        let position = previous.session_position(cx).map(|mut position| {
+            let old = previous.document.source.as_bytes();
+            let new = self.document.source.as_bytes();
+            let prefix = old.iter().zip(new).take_while(|(a, b)| a == b).count();
+            let suffix = old[prefix..]
+                .iter()
+                .rev()
+                .zip(new[prefix..].iter().rev())
+                .take_while(|(a, b)| a == b)
+                .count();
+            let remap = |offset| {
+                if offset > prefix && offset >= old.len() - suffix {
+                    new.len() - (old.len() - offset)
+                } else {
+                    offset
+                }
+            };
+            position.source_offset = position.source_offset.map(remap);
+            if let Some(line) = &mut position.line {
+                line.source_offset = remap(line.source_offset);
+            }
+            position
+        });
+        let focused = previous.text.read(cx).focus_handle().is_focused(window);
+        let display = previous.displayed_images.clone();
+        self.image_thumbnails = previous.image_thumbnails.clone();
+        self.document
+            .graphics
+            .reuse_ready(&previous.document.graphics);
+        display.update(cx, |display, _| display.clear_block_tracking());
+        self.image_subscription = cx.observe(&display, Self::refresh_image_layout);
+        self.displayed_images = display;
+
+        if let Some(position) = position {
+            // Seed the initial layout at the old block before restoring the exact line.
+            self.text.update(cx, |text, _| {
+                let item_ix = position
+                    .source_offset
+                    .and_then(|offset| text.block_for_source_offset(offset))
+                    .unwrap_or(position.block);
+                text.scroll_to_block(
+                    ListOffset {
+                        item_ix,
+                        offset_in_item: px(position.inset),
+                    },
+                    false,
+                );
+            });
+            self.restore_position(Some(position));
+        }
+        if focused {
+            self.focus_content(window, cx);
+        }
+    }
+
+    fn follow_preview_link(&mut self, target: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(Destination::Local {
+            path,
+            fragment: Some(fragment),
+        }) = destination(&self.path, target)
+            && path == self.path
+        {
+            if !self.jump_to_fragment_with_motion(&fragment, true, cx) {
+                _ = self.workspace.update(cx, |workspace, cx| {
+                    workspace.preview_fragment_missing(&fragment, window, cx);
+                });
+            }
+            return;
+        }
+        let workspace = self.workspace.clone();
+        let path = self.path.clone();
+        let target = target.to_owned();
+        window.defer(cx, move |window, cx| {
+            _ = workspace.update(cx, |workspace, cx| {
+                workspace.follow_editor_preview_link(&path, &target, window, cx);
+            });
+        });
+    }
+
     pub(crate) fn refresh_language(&mut self, _: &mut Window, cx: &mut Context<Self>) {
         cx.notify();
     }
@@ -673,6 +797,7 @@ impl DocReader {
             show_outline: None,
             outline_width: px(195.),
             standalone: false,
+            editor_preview: false,
             outline_was_visible: false,
             outline_scroll: ScrollHandle::new(),
             selected_heading: None,
@@ -1339,6 +1464,7 @@ impl Render for DocReader {
                 let reader = reader.clone();
                 let workspace = self.workspace.clone();
                 let path = self.path.clone();
+                let editor_preview = self.editor_preview;
                 move |target, event, window, cx| {
                     if event.is_right_click() {
                         context_menu::show(
@@ -1354,13 +1480,20 @@ impl Render for DocReader {
                     if matches!(event, ClickEvent::Mouse(click) if matches!(click.up.button, MouseButton::Navigate(_))) {
                         return;
                     }
+                    let target = target.clone();
+                    let reader = reader.clone();
                     let workspace = workspace.clone();
                     let path = path.clone();
-                    let target = target.clone();
                     window.defer(cx, move |window, cx| {
-                        _ = workspace.update(cx, |workspace, cx| {
-                            workspace.follow_document_link(&path, &target, window, cx)
-                        });
+                        if editor_preview {
+                            _ = reader.update(cx, |reader, cx| {
+                                reader.follow_preview_link(&target, window, cx);
+                            });
+                        } else {
+                            _ = workspace.update(cx, |workspace, cx| {
+                                workspace.follow_document_link(&path, &target, window, cx);
+                            });
+                        }
                     });
                 }
             })

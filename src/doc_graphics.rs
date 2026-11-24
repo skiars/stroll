@@ -161,6 +161,25 @@ impl Graphics {
         self.generated.lock().unwrap().reader = Some(reader);
     }
 
+    pub(crate) fn reuse_ready(&self, previous: &Self) {
+        let images = previous
+            .generated
+            .lock()
+            .unwrap()
+            .images
+            .iter()
+            .filter(|(request, state)| {
+                matches!(state, GraphicState::Ready(_))
+                    && self
+                        .sources
+                        .get(&request.kind)
+                        .is_some_and(|sources| sources.contains_key(request.source.as_ref()))
+            })
+            .map(|(request, state)| (request.clone(), state.clone()))
+            .collect::<Vec<_>>();
+        self.generated.lock().unwrap().images.extend(images);
+    }
+
     fn state(&self, request: &GraphicRequest) -> GraphicState {
         if !self
             .sources

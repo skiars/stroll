@@ -961,6 +961,9 @@ impl Store {
                 self.session_file_exists(repo, path)
             }
         });
+        session
+            .editor_previews
+            .retain(|path, _| session.tabs.index(path).is_some());
         Ok(())
     }
 

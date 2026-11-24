@@ -105,6 +105,9 @@ impl Workspace {
                 if let Some(position) = session.document_position {
                     this.session.documents.insert(path.clone(), position);
                 }
+                if let Some(mode) = session.editor_preview {
+                    this.session.editor_previews.insert(path.clone(), mode);
+                }
                 this.restore_panel_preferences();
                 match view {
                     WorkspaceView::Docs => {
@@ -313,6 +316,7 @@ impl Workspace {
                     .when(show_tabs, |bar| {
                         bar.h_full().pl_0().child(self.titlebar_tabs(cx, colors))
                     })
+                    .children(editing.then(|| self.editor_preview_button(cx)).flatten())
                     .child(actions),
             )
     }
