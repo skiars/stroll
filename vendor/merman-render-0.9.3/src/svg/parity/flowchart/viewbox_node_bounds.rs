@@ -72,7 +72,7 @@ fn measure_flowchart_layout_node_label(
             raw_label: label,
             label_type,
             style: &node_text_style,
-            max_width_px: Some(ctx.wrapping_width),
+            max_width_px: Some(ctx.node_wrapping_width(label)),
             wrap_mode: ctx.node_wrap_mode,
             config: ctx.config,
             math_renderer: ctx.math_renderer,

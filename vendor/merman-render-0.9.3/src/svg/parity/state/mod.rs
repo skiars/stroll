@@ -42,6 +42,7 @@ struct StateRenderCtx<'a> {
     hand_drawn_seed: roughr::core::RoughRandomness,
     html_labels: bool,
     html_label_wrapping_width: f64,
+    edge_label_wrap: Option<f64>,
     label_min_width: f64,
     state_padding: f64,
     node_order: Vec<&'a str>,

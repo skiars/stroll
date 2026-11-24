@@ -173,8 +173,13 @@ pub(super) fn layout(
             continue;
         }
         let label = crate::text::mermaid_html_breaks_to_newlines(&edge.label);
-        let (width, height) =
-            edge_label_metrics(&label, measurer, &settings.text_style, settings.wrap_mode);
+        let (width, height) = edge_label_metrics(
+            &label,
+            measurer,
+            &settings.text_style,
+            settings.wrap_mode,
+            settings.edge_label_wrap,
+        );
         edges.push(elk::Edge {
             id: edge.id.clone(),
             source: canonical(&edge.start),

@@ -334,8 +334,8 @@ impl<'a> SvgPostprocessContext<'a> {
             .controlled_text_measurer(phase, OperationPhase::Postprocess)
     }
 
-    /// Checks the operation-owned postprocess control for work performed by a built-in pass.
-    pub(crate) fn checkpoint(&self) -> crate::Result<()> {
+    /// Checks the operation deadline while processing a draft SVG.
+    pub fn checkpoint(&self) -> crate::Result<()> {
         self.execution().checkpoint()
     }
 

@@ -110,19 +110,6 @@ pub(in crate::svg::parity::flowchart) fn render_flowchart_edge_path(
         }
     }
 
-    let _ = write!(
-        out,
-        r#"<path d="{}" id="{}-{}" class=""#,
-        d,
-        ctx.diagram_id,
-        escape_xml_display(&edge.id),
-    );
-    ctx.checkpoint_emit()?;
-    css::write_flowchart_edge_class_attr(out, edge);
-    if hand_drawn {
-        out.push_str(" transition");
-    }
-    out.push_str(r#"" style=""#);
     scratch.edge_style.clear();
     if data_look == "neo"
         && !flowchart_edge_is_animated(ctx, edge)
@@ -162,42 +149,99 @@ pub(in crate::svg::parity::flowchart) fn render_flowchart_edge_path(
     } else {
         std::borrow::Cow::Borrowed(scratch.edge_style.as_str())
     };
-    let _ = write!(out, "{}", escape_attr_display(&style));
-    if hand_drawn {
-        out.push_str(r##"" stroke="#000" stroke-width="1" fill="none"##);
+    let gap = if let Some(bounds) =
+        super::edge_label::reader_edge_label_gap_bounds(ctx, edge, geom, d, origin_x, origin_y)
+    {
+        crate::svg::parity::edge_gap::cut_label_gap(d, bounds, ctx.work_meter)?
+    } else {
+        None
+    };
+
+    let marker_start = flowchart_edge_marker_start_base(edge);
+    let marker_end = flowchart_edge_marker_end_base(edge);
+    let animated = flowchart_edge_is_animated(ctx, edge);
+    let write_path = |out: &mut String,
+                      d: &str,
+                      style: &str,
+                      primary: bool,
+                      start: Option<&str>,
+                      end: Option<&str>| {
+        let _ = write!(out, r#"<path d="{d}""#);
+        if primary {
+            let _ = write!(
+                out,
+                r#" id="{}-{}""#,
+                ctx.diagram_id,
+                escape_xml_display(&edge.id)
+            );
+        }
+        out.push_str(r#" class=""#);
+        css::write_flowchart_edge_class_attr(out, edge);
+        if hand_drawn {
+            out.push_str(" transition");
+        }
+        let _ = write!(out, r#"" style="{}"#, escape_attr_display(style));
+        if hand_drawn {
+            out.push_str(r##"" stroke="#000" stroke-width="1" fill="none"##);
+        }
+        out.push('"');
+        if primary {
+            out.push_str(r#" data-edge="true" data-et="edge""#);
+        }
+        let _ = write!(out, r#" data-id="{}""#, escape_xml_display(&edge.id));
+        if primary {
+            let _ = write!(out, r#" data-points="{data_points_b64}""#);
+        }
+        let _ = write!(out, r#" data-look="{}""#, escape_xml_display(data_look));
+        for (side, base) in [("start", start), ("end", end)] {
+            if let Some(base) = base {
+                let _ = write!(out, r#" marker-{side}="url(#"#);
+                write_flowchart_marker_id_xml(
+                    out,
+                    ctx.diagram_id,
+                    ctx.diagram_type,
+                    base,
+                    data_look == "neo" && !animated,
+                    marker_color,
+                );
+                out.push_str(r#")""#);
+            }
+        }
+        out.push_str(" />");
+    };
+
+    if let Some(gap) = gap {
+        let pieces = gap.visible.len();
+        let mut primary = true;
+        for (index, part) in gap.visible.iter().enumerate() {
+            let mut painted_style = std::borrow::Cow::Borrowed(style.as_ref());
+            if !animated && part.dash_offset > 0.0 {
+                painted_style = dash_style_at_distance(&style, part.dash_offset);
+            }
+            write_path(
+                out,
+                &part.path.to_svg(),
+                &painted_style,
+                primary,
+                marker_start.filter(|_| index == 0 && gap.start_marker_path.is_none()),
+                marker_end.filter(|_| index + 1 == pieces && gap.end_marker_path.is_none()),
+            );
+            primary = false;
+        }
+        for (path, start, end) in [
+            (gap.start_marker_path, marker_start, None),
+            (gap.end_marker_path, None, marker_end),
+        ] {
+            if let Some(path) = path.filter(|_| start.is_some() || end.is_some()) {
+                let marker_style = format!("{style};fill:none!important;stroke:none!important;");
+                write_path(out, &path.to_svg(), &marker_style, primary, start, end);
+                primary = false;
+            }
+        }
+    } else {
+        write_path(out, d, &style, true, marker_start, marker_end);
     }
-    let _ = write!(
-        out,
-        r#"" data-edge="true" data-et="edge" data-id="{}" data-points="{}" data-look="{}""#,
-        escape_xml_display(&edge.id),
-        data_points_b64,
-        escape_xml_display(data_look),
-    );
-    if let Some(base) = flowchart_edge_marker_start_base(edge) {
-        out.push_str(r#" marker-start="url(#"#);
-        write_flowchart_marker_id_xml(
-            out,
-            ctx.diagram_id,
-            ctx.diagram_type,
-            base,
-            data_look == "neo" && !flowchart_edge_is_animated(ctx, edge),
-            marker_color,
-        );
-        out.push_str(r#")""#);
-    }
-    if let Some(base) = flowchart_edge_marker_end_base(edge) {
-        out.push_str(r#" marker-end="url(#"#);
-        write_flowchart_marker_id_xml(
-            out,
-            ctx.diagram_id,
-            ctx.diagram_type,
-            base,
-            data_look == "neo" && !flowchart_edge_is_animated(ctx, edge),
-            marker_color,
-        );
-        out.push_str(r#")""#);
-    }
-    out.push_str(" />");
+    ctx.checkpoint_emit()?;
 
     if let Some(emitted_d_for_label) = rough_d
         && let Some(cache_entry) = edge_cache.get_mut(edge.id.as_str())
@@ -207,6 +251,40 @@ pub(in crate::svg::parity::flowchart) fn render_flowchart_edge_path(
         cache_entry.geom.emitted_d_for_label = Some(emitted_d_for_label);
     }
     Ok(())
+}
+
+fn dash_style_at_distance(style: &str, distance: f64) -> std::borrow::Cow<'_, str> {
+    fn dash_offset(declaration: &str) -> Option<&str> {
+        let (name, value) = declaration.split_once(':')?;
+        name.trim()
+            .eq_ignore_ascii_case("stroke-dashoffset")
+            .then(|| value.trim())
+    }
+
+    let offset = style.rsplit(';').find_map(dash_offset);
+    let (offset, priority) = offset
+        .and_then(|value| value.strip_suffix("!important"))
+        .map_or((offset.unwrap_or("0"), ""), |value| {
+            (value.trim(), " !important")
+        });
+    let Ok(offset) = offset.strip_suffix("px").unwrap_or(offset).parse::<f64>() else {
+        return std::borrow::Cow::Borrowed(style);
+    };
+
+    let mut adjusted = String::with_capacity(style.len() + 32);
+    for declaration in style
+        .split(';')
+        .filter(|value| dash_offset(value).is_none())
+    {
+        adjusted.push_str(declaration);
+        adjusted.push(';');
+    }
+    let _ = write!(
+        adjusted,
+        "stroke-dashoffset:{}{priority};",
+        fmt_display(offset + distance)
+    );
+    std::borrow::Cow::Owned(adjusted)
 }
 
 fn write_flowchart_neo_edge_mask(

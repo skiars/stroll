@@ -110,6 +110,7 @@ pub(in crate::svg::parity) fn render_state_diagram_svg_model(
         hand_drawn_seed,
         html_labels: state_render_settings.html_labels,
         html_label_wrapping_width: state_render_settings.html_label_wrapping_width,
+        edge_label_wrap: state_render_settings.edge_label_wrap,
         label_min_width: state_render_settings.label_min_width,
         state_padding: state_render_settings.state_padding,
         node_order,

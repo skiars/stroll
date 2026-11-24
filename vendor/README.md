@@ -438,3 +438,20 @@ dialogs in a Wayland window after changes to paint order or focus handling.
   Run `cargo test --release --locked --test checkbox` and the
   `markdown_list_and_table_checkboxes_follow_document_typography` and
   `stage_slot_covers_the_cell_and_hands_clicks_to_staging` library tests.
+
+### Mermaid rendering
+
+`merman-render-0.9.3` is the published renderer with an opt-in reader presentation
+for ELK flowcharts. Decision nodes become rounded rectangles before layout.
+Labels with explicit line breaks share a per-node wrap width across ELK
+measurement, SVG emission, view bounds, and edge intersections. ELK reserves
+space for native SVG label text and its capsule before routing. For desktop
+state diagrams, transition labels use a shared wrap width in layout and SVG
+emission. Layout reserves room for each label row and for rasterizer font
+differences. Desktop state transitions omit the path segments inside their
+label bounds and draw transparent labels. Desktop ELK flowcharts likewise
+omit edge segments inside their label bounds, with the capsule painted over
+the resulting gap. The SVG postprocessor can check
+the render deadline. Upstream licenses and third-party
+notices are included. Run the `mermaid` library tests and the `documents` and
+`smooth_scroll` integration tests.

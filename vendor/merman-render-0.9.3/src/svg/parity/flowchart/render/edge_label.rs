@@ -9,8 +9,7 @@ fn padded_html_edge_label_background(padding: f64, width: f64, height: f64) -> S
         return String::new();
     }
 
-    let width = width + 2.0 * padding;
-    let height = height + 2.0 * padding;
+    let (width, height) = padded_edge_label_size(padding, width, height);
     format!(
         r#"<rect class="background" x="{}" y="{}" width="{}" height="{}" rx="{}" ry="{}"/>"#,
         fmt_display(-width / 2.0),
@@ -20,6 +19,48 @@ fn padded_html_edge_label_background(padding: f64, width: f64, height: f64) -> S
         fmt_display(padding),
         fmt_display(padding),
     )
+}
+
+fn padded_edge_label_size(padding: f64, width: f64, height: f64) -> (f64, f64) {
+    (width + 2.0 * padding, height + 2.0 * padding)
+}
+
+pub(super) fn reader_edge_label_gap_bounds(
+    ctx: &FlowchartRenderCtx<'_>,
+    edge: &crate::flowchart::FlowEdge,
+    geom: &FlowchartEdgePathGeom,
+    d: &str,
+    origin_x: f64,
+    origin_y: f64,
+) -> Option<kurbo::Rect> {
+    if !ctx.uses_elk_adapter_dom
+        || !crate::flowchart::reader_label_padding(ctx.config)
+        || crate::flowchart::flowchart_label_is_empty_for_render(
+            ctx.model.edge_label_for_render(edge).unwrap_or_default(),
+        )
+    {
+        return None;
+    }
+    let label = ctx
+        .layout_edges_by_id
+        .get(edge.id.as_str())?
+        .label
+        .as_ref()?;
+    if label.width <= 0.0 || label.height <= 0.0 {
+        return None;
+    }
+    let anchor = crate::model::LayoutPoint {
+        x: label.x + ctx.tx - origin_x,
+        y: label.y + ctx.ty - origin_y,
+    };
+    let center = position_flowchart_edge_label_on_path(anchor, geom, d, false);
+    let padding = if ctx.edge_html_labels {
+        ctx.edge_label_padding
+    } else {
+        0.0
+    };
+    let size = padded_edge_label_size(padding, label.width, label.height);
+    Some(kurbo::Rect::from_center_size((center.x, center.y), size).inflate(0.5, 0.5))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -64,6 +105,15 @@ fn position_flowchart_edge_label(
         .emitted_d_for_label
         .as_deref()
         .unwrap_or(geom.d.as_str());
+    position_flowchart_edge_label_on_path(dagre_anchor, geom, rendered_d, always_recompute)
+}
+
+fn position_flowchart_edge_label_on_path(
+    dagre_anchor: crate::model::LayoutPoint,
+    geom: &FlowchartEdgePathGeom,
+    rendered_d: &str,
+    always_recompute: bool,
+) -> crate::model::LayoutPoint {
     crate::svg::parity::edge_label_geometry::position_edge_label(
         geom.label_anchor.clone().unwrap_or(dagre_anchor),
         Some(geom.original_label_path_points.as_slice()),
@@ -390,7 +440,13 @@ pub(in crate::svg::parity) fn render_flowchart_edge_label(
             let layout_w = lbl.width.max(0.0);
             let h = lbl.height.max(0.0);
             let background = padded_html_edge_label_background(ctx.edge_label_padding, layout_w, h);
-            let wrapped_style = if layout_w >= FLOWCHART_EDGE_LABEL_WRAP_WIDTH - 0.01 {
+            let wrap_threshold =
+                if ctx.uses_elk_adapter_dom && crate::flowchart::reader_label_padding(ctx.config) {
+                    crate::flowchart::reader_edge_label_width(FLOWCHART_EDGE_LABEL_WRAP_WIDTH)
+                } else {
+                    FLOWCHART_EDGE_LABEL_WRAP_WIDTH
+                };
+            let wrapped_style = if layout_w >= wrap_threshold - 0.01 {
                 format!(
                     "display: table; white-space: break-spaces; line-height: 1.5; max-width: {mw}px; text-align: center; width: {mw}px;",
                     mw = fmt_display(FLOWCHART_EDGE_LABEL_WRAP_WIDTH)

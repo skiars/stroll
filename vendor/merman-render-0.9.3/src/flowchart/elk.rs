@@ -1316,6 +1316,8 @@ fn node_dimensions_and_label(
 ) -> (f64, f64, elk::Label) {
     let raw_label = ctx.model.node_label_for_render(node).unwrap_or(&node.id);
     let label_type = node.label_type.as_deref().unwrap_or("text");
+    let wrapping_width =
+        super::reader_node_wrapping_width(raw_label, ctx.wrapping_width, ctx.effective_config);
     let node_text_style = flowchart_effective_text_style_for_node_classes(
         ctx.node_label_base_style,
         &ctx.model.class_defs,
@@ -1337,7 +1339,7 @@ fn node_dimensions_and_label(
             raw_label,
             label_type,
             style: node_text_style.as_ref(),
-            max_width_px: Some(ctx.wrapping_width),
+            max_width_px: Some(wrapping_width),
             wrap_mode: ctx.node_wrap_mode,
             config: ctx.effective_config,
             math_renderer: ctx.math_renderer,
@@ -1355,6 +1357,7 @@ fn node_dimensions_and_label(
         );
     }
 
+    let text_width = metrics.width;
     metrics = metrics.with_label_min_width(
         raw_label,
         super::flowchart_node_label_min_width(
@@ -1378,7 +1381,7 @@ fn node_dimensions_and_label(
         },
         metrics,
         has_label: !raw_label.is_empty(),
-        wrapping_width: ctx.wrapping_width,
+        wrapping_width,
         node_constraint: node.constraint.as_deref(),
         padding: ctx.node_padding,
         look_is_neo: crate::config::mermaid_config_diagram_look(ctx.effective_config).is_neo(),
@@ -1390,6 +1393,16 @@ fn node_dimensions_and_label(
         node_asset_height: node.asset_height,
     });
 
+    let width = if ctx.node_wrap_mode == WrapMode::HtmlLike
+        && super::reader_label_padding(ctx.effective_config)
+        && matches!(
+            super::FlowchartShape::resolve(node.layout_shape.as_deref().unwrap_or("squareRect")),
+            Ok(super::FlowchartShape::Process | super::FlowchartShape::RoundedRectangle)
+        ) {
+        width.max(text_width * 1.12 + 20.0)
+    } else {
+        width
+    };
     (width, height, label)
 }
 
@@ -1471,6 +1484,11 @@ fn edge_label(
         )
     };
 
+    let width = if ctx.edge_html_labels && super::reader_label_padding(ctx.effective_config) {
+        super::reader_edge_label_width(width)
+    } else {
+        width
+    };
     Some(elk::Label { width, height })
 }
 

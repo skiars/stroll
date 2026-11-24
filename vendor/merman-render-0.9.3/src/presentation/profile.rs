@@ -109,6 +109,7 @@ impl ResolvedPresentation {
     pub const fn render_policy(&self) -> PresentationRenderPolicy {
         PresentationRenderPolicy {
             profile: self.presentation.profile,
+            reader_flowchart_style: false,
         }
     }
 }
@@ -121,9 +122,20 @@ impl ResolvedPresentation {
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct PresentationRenderPolicy {
     profile: Option<PresentationProfile>,
+    reader_flowchart_style: bool,
 }
 
 impl PresentationRenderPolicy {
+    /// Enables the reader shapes used when laying out ELK flowcharts.
+    pub const fn with_reader_flowchart_style(mut self) -> Self {
+        self.reader_flowchart_style = true;
+        self
+    }
+
+    pub(crate) const fn reader_flowchart_style(self) -> bool {
+        self.reader_flowchart_style
+    }
+
     pub const fn profile(self) -> Option<PresentationProfile> {
         self.profile
     }

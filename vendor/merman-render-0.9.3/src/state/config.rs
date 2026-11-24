@@ -148,6 +148,7 @@ impl<'a> StateConfigView<'a> {
             html_labels,
             wrap_mode: state_wrap_mode(html_labels),
             wrapping_width: self.html_label_wrapping_width(),
+            edge_label_wrap: self.reader_edge_label_wrap(),
             state_padding: self.state_padding(),
             label_min_width: self.state_label_min_width(),
             text_style: self.text_style(),
@@ -168,6 +169,7 @@ impl<'a> StateConfigView<'a> {
                 .unwrap_or(0.0),
             html_labels,
             html_label_wrapping_width: self.html_label_wrapping_width(),
+            edge_label_wrap: self.reader_edge_label_wrap(),
             label_min_width: self.state_label_min_width(),
             state_padding: self.state_padding(),
             security_level_loose: self.root_string("securityLevel").as_deref() == Some("loose"),
@@ -220,6 +222,11 @@ impl<'a> StateConfigView<'a> {
             .max(0.0)
     }
 
+    pub(crate) fn reader_edge_label_wrap(&self) -> Option<f64> {
+        config_f64_css_px(self.state_config, &["readerEdgeLabelWrappingWidth"])
+            .filter(|width| width.is_finite() && *width > 0.0)
+    }
+
     pub(crate) fn state_padding(&self) -> f64 {
         self.state_compat_f64("padding")
             .unwrap_or(DEFAULT_STATE_PADDING)
@@ -264,6 +271,7 @@ pub(super) struct StateLayoutSettings {
     pub(super) html_labels: bool,
     pub(super) wrap_mode: WrapMode,
     pub(super) wrapping_width: f64,
+    pub(super) edge_label_wrap: Option<f64>,
     pub(super) state_padding: f64,
     pub(super) label_min_width: f64,
     pub(super) text_style: TextStyle,
@@ -275,6 +283,7 @@ pub(crate) struct StateRenderSettings {
     pub(crate) hand_drawn_seed: f64,
     pub(crate) html_labels: bool,
     pub(crate) html_label_wrapping_width: f64,
+    pub(crate) edge_label_wrap: Option<f64>,
     pub(crate) label_min_width: f64,
     pub(crate) state_padding: f64,
     pub(crate) security_level_loose: bool,

@@ -1801,7 +1801,13 @@ fn prepare_non_class_render(
             )?)
         }
         #[cfg(any(feature = "diagram-flowchart", feature = "diagram-swimlane"))]
-        RenderSemanticModel::Flowchart(model) => {
+        RenderSemanticModel::Flowchart(mut model) => {
+            if render_policy.reader_flowchart_style()
+                && crate::layout_backend::resolve_graph_layout(effective_config).backend
+                    == crate::layout_backend::GraphLayoutBackend::Elk
+            {
+                crate::flowchart::apply_reader_node_shapes(&mut model);
+            }
             BuiltinFamilyArtifact::Flowchart(prepare_flowchart_artifact(
                 model,
                 flowchart_label_sources,

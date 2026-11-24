@@ -170,3 +170,74 @@ pub(crate) use svg_label_artifact::{
     FlowchartSvgLabelSidecarBuilder, measure_flowchart_svg_label_for_layout,
     measure_flowchart_svg_label_for_layout_with_metrics_style,
 };
+
+/// Applies reader shapes before ELK measures and routes the same semantic model.
+pub(crate) fn apply_reader_node_shapes(model: &mut FlowchartModel) {
+    use rustc_hash::FxHashSet;
+
+    let sources: FxHashSet<_> = model.edges.iter().map(|edge| edge.from.as_str()).collect();
+    let targets: FxHashSet<_> = model.edges.iter().map(|edge| edge.to.as_str()).collect();
+    let default_style = model.class_defs.contains_key("default");
+    for node in &mut model.nodes {
+        if node.is_subgraph_anchor() {
+            continue;
+        }
+        let styled = default_style || !node.styles.is_empty() || !node.classes.is_empty();
+        let shape = node.layout_shape.as_deref().unwrap_or("squareRect");
+        let appearance = match FlowchartShape::resolve(shape) {
+            Ok(FlowchartShape::Diamond) => {
+                node.layout_shape = Some("rounded".to_owned());
+                node.shape = Some("rounded".to_owned());
+                if styled {
+                    "stroll-decision-authored"
+                } else {
+                    "stroll-decision"
+                }
+            }
+            Ok(FlowchartShape::Process | FlowchartShape::RoundedRectangle) if !styled => {
+                if sources.contains(node.id.as_str()) && !targets.contains(node.id.as_str()) {
+                    "stroll-entry"
+                } else {
+                    "stroll-process"
+                }
+            }
+            _ => continue,
+        };
+        node.classes.push(appearance.to_owned());
+    }
+}
+
+/// A manual break permits wider lines without changing ordinary labels or authored wrap widths.
+pub(crate) fn reader_node_wrapping_width(
+    label: &str,
+    width: f64,
+    config: &merman_core::MermaidConfig,
+) -> f64 {
+    let bytes = label.as_bytes();
+    let has_explicit_break = bytes.windows(3).enumerate().any(|(start, part)| {
+        if !part.eq_ignore_ascii_case(b"<br") {
+            return false;
+        }
+        let suffix = bytes[start + 3..].trim_ascii_start();
+        suffix.starts_with(b">") || suffix.starts_with(b"/>")
+    });
+    if width != 120.0 || !has_explicit_break {
+        return width;
+    }
+    crate::config::config_f64(
+        config.as_value(),
+        &["flowchart", "explicitLineBreakWrappingWidth"],
+    )
+    .unwrap_or(width)
+    .max(width)
+}
+
+pub(crate) fn reader_label_padding(config: &merman_core::MermaidConfig) -> bool {
+    crate::config::config_bool(config.as_value(), &["flowchart", "readerLabelPadding"])
+        == Some(true)
+}
+
+/// Reserves horizontal space for the native SVG font and the capsule border before ELK routes.
+pub(crate) fn reader_edge_label_width(text_width: f64) -> f64 {
+    text_width * 1.2 + 16.0
+}

@@ -174,11 +174,12 @@ pub(super) fn edge_label_metrics(
     measurer: &dyn TextMeasurer,
     text_style: &TextStyle,
     wrap_mode: WrapMode,
+    reader_wrap: Option<f64>,
 ) -> (f64, f64) {
     if label.trim().is_empty() {
         return (0.0, 0.0);
     }
-    let wrapping_width = crate::text::MERMAID_CREATE_TEXT_DEFAULT_WIDTH_PX;
+    let wrapping_width = reader_wrap.unwrap_or(crate::text::MERMAID_CREATE_TEXT_DEFAULT_WIDTH_PX);
     let mut metrics = super::measure_state_markdown_label(
         label,
         measurer,
@@ -187,6 +188,16 @@ pub(super) fn edge_label_metrics(
         wrap_mode,
     )
     .metrics;
+    if reader_wrap.is_some() {
+        // The SVG rasterizer can resolve a different face from Mermaid's reference fonts.
+        // Reserve space for that difference and for the padding around each text row.
+        let width = metrics.width * 1.15 + 12.0;
+        let height = metrics
+            .height
+            .max(text_style.font_size * 1.5 * metrics.line_count.max(1) as f64)
+            + 4.0;
+        return (width, height);
+    }
     // For SVG edge labels, `createText(..., addSvgBackground=true)` adds a background rect with a
     // 2px padding.
     if wrap_mode == WrapMode::SvgLike {
@@ -1677,7 +1688,13 @@ fn build_state_diagram_dagre_input(
         {
             continue;
         }
-        let (lw, lh) = edge_label_metrics(&e.label, measurer, &text_style, wrap_mode);
+        let (lw, lh) = edge_label_metrics(
+            &e.label,
+            measurer,
+            &text_style,
+            wrap_mode,
+            settings.edge_label_wrap,
+        );
         let mut base = EdgeLabel {
             width: lw,
             height: lh,
@@ -2239,7 +2256,7 @@ mod tests {
         let style = TextStyle::default();
 
         assert_eq!(
-            edge_label_metrics("edge", &measurer, &style, WrapMode::HtmlLike),
+            edge_label_metrics("edge", &measurer, &style, WrapMode::HtmlLike, None),
             (73.123_456_789, 17.25)
         );
         assert_eq!(
@@ -2269,7 +2286,7 @@ mod tests {
         let style = TextStyle::default();
 
         assert_eq!(
-            edge_label_metrics("edge", &measurer, &style, WrapMode::HtmlLike),
+            edge_label_metrics("edge", &measurer, &style, WrapMode::HtmlLike, None),
             (250.123_456_789, 17.25)
         );
         assert_eq!(
@@ -2290,7 +2307,7 @@ mod tests {
             height: 17.25,
         };
         assert_eq!(
-            edge_label_metrics("edge", &measurer, &style, WrapMode::SvgLike),
+            edge_label_metrics("edge", &measurer, &style, WrapMode::SvgLike, None),
             (77.123_456_789, 21.25)
         );
     }

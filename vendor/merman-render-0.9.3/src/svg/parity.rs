@@ -64,6 +64,13 @@ mod css;
 mod curve;
 #[cfg(feature = "diagram-cynefin")]
 mod cynefin;
+#[cfg(any(
+    feature = "diagram-state",
+    feature = "diagram-flowchart",
+    feature = "diagram-swimlane",
+    feature = "diagram-agentflow"
+))]
+mod edge_gap;
 #[cfg_attr(
     not(feature = "all-diagrams"),
     allow(

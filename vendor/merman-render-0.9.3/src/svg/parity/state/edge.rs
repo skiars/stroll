@@ -540,6 +540,24 @@ pub(super) fn state_edge_prepare_geometry(
     )
 }
 
+fn state_edge_label_position(
+    label: &crate::model::LayoutLabel,
+    geometry: &StatePreparedEdgeGeometry,
+    origin_x: f64,
+    origin_y: f64,
+) -> crate::model::LayoutPoint {
+    super::super::edge_label_geometry::position_edge_label(
+        crate::model::LayoutPoint {
+            x: label.x - origin_x,
+            y: label.y - origin_y,
+        },
+        Some(&geometry.original_label_path_points),
+        &geometry.label_path_points,
+        &geometry.rendered_d,
+        geometry.points_were_explicitly_updated,
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 fn write_state_edge_path(
     out: &mut String,
@@ -583,10 +601,30 @@ fn write_state_edge_path(
     } else {
         std::borrow::Cow::Borrowed(original_style.as_str())
     };
+    let gap =
+        if let Some(label) = le.label.as_ref().filter(|label| {
+            ctx.edge_label_wrap.is_some() && label.width > 0.0 && label.height > 0.0
+        }) {
+            let center = state_edge_label_position(label, &geometry, origin_x, origin_y);
+            let bounds =
+                kurbo::Rect::from_center_size((center.x, center.y), (label.width, label.height))
+                    .inflate(1.0, 1.0);
+            crate::svg::parity::edge_gap::cut_label_gap(rendered_d, bounds, work_meter)?
+        } else {
+            None
+        };
+
+    let visible_path = gap.as_ref().map(|gap| {
+        gap.visible
+            .iter()
+            .map(|piece| piece.path.to_svg())
+            .collect::<Vec<_>>()
+            .join(" ")
+    });
     let _ = write!(
         out,
         r#"<path d="{}" id="{}" class="{}" style="{}" data-edge="true" data-et="edge" data-id="{}" data-points="{}" data-look="{}""#,
-        rendered_d,
+        visible_path.as_deref().unwrap_or(rendered_d),
         state_scoped_dom_id(ctx, edge_id),
         escape_xml_display(classes),
         escape_xml_display(&style),
@@ -594,10 +632,21 @@ fn write_state_edge_path(
         data_points,
         escape_xml_display(state_data_look(ctx))
     );
-    if let Some(marker_end) = marker_end {
+    let marker_at_gap = gap.as_ref().and_then(|gap| gap.end_marker_path.as_ref());
+    if let Some(marker_end) = marker_end.filter(|_| marker_at_gap.is_none()) {
         let _ = write!(out, r#" marker-end="{}""#, escape_xml_display(marker_end));
     }
     out.push_str("/>");
+    if let (Some(path), Some(marker_end)) = (marker_at_gap, marker_end) {
+        // The label can reach the end of a short edge. Keep its arrow at the original tip.
+        let _ = write!(
+            out,
+            r#"<path d="{}" class="{}" style="fill:none;stroke:none" marker-end="{}"/>"#,
+            path.to_svg(),
+            escape_xml_display(classes),
+            escape_xml_display(marker_end),
+        );
+    }
     Ok(())
 }
 
@@ -708,14 +757,23 @@ pub(super) fn render_state_edge_label(
         label_pos: crate::model::LayoutPoint,
         w: f64,
         h: f64,
-        html_labels: bool,
+        ctx: &StateRenderCtx<'_>,
     ) {
         let w = w.max(0.0);
         let h = h.max(0.0);
-        if html_labels {
+        if ctx.html_labels {
+            let (style, overflow, class) = if let Some(wrap) = ctx.edge_label_wrap {
+                let style = format!(
+                    "white-space: normal; line-height: 1.5; max-width: {}px; text-align: center;",
+                    fmt_display(wrap),
+                );
+                (style, r#" style="overflow: visible;""#, "")
+            } else {
+                (edge_label_div_style(w), "", r#" class="labelBkg""#)
+            };
             let _ = write!(
                 out,
-                r#"<g class="edgeLabel" transform="translate({}, {})"><g class="label" data-id="{}" transform="translate({}, {})"><foreignObject width="{}" height="{}"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="{}"><span class="edgeLabel">{}</span></div></foreignObject></g></g>"#,
+                r#"<g class="edgeLabel" transform="translate({}, {})"><g class="label" data-id="{}" transform="translate({}, {})"><foreignObject width="{}" height="{}"{overflow}><div xmlns="http://www.w3.org/1999/xhtml"{class} style="{style}"><span class="edgeLabel">{}</span></div></foreignObject></g></g>"#,
                 fmt_display(label_pos.x),
                 fmt_display(label_pos.y),
                 escape_attr(id),
@@ -723,13 +781,17 @@ pub(super) fn render_state_edge_label(
                 fmt_display(-h / 2.0),
                 fmt_display(w),
                 fmt_display(h),
-                edge_label_div_style(w),
                 label_dom
             );
         } else {
+            let background = if ctx.edge_label_wrap.is_some() {
+                "fill:none;stroke:none"
+            } else {
+                "stroke: none"
+            };
             let _ = write!(
                 out,
-                r#"<g class="edgeLabel" transform="translate({}, {})"><g class="label" data-id="{}" transform="translate({}, {})"><g><rect class="background" style="stroke: none" x="0" y="0" width="{}" height="{}"/><g transform="translate({}, {})">{}</g></g></g></g>"#,
+                r#"<g class="edgeLabel" transform="translate({}, {})"><g class="label" data-id="{}" transform="translate({}, {})"><g><rect class="background" style="{background}" x="0" y="0" width="{}" height="{}"/><g transform="translate({}, {})">{}</g></g></g></g>"#,
                 fmt_display(label_pos.x),
                 fmt_display(label_pos.y),
                 escape_attr(id),
@@ -773,16 +835,7 @@ pub(super) fn render_state_edge_label(
         origin_x,
         origin_y,
     );
-    let label_position = super::super::edge_label_geometry::position_edge_label(
-        crate::model::LayoutPoint {
-            x: lbl.x - origin_x,
-            y: lbl.y - origin_y,
-        },
-        Some(&geometry.original_label_path_points),
-        &geometry.label_path_points,
-        &geometry.rendered_d,
-        geometry.points_were_explicitly_updated,
-    );
+    let label_position = state_edge_label_position(lbl, &geometry, origin_x, origin_y);
     let w = lbl.width.max(0.0);
     let h = lbl.height.max(0.0);
 
@@ -793,20 +846,19 @@ pub(super) fn render_state_edge_label(
             label_text,
             ctx.measurer,
             &ctx.text_style,
-            Some(crate::text::MERMAID_CREATE_TEXT_DEFAULT_WIDTH_PX),
+            Some(
+                ctx.edge_label_wrap
+                    .unwrap_or(crate::text::MERMAID_CREATE_TEXT_DEFAULT_WIDTH_PX),
+            ),
             WrapMode::SvgLike,
         );
-        state_svg_word_label(&measurement.svg_word_lines, true, None)
+        if ctx.edge_label_wrap.is_some() {
+            state_centered_svg_edge_label(&measurement.svg_word_lines, ctx.text_style.font_size)
+        } else {
+            state_svg_word_label(&measurement.svg_word_lines, true, None)
+        }
     };
-    write_visible_edge_label(
-        out,
-        &edge.id,
-        &label_dom,
-        label_position,
-        w,
-        h,
-        ctx.html_labels,
-    );
+    write_visible_edge_label(out, &edge.id, &label_dom, label_position, w, h, ctx);
 }
 
 #[cfg(test)]

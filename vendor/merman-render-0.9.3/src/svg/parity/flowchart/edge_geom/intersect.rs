@@ -798,7 +798,7 @@ fn compute_node_label_metrics_for_intersection(
             label_text,
             ctx.measurer,
             node_text_style.as_ref(),
-            Some(ctx.wrapping_width),
+            Some(ctx.node_wrapping_width(label_text)),
             true,
             crate::flowchart::FlowchartSvgWidthMode::Bbox,
         )
@@ -811,7 +811,7 @@ fn compute_node_label_metrics_for_intersection(
             raw_label: label_text,
             label_type,
             style: &node_text_style,
-            max_width_px: Some(ctx.wrapping_width),
+            max_width_px: Some(ctx.node_wrapping_width(label_text)),
             wrap_mode: ctx.node_wrap_mode,
             config: ctx.config,
             math_renderer: ctx.math_renderer,

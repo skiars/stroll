@@ -93,6 +93,14 @@ pub(in crate::svg::parity) struct FlowchartRenderCtx<'a> {
 }
 
 impl FlowchartRenderCtx<'_> {
+    pub(in crate::svg::parity::flowchart) fn node_wrapping_width(&self, label: &str) -> f64 {
+        if self.uses_elk_adapter_dom {
+            crate::flowchart::reader_node_wrapping_width(label, self.wrapping_width, self.config)
+        } else {
+            self.wrapping_width
+        }
+    }
+
     pub(in crate::svg::parity::flowchart) fn subgraph_has_children(&self, id: &str) -> bool {
         self.subgraph_ids_with_children.contains(id)
     }

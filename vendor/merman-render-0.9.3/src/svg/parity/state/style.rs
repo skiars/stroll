@@ -471,26 +471,33 @@ where
         r#"#{} .stateLabel .box{{stroke:none;stroke-width:0;fill:{};opacity:0.5;}}"#,
         id, main_bkg
     );
-    let _ = write!(
-        &mut css,
-        r#"#{} .edgeLabel .label rect{{fill:{};opacity:0.5;}}"#,
-        id, label_background
-    );
-    let _ = write!(
-        &mut css,
-        r#"#{} .edgeLabel{{background-color:{};text-align:center;}}"#,
-        id, edge_label_background
-    );
-    let _ = write!(
-        &mut css,
-        r#"#{} .edgeLabel p{{background-color:{};}}"#,
-        id, edge_label_background
-    );
-    let _ = write!(
-        &mut css,
-        r#"#{} .edgeLabel rect{{opacity:0.5;background-color:{};fill:{};}}"#,
-        id, edge_label_background, edge_label_background
-    );
+    if crate::state::StateConfigView::new(effective_config)
+        .reader_edge_label_wrap()
+        .is_some()
+    {
+        let _ = write!(&mut css, r#"#{} .edgeLabel{{text-align:center;}}"#, id);
+    } else {
+        let _ = write!(
+            &mut css,
+            r#"#{} .edgeLabel .label rect{{fill:{};opacity:0.5;}}"#,
+            id, label_background
+        );
+        let _ = write!(
+            &mut css,
+            r#"#{} .edgeLabel{{background-color:{};text-align:center;}}"#,
+            id, edge_label_background
+        );
+        let _ = write!(
+            &mut css,
+            r#"#{} .edgeLabel p{{background-color:{};}}"#,
+            id, edge_label_background
+        );
+        let _ = write!(
+            &mut css,
+            r#"#{} .edgeLabel rect{{opacity:0.5;background-color:{};fill:{};}}"#,
+            id, edge_label_background, edge_label_background
+        );
+    }
     let _ = write!(
         &mut css,
         r#"#{} .edgeLabel .label text{{fill:{};}}"#,
@@ -1002,12 +1009,41 @@ pub(super) fn state_svg_word_label(
         .unwrap_or_default();
 
     let mut out = format!(r#"<text y="-10.1"{text_anchor}{style_attr}>"#);
-    for (idx, words) in lines.iter().enumerate() {
+    write_state_svg_label_rows(&mut out, lines, |idx| {
         let y = idx as f64 * 1.1 - 0.1;
+        format!(r#"x="0" y="{}em" dy="1.1em""#, fmt_display(y))
+    });
+    out.push_str("</text>");
+    out
+}
+
+pub(super) fn state_centered_svg_edge_label(
+    lines: &[Vec<(String, crate::text::MermaidMarkdownWordType)>],
+    font_size: f64,
+) -> String {
+    let mut out = format!(
+        r#"<text text-anchor="middle" dominant-baseline="central" style="font-size:{}px">"#,
+        fmt_display(font_size),
+    );
+    let first_row = (1.0 - lines.len() as f64) / 2.0;
+    write_state_svg_label_rows(&mut out, lines, |idx| {
+        let y = (first_row + idx as f64) * font_size * 1.5;
+        format!(r#"x="0" y="{}""#, fmt_display(y))
+    });
+    out.push_str("</text>");
+    out
+}
+
+fn write_state_svg_label_rows(
+    out: &mut String,
+    lines: &[Vec<(String, crate::text::MermaidMarkdownWordType)>],
+    position: impl Fn(usize) -> String,
+) {
+    for (idx, words) in lines.iter().enumerate() {
         let _ = write!(
-            &mut out,
-            r#"<tspan class="text-outer-tspan row" x="0" y="{}em" dy="1.1em">"#,
-            fmt_display(y),
+            out,
+            r#"<tspan class="text-outer-tspan row" {}>"#,
+            position(idx),
         );
         for (index, (word, kind)) in words.iter().enumerate() {
             let font_style = if *kind == crate::text::MermaidMarkdownWordType::Em {
@@ -1022,18 +1058,16 @@ pub(super) fn state_svg_word_label(
             };
             let visible = crate::entities::decode_svg_text_content_entities(word);
             let _ = write!(
-                &mut out,
+                out,
                 r#"<tspan font-style="{font_style}" class="text-inner-tspan" font-weight="{font_weight}">"#
             );
             if index > 0 {
                 out.push(' ');
             }
-            let _ = write!(&mut out, "{}</tspan>", escape_xml_display(&visible));
+            let _ = write!(out, "{}</tspan>", escape_xml_display(&visible));
         }
         out.push_str("</tspan>");
     }
-    out.push_str("</text>");
-    out
 }
 
 #[cfg(test)]

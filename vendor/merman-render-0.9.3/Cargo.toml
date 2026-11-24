@@ -138,10 +138,6 @@ system-timing = ["merman-core/system-timing"]
 name = "merman_render"
 path = "src/lib.rs"
 
-[[example]]
-name = "er_svg"
-path = "examples/er_svg.rs"
-
 [dependencies.base64]
 version = "0.23.1"
 

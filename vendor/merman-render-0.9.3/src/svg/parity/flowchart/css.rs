@@ -49,7 +49,18 @@ fn flowchart_css_for_id(
     let cluster_border = theme.cluster_border.as_str();
     let tooltip_border = theme_token(effective_config, "border2", cluster_border);
 
-    let label_bkg = css_rgba_fade(edge_label_background, 0.5)?;
+    let reader_capsule =
+        crate::config::config_bool(effective_config, &["flowchart", "readerLabelPadding"])
+            == Some(true);
+    let (label_bkg, label_text_bkg, label_rect_opacity) = if reader_capsule {
+        ("transparent".to_owned(), "transparent", 1.0)
+    } else {
+        (
+            css_rgba_fade(edge_label_background, 0.5)?,
+            edge_label_background,
+            0.5,
+        )
+    };
     let id = diagram_id;
     let mut out = String::new();
     let _ = write!(
@@ -129,16 +140,7 @@ fn flowchart_css_for_id(
     checkpoint()?;
     let _ = write!(
         &mut out,
-        r#"#{} .edgeLabel{{background-color:{};text-align:center;}}#{} .edgeLabel p{{background-color:{};}}#{} .edgeLabel rect{{opacity:0.5;background-color:{};fill:{};}}#{} .labelBkg{{background-color:{};}}"#,
-        id,
-        edge_label_background,
-        id,
-        edge_label_background,
-        id,
-        edge_label_background,
-        edge_label_background,
-        id,
-        label_bkg
+        r#"#{id} .edgeLabel{{background-color:{label_text_bkg};text-align:center;}}#{id} .edgeLabel p{{background-color:{label_text_bkg};}}#{id} .edgeLabel rect{{opacity:{label_rect_opacity};background-color:{edge_label_background};fill:{edge_label_background};}}#{id} .labelBkg{{background-color:{label_bkg};}}"#
     );
     checkpoint()?;
     let _ = write!(
