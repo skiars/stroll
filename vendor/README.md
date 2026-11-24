@@ -27,6 +27,13 @@ example and benchmark targets. The application tests live in `tests/`.
   Run the `docs::tests::markdown_` reader tests and the `documents` and
   `smooth_scroll` integration tests.
 
+- Parsed SVGs supply intrinsic image sizes during layout and rasterize on a
+  background worker at the snapped device-pixel paint size. The shared cache
+  coalesces identical jobs, retains the previous raster during continuous
+  resizing, and removes evicted textures from the atlas. Markdown SVGs and
+  generated graphics use this path. Run the `document_svg_rasters_` and
+  `mermaid_reader_` reader tests.
+
 To upgrade, start from the corresponding published crates and reapply the
 local changes. Run `cargo test --release --locked` on Linux with a Vulkan or
 other supported WGPU adapter. A software Vulkan adapter also runs the
@@ -440,6 +447,11 @@ dialogs in a Wayland window after changes to paint order or focus handling.
   `stage_slot_covers_the_cell_and_hands_clicks_to_staging` library tests.
 
 ### Mermaid rendering
+
+Han characters and ideographic punctuation in SVGs first use a fallback
+face at the requested weight, style, and stretch. Emoji keep their own fallback.
+The SVG renderer tests cover the case where a heavier font is listed first,
+and the Mermaid reader offscreen test exercises the Chinese diagram fixture.
 
 `merman-render-0.9.3` is the published renderer with an opt-in reader presentation
 for ELK flowcharts. Decision nodes become rounded rectangles before layout.

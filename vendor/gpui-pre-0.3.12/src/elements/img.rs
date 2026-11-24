@@ -1,10 +1,10 @@
-use super::ImageThumbnails;
+use super::{ImageThumbnails, svg_rasters::SvgRasterCache};
 use crate::{
     AnyElement, AnyImageCache, App, Asset, AssetLogger, Bounds, DefiniteLength, Element, ElementId,
     Entity, GlobalElementId, Hitbox, Image, ImageCache, InspectorElementId, InteractiveElement,
-    Interactivity, IntoElement, LayoutId, Length, ObjectFit, Pixels, RenderImage, Resource,
-    SharedString, SharedUri, StyleRefinement, Styled, Task, Window, decode_gif_image,
-    decode_static_image, decode_webp_image, px,
+    Interactivity, IntoElement, LayoutId, Length, ObjectFit, ParsedSvg, Pixels, RenderImage,
+    Resource, SharedString, SharedUri, Size, StyleRefinement, Styled, Task, Window,
+    decode_gif_image, decode_static_image, decode_webp_image, px,
 };
 use anyhow::Result;
 
@@ -37,6 +37,33 @@ pub type ImgResourceLoader = AssetLogger<ImageAssetLoader>;
 type DeferredImageLoader =
     dyn Fn(bool, &mut Window, &mut App) -> Option<Result<Arc<RenderImage>, ImageCacheError>>;
 
+type DeferredImageContentLoader =
+    dyn Fn(bool, &mut Window, &mut App) -> Option<Result<ImageContent, ImageCacheError>>;
+
+/// The decoded content of an image, available for layout before it is painted.
+#[derive(Clone)]
+pub enum ImageContent {
+    /// A decoded raster image.
+    Raster(Arc<RenderImage>),
+    /// A vector image with a logical display size.
+    Svg(Arc<ParsedSvg>, Size<Pixels>),
+}
+
+impl ImageContent {
+    /// Use the parsed SVG's intrinsic logical size.
+    pub fn svg(svg: Arc<ParsedSvg>) -> Self {
+        let size = svg.size();
+        Self::Svg(svg, size)
+    }
+
+    fn raster(self) -> Option<Arc<RenderImage>> {
+        match self {
+            Self::Raster(image) => Some(image),
+            Self::Svg(..) => None,
+        }
+    }
+}
+
 /// A source of image content.
 #[derive(Clone)]
 pub enum ImageSource {
@@ -50,6 +77,10 @@ pub enum ImageSource {
     Custom(Arc<dyn Fn(&mut Window, &mut App) -> Option<Result<Arc<RenderImage>, ImageCacheError>>>),
     /// An image source whose loading starts only when a visible element is painted.
     Deferred(Arc<DeferredImageLoader>),
+    /// Decoded content containing either raster pixels or a parsed SVG.
+    Content(ImageContent),
+    /// A visible-only loader for raster or vector images.
+    DeferredContent(Arc<DeferredImageContentLoader>),
     /// 保留原始布局尺寸，按实际绘制尺寸生成缩略图。
     Fit(Arc<ImageSource>, Entity<ImageThumbnails>),
 }
@@ -117,6 +148,12 @@ impl From<Arc<RenderImage>> for ImageSource {
 impl From<Arc<Image>> for ImageSource {
     fn from(value: Arc<Image>) -> Self {
         Self::Image(value)
+    }
+}
+
+impl From<ImageContent> for ImageSource {
+    fn from(content: ImageContent) -> Self {
+        Self::Content(content)
     }
 }
 
@@ -344,44 +381,70 @@ impl Element for Img {
                         window,
                         cx,
                     ) {
-                        Some(Ok(data)) => {
-                            let frame_count = data.frame_count();
-                            let max_frame_index = frame_count.saturating_sub(1);
+                        Some(Ok(content)) => {
+                            let image_size = match content {
+                                ImageContent::Svg(_, size) => {
+                                    if let Some(state) = &mut state {
+                                        state.started_loading = None;
+                                        state.last_frame_time = None;
+                                        state.frame_index = 0;
+                                    }
+                                    frame_index = 0;
+                                    size
+                                }
+                                ImageContent::Raster(data) => {
+                                    let frame_count = data.frame_count();
+                                    let max_frame_index = frame_count.saturating_sub(1);
 
-                            if let Some(state) = &mut state {
-                                state.frame_index = state.frame_index.min(max_frame_index);
-                                if frame_count > 1 && !cx.reduce_motion() {
-                                    if window.is_window_active() {
-                                        let current_time = Instant::now();
-                                        if let Some(last_frame_time) = state.last_frame_time {
-                                            let elapsed = current_time - last_frame_time;
-                                            let frame_duration =
-                                                Duration::from(data.delay(state.frame_index));
+                                    if let Some(state) = &mut state {
+                                        state.frame_index = state.frame_index.min(max_frame_index);
+                                        if frame_count > 1 && !cx.reduce_motion() {
+                                            if window.is_window_active() {
+                                                let current_time = Instant::now();
+                                                if let Some(last_frame_time) = state.last_frame_time
+                                                {
+                                                    let elapsed = current_time - last_frame_time;
+                                                    let frame_duration = Duration::from(
+                                                        data.delay(state.frame_index),
+                                                    );
 
-                                            if elapsed >= frame_duration {
-                                                state.frame_index =
-                                                    (state.frame_index + 1) % frame_count;
-                                                state.last_frame_time =
-                                                    Some(current_time - (elapsed - frame_duration));
+                                                    if elapsed >= frame_duration {
+                                                        state.frame_index =
+                                                            (state.frame_index + 1) % frame_count;
+                                                        state.last_frame_time = Some(
+                                                            current_time
+                                                                - (elapsed - frame_duration),
+                                                        );
+                                                    }
+                                                } else {
+                                                    state.last_frame_time = Some(current_time);
+                                                }
+                                            } else {
+                                                state.last_frame_time = None;
                                             }
                                         } else {
-                                            state.last_frame_time = Some(current_time);
+                                            state.last_frame_time = None;
                                         }
-                                    } else {
-                                        state.last_frame_time = None;
+                                        state.started_loading = None;
+                                        frame_index = state.frame_index;
                                     }
-                                } else {
-                                    state.last_frame_time = None;
-                                }
-                                state.started_loading = None;
-                                frame_index = state.frame_index;
-                            }
 
-                            let image_size = if self.style.limit_intrinsic_size_to_device_pixels {
-                                let scale = window.scale_factor().max(data.scale_factor);
-                                data.size(frame_index).map(|dimension| px(i32::from(dimension) as f32 / scale))
-                            } else {
-                                data.render_size(frame_index)
+                                    if global_id.is_some()
+                                        && frame_count > 1
+                                        && window.is_window_active()
+                                        && !cx.reduce_motion()
+                                    {
+                                        window.request_animation_frame();
+                                    }
+                                    if self.style.limit_intrinsic_size_to_device_pixels {
+                                        let scale = window.scale_factor().max(data.scale_factor);
+                                        data.size(frame_index).map(|dimension| {
+                                            px(i32::from(dimension) as f32 / scale)
+                                        })
+                                    } else {
+                                        data.render_size(frame_index)
+                                    }
+                                }
                             };
 
                             if style.aspect_ratio.is_none() {
@@ -414,14 +477,6 @@ impl Element for Img {
                                     }
                                     _ => Length::Definite(image_size.height.into()),
                                 };
-                            }
-
-                            if global_id.is_some()
-                                && data.frame_count() > 1
-                                && window.is_window_active()
-                                && !cx.reduce_motion()
-                            {
-                                window.request_animation_frame();
                             }
                         }
                         Some(_err) => {
@@ -517,7 +572,7 @@ impl Element for Img {
                 if bounds.intersect(&window.content_mask().bounds).is_empty() {
                     return;
                 }
-                if let Some(Ok(data)) = source.load_data(
+                if let Some(Ok(content)) = source.load_data(
                     true,
                     self.image_cache
                         .clone()
@@ -525,6 +580,36 @@ impl Element for Img {
                     window,
                     cx,
                 ) {
+                    let data = match content {
+                        ImageContent::Raster(data) => data,
+                        ImageContent::Svg(svg, intrinsic) => {
+                            let image_bounds = window.pixel_snap_bounds(
+                                self.style.object_fit.get_bounds_for_size(bounds, intrinsic),
+                            );
+                            let bounds = window.pixel_snap_bounds(bounds);
+                            if let Some(image) = SvgRasterCache::for_bounds(
+                                svg,
+                                image_bounds,
+                                bounds,
+                                global_id,
+                                window,
+                                cx,
+                            ) {
+                                window
+                                    .paint_image_with_sampling(
+                                        bounds,
+                                        image_bounds,
+                                        style.corner_radii.to_pixels(window.rem_size()),
+                                        image,
+                                        0,
+                                        self.style.grayscale,
+                                        self.style.sampling,
+                                    )
+                                    .log_err();
+                            }
+                            return;
+                        }
+                    };
                     if data.frame_count() == 0 {
                         return;
                     }
@@ -535,7 +620,8 @@ impl Element for Img {
                         .get_bounds(bounds, data.size(frame_index));
                     let (data, frame_index) = match &source {
                         ImageSource::Fit(_, thumbnails)
-                            if data.frame_count() == 1 && self.style.sampling == ImageSampling::Linear =>
+                            if data.frame_count() == 1
+                                && self.style.sampling == ImageSampling::Linear =>
                         {
                             let Some(image) = ImageThumbnails::for_bounds(
                                 thumbnails, data, new_bounds, window, cx,
@@ -603,6 +689,15 @@ impl ImageSource {
         Self::Deferred(Arc::new(load))
     }
 
+    /// Creates a source that exposes the intrinsic size of a parsed SVG during layout.
+    /// The loader should only start work when called with `visible` set.
+    pub fn deferred_content(
+        load: impl Fn(bool, &mut Window, &mut App) -> Option<Result<ImageContent, ImageCacheError>>
+        + 'static,
+    ) -> Self {
+        Self::DeferredContent(Arc::new(load))
+    }
+
     pub(crate) fn use_data(
         &self,
         cache: Option<AnyImageCache>,
@@ -610,6 +705,7 @@ impl ImageSource {
         cx: &mut App,
     ) -> Option<Result<Arc<RenderImage>, ImageCacheError>> {
         self.load_data(true, cache, window, cx)
+            .and_then(|content| content.map(ImageContent::raster).transpose())
     }
 
     fn load_data(
@@ -618,8 +714,8 @@ impl ImageSource {
         cache: Option<AnyImageCache>,
         window: &mut Window,
         cx: &mut App,
-    ) -> Option<Result<Arc<RenderImage>, ImageCacheError>> {
-        match self {
+    ) -> Option<Result<ImageContent, ImageCacheError>> {
+        let raster = match self {
             ImageSource::Resource(resource) => {
                 if let Some(cache) = cache {
                     cache.load(resource, window, cx)
@@ -631,8 +727,11 @@ impl ImageSource {
             ImageSource::Render(data) => Some(Ok(data.to_owned())),
             ImageSource::Image(data) => window.use_asset::<AssetLogger<ImageDecoder>>(data, cx),
             ImageSource::Deferred(load) => load(visible, window, cx),
-            ImageSource::Fit(source, _) => source.load_data(visible, cache, window, cx),
-        }
+            ImageSource::Content(content) => return Some(Ok(content.clone())),
+            ImageSource::DeferredContent(load) => return load(visible, window, cx),
+            ImageSource::Fit(source, _) => return source.load_data(visible, cache, window, cx),
+        };
+        raster.map(|result| result.map(ImageContent::Raster))
     }
 
     pub(crate) fn get_data(
@@ -653,6 +752,9 @@ impl ImageSource {
             ImageSource::Render(data) => Some(Ok(data.to_owned())),
             ImageSource::Image(data) => window.get_asset::<AssetLogger<ImageDecoder>>(data, cx),
             ImageSource::Deferred(load) => load(false, window, cx),
+            ImageSource::Content(content) => content.clone().raster().map(Ok),
+            ImageSource::DeferredContent(load) => load(false, window, cx)
+                .and_then(|content| content.map(ImageContent::raster).transpose()),
             ImageSource::Fit(source, _) => source.get_data(cache, window, cx),
         }
     }
@@ -663,7 +765,11 @@ impl ImageSource {
             ImageSource::Resource(resource) => {
                 cx.remove_asset::<ImgResourceLoader>(resource);
             }
-            ImageSource::Custom(_) | ImageSource::Deferred(_) | ImageSource::Render(_) => {}
+            ImageSource::Custom(_)
+            | ImageSource::Deferred(_)
+            | ImageSource::Render(_)
+            | ImageSource::Content(_)
+            | ImageSource::DeferredContent(_) => {}
             ImageSource::Image(data) => cx.remove_asset::<AssetLogger<ImageDecoder>>(data),
             ImageSource::Fit(source, _) => source.remove_asset(cx),
         }
@@ -675,7 +781,11 @@ impl ImageSource {
     pub fn is_asset_cached(&self, cx: &App) -> bool {
         match self {
             ImageSource::Resource(resource) => cx.has_asset::<ImgResourceLoader>(resource),
-            ImageSource::Custom(_) | ImageSource::Deferred(_) | ImageSource::Render(_) => false,
+            ImageSource::Custom(_)
+            | ImageSource::Deferred(_)
+            | ImageSource::Render(_)
+            | ImageSource::Content(_)
+            | ImageSource::DeferredContent(_) => false,
             ImageSource::Image(data) => cx.has_asset::<AssetLogger<ImageDecoder>>(data),
             ImageSource::Fit(source, _) => source.is_asset_cached(cx),
         }

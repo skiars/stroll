@@ -10,6 +10,7 @@ mod img;
 mod list;
 mod surface;
 mod svg;
+mod svg_rasters;
 mod text;
 mod uniform_list;
 
@@ -25,5 +26,7 @@ pub use img::*;
 pub use list::*;
 pub use surface::*;
 pub use svg::*;
+#[cfg(any(test, feature = "test-support"))]
+pub use svg_rasters::svg_raster_stats;
 pub use text::*;
 pub use uniform_list::*;

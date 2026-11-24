@@ -46,7 +46,17 @@ impl ObjectFit {
         bounds: Bounds<Pixels>,
         image_size: Size<DevicePixels>,
     ) -> Bounds<Pixels> {
-        let image_size = image_size.map(|dimension| Pixels::from(u32::from(dimension)));
+        self.get_bounds_for_size(
+            bounds,
+            image_size.map(|dimension| Pixels::from(u32::from(dimension))),
+        )
+    }
+
+    pub(crate) fn get_bounds_for_size(
+        &self,
+        bounds: Bounds<Pixels>,
+        image_size: Size<Pixels>,
+    ) -> Bounds<Pixels> {
         let image_ratio = image_size.width / image_size.height;
         let bounds_ratio = bounds.size.width / bounds.size.height;
 

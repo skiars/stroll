@@ -3151,6 +3151,12 @@ impl Window {
         &self.rendered_frame.scene
     }
 
+    /// Returns the images in the most recently rendered frame.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn painted_images(&self) -> &[crate::PolychromeSprite] {
+        &self.rendered_frame.scene.polychrome_sprites
+    }
+
     /// Returns the quads in the most recently rendered frame's scene, so tests can assert on
     /// painted output without rasterizing the frame. Quad bounds are in scaled pixels and are
     /// not clipped; each quad carries the content mask it will be clipped to when drawn. Quads

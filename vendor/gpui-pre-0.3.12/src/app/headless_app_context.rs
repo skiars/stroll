@@ -161,6 +161,26 @@ impl HeadlessAppContext {
         app.update_window(window, f)
     }
 
+    /// Simulates moving a headless window to a display with the given scale.
+    pub fn simulate_scale_factor_change(
+        &mut self,
+        window: AnyWindowHandle,
+        scale: f32,
+    ) -> Result<()> {
+        let test_window = self
+            .app
+            .borrow_mut()
+            .windows
+            .get_mut(window.window_id())
+            .and_then(Option::as_mut)
+            .and_then(|window| window.platform_window.as_test())
+            .cloned();
+        let mut test_window =
+            test_window.ok_or_else(|| anyhow::anyhow!("Headless window not found"))?;
+        test_window.simulate_scale_factor_change(scale);
+        Ok(())
+    }
+
     /// Captures a screenshot from a window.
     ///
     /// Requires that the context was created with a renderer factory that

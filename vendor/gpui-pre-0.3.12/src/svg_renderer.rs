@@ -1,5 +1,5 @@
 use crate::{
-    AssetSource, DevicePixels, IsZero, RenderImage, Result, SharedString, Size,
+    AssetSource, DevicePixels, IsZero, Pixels, RenderImage, Result, SharedString, Size, px, size,
     swap_rgba_pa_to_bgra,
 };
 use image::Frame;
@@ -7,7 +7,10 @@ use resvg::tiny_skia::Pixmap;
 use smallvec::SmallVec;
 use std::{
     hash::Hash,
-    sync::{Arc, LazyLock, OnceLock},
+    sync::{
+        Arc, LazyLock, OnceLock,
+        atomic::{AtomicUsize, Ordering},
+    },
 };
 
 #[cfg(target_os = "macos")]
@@ -37,6 +40,29 @@ fn is_emoji_presentation(c: char) -> bool {
         LazyLock::new(|| regex::Regex::new("\\p{Emoji_Presentation}").unwrap());
     let mut buf = [0u8; 4];
     EMOJI_PRESENTATION_REGEX.is_match(c.encode_utf8(&mut buf))
+}
+
+fn uses_han_fallback(ch: char) -> bool {
+    static HAN: LazyLock<regex::Regex> =
+        LazyLock::new(|| regex::Regex::new(r"\A\p{scx=Han}\z").unwrap());
+    HAN.is_match(ch.encode_utf8(&mut [0; 4]))
+}
+
+fn select_weight_matched_font(
+    ch: char,
+    used_fonts: &[usvg::fontdb::ID],
+    db: &usvg::fontdb::Database,
+) -> Option<usvg::fontdb::ID> {
+    let requested = db.face(*used_fonts.first()?)?;
+    db.faces()
+        .find(|face| {
+            face.weight == requested.weight
+                && face.style == requested.style
+                && face.stretch == requested.stretch
+                && !used_fonts.contains(&face.id)
+                && font_has_char(db, face.id, ch)
+        })
+        .map(|face| face.id)
 }
 
 fn font_has_char(db: &usvg::fontdb::Database, id: usvg::fontdb::ID, ch: char) -> bool {
@@ -100,7 +126,26 @@ pub struct SvgRenderer {
 /// [`SvgRenderer::render_parsed`]. Parsing resolves fonts and converts text
 /// to paths, so callers that need to rasterize the same SVG at multiple
 /// scales should retain this value to avoid re-paying the parse cost.
-pub struct ParsedSvg(usvg::Tree);
+pub struct ParsedSvg {
+    pub(crate) id: usize,
+    tree: usvg::Tree,
+}
+
+impl ParsedSvg {
+    fn new(tree: usvg::Tree) -> Self {
+        static NEXT_ID: AtomicUsize = AtomicUsize::new(0);
+        Self {
+            id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
+            tree,
+        }
+    }
+
+    /// The SVG's intrinsic logical size, independent of the display scale.
+    pub fn size(&self) -> Size<Pixels> {
+        let intrinsic = self.tree.size();
+        size(px(intrinsic.width()), px(intrinsic.height()))
+    }
+}
 
 /// The size in which to rasterize the SVG.
 #[derive(Clone, Copy)]
@@ -170,6 +215,13 @@ impl SvgRenderer {
                     }
                 }
 
+                // usvg's fallback can choose a heavier face solely because it appears first.
+                if uses_han_fallback(ch)
+                    && let Some(id) = select_weight_matched_font(ch, fonts, db)
+                {
+                    return Some(id);
+                }
+
                 default_fallback_selection(ch, fonts, db)
             },
         );
@@ -188,7 +240,7 @@ impl SvgRenderer {
 
     /// Parses SVG data into a [`ParsedSvg`] that can be rasterized at any scale.
     pub fn parse_svg(&self, bytes: &[u8]) -> Result<ParsedSvg, usvg::Error> {
-        usvg::Tree::from_data(bytes, &self.usvg_options).map(ParsedSvg)
+        usvg::Tree::from_data(bytes, &self.usvg_options).map(ParsedSvg::new)
     }
 
     /// Rasterizes a previously parsed SVG into an image buffer.
@@ -205,7 +257,7 @@ impl SvgRenderer {
                 SMOOTH_SVG_SCALE_FACTOR,
             ),
         };
-        let pixmap = rasterize_tree(&svg.0, size)?;
+        let pixmap = rasterize_tree(&svg.tree, size)?;
         let mut buffer =
             image::ImageBuffer::from_raw(pixmap.width(), pixmap.height(), pixmap.take()).unwrap();
 
@@ -228,16 +280,13 @@ impl SvgRenderer {
         self.render_parsed(&svg, scale_factor)
     }
 
-    /// Renders a standalone SVG without resolving embedded or external images.
-    /// Bounds both raster dimensions by `max_dimension` in device pixels.
-    pub fn render_standalone_svg(
-        &self,
-        source: &str,
-        max_dimension: u32,
-    ) -> Result<Arc<RenderImage>, usvg::Error> {
+    /// Parses a standalone SVG without resolving embedded or external images.
+    pub fn parse_standalone_svg(&self, source: &str) -> Result<ParsedSvg, usvg::Error> {
         let options = usvg::Options {
             font_resolver: usvg::FontResolver {
-                select_font: Box::new(|font, db| (self.usvg_options.font_resolver.select_font)(font, db)),
+                select_font: Box::new(|font, db| {
+                    (self.usvg_options.font_resolver.select_font)(font, db)
+                }),
                 select_fallback: Box::new(|ch, excluded, db| {
                     (self.usvg_options.font_resolver.select_fallback)(ch, excluded, db)
                 }),
@@ -254,14 +303,24 @@ impl SvgRenderer {
         };
         let document = usvg::roxmltree::Document::parse_with_options(source, xml_options)
             .map_err(usvg::Error::ParsingFailed)?;
-        let tree = usvg::Tree::from_xmltree(&document, &options)?;
-        let size = tree.size();
+        usvg::Tree::from_xmltree(&document, &options).map(ParsedSvg::new)
+    }
+
+    /// Renders a standalone SVG without resolving embedded or external images.
+    /// Bounds both raster dimensions by `max_dimension` in device pixels.
+    pub fn render_standalone_svg(
+        &self,
+        source: &str,
+        max_dimension: u32,
+    ) -> Result<Arc<RenderImage>, usvg::Error> {
+        let svg = self.parse_standalone_svg(source)?;
+        let size = svg.tree.size();
         let scale = (max_dimension as f32 / size.width().max(size.height())).min(1.0);
         let dimensions = Size::new(
             DevicePixels((size.width() * scale).round().max(1.0) as i32),
             DevicePixels((size.height() * scale).round().max(1.0) as i32),
         );
-        self.render_parsed(&ParsedSvg(tree), SvgSize::ExactSize(dimensions))
+        self.render_parsed(&svg, SvgSize::ExactSize(dimensions))
     }
 
     pub(crate) fn render_alpha_mask(
@@ -539,6 +598,44 @@ mod tests {
         assert_eq!(selected, lilex);
         assert!(!font_has_char(&db, ibm_plex_sans, '│'));
         assert!(font_has_char(&db, selected, '│'));
+    }
+
+    #[test]
+    fn han_fallback_includes_ideographic_punctuation() {
+        for ch in ['中', '漢', '。'] {
+            assert!(uses_han_fallback(ch), "{ch}");
+        }
+        for ch in ['a', 'カ', '😀'] {
+            assert!(!uses_han_fallback(ch), "{ch}");
+        }
+    }
+
+    #[test]
+    fn svg_fallback_prefers_the_requested_weight_to_database_order() {
+        use usvg::fontdb::Weight;
+
+        let bundled = db_with_bundled_fonts();
+        let face = |name| {
+            let id = bundled
+                .query(&Query {
+                    families: &[Family::Name(name)],
+                    ..Default::default()
+                })
+                .unwrap();
+            bundled.face(id).unwrap().clone()
+        };
+        let mut db = Database::new();
+        let base = db.push_face_info(face("IBM Plex Sans"));
+        let mut heavier = face("Lilex");
+        heavier.weight = Weight(900);
+        let heavy = db.push_face_info(heavier);
+        let regular = db.push_face_info(face("Lilex"));
+
+        assert!(!font_has_char(&db, base, '│'));
+        assert!(font_has_char(&db, heavy, '│'));
+        assert_eq!(select_weight_matched_font('│', &[base], &db), Some(regular));
+        assert_eq!(select_weight_matched_font('│', &[heavy], &db), None);
+        assert_eq!(select_weight_matched_font('│', &[base, regular], &db), None);
     }
 
     #[test]
