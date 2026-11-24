@@ -60,13 +60,10 @@ impl Workspace {
         document: &Document,
         editor: &mut EditorState,
     ) -> Result<()> {
-        if document.conflict {
-            return Ok(());
-        }
         if let Some(saved) = self
             .store
             .read_editor_history(self.repository.as_deref(), path)?
-            && saved.baseline == document.draft_baseline()
+            && saved.baseline == document.edit_baseline()
             && saved.buffer == <[u8; 32]>::from(Sha256::digest(document.text.as_bytes()))
         {
             editor.restore_edit_history(&saved.history)?;
@@ -78,7 +75,7 @@ impl Workspace {
         let mut files = self
             .files
             .values()
-            .filter(|file| file.pending_draft && !file.document.conflict && !file.missing)
+            .filter(|file| file.pending_draft && !file.missing)
             .collect::<Vec<_>>();
         files.sort_unstable_by(|a, b| a.path.cmp(&b.path));
         let mut updates = Vec::new();
@@ -97,7 +94,7 @@ impl Workspace {
                     key: self
                         .store
                         .edit_history_key(self.repository.as_deref(), &file.path),
-                    baseline: file.document.draft_baseline(),
+                    baseline: file.document.edit_baseline(),
                     buffer: Sha256::digest(text.as_bytes()).into(),
                     draft: (editor.text() != &file.saved).then_some(text),
                     history,
@@ -111,10 +108,7 @@ impl Workspace {
 
     pub(super) fn queue_drafts(&mut self, window: &Window, cx: &mut Context<Self>) {
         if !self.files.values().any(|file| {
-            file.pending_draft
-                && !file.document.conflict
-                && !file.missing
-                && file.queued_revision != Some(file.revision)
+            file.pending_draft && !file.missing && file.queued_revision != Some(file.revision)
         }) {
             return;
         }

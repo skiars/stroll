@@ -550,6 +550,7 @@ pub struct Document {
     bom: bool,
     crlf: bool,
     baseline: [u8; 32],
+    recovered_baseline: Option<[u8; 32]>,
 }
 
 impl Document {
@@ -570,6 +571,7 @@ impl Document {
         if let Some(draft) = draft.filter(|draft| draft.text != self.saved_text) {
             self.restored = true;
             self.conflict = draft.baseline != self.baseline;
+            self.recovered_baseline = self.conflict.then_some(draft.baseline);
             self.text = draft.text;
         }
     }
@@ -584,7 +586,7 @@ impl Document {
 
     #[cfg(feature = "desktop")]
     pub(crate) fn read_for_sync(repo: Option<&Repository>, path: &Path) -> Result<Option<Self>> {
-        if let Some(repo) = repo {
+        if let Some(repo) = repo.filter(|_| !path.is_absolute()) {
             return repo.bytes_if_present(path)?.map(Self::decode).transpose();
         }
         match Self::read_local(path) {
@@ -627,6 +629,7 @@ impl Document {
             bom,
             crlf,
             baseline,
+            recovered_baseline: None,
         })
     }
 
@@ -638,11 +641,7 @@ impl Document {
         text: &str,
         dirty: bool,
     ) -> Result<()> {
-        // A recovered conflict keeps the original draft and its baseline.
-        if dirty && self.conflict {
-            return Ok(());
-        }
-        store.write_draft(repo, path, self.baseline, text, dirty)
+        store.write_draft(repo, path, self.edit_baseline(), text, dirty)
     }
 
     #[cfg(feature = "desktop")]
@@ -664,6 +663,21 @@ impl Document {
 
     pub(crate) fn draft_baseline(&self) -> [u8; 32] {
         self.baseline
+    }
+
+    pub(crate) fn edit_baseline(&self) -> [u8; 32] {
+        self.recovered_baseline.unwrap_or(self.baseline)
+    }
+
+    #[cfg(feature = "desktop")]
+    pub(crate) fn matches_recovered_baseline(expected: [u8; 32], text: &str) -> bool {
+        // A recovered draft only stores the original file hash. The current
+        // disk version may use a different BOM or newline convention.
+        let crlf = text.replace('\n', "\r\n");
+        [text, crlf.as_str()].into_iter().any(|text| {
+            digest(text.as_bytes()) == expected
+                || digest(format!("\u{feff}{text}").as_bytes()) == expected
+        })
     }
 
     pub(crate) fn encode_text(&self, text: &str) -> Vec<u8> {
@@ -730,6 +744,7 @@ impl Document {
         self.saved_text = text.to_owned();
         self.baseline = new_baseline;
         self.restored = false;
+        self.recovered_baseline = None;
         Ok(())
     }
 }

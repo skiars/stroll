@@ -9,8 +9,119 @@ use crate::{
     remote::Request,
     repository::files::{DocumentBatch, DocumentScan},
 };
+use gpui_component::input::RopeExt as _;
+use similar::{DiffTag, TextDiff};
+use std::ops::Range;
 
 static NEXT_DOCUMENT_SCAN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+pub(super) struct ReloadEdits {
+    before: Rope,
+    edits: Vec<(Range<usize>, String)>,
+    changes: Vec<(Range<usize>, usize)>,
+}
+
+impl ReloadEdits {
+    pub(super) fn new(before: Rope, after: &str) -> Self {
+        let original = before.to_string();
+        let diff = TextDiff::configure()
+            .timeout(Duration::from_millis(25))
+            .diff_lines(original.as_str(), after);
+        let mut edits = Vec::new();
+        let mut offset = 0;
+        for op in diff.ops() {
+            let old = &diff.old_slices()[op.old_range()];
+            if op.tag() != DiffTag::Equal {
+                let new = &diff.new_slices()[op.new_range()];
+                let (range, text) = editor_git::restore_text_edit(&old.concat(), &new.concat());
+                edits.push((offset + range.start..offset + range.end, text));
+            }
+            offset += old.iter().map(|line| line.len()).sum::<usize>();
+        }
+        let changes = language_actions::language_edit_changes(&before, &edits);
+        Self {
+            before,
+            edits,
+            changes,
+        }
+    }
+
+    fn apply(&self, editor: &mut EditorState, window: &mut Window, cx: &mut Context<EditorState>) {
+        let viewport = editor.viewport_anchor();
+        let scroll = editor.scroll_offset();
+        let map = |after: &Rope, offset, right| {
+            language_actions::map_language_edit_offset(
+                &self.before,
+                after,
+                &self.changes,
+                offset,
+                right,
+            )
+        };
+        editor.edit_ranges_mapping_selection_ranges(
+            &self.edits,
+            None,
+            |after, selection| {
+                let start = map(after, selection.start, true);
+                let end = if selection.is_empty() {
+                    start
+                } else {
+                    map(after, selection.end, false).max(start)
+                };
+                start..end
+            },
+            window,
+            cx,
+        );
+        if let Some((position, inset)) = viewport {
+            let offset = map(
+                editor.text(),
+                self.before.position_to_offset(&position),
+                true,
+            );
+            editor.restore_viewport_anchor(
+                editor.text().offset_to_position(offset),
+                inset,
+                scroll.x,
+                cx,
+            );
+        } else {
+            editor.set_scroll_offset(scroll, cx);
+        }
+    }
+}
+
+impl OpenFile {
+    pub(super) fn apply_synced_document(
+        &mut self,
+        disk: Document,
+        reload: Option<ReloadEdits>,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        self.saved = Rope::from(disk.saved_text.as_str());
+        self.committed = if reload.is_some() {
+            self.saved.clone()
+        } else {
+            self.editor.read(cx).text().clone()
+        };
+        self.document = disk;
+        self.unconfirmed_save = None;
+        self.external = None;
+        self.missing = false;
+        self.dirty = self.committed != self.saved;
+        self.pending_draft = true;
+        self.revision += 1;
+        if let Some(reload) = reload {
+            self.editor
+                .update(cx, |editor, cx| reload.apply(editor, window, cx));
+        }
+        if let Some(server) = &self.language_server {
+            server.document.changed(self.committed.clone());
+            server.document.saved(self.saved.clone());
+        }
+    }
+}
 
 impl Workspace {
     pub(super) fn reset_workspace_tree(&mut self, cx: &mut Context<Self>) {
@@ -877,7 +988,7 @@ impl Workspace {
         });
     }
 
-    fn sync_document_paths(
+    pub(super) fn sync_document_paths(
         &mut self,
         paths: Vec<PathBuf>,
         window: &mut Window,
@@ -887,12 +998,17 @@ impl Workspace {
             .into_iter()
             .filter_map(|path| {
                 let file = self.files.get_mut(&path)?;
+                let before = file.editor.read(cx).text().clone();
+                let clean = before == file.saved;
                 file.sync_revision += 1;
                 Some((
                     path,
                     file.editor.entity_id(),
                     file.document.draft_baseline(),
+                    file.document.edit_baseline(),
                     file.sync_revision,
+                    before,
+                    clean,
                 ))
             })
             .collect::<Vec<_>>();
@@ -904,10 +1020,27 @@ impl Workspace {
         let read = cx.background_spawn(async move {
             paths
                 .into_iter()
-                .map(|(path, editor, baseline, revision)| {
-                    let disk = Document::read_for_sync(repo.as_deref(), &path);
-                    (path, editor, baseline, revision, disk)
-                })
+                .map(
+                    |(path, editor, baseline, edit_baseline, revision, before, clean)| {
+                        let disk = Document::read_for_sync(repo.as_deref(), &path);
+                        let recovered = (!clean
+                            && baseline != edit_baseline
+                            && Document::matches_recovered_baseline(
+                                edit_baseline,
+                                &before.to_string(),
+                            ))
+                        .then(|| before.clone());
+                        let reload = disk
+                            .as_ref()
+                            .ok()
+                            .and_then(Option::as_ref)
+                            .filter(|disk| {
+                                (clean || recovered.is_some()) && before != disk.saved_text.as_str()
+                            })
+                            .map(|disk| ReloadEdits::new(before, &disk.saved_text));
+                        (path, editor, baseline, revision, disk, reload, recovered)
+                    },
+                )
                 .collect::<Vec<_>>()
         });
         cx.spawn_in(window, async move |this, cx| {
@@ -923,7 +1056,7 @@ impl Workspace {
                 }
                 let mut changed = false;
                 let mut retry = Vec::new();
-                for (path, editor_id, baseline, revision, disk) in documents {
+                for (path, editor_id, baseline, revision, disk, reload, recovered) in documents {
                     let Some(file) = this.files.get_mut(&path).filter(|file| {
                         file.editor.entity_id() == editor_id && file.sync_revision == revision
                     }) else {
@@ -944,6 +1077,7 @@ impl Workspace {
                             if !file.missing {
                                 changed = true;
                                 file.missing = true;
+                                file.external = None;
                                 if let Some(panel) = &this.git {
                                     panel.update(cx, |panel, cx| {
                                         panel.repository_source_changed(path, cx)
@@ -955,70 +1089,54 @@ impl Workspace {
                         Err(_) => continue,
                     };
                     let was_missing = file.missing;
-                    changed |= was_missing;
-                    file.missing = false;
-                    // A recovered conflict already loaded the newer disk baseline.
-                    // A matching file event must not unlock the original draft.
                     if disk.draft_baseline() == baseline
-                        && !(file.document.restored && file.document.conflict)
+                        && !was_missing
+                        && !file.document.conflict
+                        && file.unconfirmed_save.is_none()
                     {
-                        if was_missing || file.document.conflict {
-                            file.document.conflict = false;
-                            changed = true;
-                            if let Some(panel) = &this.git {
-                                panel.update(cx, |panel, cx| {
-                                    panel.repository_source_changed(path, cx)
-                                });
-                            }
-                        }
                         continue;
                     }
-                    if editor.text() != &file.saved && editor.text() != disk.saved_text.as_str() {
-                        if !file.document.conflict {
-                            if file.committed != *editor.text() {
-                                file.committed = editor.text().clone();
-                                file.pending_draft = true;
-                                file.revision += 1;
-                            }
-                            if file.flush_draft(origin.as_deref(), &this.store).is_ok() {
-                                file.document.conflict = true;
-                                file.document.restored = false;
-                                changed = true;
-                                if let Some(panel) = &this.git {
-                                    panel.update(cx, |panel, cx| {
-                                        panel.repository_source_changed(path, cx)
-                                    });
-                                }
-                            }
+                    let clean =
+                        editor.text() == &file.saved || recovered.as_ref() == Some(editor.text());
+                    let matches_disk = editor.text() == disk.saved_text.as_str();
+                    let disk_matches_baseline =
+                        disk.draft_baseline() == file.document.edit_baseline();
+                    let confirmed = file
+                        .unconfirmed_save
+                        .as_ref()
+                        .is_some_and(|text| text == disk.saved_text.as_str());
+                    if !clean && !matches_disk && !disk_matches_baseline && !confirmed {
+                        let new_conflict = !file.document.conflict;
+                        file.missing = false;
+                        file.unconfirmed_save = None;
+                        file.document.conflict = true;
+                        let disk_baseline = disk.draft_baseline();
+                        if file
+                            .external
+                            .as_ref()
+                            .is_none_or(|(baseline, _)| *baseline != disk_baseline)
+                        {
+                            file.external =
+                                Some((disk_baseline, Rope::from(disk.saved_text.as_str())));
                         }
-                        continue;
+                        if !new_conflict && !was_missing {
+                            continue;
+                        }
+                    } else {
+                        let reload = if clean && !matches_disk && !confirmed {
+                            let Some(reload) =
+                                reload.filter(|reload| &reload.before == editor.text())
+                            else {
+                                retry.push((path, editor_id, revision));
+                                continue;
+                            };
+                            Some(reload)
+                        } else {
+                            None
+                        };
+                        file.apply_synced_document(disk, reload, window, cx);
                     }
                     changed = true;
-                    let text = disk.saved_text.clone();
-                    let update_editor = editor.text() != text.as_str();
-                    let persist = file.is_dirty();
-                    file.saved = Rope::from(text.as_str());
-                    file.committed = file.saved.clone();
-                    if update_editor {
-                        file.editor.update(cx, |editor, cx| {
-                            let selection = editor.selected_range();
-                            let reversed = editor.is_selection_reversed();
-                            let scroll = editor.scroll_offset();
-                            editor.set_value(text, window, cx);
-                            let start = selection.start.min(editor.text().len());
-                            let end = selection.end.min(editor.text().len());
-                            editor.set_selected_range_with_direction(start..end, reversed, cx);
-                            editor.set_scroll_offset(scroll, cx);
-                        });
-                    }
-                    file.document = disk;
-                    file.dirty = false;
-                    file.pending_draft = persist;
-                    file.revision += 1;
-                    if let Some(server) = &file.language_server {
-                        server.document.changed(file.saved.clone());
-                        server.document.saved(file.saved.clone());
-                    }
                     if let Some(panel) = &this.git {
                         panel.update(cx, |panel, cx| panel.repository_source_changed(path, cx));
                     }
@@ -1026,10 +1144,9 @@ impl Workspace {
                 if changed {
                     this.queue_drafts(window, cx);
                     if this.view == WorkspaceView::Editor {
-                        if this
-                            .active_file()
-                            .is_some_and(|file| this.file_editor_locked(file))
-                        {
+                        if this.active_file().is_some_and(|file| {
+                            file.document.conflict || this.file_editor_locked(file)
+                        }) {
                             this.language_format = Task::ready(());
                         }
                         this.watch_editor_git(window, cx);

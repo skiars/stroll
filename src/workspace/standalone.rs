@@ -693,25 +693,75 @@ fn standalone_editor_syncs_external_replacements_and_retains_draft_conflicts() -
     settle(&mut visual, &workspace, &|this, _| {
         this.repository_watch_active && this.active_file().is_some()
     });
-    replace("External edit\n")?;
+    visual.simulate_keystrokes("end");
+    replace("\u{feff}External edit\r\nOriginal\r\n")?;
     settle(&mut visual, &workspace, &|this, cx| {
-        this.active_file()
-            .is_some_and(|file| file.editor.read(cx).text() == "External edit\n")
+        this.active_file().is_some_and(|file| {
+            let editor = file.editor.read(cx);
+            editor.text() == "External edit\nOriginal\n"
+                && editor.cursor_position() == lsp_types::Position::new(1, 8)
+        })
+    });
+    visual.simulate_input("!");
+    let read = |visual: &mut VisualTestContext, workspace: &Entity<Workspace>| {
+        visual.update(|_, cx| {
+            workspace
+                .read(cx)
+                .active_file()
+                .unwrap()
+                .editor
+                .read(cx)
+                .text()
+                .clone()
+        })
+    };
+    assert_eq!(read(&mut visual, &workspace), "External edit\nOriginal!\n");
+    let replay = |visual: &mut VisualTestContext, undo| {
+        visual.update(|window, cx| {
+            if undo {
+                window.dispatch_action(Box::new(gpui_component::input::Undo), cx);
+            } else {
+                window.dispatch_action(Box::new(gpui_component::input::Redo), cx);
+            }
+        });
+        visual.run_until_parked();
+    };
+    replay(&mut visual, true);
+    replay(&mut visual, true);
+    assert_eq!(read(&mut visual, &workspace), "Original\n");
+    replay(&mut visual, false);
+    assert_eq!(read(&mut visual, &workspace), "External edit\nOriginal\n");
+    visual.update(|window, cx| {
+        window.dispatch_action(Box::new(gpui_component::input::MoveToStart), cx);
     });
     visual.simulate_input("Draft: ");
     replace("Different disk contents\n")?;
-    let conflict = |this: &Workspace, cx: &App| {
-        this.active_file().is_some_and(|file| {
-            file.document.conflict && file.editor.read(cx).text() == "Draft: External edit\n"
-        })
+    let conflict = |this: &Workspace, cx: &App, expected: &str| {
+        this.active_file()
+            .is_some_and(|file| file.document.conflict && file.editor.read(cx).text() == expected)
     };
-    settle(&mut visual, &workspace, &conflict);
+    settle(&mut visual, &workspace, &|this, cx| {
+        conflict(this, cx, "Draft: External edit\nOriginal\n")
+    });
+    visual.simulate_keystrokes("end");
+    visual.simulate_input(" more");
+    assert_eq!(
+        read(&mut visual, &workspace),
+        "Draft: External edit more\nOriginal\n"
+    );
     assert_eq!(fs::read_to_string(&path)?, "Different disk contents\n");
-    visual.update(|window, _| window.remove_window());
+    visual.update(|window, cx| {
+        workspace
+            .update(cx, |this, cx| this.flush_drafts(cx))
+            .unwrap();
+        window.remove_window()
+    });
 
     let (workspace, mut visual) = open(&mut app)?;
+    let recovered =
+        |this: &Workspace, cx: &App| conflict(this, cx, "Draft: External edit more\nOriginal\n");
     settle(&mut visual, &workspace, &|this, cx| {
-        this.repository_watch_active && conflict(this, cx)
+        this.repository_watch_active && recovered(this, cx)
     });
     let revision = visual.update(|_, cx| workspace.read(cx).active_file().unwrap().sync_revision);
     replace("Different disk contents\n")?;
@@ -720,6 +770,17 @@ fn standalone_editor_syncs_external_replacements_and_retains_draft_conflicts() -
             .is_some_and(|file| file.sync_revision > revision)
     });
     visual.run_until_parked();
-    assert!(visual.update(|_, cx| conflict(workspace.read(cx), cx)));
+    assert!(visual.update(|_, cx| recovered(workspace.read(cx), cx)));
+    replay(&mut visual, true);
+    assert_eq!(
+        read(&mut visual, &workspace),
+        "Draft: External edit\nOriginal\n"
+    );
+    replay(&mut visual, true);
+    settle(&mut visual, &workspace, &|this, cx| {
+        this.active_file().is_some_and(|file| {
+            !file.document.conflict && file.editor.read(cx).text() == "Different disk contents\n"
+        })
+    });
     Ok(())
 }

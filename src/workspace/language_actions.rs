@@ -761,7 +761,10 @@ fn apply_language_text_edits(
 }
 
 // Refine the selection mapping without changing the edits applied to the buffer.
-fn language_edit_changes(before: &Rope, edits: &TextEdits) -> Vec<(Range<usize>, usize)> {
+pub(super) fn language_edit_changes(
+    before: &Rope,
+    edits: &[(Range<usize>, String)],
+) -> Vec<(Range<usize>, usize)> {
     let deadline = Instant::now() + Duration::from_millis(25);
     let mut remaining_bytes = 1024 * 1024;
     let mut changes = Vec::new();
@@ -800,7 +803,7 @@ fn language_edit_changes(before: &Rope, edits: &TextEdits) -> Vec<(Range<usize>,
     changes
 }
 
-fn map_language_edit_offset(
+pub(super) fn map_language_edit_offset(
     before: &Rope,
     after: &Rope,
     changes: &[(Range<usize>, usize)],
@@ -963,6 +966,7 @@ impl Workspace {
             && self.repository_ui.opening.is_none()
             && !self.repository_overlay_open()
             && !self.confirming_close
+            && !file.document.conflict
             && !self.file_editor_locked(file)
             && file.editor.read(cx).is_editable()
             && !file.editor.read(cx).is_composing()

@@ -711,6 +711,7 @@ struct OpenFile {
     dirty: bool,
     pending_draft: bool,
     unconfirmed_save: Option<Rope>,
+    external: Option<([u8; 32], Rope)>,
     missing: bool,
     sync_revision: u64,
     wrap: bool,
@@ -720,11 +721,11 @@ struct OpenFile {
 
 impl OpenFile {
     fn is_dirty(&self) -> bool {
-        self.dirty || self.pending_draft
+        self.dirty || (self.pending_draft && self.committed != self.saved)
     }
 
     fn flush_draft(&mut self, repo: Option<&Repository>, store: &Store) -> Result<()> {
-        if !self.pending_draft || self.document.conflict {
+        if !self.pending_draft {
             return Ok(());
         }
         let mut write = self.draft_write.lock().unwrap();
@@ -744,7 +745,7 @@ impl OpenFile {
                     store.update_editor_draft(
                         None,
                         &self.path,
-                        Some(self.document.draft_baseline()),
+                        Some(self.document.edit_baseline()),
                         dirty.then_some(text.as_str()),
                     )?;
                 }
@@ -1110,8 +1111,12 @@ impl Workspace {
         workspace.observe_window_geometry(window, cx);
         cx.observe_window_activation(window, |this, window, cx| {
             this.refresh_active_selection_highlight(window, cx);
-            if window.is_window_active() && !this.repository_watch_active {
-                this.rescan_workspace(window, cx);
+            if window.is_window_active() {
+                if this.repository_watch_active {
+                    this.sync_document_paths(this.files.keys().cloned().collect(), window, cx);
+                } else {
+                    this.rescan_workspace(window, cx);
+                }
             }
         })
         .detach();
@@ -1595,6 +1600,7 @@ impl Workspace {
         for path in images {
             self.load_image_tab(path, window, cx);
         }
+        self.sync_document_paths(paths.clone(), window, cx);
         let check_repo = repo.clone();
         let lsp_config = repo.worktree_lsp.read().unwrap().clone();
         let check_config = lsp_config.clone();
@@ -1602,15 +1608,14 @@ impl Workspace {
             paths
                 .into_iter()
                 .map(|path| {
-                    let disk = Document::read(&check_repo, &path);
                     let project = ServerProject::with_config(&check_repo, &path, &check_config);
-                    (path, disk, project)
+                    (path, project)
                 })
                 .collect::<Vec<_>>()
         });
         cx.spawn_in(window, async move |this, cx| {
             let updates = check.await;
-            _ = this.update_in(cx, move |this, window, cx| {
+            _ = this.update_in(cx, move |this, _, cx| {
                 if !this
                     .repository
                     .as_ref()
@@ -1621,48 +1626,10 @@ impl Workspace {
                 let mut keys = std::collections::HashSet::new();
                 let stale_lsp = !Arc::ptr_eq(&lsp_config, &repo.worktree_lsp.read().unwrap());
                 let mut resolve = Vec::new();
-                for (path, disk, project) in updates {
+                for (path, project) in updates {
                     let Some(file) = this.files.get_mut(&path) else {
                         continue;
                     };
-                    if !this.saving.contains(&path)
-                        && let Ok(disk) = disk
-                    {
-                        let modified = file.committed != file.saved;
-                        let confirmed = file
-                            .unconfirmed_save
-                            .take()
-                            .is_some_and(|text| disk.saved_text == text.to_string());
-                        if disk.draft_baseline() != file.document.draft_baseline() {
-                            if !modified
-                                || disk.saved_text == file.committed.to_string()
-                                || confirmed
-                            {
-                                let update_editor =
-                                    !modified && file.committed.to_string() != disk.saved_text;
-                                file.saved = Rope::from(disk.saved_text.as_str());
-                                file.document = disk;
-                                if update_editor {
-                                    file.committed = file.saved.clone();
-                                    let text = file.document.saved_text.clone();
-                                    file.editor.update(cx, |editor, cx| {
-                                        editor.set_value(text, window, cx)
-                                    });
-                                }
-                                file.dirty = file.committed != file.saved;
-                                file.pending_draft = true;
-                                file.revision += 1;
-                                if let Err(error) = file.flush_draft(Some(&repo), &this.store) {
-                                    toast::error(window, cx, format!("{error:#}"));
-                                }
-                            } else {
-                                if let Err(error) = file.flush_draft(Some(&repo), &this.store) {
-                                    toast::error(window, cx, format!("{error:#}"));
-                                }
-                                file.document.conflict = true;
-                            }
-                        }
-                    }
                     if stale_lsp {
                         resolve.push(path);
                     } else {
@@ -3295,6 +3262,7 @@ impl Workspace {
                 dirty,
                 pending_draft: false,
                 unconfirmed_save: None,
+                external: None,
                 missing: false,
                 sync_revision: 0,
                 wrap,
@@ -3454,6 +3422,10 @@ impl Workspace {
             return;
         }
         file.committed = text.clone();
+        let resync = (file.document.conflict
+            && (text == &file.saved
+                || file.external.as_ref().is_some_and(|(_, disk)| disk == text)))
+        .then(|| path.clone());
         if let Some(server) = &file.language_server {
             server.document.changed(file.committed.clone());
         }
@@ -3461,6 +3433,9 @@ impl Workspace {
             file.dirty = file.committed != file.saved;
             file.revision += 1;
             file.pending_draft = true;
+            if let Some(path) = resync {
+                self.sync_document_paths(vec![path], window, cx);
+            }
             self.schedule_draft_write(window, cx);
             cx.notify();
             return;
@@ -3500,6 +3475,9 @@ impl Workspace {
             self.refresh_editor_git_marks(&path, window, cx);
             self.refresh_editor_commit_markers(&path, window, cx);
         }
+        if let Some(path) = resync {
+            self.sync_document_paths(vec![path], window, cx);
+        }
         self.schedule_draft_write(window, cx);
         cx.notify();
     }
@@ -3509,7 +3487,20 @@ impl Workspace {
             cx.background_executor()
                 .timer(Duration::from_millis(220))
                 .await;
-            _ = this.update_in(cx, |this, window, cx| this.queue_drafts(window, cx));
+            _ = this.update_in(cx, |this, window, cx| {
+                let recovered = this
+                    .files
+                    .values()
+                    .filter(|file| {
+                        file.pending_draft
+                            && file.document.conflict
+                            && file.document.edit_baseline() != file.document.draft_baseline()
+                    })
+                    .map(|file| file.path.clone())
+                    .collect();
+                this.sync_document_paths(recovered, window, cx);
+                this.queue_drafts(window, cx);
+            });
         });
     }
 
@@ -3563,13 +3554,24 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.save_buffer(path, close, None, window, cx);
+    }
+
+    fn save_buffer(
+        &mut self,
+        path: PathBuf,
+        close: bool,
+        overwrite: Option<[u8; 32]>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.tree_busy || self.saving.contains(&path) || self.git_edit.contains(&path) {
             return;
         }
         if self
             .files
             .get(&path)
-            .is_some_and(|file| file.document.conflict || file.missing)
+            .is_some_and(|file| (file.document.conflict && overwrite.is_none()) || file.missing)
         {
             self.prompt_conflict(path, window, cx);
             return;
@@ -3578,15 +3580,20 @@ impl Workspace {
         if repo.is_none() && self.standalone.is_none() {
             return;
         }
+        let origin = repo.clone();
+        let editor_id = self.files.get(&path).map(|file| file.editor.entity_id());
         if let Err(error) = self.flush_drafts(cx) {
             self.show_error(error, window, cx);
             cx.notify();
             return;
         }
-        let buffer = self
-            .files
-            .get(&path)
-            .map(|file| (file.document.clone(), file.committed.clone(), file.dirty));
+        let buffer = self.files.get(&path).map(|file| {
+            (
+                file.document.clone(),
+                file.committed.clone(),
+                file.committed != file.saved,
+            )
+        });
         let store = self.store.clone();
         let target = path.clone();
         let task = cx.background_spawn(async move {
@@ -3602,31 +3609,77 @@ impl Workspace {
                     (document, text, dirty)
                 }
             };
-            let result = if dirty {
+            let result = if let Some(expected) = overwrite {
+                let mut disk = Document::read_for_sync(repo.as_deref(), &target)?
+                    .ok_or_else(|| anyhow::anyhow!(t!("workspace.tree_file_missing")))?;
+                if disk.draft_baseline() != expected {
+                    Err(anyhow::anyhow!(t!("storage.changed_on_disk")))
+                } else {
+                    match disk.save_target(repo.as_deref(), &target, &text.to_string()) {
+                        Ok(()) => {
+                            document = disk;
+                            Ok(())
+                        }
+                        Err(error) if disk.conflict => Err(error),
+                        Err(error) => return Err(error),
+                    }
+                }
+            } else if dirty {
                 document.save_target(repo.as_deref(), &target, &text.to_string())
             } else {
                 Ok(())
             };
-            Ok::<_, anyhow::Error>((document, text, dirty, result))
+            let external = if document.conflict && result.is_err() {
+                Document::read_for_sync(repo.as_deref(), &target)
+                    .ok()
+                    .flatten()
+            } else {
+                None
+            };
+            Ok::<_, anyhow::Error>((
+                document,
+                text,
+                dirty || overwrite.is_some(),
+                result,
+                external,
+            ))
         });
         self.saving.insert(path.clone());
         cx.spawn_in(window, async move |this, cx| {
             let result = task.await;
             _ = this.update_in(cx, move |this, window, cx| {
                 this.saving.remove(&path);
+                match editor_id {
+                    Some(id)
+                        if this
+                            .files
+                            .get(&path)
+                            .is_none_or(|file| file.editor.entity_id() != id) =>
+                    {
+                        return;
+                    }
+                    None if this
+                        .repository
+                        .as_ref()
+                        .zip(origin.as_ref())
+                        .is_none_or(|(current, origin)| !Arc::ptr_eq(current, origin)) =>
+                    {
+                        return;
+                    }
+                    _ => {}
+                }
                 // The write itself detects a file that changed on disk, so the
                 // conflict can surface on the very first save. It then belongs
                 // to the prompt, not to an error toast next to a dialog.
                 let mut conflicted = false;
-                let result = result.and_then(|(document, text, wrote, result)| {
+                let result = result.and_then(|(document, text, wrote, result, external)| {
                     let repo = this.repository.as_ref();
                     if let Some(file) = this.files.get_mut(&path) {
                         file.document = document;
                         conflicted = file.document.conflict;
-                        if conflicted {
-                            file.editor
-                                .update(cx, |editor, cx| editor.set_readonly(true, cx));
-                        }
+                        file.external = external.map(|disk| {
+                            (disk.draft_baseline(), Rope::from(disk.saved_text.as_str()))
+                        });
                         if let Err(error) = result {
                             if !path.is_absolute()
                                 && repo.is_some_and(|repo| repo.ssh.is_some())
@@ -3721,9 +3774,22 @@ impl Workspace {
     /// when the write itself is what discovered the change on disk.
     fn prompt_conflict(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
         let workspace = cx.weak_entity();
+        let file = self.files.get(&path);
+        let missing = file.is_some_and(|file| file.missing);
+        let overwrite = file.filter(|file| !file.missing).and_then(|file| {
+            file.external
+                .as_ref()
+                .map(|(digest, _)| *digest)
+                .or_else(|| {
+                    (file.document.edit_baseline() != file.document.draft_baseline())
+                        .then(|| file.document.draft_baseline())
+                })
+        });
         window.open_dialog(cx, move |dialog, _, _| {
             let reload = workspace.clone();
             let reload_path = path.clone();
+            let save = workspace.clone();
+            let save_path = path.clone();
             dialog
                 .entrance(gpui_component::dialog::DialogEntrance::Fade)
                 .centered()
@@ -3731,20 +3797,24 @@ impl Workspace {
                 .close_button(false)
                 .title(t!("workspace.conflict_title"))
                 .child(div().child(paths::display(&path)))
-                .child(div().text_sm().child(t!("workspace.draft_conflict")))
+                .child(div().text_sm().child(if missing {
+                    t!("workspace.tree_file_missing")
+                } else {
+                    t!("workspace.draft_conflict")
+                }))
                 .footer(
                     h_flex()
                         .justify_end()
                         .gap_2()
                         .child(
                             action_button("keep-draft")
-                                .secondary()
+                                .primary()
                                 .label(t!("workspace.keep_draft"))
                                 .on_click(|_, window, cx| window.close_dialog(cx)),
                         )
                         .child(
                             action_button("reload-from-disk")
-                                .primary()
+                                .secondary()
                                 .label(t!("workspace.reload_from_disk"))
                                 .on_click(move |_, window, cx| {
                                     _ = reload.update(cx, |this, cx| {
@@ -3752,7 +3822,28 @@ impl Workspace {
                                     });
                                     window.close_dialog(cx);
                                 }),
-                        ),
+                        )
+                        .when_some(overwrite, |footer, expected| {
+                            footer.child(
+                                div().debug_selector(|| "overwrite-disk".into()).child(
+                                    action_button("overwrite-disk")
+                                        .secondary()
+                                        .label(t!("workspace.overwrite_disk"))
+                                        .on_click(move |_, window, cx| {
+                                            window.close_dialog(cx);
+                                            _ = save.update(cx, |this, cx| {
+                                                this.save_buffer(
+                                                    save_path.clone(),
+                                                    false,
+                                                    Some(expected),
+                                                    window,
+                                                    cx,
+                                                );
+                                            });
+                                        }),
+                                ),
+                            )
+                        }),
                 )
         });
     }
@@ -3766,48 +3857,51 @@ impl Workspace {
         if repo.is_none() && self.standalone.is_none() {
             return;
         }
-        let store = self.store.clone();
+        let Some(file) = self.files.get(path) else {
+            return;
+        };
+        let editor = file.editor.clone();
+        let revision = editor.read(cx).document_revision();
+        let before = editor.read(cx).text().clone();
         let target = path.to_owned();
         self.saving.insert(target.clone());
         cx.spawn_in(window, async move |this, cx| {
             let read_path = target.clone();
             let result = cx
                 .background_spawn(async move {
-                    if let Some(repo) = repo {
-                        let document = Document::read(&repo, &read_path)?;
-                        store.discard_draft(&repo, &read_path)?;
-                        Ok::<_, anyhow::Error>(document)
+                    let disk = if let Some(repo) = repo {
+                        Document::read(&repo, &read_path)?
                     } else {
-                        let document = Document::read_local(&read_path)?;
-                        store.discard_local_editor_draft(&read_path)?;
-                        Ok(document)
-                    }
+                        Document::read_local(&read_path)?
+                    };
+                    let reload = (before != disk.saved_text.as_str())
+                        .then(|| repo_sync::ReloadEdits::new(before, &disk.saved_text));
+                    Ok::<_, anyhow::Error>((disk, reload))
                 })
                 .await;
             _ = this.update_in(cx, |this, window, cx| {
                 this.saving.remove(&target);
-                let document = match result {
+                let Some(file) = this
+                    .files
+                    .get_mut(&target)
+                    .filter(|file| file.editor == editor)
+                else {
+                    return;
+                };
+                if editor.read(cx).document_revision() != revision || editor.read(cx).is_composing()
+                {
+                    this.sync_document_paths(vec![target], window, cx);
+                    return;
+                }
+                let (disk, reload) = match result {
                     Ok(document) => document,
                     Err(error) => {
                         toast::error(window, cx, format!("{error:#}"));
                         return;
                     }
                 };
-                let Some(file) = this.files.get_mut(&target) else {
-                    return;
-                };
-                let text = document.saved_text.clone();
-                file.saved = Rope::from(text.as_str());
-                file.committed = file.saved.clone();
-                file.document = document;
-                file.unconfirmed_save = None;
-                file.dirty = false;
-                file.pending_draft = this.standalone.is_none();
-                file.revision += 1;
-                file.editor.update(cx, |editor, cx| {
-                    editor.set_value(text.clone(), window, cx);
-                    editor.set_readonly(false, cx);
-                });
+                file.apply_synced_document(disk, reload, window, cx);
+                this.queue_drafts(window, cx);
                 if this.standalone.is_some()
                     && this
                         .doc
@@ -3820,15 +3914,11 @@ impl Workspace {
                         this.open_doc(target.clone(), None, window, cx);
                     }
                 }
-                if let Some(server) = this
-                    .files
-                    .get(&target)
-                    .and_then(|file| file.language_server.as_ref())
-                {
-                    server.document.changed(Rope::from(text.as_str()));
-                    server.document.saved(Rope::from(text.as_str()));
+                if this.view == WorkspaceView::Editor && this.tabs.active() == Some(&target) {
+                    this.watch_editor_git(window, cx);
+                } else {
+                    this.refresh_editor_commit_markers(&target, window, cx);
                 }
-                this.refresh_editor_commit_markers(&target, window, cx);
                 if let Some(panel) = &this.git {
                     panel.update(cx, |panel, cx| panel.repository_source_changed(target, cx));
                 }
@@ -3905,10 +3995,7 @@ impl Workspace {
     }
 
     fn file_editor_locked(&self, file: &OpenFile) -> bool {
-        file.missing
-            || file.document.conflict
-            || file.document.mixed_newlines
-            || self.git_edit.contains(&file.path)
+        file.missing || file.document.mixed_newlines || self.git_edit.contains(&file.path)
     }
 
     fn tab_is_dirty(&self, path: &Path) -> bool {
@@ -5059,8 +5146,7 @@ impl Workspace {
     ) -> impl IntoElement {
         let path = &file.path;
         let radii = window_corner_radii(window, cx);
-        let locked =
-            file.document.conflict || file.document.mixed_newlines || self.git_edit.contains(path);
+        let locked = self.file_editor_locked(file);
         let status_size = text_base_size(cx) - 0.5;
         let caret = file.editor.read(cx).cursor_position();
         let position = format!("Ln {}:{}", caret.line + 1, caret.character + 1);
@@ -7030,7 +7116,7 @@ mod layout_tests {
     /// before the draft is lost, and the prompt is the whole message: no error
     /// toast next to it, and no toast for a state the tab badge already marks.
     #[::core::prelude::v1::test]
-    fn a_save_that_finds_the_file_changed_asks_once() -> Result<()> {
+    fn a_save_that_finds_the_file_changed_requires_a_fresh_overwrite_confirmation() -> Result<()> {
         let fixture = tempfile::tempdir()?;
         let root = fixture.path().join("repo");
         fs::create_dir(&root)?;
@@ -7108,6 +7194,44 @@ mod layout_tests {
             let this = workspace.read(cx);
             let file = this.files.get(Path::new("notes.txt")).expect("open file");
             assert!(file.document.conflict);
+            assert!(file.editor.read(cx).is_editable());
+        });
+
+        let overwrite = visual
+            .debug_bounds("overwrite-disk")
+            .expect("overwrite action is visible");
+        fs::write(&file, "newer disk text\n")?;
+        visual.simulate_click(overwrite.center(), Modifiers::default());
+        for _ in 0..4 {
+            visual.run_until_parked();
+            visual.update(|window, cx| window.draw(cx).clear(cx));
+        }
+        visual.update(|window, cx| {
+            assert!(
+                window.has_active_dialog(cx),
+                "the newer version requires a new decision"
+            );
+        });
+        assert_eq!(fs::read_to_string(&file)?, "newer disk text\n");
+
+        let overwrite = visual
+            .debug_bounds("overwrite-disk")
+            .expect("overwrite action for the newer version is visible");
+        visual.simulate_click(overwrite.center(), Modifiers::default());
+        for _ in 0..4 {
+            visual.run_until_parked();
+            visual.update(|window, cx| window.draw(cx).clear(cx));
+        }
+        assert_eq!(fs::read_to_string(&file)?, "draft text\n");
+        visual.update(|window, cx| {
+            assert!(!window.has_active_dialog(cx));
+            let file = workspace
+                .read(cx)
+                .files
+                .get(Path::new("notes.txt"))
+                .unwrap();
+            assert!(!file.document.conflict);
+            assert!(!file.is_dirty());
         });
         Ok(())
     }
