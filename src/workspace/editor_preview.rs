@@ -3,6 +3,8 @@ use crate::session::EditorPreviewMode;
 use gpui_base::InteractiveElementExt as _;
 use std::borrow::Cow;
 
+mod markdown_scroll;
+
 const DEFAULT_SPLIT_FRACTION: f32 = 0.5;
 const MIN_SPLIT_FRACTION: f32 = 0.25;
 const MAX_SPLIT_FRACTION: f32 = 0.75;
@@ -74,11 +76,13 @@ pub(super) struct EditorPreviews {
     markdown: HashMap<PathBuf, MarkdownPreview>,
     pub(super) svg_source_errors: HashMap<PathBuf, SharedString>,
     pub(super) split_drag: Option<(PreviewKind, f32)>,
+    scroll_follow: markdown_scroll::ScrollFollow,
 }
 
 struct MarkdownPreview {
     source: Option<Rope>,
     reader: Option<Result<Entity<docs::DocReader>, SharedString>>,
+    reader_revision: Option<u64>,
     _task: Task<()>,
 }
 
@@ -240,9 +244,13 @@ impl Workspace {
         let path = path.to_owned();
         let (art, selector) = mode.icon();
         let glyph = Icon::default().data(art).text_color(color);
+        let button = if self.standalone.is_some() {
+            icon_button("editor-preview-mode", glyph, mode.label()).icon_size(px(16.))
+        } else {
+            tab_bar_icon_button("editor-preview-mode", glyph, mode.label())
+        };
         Some(
-            icon_button("editor-preview-mode", glyph, mode.label())
-                .icon_size(px(16.))
+            button
                 .tooltip_placement(Placement::Bottom)
                 .debug_selector(move || selector.into())
                 .on_click(cx.listener(move |this, _, window, cx| {
@@ -251,6 +259,9 @@ impl Workspace {
                     }
                     let current = this.editor_preview_mode(&path);
                     let next = current.next();
+                    if current == EditorPreviewMode::Split {
+                        this.reset_markdown_scroll_follow(cx);
+                    }
                     if next == EditorPreviewMode::Full {
                         this.capture_active_file_position(cx);
                         if let Some(file) = this.files.get(&path) {
@@ -329,15 +340,19 @@ impl Workspace {
         window: &Window,
         cx: &mut Context<Self>,
     ) {
-        let existing = self.editor_previews.markdown.get_mut(&path);
-        if existing
-            .as_ref()
-            .is_some_and(|preview| preview.source.as_ref() == Some(&source))
-        {
-            return;
-        }
-        let updating = existing.is_some();
-        let reader = existing.and_then(|preview| preview.reader.take());
+        let (updating, reader) = match self.editor_previews.markdown.get_mut(&path) {
+            Some(preview) if preview.source.as_ref() == Some(&source) => {
+                if preview.reader_revision.is_some() {
+                    preview.reader_revision = self
+                        .files
+                        .get(&path)
+                        .map(|file| file.editor.read(cx).document_revision());
+                }
+                return;
+            }
+            Some(preview) => (true, preview.reader.take()),
+            None => (false, None),
+        };
         let repo = self.repository.clone();
         let remote = repo
             .as_ref()
@@ -404,15 +419,17 @@ impl Workspace {
                 let Some(preview) = this.editor_previews.markdown.get_mut(&key) else {
                     return;
                 };
-                if this
+                let Some(editor) = this
                     .files
                     .get(&key)
-                    .is_none_or(|file| file.editor.read(cx).text() != &snapshot)
-                {
+                    .map(|file| file.editor.read(cx))
+                    .filter(|editor| editor.text() == &snapshot)
+                else {
                     preview.source = None;
                     cx.notify();
                     return;
-                }
+                };
+                let revision = editor.document_revision();
                 let typography = this.config.current().docs;
                 reader.update(cx, |reader, cx| {
                     reader.set_typography(typography, cx);
@@ -421,6 +438,7 @@ impl Workspace {
                     }
                 });
                 preview.reader = Some(Ok(reader));
+                preview.reader_revision = Some(revision);
                 cx.notify();
             });
         });
@@ -429,6 +447,7 @@ impl Workspace {
             MarkdownPreview {
                 source: Some(source),
                 reader,
+                reader_revision: None,
                 _task: task,
             },
         );
@@ -509,23 +528,52 @@ impl Workspace {
             )
             .child(
                 v_flex()
+                    .relative()
                     .w(relative(fraction))
                     .flex_none()
                     .h_full()
                     .min_w_0()
                     .min_h_0()
                     .overflow_hidden()
-                    .child(source),
+                    .child(source)
+                    .when(kind == PreviewKind::Markdown, |pane| {
+                        pane.child(Self::markdown_scroll_input(true, cx))
+                            .capture_key_down(cx.listener(
+                                |this, event: &KeyDownEvent, window, cx| {
+                                    if matches!(event.keystroke.key.as_str(), "pageup" | "pagedown")
+                                    {
+                                        this.begin_markdown_scroll_follow(window, cx);
+                                    }
+                                },
+                            ))
+                    }),
             )
             .child(
                 v_flex()
+                    .relative()
                     .debug_selector(|| "editor-preview-pane".into())
                     .flex_1()
                     .h_full()
                     .min_w_0()
                     .min_h_0()
                     .overflow_hidden()
-                    .child(preview),
+                    .child(preview)
+                    .when(kind == PreviewKind::Markdown, |pane| {
+                        pane.child(Self::markdown_scroll_input(false, cx))
+                            .capture_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                                if matches!(
+                                    event.keystroke.key.as_str(),
+                                    "up" | "down"
+                                        | "pageup"
+                                        | "pagedown"
+                                        | "home"
+                                        | "end"
+                                        | "space"
+                                ) {
+                                    this.pause_markdown_scroll_follow(cx);
+                                }
+                            }))
+                    }),
             )
             .child(Self::editor_preview_divider(kind, fraction, cx))
             .into_any_element()
@@ -645,6 +693,7 @@ impl Workspace {
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 mod tests {
     use super::*;
+    use crate::session::DocumentPosition;
     use std::time::Instant;
 
     #[track_caller]
@@ -684,6 +733,529 @@ mod tests {
             "divider at {}, expected {expected} for fraction {fraction}",
             line.left()
         );
+    }
+
+    fn markdown_scroll_frames(
+        visual: &mut VisualTestContext,
+        workspace: &Entity<Workspace>,
+    ) -> Vec<Option<DocumentPosition>> {
+        (0..8)
+            .map(|_| {
+                visual.executor().advance_clock(Duration::from_millis(16));
+                visual.run_until_parked();
+                visual.update(|window, cx| {
+                    window.simulate_next_frame(cx);
+                    window.draw(cx).clear(cx);
+                    workspace
+                        .read(cx)
+                        .active_markdown_preview()
+                        .and_then(|reader| reader.read(cx).session_position(cx))
+                })
+            })
+            .collect()
+    }
+
+    #[track_caller]
+    fn send_source_scroll_to(
+        visual: &mut VisualTestContext,
+        workspace: &Entity<Workspace>,
+        source: &str,
+        offset: usize,
+    ) -> usize {
+        let row = source[..offset]
+            .bytes()
+            .filter(|&byte| byte == b'\n')
+            .count();
+        let position = visual.debug_bounds("workspace-editor").unwrap().center();
+        let delta = visual.update(|_, cx| {
+            let editor = workspace.read(cx).active_file().unwrap().editor.read(cx);
+            let (top, inset) = editor.viewport_anchor().unwrap();
+            let line_height = editor.line_height().unwrap();
+            line_height * (row as f32 - top.line as f32 + 0.65) - inset
+        });
+        visual.simulate_mouse_move(position, None, Modifiers::default());
+        visual.simulate_event(ScrollEvent {
+            position,
+            delta: ScrollDelta::Pixels(point(px(0.), -delta)),
+            touch_phase: TouchPhase::Started,
+            ..Default::default()
+        });
+        row
+    }
+
+    #[track_caller]
+    fn scroll_source_to(
+        visual: &mut VisualTestContext,
+        workspace: &Entity<Workspace>,
+        source: &str,
+        offset: usize,
+    ) -> Vec<Option<DocumentPosition>> {
+        let row = send_source_scroll_to(visual, workspace, source, offset);
+        let frames = markdown_scroll_frames(visual, workspace);
+        let source_row = visual.update(|_, cx| {
+            let editor = workspace.read(cx).active_file().unwrap().editor.read(cx);
+            editor.viewport_anchor().unwrap().0.line as usize
+        });
+        assert_eq!(
+            source_row,
+            row,
+            "source scroll to {}",
+            &source[offset..].lines().next().unwrap()
+        );
+        frames
+    }
+
+    const MARKDOWN_SCROLL_FIXTURE: &str =
+        include_str!("../../tests/fixtures/markdown-scroll/complex-layout.md");
+
+    fn open_markdown_scroll_fixture<'a>(
+        cx: &'a mut TestAppContext,
+        fixture: &Path,
+    ) -> Result<(Entity<Workspace>, &'a mut VisualTestContext)> {
+        let image = include_bytes!("../../tests/fixtures/markdown-scroll/tall-image.svg");
+        let path = fixture.join("complex-layout.md");
+        fs::write(&path, MARKDOWN_SCROLL_FIXTURE)?;
+        fs::write(fixture.join("tall-image.svg"), image)?;
+        let config_path = fixture.join("config.toml");
+        fs::write(&config_path, "[editor]\nsoft_wrap = false\n")?;
+        let config = ConfigFile::load(Some(config_path));
+        let store = Arc::new(Store::new(fixture.join("state"))?);
+        store.save_editor_preview_preference("markdown", EditorPreviewMode::Split)?;
+        cx.update(gpui_component::init);
+        let mut workspace = None;
+        let (_, mut visual) = cx.add_window_view(|window, cx| {
+            let view = cx.new(|cx| {
+                Workspace::with_window(
+                    store,
+                    config,
+                    Some(WorkspaceView::Editor),
+                    Some(path.clone()),
+                    window,
+                    cx,
+                )
+            });
+            view.update(cx, |this, cx| {
+                this.request_file(path, FileOpen::Startup, window, cx)
+            });
+            workspace = Some(view.clone());
+            gpui_component::Root::new(view, window, cx)
+        });
+        let workspace = workspace.unwrap();
+        visual.simulate_resize(size(px(950.), px(330.)));
+        settle(&mut visual, &workspace, |this, cx| {
+            this.active_markdown_preview()
+                .is_some_and(|reader| reader.read(cx).session_position(cx).is_some())
+        });
+        Ok((workspace, visual))
+    }
+
+    #[::core::prelude::v1::test]
+    fn markdown_split_scroll_holds_through_complex_layout_and_rejoins_the_right_heading()
+    -> Result<()> {
+        let source = MARKDOWN_SCROLL_FIXTURE;
+        let fixture = tempfile::tempdir()?;
+        let mut cx = TestAppContext::build_with_text_system(
+            TestDispatcher::new(0),
+            None,
+            crate::test_support::text_system(cfg!(target_os = "linux")),
+        );
+        let (workspace, mut visual) = open_markdown_scroll_fixture(&mut cx, fixture.path())?;
+        visual.update(|_, cx| cx.set_smooth_scrolling(false));
+
+        let checkpoints: Vec<_> = source
+            .match_indices("## Checkpoint\n")
+            .map(|(offset, _)| offset)
+            .collect();
+        let (before, after) = (checkpoints[0], checkpoints[1]);
+        let reach = |visual: &mut VisualTestContext, at| {
+            let frames = scroll_source_to(visual, &workspace, source, at);
+            assert_eq!(
+                frames
+                    .last()
+                    .and_then(|frame| *frame)
+                    .and_then(|position| position.source_offset),
+                Some(at)
+            );
+            frames
+        };
+        reach(&mut visual, before);
+        let plain_line = source
+            .find("the same paragraph with visible words")
+            .unwrap();
+        let ordinary = scroll_source_to(&mut visual, &workspace, source, plain_line)
+            .pop()
+            .unwrap()
+            .unwrap();
+        assert_eq!(ordinary.source_offset, source.find("This plain paragraph"));
+        let visible_line = ordinary.line.unwrap().source_offset;
+        assert!(visible_line <= plain_line && plain_line - visible_line < 90);
+
+        let start = reach(&mut visual, before).pop().unwrap().unwrap();
+        assert_eq!(start.inset, 0.);
+        for landmark in [
+            "| Delta",
+            "    B -- No",
+            "![Tall calibration",
+            "# Example heading inside a literal block",
+            "\\sum_",
+        ] {
+            let frames = scroll_source_to(
+                &mut visual,
+                &workspace,
+                source,
+                source.find(landmark).unwrap(),
+            );
+            for position in frames {
+                let position = position.expect("the held preview is visible");
+                assert_eq!(
+                    position.source_offset,
+                    Some(before),
+                    "preview moved while crossing {landmark}"
+                );
+                assert_eq!(
+                    position.inset, start.inset,
+                    "preview shook while crossing {landmark}"
+                );
+            }
+        }
+        visual.simulate_resize(size(px(850.), px(330.)));
+        assert!(
+            markdown_scroll_frames(&mut visual, &workspace)
+                .iter()
+                .all(|frame| {
+                    frame.is_some_and(|position| position.source_offset == Some(before))
+                })
+        );
+        let frames = reach(&mut visual, after);
+        let visited: Vec<_> = frames
+            .iter()
+            .flatten()
+            .filter_map(|frame| frame.source_offset)
+            .collect();
+        assert!(
+            visited
+                .iter()
+                .all(|offset| *offset == before || *offset == after)
+        );
+        assert!(visited.windows(2).all(|pair| pair[0] <= pair[1]));
+
+        let source_y = visual.update(|_, cx| {
+            workspace
+                .read(cx)
+                .active_file()
+                .unwrap()
+                .editor
+                .read(cx)
+                .scroll_offset()
+                .y
+        });
+        let preview = visual.debug_bounds("editor-preview-pane").unwrap().center();
+        visual.simulate_mouse_move(preview, None, Modifiers::default());
+        visual.simulate_event(ScrollEvent {
+            position: preview,
+            delta: ScrollDelta::Pixels(point(px(0.), px(180.))),
+            ..Default::default()
+        });
+        let manual = markdown_scroll_frames(&mut visual, &workspace)
+            .pop()
+            .unwrap()
+            .unwrap();
+        assert_ne!(manual.source_offset, Some(after));
+        assert_eq!(
+            visual.update(|_, cx| workspace
+                .read(cx)
+                .active_file()
+                .unwrap()
+                .editor
+                .read(cx)
+                .scroll_offset()
+                .y),
+            source_y
+        );
+
+        let source_pane = visual.debug_bounds("workspace-editor").unwrap().center();
+        visual.simulate_mouse_move(source_pane, None, Modifiers::default());
+        visual.simulate_event(ScrollEvent {
+            position: source_pane,
+            delta: ScrollDelta::Pixels(point(px(0.), px(-18.))),
+            touch_phase: TouchPhase::Moved,
+            ..Default::default()
+        });
+        assert!(
+            markdown_scroll_frames(&mut visual, &workspace)
+                .iter()
+                .all(|frame| {
+                    frame.is_some_and(|position| {
+                        position.source_offset == manual.source_offset
+                            && position.inset == manual.inset
+                    })
+                }),
+            "an earlier source gesture reclaimed the manually scrolled preview"
+        );
+
+        let closing = source.find("## Final section").unwrap();
+        reach(&mut visual, closing);
+        reach(&mut visual, after);
+        let frames = scroll_source_to(
+            &mut visual,
+            &workspace,
+            source,
+            source.find("| Mu").unwrap(),
+        );
+        assert!(
+            frames
+                .iter()
+                .all(|frame| frame.and_then(|position| position.source_offset) == Some(after))
+        );
+        reach(&mut visual, before);
+
+        let draft = source.replacen(
+            "## Checkpoint",
+            "## Draft-only heading\n\nAdded before the first checkpoint.\n\n## Checkpoint",
+            1,
+        );
+        visual.update(|window, cx| {
+            let editor = workspace.read(cx).active_file().unwrap().editor.clone();
+            editor.update(cx, |editor, cx| {
+                editor.replace_all(draft.clone(), window, cx)
+            });
+            window.draw(cx).clear(cx);
+        });
+        let draft_only = draft.find("## Draft-only heading").unwrap();
+        let frames = scroll_source_to(&mut visual, &workspace, &draft, draft_only);
+        assert!(
+            frames[..4].iter().all(|frame| {
+                frame.is_some_and(|position| position.source_offset == Some(before))
+            }),
+            "the earlier rendered buffer followed newly edited source"
+        );
+        settle(&mut visual, &workspace, |this, cx| {
+            this.active_markdown_preview().is_some_and(|reader| {
+                reader.read(cx).source_text().as_ref() == draft
+                    && reader.read(cx).session_position(cx).is_some()
+            })
+        });
+        let draft_checkpoint = draft.rfind("## Checkpoint").unwrap();
+        assert_eq!(
+            scroll_source_to(&mut visual, &workspace, &draft, draft_checkpoint)
+                .last()
+                .and_then(|frame| *frame)
+                .and_then(|position| position.source_offset),
+            Some(draft_checkpoint)
+        );
+        Ok(())
+    }
+
+    #[::core::prelude::v1::test]
+    fn markdown_split_scroll_interpolates_text_and_animates_safe_reentry() -> Result<()> {
+        let source = MARKDOWN_SCROLL_FIXTURE;
+        let fixture = tempfile::tempdir()?;
+        let mut cx = TestAppContext::build_with_text_system(
+            TestDispatcher::new(0),
+            None,
+            crate::test_support::text_system(cfg!(target_os = "linux")),
+        );
+        let (workspace, mut visual) = open_markdown_scroll_fixture(&mut cx, fixture.path())?;
+        visual.update(|_, cx| {
+            cx.set_smooth_scrolling(true);
+            cx.set_reduce_motion(false);
+        });
+        let reader_position = |visual: &mut VisualTestContext| {
+            visual.update(|_, cx| {
+                let reader = workspace
+                    .read(cx)
+                    .active_markdown_preview()
+                    .unwrap()
+                    .read(cx);
+                (
+                    reader.editor_scroll_pixels(cx),
+                    reader.editor_scroll_is_navigating(cx),
+                )
+            })
+        };
+        let frame = |visual: &mut VisualTestContext| {
+            visual.executor().advance_clock(Duration::from_millis(16));
+            visual.run_until_parked();
+            visual.update(|window, cx| {
+                window.simulate_next_frame(cx);
+                window.draw(cx).clear(cx);
+            });
+            reader_position(visual).0
+        };
+        let plain = source.find("This plain paragraph").unwrap();
+        send_source_scroll_to(&mut visual, &workspace, source, plain);
+        settle(&mut visual, &workspace, |this, cx| {
+            this.active_markdown_preview().is_some_and(|reader| {
+                reader
+                    .read(cx)
+                    .session_position(cx)
+                    .is_some_and(|position| position.source_offset == Some(plain))
+            })
+        });
+        let editor_row = |visual: &mut VisualTestContext| {
+            visual.update(|_, cx| {
+                workspace
+                    .read(cx)
+                    .active_file()
+                    .unwrap()
+                    .editor
+                    .read(cx)
+                    .viewport_anchor()
+                    .unwrap()
+                    .0
+            })
+        };
+        let top = editor_row(&mut visual);
+        let pane = visual.debug_bounds("workspace-editor").unwrap().center();
+        let mut previous = reader_position(&mut visual).0;
+        for _ in 0..3 {
+            visual.simulate_event(ScrollEvent {
+                position: pane,
+                delta: ScrollDelta::Pixels(point(px(0.), px(-1.25))),
+                ..Default::default()
+            });
+            let next = frame(&mut visual);
+            assert!(
+                next > previous,
+                "each sub-line scroll advances the measured preview"
+            );
+            assert_eq!(editor_row(&mut visual), top);
+            assert!(!reader_position(&mut visual).1);
+            previous = next;
+        }
+
+        let table = source.find("| Mu").unwrap();
+        let after = source.rfind("## Checkpoint").unwrap();
+        send_source_scroll_to(&mut visual, &workspace, source, table);
+        let held = reader_position(&mut visual).0;
+        assert!((0..4).all(|_| frame(&mut visual) == held));
+        send_source_scroll_to(&mut visual, &workspace, source, after);
+        let moving: Vec<_> = (0..8).map(|_| frame(&mut visual)).collect();
+        assert!(
+            reader_position(&mut visual).1,
+            "re-entry uses a live navigation animation"
+        );
+        assert!(moving.windows(2).all(|step| step[0] <= step[1]));
+        assert!(moving.windows(2).filter(|step| step[0] < step[1]).count() >= 2);
+
+        let reversal = reader_position(&mut visual).0;
+        send_source_scroll_to(&mut visual, &workspace, source, table);
+        assert!((0..6).all(|_| frame(&mut visual) == reversal));
+        assert!(!reader_position(&mut visual).1);
+        send_source_scroll_to(&mut visual, &workspace, source, after);
+        frame(&mut visual);
+        assert!(reader_position(&mut visual).1);
+        let preview = visual.debug_bounds("editor-preview-pane").unwrap().center();
+        visual.simulate_mouse_move(preview, None, Modifiers::default());
+        visual.simulate_event(ScrollEvent {
+            position: preview,
+            delta: ScrollDelta::Pixels(point(px(0.), px(12.))),
+            ..Default::default()
+        });
+        let manual = frame(&mut visual);
+        assert!(!reader_position(&mut visual).1);
+        assert!((0..5).all(|_| frame(&mut visual) == manual));
+
+        send_source_scroll_to(&mut visual, &workspace, source, table);
+        frame(&mut visual);
+        send_source_scroll_to(&mut visual, &workspace, source, after);
+        settle(&mut visual, &workspace, |this, cx| {
+            this.active_markdown_preview().is_some_and(|reader| {
+                reader
+                    .read(cx)
+                    .session_position(cx)
+                    .is_some_and(|position| position.source_offset == Some(after))
+            })
+        });
+        Ok(())
+    }
+
+    #[::core::prelude::v1::test]
+    fn markdown_split_scroll_retargets_before_the_previous_anchor_settles() -> Result<()> {
+        let source = MARKDOWN_SCROLL_FIXTURE;
+        let fixture = tempfile::tempdir()?;
+        let mut cx = TestAppContext::build_with_text_system(
+            TestDispatcher::new(0),
+            None,
+            crate::test_support::text_system(cfg!(target_os = "linux")),
+        );
+        let (workspace, mut visual) = open_markdown_scroll_fixture(&mut cx, fixture.path())?;
+        visual.update(|_, cx| {
+            cx.set_smooth_scrolling(true);
+            cx.set_reduce_motion(false);
+        });
+        let frame = |visual: &mut VisualTestContext| {
+            visual.executor().advance_clock(Duration::from_millis(16));
+            visual.run_until_parked();
+            visual.update(|window, cx| {
+                window.simulate_next_frame(cx);
+                window.draw(cx).clear(cx);
+                let reader = workspace
+                    .read(cx)
+                    .active_markdown_preview()
+                    .unwrap()
+                    .read(cx);
+                (
+                    reader.editor_scroll_pixels(cx),
+                    reader.editor_scroll_destination(cx),
+                )
+            })
+        };
+        let table = source.find("| Mu").unwrap();
+        let first = source.rfind("## Checkpoint").unwrap();
+        let next = source.find("## Final section").unwrap();
+        let gap = source.find("\n\nThis is the checkpoint after").unwrap() + 1;
+        send_source_scroll_to(&mut visual, &workspace, source, table);
+        frame(&mut visual);
+        send_source_scroll_to(&mut visual, &workspace, source, first);
+        frame(&mut visual);
+        let (previous, _) = frame(&mut visual);
+        send_source_scroll_to(&mut visual, &workspace, source, gap);
+        let (before, destination) = frame(&mut visual);
+        assert_eq!(
+            destination,
+            Some(first),
+            "a blank source line keeps the accepted goal"
+        );
+        let step = before - previous;
+        assert!(step > px(1.), "the first animation is still moving");
+
+        let next_row = send_source_scroll_to(&mut visual, &workspace, source, next);
+        let (retargeted, destination) = frame(&mut visual);
+        let source_row = visual.update(|_, cx| {
+            workspace
+                .read(cx)
+                .active_file()
+                .unwrap()
+                .editor
+                .read(cx)
+                .viewport_anchor()
+                .unwrap()
+                .0
+                .line as usize
+        });
+        assert_eq!(source_row, next_row);
+        assert_eq!(
+            destination,
+            Some(next),
+            "the new anchor should replace the old target in flight"
+        );
+        let (continued, destination) = frame(&mut visual);
+        assert_eq!(destination, Some(next));
+        assert!(before < retargeted && retargeted < continued);
+        assert!(
+            continued - retargeted < step * 2.,
+            "retargeting restarted the animation at launch speed"
+        );
+        settle(&mut visual, &workspace, |this, cx| {
+            this.active_markdown_preview().is_some_and(|reader| {
+                reader
+                    .read(cx)
+                    .session_position(cx)
+                    .is_some_and(|position| position.source_offset == Some(next))
+            })
+        });
+        Ok(())
     }
 
     fn drag_split(visual: &mut VisualTestContext, workspace: &Entity<Workspace>, fraction: f32) {
@@ -802,7 +1374,7 @@ mod tests {
             |visual: &mut VisualTestContext, workspace: &Entity<Workspace>, icon: &'static str| {
                 let button = visual.debug_bounds(icon).expect("preview icon");
                 let actions = visual.debug_bounds("workspace-actions-trigger").unwrap();
-                assert_eq!(button.size, size(px(28.), px(28.)));
+                assert_eq!(button.size, size(px(22.), px(22.)));
                 assert_eq!(button.size, actions.size);
                 assert_eq!(button.center().y, actions.center().y);
                 visual.simulate_click(button.center(), Modifiers::default());

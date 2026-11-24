@@ -5,9 +5,10 @@ use std::{cell::Cell, rc::Rc, time::Duration};
 
 use gpui::{
     AppContext as _, Context, Entity, InteractiveElement as _, IntoElement, ListAlignment,
-    ListState, ParentElement as _, Pixels, Render, ScrollDelta, ScrollEvent, ScrollHandle,
-    ScrollSource, StatefulInteractiveElement as _, Styled as _, TestAppContext, TestDispatcher,
-    UniformListScrollHandle, VisualTestContext, Window, div, list, point, px, uniform_list,
+    ListOffset, ListState, ParentElement as _, Pixels, Render, ScrollDelta, ScrollEvent,
+    ScrollHandle, ScrollSource, StatefulInteractiveElement as _, Styled as _, TestAppContext,
+    TestDispatcher, UniformListScrollHandle, VisualTestContext, Window, div, list, point, px,
+    uniform_list,
 };
 use gpui_component::{
     Root,
@@ -326,6 +327,57 @@ fn markdown_navigation_measures_the_target_before_painting_the_arrival(cx: &mut 
     });
     draw(visual);
     assert!((animated - list.scroll_px_offset_for_scrollbar().y).abs() <= px(1.));
+}
+
+#[gpui::test]
+fn sibling_scroll_only_preserves_an_active_list_reveal(cx: &mut TestAppContext) {
+    struct Panes(ListState);
+    impl Render for Panes {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .size_full()
+                .flex()
+                .child(div().w(px(160.)).h_full().flex_none())
+                .child(
+                    list(self.0.clone(), |_, _, _| {
+                        div().h(px(20.)).into_any_element()
+                    })
+                    .flex_1()
+                    .h_full(),
+                )
+        }
+    }
+
+    let rows = ListState::new(100, ListAlignment::Top, px(300.));
+    let (_, visual) = cx.add_window_view(|window, cx| {
+        gpui_component::init(cx);
+        cx.set_smooth_scrolling(true);
+        cx.set_reduce_motion(false);
+        Root::new(cx.new(|_| Panes(rows.clone())), window, cx)
+    });
+    visual.simulate_resize(gpui::size(px(400.), px(200.)));
+    draw(visual);
+    rows.navigate_to_reveal_item(16, true, true);
+    draw(visual);
+    advance_frame(visual, 16);
+    assert!(rows.is_navigating());
+    scroll(visual, px(90.), ScrollDelta::Lines(point(0., -1.)));
+    assert!(
+        rows.is_navigating(),
+        "a sibling's wheel should leave the reveal running"
+    );
+
+    rows.navigate_to(ListOffset {
+        item_ix: 26,
+        offset_in_item: px(0.),
+    });
+    draw(visual);
+    assert!(rows.is_navigating());
+    scroll(visual, px(90.), ScrollDelta::Lines(point(0., -1.)));
+    assert!(
+        !rows.is_navigating(),
+        "a new position navigation should keep the usual unscoped cancellation"
+    );
 }
 
 #[gpui::test]

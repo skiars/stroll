@@ -416,6 +416,16 @@ dialogs in a Wayland window after changes to paint order or focus handling.
   The reader, source history, and `documents` tests cover these paths and
   the existing GFM header styling.
 
+- Successive animated text reveals use the shared list navigation retargeting
+  path so a new Markdown anchor keeps the current scroll velocity. Direct
+  scroll input cancels a reveal in its own list region, leaving reveals in
+  sibling panes in motion. Instant and enclosing-view reveals still cancel
+  navigation before applying their positions. A new position request cannot
+  inherit a canceled reveal's list region. Run
+  `cargo test --release --locked --test smooth_scroll` for input isolation and
+  `cargo test --release --locked --lib markdown_split_scroll` for continuous
+  anchor motion and input handoff coverage.
+
 - Completed Markdown task items inherit the body text color. The `documents`
   integration test compares the painted text colors of both task states.
 

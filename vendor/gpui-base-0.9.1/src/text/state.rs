@@ -867,7 +867,9 @@ impl TextViewState {
         let mut reveal = PendingReveal::new(&text, &range, now, top_inset)
             .ok_or(RangeHighlightError::InvalidRange(0))?;
         reveal.scroll = scroll;
-        self.list_state.cancel_navigation();
+        if scroll != Some(true) {
+            self.list_state.cancel_navigation();
+        }
         self.pending_reveal = Some(reveal);
         cx.notify();
         Ok(())

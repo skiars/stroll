@@ -175,15 +175,24 @@ struct Heading {
 pub struct PreparedDocument {
     source: SharedString,
     headings: Vec<Heading>,
+    editor_scroll_spans: Vec<Range<usize>>,
     html_anchors: HashMap<SharedString, usize>,
     extensions: MarkdownExtensions,
     graphics: Arc<Graphics>,
     remote: Option<RemoteResources>,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct EditorScrollAnchor {
+    pub(crate) source: usize,
+    pub(crate) span: (usize, usize),
+    block: usize,
+    line: Option<usize>,
+}
+
 impl PreparedDocument {
     pub(crate) fn from_editor(source: String, remote: Option<RemoteResources>) -> Result<Self> {
-        let mut document = Self::new(source)?;
+        let mut document = Self::prepare(source, true)?;
         document.remote = remote;
         Ok(document)
     }
@@ -201,8 +210,28 @@ impl PreparedDocument {
     }
 
     pub fn new(source: String) -> Result<Self> {
+        Self::prepare(source, false)
+    }
+
+    fn prepare(source: String, editor_preview: bool) -> Result<Self> {
         let ast = parse_markdown(&source)?;
         let headings = headings(&ast);
+        let editor_scroll_spans = if editor_preview {
+            ast.children()
+                .into_iter()
+                .flatten()
+                .filter(|node| {
+                    matches!(node, Node::Heading(_) | Node::Paragraph(_))
+                        && scrollable_inline_text(node)
+                })
+                .filter_map(|node| {
+                    node.position()
+                        .map(|span| span.start.offset..span.end.offset)
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
         let mut graphics = Graphics::default();
         let mut task_cells = HashMap::new();
         visit(&ast, &mut |node| {
@@ -226,11 +255,30 @@ impl PreparedDocument {
         Ok(Self {
             source: source.into(),
             headings,
+            editor_scroll_spans,
             html_anchors,
             extensions: doc_graphics::extensions(graphics.clone()).plugin(TaskTable(task_cells)),
             graphics,
             remote: None,
         })
+    }
+}
+
+// Only follow text whose display order comes directly from its source.
+// In particular, a paragraph containing an image or formula can reflow after paint.
+fn scrollable_inline_text(node: &Node) -> bool {
+    match node {
+        Node::Text(_) | Node::InlineCode(_) | Node::Break(_) => true,
+        Node::Heading(_)
+        | Node::Paragraph(_)
+        | Node::Emphasis(_)
+        | Node::Strong(_)
+        | Node::Delete(_)
+        | Node::Link(_)
+        | Node::LinkReference(_) => node
+            .children()
+            .is_some_and(|children| children.iter().all(scrollable_inline_text)),
+        _ => false,
     }
 }
 
@@ -638,6 +686,184 @@ impl DocReader {
 
     pub(crate) fn editor_preview_parsed(&self, cx: &App) -> bool {
         self.text.read(cx).rendered_text().source() == self.document.source.as_ref()
+    }
+
+    pub(crate) fn editor_scroll_anchor(
+        &self,
+        offset: usize,
+        cx: &App,
+    ) -> Option<EditorScrollAnchor> {
+        let spans = &self.document.editor_scroll_spans;
+        let span = spans.get(spans.partition_point(|span| span.end <= offset))?;
+        let source = self.document.source.as_str();
+        if offset < span.start
+            && !source
+                .get(offset..span.start)?
+                .bytes()
+                .all(|byte| matches!(byte, b' ' | b'\t'))
+        {
+            return None;
+        }
+        if self.pending_position.is_some()
+            || self.pending_fragment.is_some()
+            || self.pending_source_location.is_some()
+        {
+            return None;
+        }
+        let text = self.text.read(cx);
+        let list = text.list_state();
+        if list.viewport_bounds().size.height <= px(0.) {
+            return None;
+        }
+        let block = text.block_for_source_offset(span.start)?;
+        if text.source_offset_for_block(block)? != span.start {
+            return None;
+        }
+        if offset <= span.start
+            || self
+                .document
+                .headings
+                .iter()
+                .any(|heading| heading.source == *span)
+        {
+            return Some(EditorScrollAnchor {
+                source: span.start,
+                span: (span.start, span.end),
+                block,
+                line: None,
+            });
+        }
+
+        let tail = source.get(offset..span.end)?;
+        let end = tail.find('\n').unwrap_or(tail.len()) + offset;
+        let range = text.rendered_text().range_for_source(offset..end)?;
+        Some(EditorScrollAnchor {
+            source: offset,
+            span: (span.start, span.end),
+            block,
+            line: Some(range.start),
+        })
+    }
+
+    pub(crate) fn editor_scroll_is_navigating(&self, cx: &App) -> bool {
+        let text = self.text.read(cx);
+        text.has_pending_reveal() || text.list_state().is_navigating()
+    }
+
+    pub(crate) fn editor_scroll_delta(
+        &self,
+        anchor: EditorScrollAnchor,
+        fraction: f32,
+        cx: &App,
+    ) -> Option<Pixels> {
+        let text = self.text.read(cx);
+        let list = text.list_state();
+        let bounds = list.bounds_for_item(anchor.block)?;
+        let viewport = list.viewport_bounds();
+        if !bounds.intersects(&viewport)
+            || bounds.size.height <= px(0.)
+            || bounds.size.height > viewport.size.height
+        {
+            return None;
+        }
+        Some(bounds.top() - viewport.top() + bounds.size.height * fraction)
+    }
+
+    pub(crate) fn apply_editor_scroll_delta(&self, delta: Pixels, cx: &mut Context<Self>) {
+        let list = self.text.read(cx).list_state();
+        let position = -list.scroll_px_offset_for_scrollbar().y;
+        let remaining = (list.max_offset_for_scrollbar().y - position).max(px(0.));
+        let delta = delta.clamp(-position.max(px(0.)), remaining);
+        if delta.abs() > px(0.01) {
+            list.scroll_by(delta);
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn retarget_editor_scroll_delta(
+        &self,
+        delta: Pixels,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let text = self.text.read(cx);
+        let list = text.list_state();
+        if text.has_pending_reveal() {
+            return false;
+        }
+        let destination = list.navigation_scroll_top();
+        let Some(bounds) = list.bounds_for_item(destination.item_ix) else {
+            return false;
+        };
+        let target = delta - list.scroll_px_offset_for_scrollbar().y;
+        if target < px(0.) || target > list.max_offset_for_scrollbar().y {
+            return false;
+        }
+        let previous = bounds.top() - list.viewport_bounds().top() + destination.offset_in_item;
+        let change = delta - previous;
+        if change.abs() > px(0.5) {
+            list.navigate_by(change);
+            cx.notify();
+        }
+        true
+    }
+
+    pub(crate) fn apply_editor_scroll_anchor(
+        &self,
+        anchor: EditorScrollAnchor,
+        animate: bool,
+        cx: &mut Context<Self>,
+    ) {
+        self.text.update(cx, |text, cx| {
+            let line = if animate && anchor.line.is_none() {
+                text.rendered_text()
+                    .range_for_source(anchor.span.0..anchor.span.1)
+                    .map(|range| range.start)
+            } else {
+                anchor.line
+            };
+            if let Some(line) = line {
+                _ = text.scroll_to_range(line..line, Some(px(0.)), animate, cx);
+            } else {
+                let position = ListOffset {
+                    item_ix: anchor.block,
+                    offset_in_item: px(0.),
+                };
+                if text.has_pending_reveal() || text.list_state().logical_scroll_top() != position {
+                    text.cancel_scroll_navigation();
+                    text.scroll_to_block(position, animate);
+                    cx.notify();
+                }
+            }
+        });
+    }
+
+    #[cfg(test)]
+    pub(crate) fn editor_scroll_pixels(&self, cx: &App) -> Pixels {
+        -self
+            .text
+            .read(cx)
+            .list_state()
+            .scroll_px_offset_for_scrollbar()
+            .y
+    }
+
+    #[cfg(test)]
+    pub(crate) fn editor_scroll_destination(&self, cx: &App) -> Option<usize> {
+        let text = self.text.read(cx);
+        let list = text.list_state();
+        list.is_navigating()
+            .then(|| text.source_offset_for_block(list.navigation_scroll_top().item_ix))
+            .flatten()
+    }
+
+    pub(crate) fn cancel_editor_scroll_navigation(&self, cx: &mut Context<Self>) {
+        self.text
+            .update(cx, |text, _| text.cancel_scroll_navigation());
+    }
+
+    pub(crate) fn cancel_editor_scroll_follow(&mut self, cx: &mut Context<Self>) {
+        self.restore_position(None);
+        self.cancel_editor_scroll_navigation(cx);
     }
 
     pub(crate) fn wait_for_editor_preview_parse(

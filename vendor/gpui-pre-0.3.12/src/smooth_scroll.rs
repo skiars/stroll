@@ -7,7 +7,7 @@ use std::{
 use collections::FxHashMap;
 use scheduler::Instant;
 
-use crate::{App, Pixels, Point, Window, point, px};
+use crate::{App, Bounds, Pixels, Point, Window, point, px};
 
 #[path = "scroll_navigation.rs"]
 mod navigation;
@@ -48,9 +48,17 @@ impl ScrollAnimations {
             .retain(|_, animation| animation.navigation.is_some());
     }
 
-    pub(crate) fn cancel_navigation(&mut self) {
+    pub(crate) fn cancel_for_scroll(&mut self, position: Point<Pixels>, keep_wheel: bool) {
         self.active
-            .retain(|_, animation| animation.navigation.is_none());
+            .retain(|_, animation| match &animation.navigation {
+                Some(navigation) => navigation
+                    .scroll_region
+                    .is_some_and(|region| !region.contains(&position)),
+                None => keep_wheel,
+            });
+        if !keep_wheel {
+            self.generation = self.generation.wrapping_add(1);
+        }
     }
 }
 
@@ -67,6 +75,7 @@ struct Navigation {
     running: Rc<Cell<bool>>,
     x: NavigationAxis,
     y: NavigationAxis,
+    scroll_region: Option<Bounds<Pixels>>,
 }
 
 impl SmoothScroll {
@@ -96,6 +105,20 @@ impl SmoothScroll {
         viewport_height: Pixels,
         window: &mut Window,
         cx: &mut App,
+        apply: impl FnMut(Point<Pixels>, Point<Pixels>, &mut Window, &mut App) -> Option<Point<Pixels>>
+        + 'static,
+    ) -> bool {
+        self.navigate_in_region(current, target, viewport_height, None, window, cx, apply)
+    }
+
+    pub(crate) fn navigate_in_region(
+        &self,
+        current: Point<Pixels>,
+        target: Point<Pixels>,
+        viewport_height: Pixels,
+        scroll_region: Option<Bounds<Pixels>>,
+        window: &mut Window,
+        cx: &mut App,
         mut apply: impl FnMut(
             Point<Pixels>,
             Point<Pixels>,
@@ -105,6 +128,17 @@ impl SmoothScroll {
         + 'static,
     ) -> bool {
         let id = Rc::as_ptr(&self.0) as usize;
+        // Distance retargets can inherit the viewport of the reveal they extend.
+        let scroll_region = scroll_region.or_else(|| {
+            window
+                .smooth_scroll
+                .active
+                .get(&id)?
+                .navigation
+                .as_ref()
+                .filter(|navigation| navigation.running.get())?
+                .scroll_region
+        });
         let animate = cx.smooth_scrolling() && !cx.reduce_motion() && viewport_height > px(0.);
         if animate
             && current != target
@@ -116,6 +150,7 @@ impl SmoothScroll {
         {
             navigation.x.retarget(current.x.as_f32(), target.x.as_f32());
             navigation.y.retarget(current.y.as_f32(), target.y.as_f32());
+            navigation.scroll_region = scroll_region;
             active.target = target;
             // Refresh the receiver even at the same target: the caret or the
             // list anchor can change while the viewport is still arriving.
@@ -156,6 +191,7 @@ impl SmoothScroll {
                     running,
                     x: NavigationAxis::new(start.x.as_f32(), target.x.as_f32()),
                     y: NavigationAxis::new(start.y.as_f32(), target.y.as_f32()),
+                    scroll_region,
                 }),
                 apply: Box::new(apply),
             },

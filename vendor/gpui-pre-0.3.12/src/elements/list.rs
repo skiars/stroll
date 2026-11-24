@@ -173,15 +173,21 @@ impl List {
         };
         let animate = self.state.0.borrow().last_layout_bounds.is_some()
             && !matches!(request, NavigationRequest::Reveal { animate: false, .. });
-        if !matches!(request, NavigationRequest::Distance(_)) {
+        if !matches!(
+            request,
+            NavigationRequest::Distance(_) | NavigationRequest::Reveal { animate: true, .. }
+        ) {
             scroll.cancel_navigation();
         }
         let state = Rc::downgrade(&self.state.0);
         let view = window.current_view();
-        scroll.navigate(
+        let scroll_region =
+            matches!(request, NavigationRequest::Reveal { animate: true, .. }).then_some(bounds);
+        scroll.navigate_in_region(
             current,
             target,
             if animate { bounds.size.height } else { px(0.) },
+            scroll_region,
             window,
             cx,
             move |last, next, _, cx| {

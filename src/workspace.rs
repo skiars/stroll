@@ -3955,9 +3955,9 @@ impl Workspace {
         if let Some(path) = self.tabs.active().map(Path::to_owned) {
             self.remember_editor_preview(&path);
         }
-        let active = self.tabs.active();
-        let changed = active != previous;
+        let changed = self.tabs.active() != previous;
         if changed {
+            self.reset_markdown_scroll_follow(cx);
             self.language_rename = Task::ready(());
             self.language_format = Task::ready(());
             self.lsp_panel = None;
@@ -3968,6 +3968,7 @@ impl Workspace {
                 });
             }
         }
+        let active = self.tabs.active();
         if self.view == WorkspaceView::Editor && !self.confirming_close {
             let keep_focus = self.locator.open
                 || self.repository_overlay_open()

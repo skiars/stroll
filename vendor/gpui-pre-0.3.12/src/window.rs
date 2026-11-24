@@ -6110,11 +6110,8 @@ impl Window {
         };
         match &event {
             PlatformInput::Scroll(event) => {
-                if !event.is_wheel() || !cx.smooth_scrolling() {
-                    self.smooth_scroll.cancel();
-                } else {
-                    self.smooth_scroll.cancel_navigation();
-                }
+                self.smooth_scroll
+                    .cancel_for_scroll(event.position, event.is_wheel() && cx.smooth_scrolling());
                 if !event.source.is_touchpad() {
                     self.touchpad_scroll.cancel();
                 }
