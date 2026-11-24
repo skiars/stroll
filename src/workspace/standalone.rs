@@ -233,6 +233,7 @@ impl Workspace {
             .when(cfg!(target_os = "windows"), |actions| actions.occlude())
             .flex_shrink_0()
             .gap_2()
+            .children(editing.then(|| self.editor_preview_button(cx)).flatten())
             .when(!editing, |bar| {
                 bar.when_some(self.doc.as_ref(), |bar, doc| {
                     bar.child(doc.read(cx).toolbar_actions(doc, window, cx))
@@ -318,7 +319,6 @@ impl Workspace {
                     .when(show_tabs, |bar| {
                         bar.h_full().pl_0().child(self.titlebar_tabs(cx, colors))
                     })
-                    .children(editing.then(|| self.editor_preview_button(cx)).flatten())
                     .child(actions),
             )
     }
