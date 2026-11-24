@@ -584,9 +584,10 @@ impl Workspace {
             panel.update(cx, |_, cx| cx.notify());
         }
         if previous.editor.soft_wrap != config.editor.soft_wrap {
-            self.wrap = config.editor.soft_wrap;
-            for file in self.files.values_mut() {
-                file.apply_wrap(self.wrap, window, cx);
+            for (path, file) in &mut self.files {
+                if !self.session.file_wraps.contains_key(path) {
+                    file.apply_wrap(config.editor.soft_wrap, window, cx);
+                }
             }
         }
         if previous.editor.line_numbers != config.editor.line_numbers {

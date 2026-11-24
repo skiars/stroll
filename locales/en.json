@@ -759,14 +759,12 @@
   "workspace.actions": "Workspace actions",
   "workspace.code": "Code",
   "workspace.collapse_all": "Collapse all",
-  "workspace.disable_wrap": "Turn off word wrap (Alt+Z)",
   "workspace.discard_changes": "Discard changes",
   "workspace.draft_conflict": "The file changed on disk. Your draft is kept and stays read-only until you reload the file.",
   "workspace.conflict_title": "File changed on disk",
   "workspace.keep_draft": "Keep draft",
   "workspace.reload_from_disk": "Reload from disk",
   "workspace.drop_failed": "Some dropped files could not be opened",
-  "workspace.enable_wrap": "Turn on word wrap (Alt+Z)",
   "workspace.external_definition": "The definition is outside the current repository",
   "workspace.link_failed": "Could not open this link",
   "workspace.no_docs": "No Markdown documents in this repository",
@@ -785,6 +783,9 @@
   "workspace.ssh_disconnected_detail": "SSH disconnected. The content may be out of date.\n%{error}",
   "workspace.toggle_terminal": "Toggle terminal",
   "workspace.unsaved_changes": "This file has unsaved changes",
+  "workspace.wrap_follow_global": "Follow global setting",
   "workspace.wrap_off": "Word wrap off",
-  "workspace.wrap_on": "Word wrap on"
+  "workspace.wrap_on": "Word wrap on",
+  "workspace.wrap_status_off": "Word wrap is off (Alt+Z)",
+  "workspace.wrap_status_on": "Word wrap is on (Alt+Z)"
 }

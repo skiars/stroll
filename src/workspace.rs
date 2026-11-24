@@ -69,7 +69,7 @@ use gpui_component::{
     button::{Button, ButtonVariants},
     h_flex,
     input::{Editor, EditorState, Enter, IndentInline, InputEvent, Rope, Search},
-    menu::{DropdownMenu, PopupMenuItem},
+    menu::{ContextMenuExt, DropdownMenu, PopupMenuItem},
     resizable::HandleEdge,
     scroll::{Scrollbar, ScrollbarAxis, ScrollbarHandle, ScrollbarMode, thin_scrollbar},
     v_flex, window_corner_radii, window_paddings,
@@ -851,7 +851,6 @@ pub struct Workspace {
     repository_ui: RepositoryUi,
     locator: locator::Locator,
     terminals: terminal::Terminals,
-    wrap: bool,
     file_task: Task<()>,
     image_preview: Option<Preview>,
     image_preview_focus: FocusHandle,
@@ -972,7 +971,6 @@ impl Workspace {
             })
             .detach();
         let config = config_watch::subscribe(config, window, cx);
-        let wrap = config.current().editor.soft_wrap;
         let editor_font = Self::configured_editor_font(config.current(), cx);
         let startup_lsp = config.current().lsp.clone();
         let ai = store.ai(&config);
@@ -1059,7 +1057,6 @@ impl Workspace {
             document_list_trigger: cx.focus_handle(),
             document_list_focus: cx.focus_handle(),
             focus,
-            wrap,
             file_task: Task::ready(()),
             image_preview: None,
             image_preview_focus: cx.focus_handle(),
@@ -1753,6 +1750,7 @@ impl Workspace {
             session.docs_tree_expanded.clone_from(&self.docs_expanded);
             session.worktree_lsp_trusted = self.session.worktree_lsp_trusted;
             session.source_history = std::mem::take(&mut self.session.source_history);
+            session.file_wraps = std::mem::take(&mut self.session.file_wraps);
         }
         session.source_history.normalize();
         self.source_caret = None;
@@ -3114,7 +3112,23 @@ impl Workspace {
         let language = self.source_language(path, &buffer.text);
         let syntax = self.associated_highlight(path).map(|(_, syntax)| syntax);
         self.source_resources(path).configure_editor(path, cx);
-        let wrap = self.wrap;
+        if self.standalone.is_some() {
+            match self.store.standalone_session(path) {
+                Ok(session) => {
+                    self.session.file_wraps.remove(path);
+                    self.session
+                        .file_wraps
+                        .extend(session.file_wrap.map(|wrap| (path.to_owned(), wrap)));
+                }
+                Err(error) => self.show_error(error, window, cx),
+            }
+        }
+        let wrap = self
+            .session
+            .file_wraps
+            .get(path)
+            .copied()
+            .unwrap_or(self.config.current().editor.soft_wrap);
         let line_numbers = self.config.current().editor.line_numbers;
         let stale_project = self.repository.as_ref().is_some_and(|repo| {
             if path.is_absolute() {
@@ -3771,11 +3785,56 @@ impl Workspace {
             }
             return;
         }
-        self.wrap = !self.wrap;
         if self.view == WorkspaceView::Editor
-            && let Some(file) = self.tabs.active().and_then(|path| self.files.get_mut(path))
+            && let Some(file) = self.active_file()
         {
-            file.apply_wrap(self.wrap, window, cx);
+            let path = file.path.clone();
+            self.set_file_wrap(&path, Some(!file.wrap), window, cx);
+        }
+    }
+
+    fn set_file_wrap(
+        &mut self,
+        path: &Path,
+        wrap: Option<bool>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.view != WorkspaceView::Editor
+            || self.tabs.active() != Some(path)
+            || !self.files.contains_key(path)
+        {
+            return;
+        }
+        let previous = self.session.file_wraps.get(path).copied();
+        if previous == wrap {
+            return;
+        }
+        let update_override = |overrides: &mut BTreeMap<PathBuf, bool>, value| {
+            if let Some(value) = value {
+                overrides.insert(path.to_owned(), value);
+            } else {
+                overrides.remove(path);
+            }
+        };
+        update_override(&mut self.session.file_wraps, wrap);
+        let saved = if self.standalone.is_some() {
+            self.store.set_standalone_file_wrap(path, wrap)
+        } else {
+            self.session_revision += 1;
+            self.flush_session(cx)
+        };
+        if let Err(error) = saved {
+            update_override(&mut self.session.file_wraps, previous);
+            self.show_error(error, window, cx);
+            return;
+        }
+        if let Some(file) = self.files.get_mut(path) {
+            file.apply_wrap(
+                wrap.unwrap_or(self.config.current().editor.soft_wrap),
+                window,
+                cx,
+            );
         }
         cx.notify();
     }
@@ -3854,7 +3913,6 @@ impl Workspace {
                 || self.terminal_focused(window, cx)
                 || (keep_tree_focus && self.tree_focus.is_focused(window));
             if let Some(file) = active.and_then(|path| self.files.get_mut(path)) {
-                file.apply_wrap(self.wrap, window, cx);
                 if !keep_focus {
                     file.editor
                         .update(cx, |editor, cx| editor.focus(window, cx));
@@ -4905,21 +4963,6 @@ impl Workspace {
             .or_else(|| self.source_resources(path).display_name_for_path(path))
             .unwrap_or_else(|| language_for(path).into());
         let progress = self.language_service_progress(file, status_size, colors, cx);
-        let (wrap_icon, wrap_label, wrap_tooltip, wrap_color) = if file.wrap {
-            (
-                include_bytes!("workspace/icons/wrap-on.svg").as_slice(),
-                t!("workspace.wrap_on"),
-                t!("workspace.disable_wrap"),
-                colors.accent,
-            )
-        } else {
-            (
-                include_bytes!("workspace/icons/wrap-off.svg").as_slice(),
-                t!("workspace.wrap_off"),
-                t!("workspace.enable_wrap"),
-                colors.muted,
-            )
-        };
         // Text in this row goes through `baseline_aligned`,
         // so new status content with a different size still shares the
         // row's baseline without forcing one font size everywhere.
@@ -5005,35 +5048,7 @@ impl Workspace {
                                                 format!("status-file-line-ending: {line_ending}")
                                             }),
                                     )
-                                    .child(
-                                        div()
-                                            .flex_shrink_0()
-                                            .debug_selector(|| "status-editor-wrap".into())
-                                            .child(
-                                                quiet_button("editor-wrap")
-                                                    .with_size(px(22.))
-                                                    .size(px(22.))
-                                                    .p_0()
-                                                    .icon_size(px(14.))
-                                                    .icon(
-                                                        Icon::default()
-                                                            .data(wrap_icon)
-                                                            .text_color(wrap_color),
-                                                    )
-                                                    .toggled(file.wrap)
-                                                    .accessibility_label(wrap_label)
-                                                    .tooltip(wrap_tooltip)
-                                                    .on_click(cx.listener(
-                                                        |this, _, window, cx| {
-                                                            this.toggle_wrap(
-                                                                &ToggleWrap,
-                                                                window,
-                                                                cx,
-                                                            );
-                                                        },
-                                                    )),
-                                            ),
-                                    ),
+                                    .child(self.status_wrap_button(file, colors, cx)),
                             )
                             .when(
                                 self.standalone.is_none() || file.server_project.is_some(),
@@ -5057,6 +5072,66 @@ impl Workspace {
                             ),
                     ),
             )
+    }
+
+    fn status_wrap_button(
+        &self,
+        file: &OpenFile,
+        colors: Palette,
+        cx: &Context<Self>,
+    ) -> impl IntoElement {
+        let (icon, label, color) = if file.wrap {
+            (
+                include_bytes!("workspace/icons/wrap-on.svg").as_slice(),
+                t!("workspace.wrap_status_on"),
+                colors.accent,
+            )
+        } else {
+            (
+                include_bytes!("workspace/icons/wrap-off.svg").as_slice(),
+                t!("workspace.wrap_status_off"),
+                colors.muted,
+            )
+        };
+        let path = file.path.clone();
+        let wrap = self.session.file_wraps.get(&path).copied();
+        let workspace = cx.weak_entity();
+        div()
+            .id("editor-wrap-context")
+            .flex_shrink_0()
+            .debug_selector(|| "status-editor-wrap".into())
+            .child(
+                quiet_button("editor-wrap")
+                    .with_size(px(22.))
+                    .size(px(22.))
+                    .p_0()
+                    .icon_size(px(14.))
+                    .icon(Icon::default().data(icon).text_color(color))
+                    .toggled(file.wrap)
+                    .accessibility_label(label.clone())
+                    .tooltip(label)
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.toggle_wrap(&ToggleWrap, window, cx);
+                    })),
+            )
+            .context_menu(move |mut menu, _, _| {
+                for (choice, label) in [
+                    (None, t!("workspace.wrap_follow_global")),
+                    (Some(true), t!("workspace.wrap_on")),
+                    (Some(false), t!("workspace.wrap_off")),
+                ] {
+                    let workspace = workspace.clone();
+                    let path = path.clone();
+                    menu = menu.item(PopupMenuItem::new(label).checked(wrap == choice).on_click(
+                        move |_, window, cx| {
+                            _ = workspace.update(cx, |this, cx| {
+                                this.set_file_wrap(&path, choice, window, cx);
+                            });
+                        },
+                    ));
+                }
+                menu
+            })
     }
 
     fn show_file_tree_button(&self, cx: &Context<Self>) -> Option<Button> {
@@ -6431,16 +6506,17 @@ mod layout_tests {
         };
         let wrap_button = check_status_group(visual, "status-file-line-ending: LF");
         assert_eq!(wrap_button.size, size(px(22.), px(22.)));
-        for wrap in [false, true] {
-            visual.simulate_click(wrap_button.center(), Modifiers::none());
-            draw(visual);
-            assert_eq!(visual.debug_bounds("status-editor-wrap"), Some(wrap_button));
-            visual.update(|_, cx| {
-                let file = workspace.read(cx).active_file().unwrap();
-                assert_eq!(file.wrap, wrap);
-                assert_eq!(file.editor.read(cx).projected_wrap_rows(1) > 1, wrap);
-            });
-        }
+        visual.simulate_click(wrap_button.center(), Modifiers::none());
+        draw(visual);
+        assert_eq!(visual.debug_bounds("status-editor-wrap"), Some(wrap_button));
+        visual.update(|_, cx| {
+            let this = workspace.read(cx);
+            let file = this.active_file().unwrap();
+            assert!(!file.wrap);
+            assert_eq!(file.editor.read(cx).projected_wrap_rows(1), 1);
+            assert_eq!(this.session.file_wraps.get(&file.path), Some(&false));
+            assert!(this.config.current().editor.soft_wrap);
+        });
 
         for (file, ending) in [
             ("crlf.txt", "status-file-line-ending: CRLF"),
@@ -6454,6 +6530,7 @@ mod layout_tests {
             });
             draw(visual);
             check_status_group(visual, ending);
+            visual.update(|_, cx| assert!(workspace.read(cx).active_file().unwrap().wrap));
             assert!(
                 visual
                     .debug_bounds("status-file-position: Ln 1:1")
@@ -6473,6 +6550,52 @@ mod layout_tests {
                 .debug_bounds("status-file-position: Ln 2:201")
                 .is_some()
         );
+        visual.update(|_, cx| assert!(!workspace.read(cx).active_file().unwrap().wrap));
+        let wrap_menu = |visual: &mut VisualTestContext| {
+            let point = visual.debug_bounds("status-editor-wrap").unwrap().center();
+            visual.simulate_mouse_down(point, MouseButton::Right, Modifiers::none());
+            visual.simulate_mouse_up(point, MouseButton::Right, Modifiers::none());
+            draw(visual);
+            assert!(visual.debug_bounds("popup-menu-surface").is_some());
+        };
+        wrap_menu(visual);
+        visual.simulate_keystrokes("down down enter");
+        draw(visual);
+        let path = Path::new(lf_file);
+        visual.update(|window, cx| {
+            workspace.update(cx, |this, cx| -> Result<()> {
+                assert_eq!(this.session.file_wraps.get(path), Some(&true));
+                let mut config = this.config.current().clone();
+                config.editor.soft_wrap = false;
+                this.commit_settings(config, window, cx)?;
+                assert!(this.active_file().unwrap().wrap);
+                assert!(!this.files[Path::new("crlf.txt")].wrap);
+                let fresh_store = Store::new(fixture.path().join("state"))?;
+                let persisted = fresh_store.session(this.repository.as_ref().unwrap())?;
+                assert_eq!(persisted.file_wraps, [(path.to_owned(), true)].into());
+                this.close_tabs(vec![path.to_owned()], window, cx);
+                this.open_file(path.to_owned(), false, window, cx);
+                Ok(())
+            })
+        })?;
+        draw(visual);
+        visual.update(|_, cx| assert!(workspace.read(cx).active_file().unwrap().wrap));
+
+        wrap_menu(visual);
+        visual.simulate_keystrokes("down enter");
+        draw(visual);
+        visual.update(|_, cx| {
+            let this = workspace.read(cx);
+            assert!(!this.active_file().unwrap().wrap);
+            assert!(this.session.file_wraps.is_empty());
+            assert!(
+                this.store
+                    .session(this.repository.as_ref().unwrap())
+                    .unwrap()
+                    .file_wraps
+                    .is_empty()
+            );
+        });
         Ok(())
     }
 

@@ -918,6 +918,7 @@ impl Workspace {
                 self.session
                     .files
                     .keys()
+                    .chain(self.session.file_wraps.keys())
                     .filter(|item| item.starts_with(path))
                     .cloned(),
             )
@@ -1172,7 +1173,10 @@ impl Workspace {
                 relocations.push(self.store.draft_relocation(repo, &path, &target, None));
             }
             if let Some(position) = self.session.files.remove(&path) {
-                self.session.files.insert(target, position);
+                self.session.files.insert(target.clone(), position);
+            }
+            if let Some(wrap) = self.session.file_wraps.remove(&path) {
+                self.session.file_wraps.insert(target, wrap);
             }
         }
         let images: Vec<_> = self
@@ -1268,6 +1272,7 @@ impl Workspace {
             self.remove_image_tab(&path, window);
             self.tabs.close(&path);
             self.session.files.remove(&path);
+            self.session.file_wraps.remove(&path);
             if let Err(error) = self.store.discard_draft(repo, &path) {
                 self.show_error(error, window, cx);
             }
@@ -3166,6 +3171,11 @@ mod tests {
         settle(visual, &workspace, |this| {
             this.repository_watch_active && this.active_file().is_some()
         });
+        visual.update(|window, cx| {
+            workspace.update(cx, |this, cx| {
+                this.set_file_wrap(Path::new("original.txt"), Some(false), window, cx);
+            });
+        });
         let original = visual
             .debug_bounds("workspace-tree-row:original.txt")
             .unwrap()
@@ -3209,6 +3219,18 @@ mod tests {
         });
         assert!(root.join("keyboard.txt").is_file());
         assert!(!root.join("original.txt").exists());
+        visual.update(|_, cx| {
+            let this = workspace.read(cx);
+            let saved = this
+                .store
+                .session(this.repository.as_ref().unwrap())
+                .unwrap();
+            assert_eq!(
+                saved.file_wraps,
+                [(PathBuf::from("keyboard.txt"), false)].into()
+            );
+            assert!(!this.active_file().unwrap().wrap);
+        });
         visual.update(|window, cx| {
             workspace.update(cx, |this, cx| {
                 this.focus_tree("keyboard.txt".into(), window, cx)

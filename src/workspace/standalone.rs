@@ -462,7 +462,9 @@ fn standalone_text_opens_and_saves_without_a_repository() -> Result<()> {
         Workspace::open_standalone(store.clone(), config.clone(), path.clone(), None, cx)
     })?;
     let handle = app.windows()[0];
-    app.update(|cx| Workspace::open_standalone(store, config, path.clone(), None, cx))?;
+    app.update(|cx| {
+        Workspace::open_standalone(store.clone(), config.clone(), path.clone(), None, cx)
+    })?;
     assert_eq!(app.windows(), [handle]);
     app.run_until_parked();
     app.update(|cx| assert_eq!(cx.active_window(), Some(handle)));
@@ -494,6 +496,14 @@ fn standalone_text_opens_and_saves_without_a_repository() -> Result<()> {
     })?;
     app.run_until_parked();
     assert_eq!(fs::read_to_string(&path)?, "Updated\r\n");
+    app.update_window(handle, |_, window, cx| {
+        workspace.update(cx, |this, cx| {
+            assert!(this.active_file().unwrap().wrap);
+            this.toggle_wrap(&ToggleWrap, window, cx);
+            assert!(!this.active_file().unwrap().wrap);
+        });
+    })?;
+    assert_eq!(store.standalone_session(&path)?.file_wrap, Some(false));
 
     let other = fixture.path().join("other.txt");
     fs::write(&other, "Other\n")?;
@@ -505,6 +515,41 @@ fn standalone_text_opens_and_saves_without_a_repository() -> Result<()> {
     })?;
     assert_eq!(app.windows().len(), 2);
     app.update(|cx| assert_ne!(cx.active_window(), Some(handle)));
+    let other_window = app
+        .windows()
+        .into_iter()
+        .find(|item| *item != handle)
+        .unwrap();
+    app.update_window(handle, |_, window, cx| {
+        workspace.update(cx, |this, cx| {
+            assert!(this.request_window_close(window, cx));
+            window.remove_window();
+        });
+    })?;
+    app.update(|cx| Workspace::open_standalone(store.clone(), config, path.clone(), None, cx))?;
+    app.run_until_parked();
+    let reopened = app
+        .windows()
+        .into_iter()
+        .find(|item| *item != other_window)
+        .unwrap();
+    assert_ne!(reopened, handle);
+    app.update_window(reopened, |root, window, cx| {
+        let root = root.downcast::<Root>().unwrap();
+        let workspace = root
+            .read(cx)
+            .view()
+            .clone()
+            .downcast::<Workspace>()
+            .unwrap();
+        workspace.update(cx, |this, cx| {
+            assert_eq!(this.active_file().unwrap().path, path);
+            assert!(!this.active_file().unwrap().wrap);
+            this.set_file_wrap(&path, None, window, cx);
+            assert!(this.active_file().unwrap().wrap);
+        });
+    })?;
+    assert_eq!(store.standalone_session(&path)?.file_wrap, None);
     Ok(())
 }
 

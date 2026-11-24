@@ -242,6 +242,7 @@ impl Workspace {
                     panels: self.session.panels,
                     file_position: self.session.files.get(path).copied(),
                     document_position: self.session.documents.get(path).copied(),
+                    ..Default::default()
                 },
             });
         }

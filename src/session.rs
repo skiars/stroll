@@ -23,6 +23,8 @@ pub(crate) struct WorktreeSession {
     pub view: Option<WorkspaceView>,
     pub tabs: TabSession,
     pub files: BTreeMap<PathBuf, FilePosition>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub file_wraps: BTreeMap<PathBuf, bool>,
     pub source_history: SourceHistory,
     pub document: Option<PathBuf>,
     pub documents: BTreeMap<PathBuf, DocumentPosition>,
@@ -283,4 +285,6 @@ pub(crate) struct StandaloneSession {
     pub panels: PanelPreferences,
     pub file_position: Option<FilePosition>,
     pub document_position: Option<DocumentPosition>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file_wrap: Option<bool>,
 }

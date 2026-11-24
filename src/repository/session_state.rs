@@ -92,6 +92,13 @@ impl Store {
             write_positions(
                 &tx,
                 key,
+                "file_wrap",
+                &previous.file_wraps,
+                &session.file_wraps,
+            )?;
+            write_positions(
+                &tx,
+                key,
                 "document",
                 &previous.documents,
                 &session.documents,
@@ -150,14 +157,21 @@ impl Store {
             if session.document_position != previous.document_position {
                 current.document_position = session.document_position;
             }
-            tx.execute(
-                "INSERT INTO standalone_sessions VALUES (?1, ?2)
-                 ON CONFLICT(path) DO UPDATE SET value = excluded.value",
-                params![
-                    path.as_os_str().as_encoded_bytes(),
-                    serde_json::to_vec(&current)?
-                ],
-            )?;
+            write_standalone(&tx, path, &current)?;
+            tx.commit()?;
+            Ok(())
+        })
+    }
+
+    #[cfg(feature = "desktop")]
+    pub(crate) fn set_standalone_file_wrap(&self, path: &Path, wrap: Option<bool>) -> Result<()> {
+        self.with_state(|db| {
+            let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let mut session = read_standalone(&tx, path)?;
+            if session.file_wrap != wrap {
+                session.file_wrap = wrap;
+                write_standalone(&tx, path, &session)?;
+            }
             tx.commit()?;
             Ok(())
         })
@@ -265,8 +279,22 @@ fn read_worktree_session(db: &Connection, key: &[u8]) -> Result<WorktreeSession>
         session_fields!(read_fields);
     }
     session.files = read_positions(db, key, "file")?;
+    session.file_wraps = read_positions(db, key, "file_wrap")?;
     session.documents = read_positions(db, key, "document")?;
     Ok(session)
+}
+
+#[cfg(feature = "desktop")]
+fn write_standalone(db: &Connection, path: &Path, session: &StandaloneSession) -> Result<()> {
+    db.execute(
+        "INSERT INTO standalone_sessions VALUES (?1, ?2)
+         ON CONFLICT(path) DO UPDATE SET value = excluded.value",
+        params![
+            path.as_os_str().as_encoded_bytes(),
+            serde_json::to_vec(session)?
+        ],
+    )?;
+    Ok(())
 }
 
 fn write_field(db: &Connection, key: &[u8], field: &str, value: &impl Serialize) -> Result<()> {
@@ -375,6 +403,7 @@ mod tests {
         let mut tabs_and_position = baseline.clone();
         tabs_and_position.tabs.open(a.clone(), false);
         tabs_and_position.files.insert(a.clone(), position(10));
+        tabs_and_position.file_wraps.insert(a.clone(), false);
 
         first.update_worktree_session(
             repo.storage_key(),
@@ -392,6 +421,7 @@ mod tests {
         let mut view_and_position = baseline.clone();
         view_and_position.view = Some(WorkspaceView::Docs);
         view_and_position.files.insert(b.clone(), position(20));
+        view_and_position.file_wraps.insert(b.clone(), true);
         second.update_worktree_session(
             repo.storage_key(),
             repo.checkout_key(),
@@ -403,6 +433,10 @@ mod tests {
         assert_eq!(result.tabs.active(), Some(a.as_path()));
         assert_eq!(result.terminal, terminal);
         assert_eq!(result.view, Some(WorkspaceView::Docs));
+        assert_eq!(
+            result.file_wraps,
+            [(a.clone(), false), (b.clone(), true)].into()
+        );
         assert_eq!(result.files, [(a, position(10)), (b, position(20))].into());
         Ok(())
     }
