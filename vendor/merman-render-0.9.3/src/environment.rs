@@ -582,7 +582,7 @@ impl TextMeasurementRecorder {
         outcome: TextMeasurementRouteOutcome,
     ) {
         let counter = &self.counts[Self::slot(phase, operation, outcome)];
-        let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+        let _ = counter.try_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
             Some(count.saturating_add(1))
         });
     }
@@ -638,6 +638,27 @@ impl TextMeasurementRecorder {
             }
         }
         TextMeasurementReport { entries }
+    }
+}
+
+#[cfg(test)]
+mod recorder_tests {
+    use super::*;
+
+    #[test]
+    fn measurement_count_saturates() {
+        let recorder = TextMeasurementRecorder::default();
+        let phase = TextMeasurementPhase::Layout;
+        let operation = TextMeasurementOperation::Measure;
+        let outcome = TextMeasurementRouteOutcome::Profile;
+        recorder.counts[TextMeasurementRecorder::slot(phase, operation, outcome)]
+            .store(u64::MAX - 1, Ordering::Relaxed);
+
+        recorder.record(phase, operation, outcome);
+        recorder.record(phase, operation, outcome);
+
+        let report = recorder.report(&TextMeasurementPolicy::deterministic());
+        assert_eq!(report.entries()[0].count(), u64::MAX);
     }
 }
 

@@ -477,3 +477,7 @@ the resulting gap. The SVG postprocessor can check
 the render deadline. Upstream licenses and third-party
 notices are included. Run the `mermaid` library tests and the `documents` and
 `smooth_scroll` integration tests.
+
+The text measurement counter uses `AtomicU64::try_update` to avoid the
+`fetch_update` deprecation in Rust 1.99. The `measurement_count_saturates`
+unit test covers the counter at its upper bound.

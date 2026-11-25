@@ -176,6 +176,7 @@ impl RepoWatcher {
         })
     }
 
+    #[cfg(feature = "desktop")]
     pub fn open_file(path: &Path) -> Result<Self> {
         let file = path.to_owned();
         let (mut watcher, events) = Self::build(move |event| RepoChanges {

@@ -169,6 +169,7 @@ impl Repository {
         })
     }
 
+    #[cfg(feature = "desktop")]
     fn file_tree(paths: Vec<PathBuf>) -> BTreeMap<PathBuf, Vec<Entry>> {
         let mut entries = BTreeMap::<PathBuf, BTreeSet<(bool, PathBuf)>>::new();
         for path in paths {
@@ -661,6 +662,7 @@ impl Document {
         }
     }
 
+    #[cfg(feature = "desktop")]
     pub(crate) fn draft_baseline(&self) -> [u8; 32] {
         self.baseline
     }

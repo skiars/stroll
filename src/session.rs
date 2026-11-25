@@ -1,6 +1,8 @@
+#[cfg(feature = "desktop")]
+use std::path::Path;
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
-    path::{Path, PathBuf},
+    path::PathBuf,
     sync::Arc,
 };
 
@@ -115,6 +117,7 @@ pub(crate) struct OpenDocument {
     pub title: Option<String>,
 }
 
+#[cfg(feature = "desktop")]
 impl WorktreeSession {
     pub fn select_document(&mut self, path: &Path) {
         self.remember_document(path);

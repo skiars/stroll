@@ -391,6 +391,7 @@ impl SshSession {
         }))
     }
 
+    #[cfg(feature = "desktop")]
     pub fn failure(&self) -> Option<String> {
         self.0.failure.lock().unwrap().clone()
     }
