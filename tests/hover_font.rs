@@ -32,7 +32,7 @@ const ORIGINAL: &str = "Returns `true` if the option is a [`None`](https://examp
 const TRANSLATION: &str =
     "若选项为 [`None`](https://example.com)，则返回 `true`，否则返回 `false`。";
 
-struct Documentation;
+struct Documentation(&'static str);
 
 impl HoverProvider for Documentation {
     fn hover(
@@ -59,6 +59,7 @@ impl HoverProvider for Documentation {
         cx: &mut gpui::App,
     ) -> Task<Option<HoverDocumentation>> {
         let timer = cx.background_executor().timer(Duration::from_millis(450));
+        let translation = self.0;
         cx.background_spawn(async move {
             timer.await;
             Some(HoverDocumentation {
@@ -66,7 +67,7 @@ impl HoverProvider for Documentation {
                     SIGNATURE.len(),
                     HoverParagraph {
                         original: ORIGINAL.into(),
-                        translation: TRANSLATION.into(),
+                        translation: translation.into(),
                     },
                 )])),
                 plaintext: None,
@@ -229,13 +230,13 @@ impl PlatformTextSystem for RecordingTextSystem {
     }
 }
 
-struct EditorProbe(gpui::Entity<EditorState>);
+struct EditorProbe(gpui::Entity<EditorState>, gpui::SharedString);
 
 impl Render for EditorProbe {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
         div()
             .size_full()
-            .child(Editor::new(&self.0).font_family(CODE_FONT).size_full())
+            .child(Editor::new(&self.0).font_family(self.1.clone()).size_full())
     }
 }
 
@@ -258,11 +259,11 @@ fn hover_markdown_shapes_code_in_the_editor_font() {
         let text = "fn source_line() {}\n".repeat(8);
         let state = cx.new(|cx| {
             let mut state = EditorState::new(window, cx).default_value(text);
-            state.lsp_mut().hover_provider = Some(Rc::new(Documentation));
+            state.lsp_mut().hover_provider = Some(Rc::new(Documentation(TRANSLATION)));
             state
         });
         editor = Some(state.clone());
-        let probe = cx.new(|_| EditorProbe(state));
+        let probe = cx.new(|_| EditorProbe(state, CODE_FONT.into()));
         Root::new(probe, window, cx)
     });
     let editor = editor.unwrap();
@@ -321,4 +322,120 @@ fn hover_markdown_shapes_code_in_the_editor_font() {
             }
         }
     }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn hover_translation_prose_uses_a_stronger_foreground_in_both_themes() -> anyhow::Result<()> {
+    use gpui::{HeadlessAppContext, InputEvent as _, MouseMoveEvent, rgb};
+    use gpui_component::ActiveTheme as _;
+
+    let mut app = HeadlessAppContext::with_platform(
+        gpui_platform::current_platform(true).text_system(),
+        Arc::new(gpui_kit_assets::AllAssets),
+        || Ok(Some(Box::new(gpui_wgpu::WgpuHeadlessRenderer::new()?))),
+    );
+    for (mode, expected) in [
+        (ThemeMode::Light, [0x3bu8, 0x41, 0x4d]),
+        (ThemeMode::Dark, [0xd0u8, 0xd2, 0xd7]),
+    ] {
+        app.update(|cx| {
+            gpui_component::init(cx);
+            stroll::workspace::apply_theme(mode, cx);
+            cx.set_reduce_motion(true);
+        });
+        let mut editor = None;
+        let window = app.open_window(size(px(480.), px(380.)), |window, cx| {
+            let state = cx.new(|cx| {
+                let mut state = EditorState::new(window, cx).default_value("fn source_line() {}");
+                state.lsp_mut().hover_provider = Some(Rc::new(Documentation(
+                    "[`None`](https://example.com): `true` translated result `false`.",
+                )));
+                state
+            });
+            editor = Some(state.clone());
+            let font = cx.theme().mono_font_family.clone();
+            let probe = cx.new(|_| EditorProbe(state, font));
+            cx.new(|cx| Root::new(probe, window, cx))
+        })?;
+        let editor = editor.unwrap();
+        app.update_window(window.into(), |_, window, cx| {
+            window.set_scale_factor(2.);
+            window.draw(cx).clear(cx);
+            let position = editor.read(cx).range_to_bounds(&(3..9)).unwrap().center();
+            window.dispatch_event(
+                MouseMoveEvent {
+                    position,
+                    ..Default::default()
+                }
+                .to_platform_input(),
+                cx,
+            );
+        })?;
+        for _ in 0..2 {
+            app.run_until_parked();
+            app.advance_clock(Duration::from_millis(500));
+        }
+        app.run_until_parked();
+        let (before_prose, after_prose) = app.update_window(window.into(), |_, window, cx| {
+            assert!(
+                editor
+                    .read(cx)
+                    .hover_popover()
+                    .unwrap()
+                    .documentation
+                    .is_some()
+            );
+            window.draw(cx).clear(cx);
+            let background = match mode {
+                ThemeMode::Light => rgb(0xf4f5f7),
+                ThemeMode::Dark => rgb(0x292b33),
+            };
+            let mut code: Vec<_> = window
+                .painted_quads()
+                .into_iter()
+                .filter(|quad| quad.background.as_solid() == Some(background.into()))
+                .map(|quad| quad.bounds)
+                .collect();
+            code.sort_by(|a, b| {
+                a.top()
+                    .as_f32()
+                    .total_cmp(&b.top().as_f32())
+                    .then_with(|| a.left().as_f32().total_cmp(&b.left().as_f32()))
+            });
+            let [original, _, _, before_prose, after_prose] = code.as_slice() else {
+                panic!("{mode:?}: expected five hover inline code backgrounds, got {code:?}");
+            };
+            assert!(
+                (original.size.width - before_prose.size.width)
+                    .as_f32()
+                    .abs()
+                    <= 1.
+            );
+            (*before_prose, *after_prose)
+        })?;
+        let screenshot = app.capture_screenshot(window.into())?;
+        let closest = screenshot
+            .enumerate_pixels()
+            .filter(|(x, y, _)| {
+                (before_prose.right().as_f32()..after_prose.left().as_f32()).contains(&(*x as f32))
+                    && (before_prose.top().as_f32()..before_prose.bottom().as_f32())
+                        .contains(&(*y as f32))
+            })
+            .map(|(_, _, pixel)| {
+                let rgb: [u8; 3] = pixel.0[..3].try_into().unwrap();
+                let distance: u16 = rgb
+                    .iter()
+                    .zip(expected)
+                    .map(|(a, b)| u16::from(a.abs_diff(b)))
+                    .sum();
+                (distance, rgb)
+            })
+            .min_by_key(|(distance, _)| *distance);
+        assert!(
+            closest.is_some_and(|(distance, _)| distance <= 9),
+            "{mode:?}: translated hover prose should paint near {expected:?}, found {closest:?} between {before_prose:?} and {after_prose:?}"
+        );
+    }
+    Ok(())
 }

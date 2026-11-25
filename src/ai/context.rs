@@ -35,6 +35,23 @@ pub(crate) fn allowed_hover_source(root: &Path, path: &Path) -> bool {
         })
 }
 
+#[cfg(feature = "desktop")]
+pub(crate) fn allowed_local_document(path: &Path) -> bool {
+    fn allowed_absolute(path: &Path) -> bool {
+        path.is_absolute()
+            && path.components().all(|component| match component {
+                std::path::Component::Normal(name) => name.to_str().is_some_and(allowed_path),
+                std::path::Component::Prefix(_) | std::path::Component::RootDir => true,
+                _ => false,
+            })
+    }
+
+    allowed_absolute(path)
+        && path
+            .canonicalize()
+            .is_ok_and(|resolved| resolved.is_file() && allowed_absolute(&resolved))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

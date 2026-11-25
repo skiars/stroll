@@ -11,7 +11,7 @@ use gpui::{
 };
 
 use crate::{
-    ActiveTheme as _, Icon, Sizable as _, StyledExt, ThemeStyled as _,
+    ActiveTheme as _, Colorize as _, Icon, Sizable as _, StyledExt, ThemeStyled as _,
     clipboard::Clipboard,
     highlighter::{DiagnosticEntry, diagnostic_foreground},
     input::{
@@ -248,7 +248,7 @@ impl Render for HoverPopover {
                             .when_some(plaintext.clone(), |view, text| {
                                 view.child(
                                     div()
-                                        .text_color(cx.theme().muted_foreground)
+                                        .text_color(translation_foreground(cx))
                                         .whitespace_normal()
                                         .child(text),
                                 )
@@ -400,13 +400,18 @@ fn documentation_extensions(
                     "hover-translated-paragraph",
                     *offset,
                     pair.translation.clone(),
-                    Some(cx.theme().muted_foreground),
+                    Some(translation_foreground(cx)),
                     &code_font,
                     &editor,
                     window,
                     cx,
                 ))
         })
+}
+
+fn translation_foreground(cx: &App) -> gpui::Hsla {
+    let theme = cx.theme();
+    theme.foreground.mix_oklab(theme.muted_foreground, 0.8)
 }
 
 /// Give the flex item its natural width. The regular TextView fills its

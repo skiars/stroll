@@ -95,6 +95,8 @@ impl Workspace {
             return;
         };
         self.session_revision += 1;
+        self.document_translation
+            .forget(super::TranslationView::Document, path);
         if active {
             self.pause_document_images(true, cx);
             self.doc = None;
@@ -196,7 +198,14 @@ impl Workspace {
             )
             .child(div().flex_1().min_w_0())
             .when_some(self.doc.as_ref(), |bar, reader| {
-                bar.child(reader.read(cx).toolbar_actions(reader, window, cx))
+                let doc = reader.read(cx);
+                let translation = self.document_translation_button(
+                    cx.entity(),
+                    super::TranslationView::Document,
+                    &doc.path,
+                    colors,
+                );
+                bar.child(doc.toolbar_actions(reader, translation, window, cx))
             })
     }
 

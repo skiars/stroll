@@ -4516,6 +4516,11 @@ impl BlockNode {
                     cell.children.render(fade_key, node_cx, window, cx)
                 });
 
+                let suffix = cell.and_then(|cell| {
+                    node_cx
+                        .markdown_extensions
+                        .render_prose_suffix(cell.children.span, window, cx)
+                });
                 let grow = SLACK_GROW * column.max / total_w;
                 let (lead, trail) = match align {
                     ColumnumnAlign::None | ColumnumnAlign::Left => (0., grow),
@@ -4559,6 +4564,7 @@ impl BlockNode {
                             })
                             .refine_style(&style.table_cell())
                             .children(content)
+                            .children(suffix)
                             .into_any_element(),
                         reveal_scroll,
                     )
@@ -4648,7 +4654,12 @@ impl BlockNode {
                     window,
                     cx,
                 );
-                if paragraph.is_empty() && !paragraph.html_anchors.is_empty() {
+                let suffix = node_cx
+                    .markdown_extensions
+                    .render_prose_suffix(paragraph.span, window, cx);
+                if let Some(suffix) = suffix {
+                    gapped(div().child(content).child(suffix).into_any_element(), mb)
+                } else if paragraph.is_empty() && !paragraph.html_anchors.is_empty() {
                     content
                 } else {
                     gapped(content, mb)
@@ -4707,9 +4718,7 @@ impl BlockNode {
                     text_size * HEADING_BOTTOM_GAP
                 };
 
-                div()
-                    .pt(top)
-                    .pb(bottom)
+                let heading = div()
                     .whitespace_normal()
                     .text_size(text_size)
                     .line_height(relative(line_height))
@@ -4723,8 +4732,13 @@ impl BlockNode {
                         node_cx,
                         window,
                         cx,
-                    ))
-                    .into_any_element()
+                    ));
+                let suffix = node_cx.markdown_extensions.render_prose_suffix(*span, window, cx);
+                if let Some(suffix) = suffix {
+                    div().pt(top).pb(bottom).child(heading).child(suffix).into_any_element()
+                } else {
+                    heading.pt(top).pb(bottom).into_any_element()
+                }
             }
             BlockNode::Blockquote { children, .. } => gapped(
                 div()

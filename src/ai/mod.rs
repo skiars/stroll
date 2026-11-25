@@ -19,10 +19,13 @@ use std::{
 };
 
 #[cfg(feature = "desktop")]
+pub(crate) use hover_translation::{DocumentTranslations, document_prose_keys};
+
+#[cfg(feature = "desktop")]
 pub(crate) use provider::{Settings, fetch_models, remove_credential, save_provider};
 
 #[cfg(all(test, feature = "desktop"))]
-pub(crate) use provider::tests::{install_test_keyring, mock_endpoint};
+pub(crate) use provider::tests::{install_test_keyring, mock_endpoint, mock_endpoint_before_reply};
 
 #[cfg(feature = "desktop")]
 #[derive(Clone)]

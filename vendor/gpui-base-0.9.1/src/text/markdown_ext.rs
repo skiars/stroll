@@ -32,6 +32,9 @@ pub type MarkdownBlockParserFn =
 pub type MarkdownBlockRenderFn =
     dyn Fn(&MarkdownNode, &mut Window, &mut App) -> AnyElement + Send + Sync;
 
+type ProseSuffixFn =
+    dyn Fn(usize, &mut Window, &mut App) -> Option<AnyElement> + Send + Sync;
+
 /// Builds the container of a [block surface](MarkdownExtensions::block_surface).
 pub type BlockSurfaceRenderFn = dyn Fn(&mut Window, &mut App) -> Div + Send + Sync;
 
@@ -254,6 +257,7 @@ pub struct MarkdownExtensions {
     inline_parsers: Vec<Arc<MarkdownInlineParserFn>>,
     inline_renderers: HashMap<SharedString, Arc<MarkdownInlineRenderFn>>,
     block_surfaces: HashMap<SharedString, Arc<BlockSurfaceRenderFn>>,
+    prose_suffix: Option<Arc<ProseSuffixFn>>,
     revision: u64,
     parser_revision: u64,
 }
@@ -308,6 +312,21 @@ impl MarkdownExtensions {
         E: IntoElement,
     {
         self.push_block_renderer(name, renderer);
+        self
+    }
+
+    /// Render a companion below native paragraphs, headings, or table cells,
+    /// addressed by their original Markdown byte offset. The companion is
+    /// outside the source text model used for selection, search and anchors.
+    pub fn prose_suffix<F, E>(mut self, render: F) -> Self
+    where
+        F: Fn(usize, &mut Window, &mut App) -> Option<E> + Send + Sync + 'static,
+        E: IntoElement,
+    {
+        self.prose_suffix = Some(Arc::new(move |offset, window, cx| {
+            render(offset, window, cx).map(IntoElement::into_any_element)
+        }));
+        self.bump_revision();
         self
     }
 
@@ -543,6 +562,15 @@ impl MarkdownExtensions {
         self.block_renderers
             .get(node.name())
             .map(|render| render(node, window, cx))
+    }
+
+    pub(crate) fn render_prose_suffix(
+        &self,
+        span: Option<Span>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Option<AnyElement> {
+        self.prose_suffix.as_ref()?(span?.start, window, cx)
     }
 
     fn bump_revision(&mut self) {

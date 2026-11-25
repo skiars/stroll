@@ -236,7 +236,14 @@ impl Workspace {
             .children(editing.then(|| self.editor_preview_button(cx)).flatten())
             .when(!editing, |bar| {
                 bar.when_some(self.doc.as_ref(), |bar, doc| {
-                    bar.child(doc.read(cx).toolbar_actions(doc, window, cx))
+                    let reader = doc.read(cx);
+                    let translation = self.document_translation_button(
+                        cx.entity(),
+                        TranslationView::Document,
+                        &reader.path,
+                        colors,
+                    );
+                    bar.child(reader.toolbar_actions(doc, translation, window, cx))
                 })
             })
             .when(editing && path.is_some(), |bar| {

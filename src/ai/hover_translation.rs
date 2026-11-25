@@ -8,9 +8,10 @@ use std::{
     time::{Duration, Instant},
 };
 
+use gpui::SharedString;
 use gpui_component::input::{HoverDocumentation, HoverParagraph};
 use lsp_types::{HoverContents, MarkupKind};
-use markdown::mdast::{Node, Paragraph};
+use markdown::mdast::Node;
 use regex::Regex;
 use sha2::{Digest, Sha256};
 
@@ -32,7 +33,10 @@ const ATTEMPT_TIMEOUT: Duration = Duration::from_secs(60);
 const RATE_WINDOW: Duration = Duration::from_secs(60);
 type Translations = HashMap<String, String>;
 
+mod document;
 mod math;
+
+pub(crate) use document::{DocumentTranslations, document_prose_keys};
 
 impl Snapshot {
     pub(crate) async fn translate_hover(
@@ -232,7 +236,7 @@ enum Run {
     Text(String),
     Wrap,
     Markup(String),
-    Image(String),
+    OriginalOnly(String),
 }
 
 #[derive(Debug)]
@@ -243,14 +247,15 @@ struct ProseParagraph {
 
 impl ProseParagraph {
     fn parse(
-        paragraph: &Paragraph,
+        node: &Node,
         source: &str,
         definitions: &HashMap<&str, &str>,
+        for_document: bool,
     ) -> Option<Self> {
-        let offset = paragraph.position.as_ref()?.start.offset;
+        let offset = node.position()?.start.offset;
         let mut tokens = Vec::new();
-        for node in &paragraph.children {
-            collect_runs(node, source, definitions, &mut tokens);
+        for child in node.children()? {
+            collect_runs(child, source, definitions, &mut tokens, for_document);
         }
         if !needs_chinese(
             &tokens
@@ -303,35 +308,43 @@ impl ProseParagraph {
         })
     }
 
-    fn render(&self, translated: &Translations) -> Option<(usize, HoverParagraph)> {
-        if !self.candidates().any(|text| translated.contains_key(text)) {
-            return None;
-        }
+    fn original(&self) -> String {
         let mut original = String::new();
+        for run in &self.runs {
+            match run {
+                Run::Text(text) => literal_markdown(&mut original, text),
+                Run::Markup(mark) | Run::OriginalOnly(mark) => original.push_str(mark),
+                Run::Wrap => unreachable!(),
+            }
+        }
+        original
+    }
+
+    fn translation(&self, translated: &Translations) -> SharedString {
         let mut translation = String::new();
         for run in &self.runs {
             match run {
                 Run::Text(text) => {
-                    literal_markdown(&mut original, text);
-                    if let Some(value) = translated.get(text).filter(|_| needs_chinese(text)) {
-                        literal_markdown(&mut translation, value);
-                    } else {
-                        literal_markdown(&mut translation, text);
-                    }
+                    let value = translated.get(text).filter(|_| needs_chinese(text));
+                    literal_markdown(&mut translation, value.unwrap_or(text));
                 }
-                Run::Markup(mark) => {
-                    original.push_str(mark);
-                    translation.push_str(mark);
-                }
-                Run::Image(mark) => original.push_str(mark),
+                Run::Markup(mark) => translation.push_str(mark),
+                Run::OriginalOnly(_) => {}
                 Run::Wrap => unreachable!(),
             }
+        }
+        translation.into()
+    }
+
+    fn render(&self, translated: &Translations) -> Option<(usize, HoverParagraph)> {
+        if !self.candidates().any(|text| translated.contains_key(text)) {
+            return None;
         }
         Some((
             self.offset,
             HoverParagraph {
-                original: original.into(),
-                translation: translation.into(),
+                original: self.original().into(),
+                translation: self.translation(translated),
             },
         ))
     }
@@ -368,9 +381,7 @@ fn collect_paragraphs(
     out: &mut Vec<ProseParagraph>,
 ) {
     match node {
-        Node::Paragraph(paragraph) => {
-            out.extend(ProseParagraph::parse(paragraph, source, definitions))
-        }
+        Node::Paragraph(_) => out.extend(ProseParagraph::parse(node, source, definitions, false)),
         Node::Root(_) | Node::Blockquote(_) | Node::List(_) | Node::ListItem(_) => {
             for child in node.children().unwrap() {
                 collect_paragraphs(child, source, definitions, out);
@@ -380,7 +391,13 @@ fn collect_paragraphs(
     }
 }
 
-fn collect_runs(node: &Node, source: &str, definitions: &HashMap<&str, &str>, runs: &mut Vec<Run>) {
+fn collect_runs(
+    node: &Node,
+    source: &str,
+    definitions: &HashMap<&str, &str>,
+    runs: &mut Vec<Run>,
+    for_document: bool,
+) {
     fn raw<'a>(source: &'a str, node: &Node) -> &'a str {
         node.position()
             .and_then(|pos| source.get(pos.start.offset..pos.end.offset))
@@ -416,6 +433,12 @@ fn collect_runs(node: &Node, source: &str, definitions: &HashMap<&str, &str>, ru
             runs.push(Run::Wrap);
             return;
         }
+        Node::Paragraph(_) => {
+            if !runs.is_empty() {
+                runs.push(Run::Wrap);
+            }
+            ("", String::new())
+        }
         Node::Strong(_) => ("**", "**".into()),
         Node::Emphasis(_) => ("*", "*".into()),
         Node::Delete(_) => ("~~", "~~".into()),
@@ -429,8 +452,12 @@ fn collect_runs(node: &Node, source: &str, definitions: &HashMap<&str, &str>, ru
                     .unwrap_or(""),
             ),
         ),
+        Node::InlineMath(_) | Node::Html(_) | Node::FootnoteReference(_) if for_document => {
+            runs.push(Run::OriginalOnly(raw(source, node).to_owned()));
+            return;
+        }
         Node::Image(_) | Node::ImageReference(_) => {
-            runs.push(Run::Image(raw(source, node).to_owned()));
+            runs.push(Run::OriginalOnly(raw(source, node).to_owned()));
             return;
         }
         _ => {
@@ -438,13 +465,17 @@ fn collect_runs(node: &Node, source: &str, definitions: &HashMap<&str, &str>, ru
             return;
         }
     };
-    runs.push(Run::Markup(open.into()));
+    if !open.is_empty() {
+        runs.push(Run::Markup(open.into()));
+    }
     if let Some(children) = node.children() {
         for child in children {
-            collect_runs(child, source, definitions, runs);
+            collect_runs(child, source, definitions, runs, for_document);
         }
     }
-    runs.push(Run::Markup(close));
+    if !close.is_empty() {
+        runs.push(Run::Markup(close));
+    }
 }
 
 fn link_end(url: &str) -> String {
@@ -483,6 +514,21 @@ fn translate(
     cancelled: &AtomicBool,
 ) -> Result<Translations, Failure> {
     let mut output = HashMap::new();
+    translate_batches(fragments, cache, provider, cancelled, false, |batch| {
+        output.extend(batch);
+        true
+    })?;
+    Ok(output)
+}
+
+fn translate_batches(
+    fragments: &[&str],
+    cache: &TranslationCache,
+    provider: &Provider,
+    cancelled: &AtomicBool,
+    stop_between_requests: bool,
+    mut report: impl FnMut(Translations) -> bool,
+) -> Result<(), Failure> {
     let mut index = 0;
     while index < fragments.len() {
         check_cancelled(cancelled)?;
@@ -499,15 +545,21 @@ fn translate(
             size += length;
             index += 1;
         }
+        let mut output = HashMap::new();
         translate_batch(
             &fragments[start..index],
             cache,
             provider,
             &mut output,
             cancelled,
+            stop_between_requests,
         )?;
+        check_cancelled(cancelled)?;
+        if !report(output) {
+            return Err(Failure::Cancelled);
+        }
     }
-    Ok(output)
+    Ok(())
 }
 
 fn check_cancelled(cancelled: &AtomicBool) -> Result<(), Failure> {
@@ -524,6 +576,7 @@ fn translate_batch(
     provider: &Provider,
     output: &mut Translations,
     cancelled: &AtomicBool,
+    stop_between_requests: bool,
 ) -> Result<(), Failure> {
     let mut remaining: Vec<_> = texts
         .iter()
@@ -547,7 +600,11 @@ fn translate_batch(
                     .unwrap()
                     .0;
             }
-            let translated = result.as_ref().unwrap().as_ref().map_err(|error| *error)?;
+            let result = result.as_ref().unwrap().as_ref();
+            if result == Err(&Failure::Cancelled) {
+                continue;
+            }
+            let translated = result.map_err(|error| *error)?;
             remaining.retain(|(text, _)| {
                 if let Some(value) = translated.get(*text) {
                     output.insert((*text).to_owned(), value.clone());
@@ -572,8 +629,14 @@ fn translate_batch(
         .iter()
         .map(|(text, (_, key))| (*text, *key))
         .collect();
-    // Once a batch is on the wire, finish it so other hovers can reuse the result.
-    let result = run_batch(&fragments, provider, cache);
+    // Hover batches finish for other waiters. Document jobs can stop before
+    // sending a retry or a fallback request when their preview is no longer visible.
+    let result = run_batch(
+        &fragments,
+        provider,
+        cache,
+        stop_between_requests.then_some(cancelled),
+    );
     {
         let mut work = WORK.lock().unwrap();
         for (_, key) in &remaining {
@@ -590,6 +653,7 @@ fn run_batch(
     fragments: &[(&str, CacheKey)],
     provider: &Provider,
     cache: &TranslationCache,
+    cancelled: Option<&AtomicBool>,
 ) -> Result<Translations, Failure> {
     let keys: Vec<_> = fragments.iter().map(|(_, key)| *key).collect();
     let mut hits = cache.load(&keys).unwrap_or_default();
@@ -615,7 +679,7 @@ fn run_batch(
         output.insert((*text).to_owned(), value.clone());
         entries.push((*key, value));
     };
-    let result = match request(&texts, provider) {
+    let result = match request(&texts, provider, cancelled) {
         Ok(values) => {
             for (fragment, value) in missing.into_iter().zip(values) {
                 save(fragment, value);
@@ -624,7 +688,7 @@ fn run_batch(
         }
         Err(error) if texts.len() > 1 && error.response_error() => {
             missing.into_iter().try_for_each(|fragment| {
-                let value = request(&[fragment.0], provider)?.pop().unwrap();
+                let value = request(&[fragment.0], provider, cancelled)?.pop().unwrap();
                 save(fragment, value);
                 Ok(())
             })
@@ -658,11 +722,18 @@ impl Drop for ActiveRequest {
     }
 }
 
-fn request(texts: &[&str], provider: &Provider) -> Result<Vec<String>, Failure> {
+fn request(
+    texts: &[&str],
+    provider: &Provider,
+    cancelled: Option<&AtomicBool>,
+) -> Result<Vec<String>, Failure> {
     let _active = ActiveRequest::start()?;
     let started = Instant::now();
     let input = texts.join("\n\n");
     for attempt in 1..=2 {
+        if let Some(cancelled) = cancelled {
+            check_cancelled(cancelled)?;
+        }
         {
             let mut work = WORK.lock().unwrap();
             let now = Instant::now();

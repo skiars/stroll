@@ -14,7 +14,7 @@ use futures_channel::oneshot;
 use gpui::{prelude::FluentBuilder as _, *};
 use gpui_base::{CheckboxIndicator, CheckboxIndicatorColors, CheckboxState};
 use gpui_component::{
-    ActiveTheme, Selectable as _, StyledExt,
+    ActiveTheme, Colorize as _, Selectable as _, StyledExt,
     button::Button,
     h_flex,
     input::{DocumentFind, Escape, SelectAll},
@@ -31,6 +31,7 @@ use percent_encoding::percent_decode_str;
 use url::Url;
 
 use crate::{
+    ai::{DocumentTranslations, document_prose_keys},
     doc_graphics::{self, GraphicKind, Graphics},
     paths,
     repository::{
@@ -176,6 +177,7 @@ pub struct PreparedDocument {
     source: SharedString,
     headings: Vec<Heading>,
     editor_scroll_spans: Vec<Range<usize>>,
+    prose_keys: Arc<HashMap<usize, String>>,
     html_anchors: HashMap<SharedString, usize>,
     extensions: MarkdownExtensions,
     graphics: Arc<Graphics>,
@@ -252,9 +254,11 @@ impl PreparedDocument {
         });
         let graphics = Arc::new(graphics);
         let html_anchors = html_anchors(&ast, &source);
+        let prose_keys = Arc::new(document_prose_keys(&ast, &source));
         Ok(Self {
             source: source.into(),
             headings,
+            prose_keys,
             editor_scroll_spans,
             html_anchors,
             extensions: doc_graphics::extensions(graphics.clone()).plugin(TaskTable(task_cells)),
@@ -282,7 +286,7 @@ fn scrollable_inline_text(node: &Node) -> bool {
     }
 }
 
-fn parse_markdown(source: &str) -> Result<Node> {
+pub(crate) fn parse_markdown(source: &str) -> Result<Node> {
     let mut options = markdown::ParseOptions::gfm();
     options.constructs.math_flow = true;
     options.constructs.math_text = true;
@@ -576,6 +580,7 @@ pub struct DocReader {
     image_thumbnails: Entity<ImageThumbnails>,
     image_subscription: Subscription,
     text: Entity<TextViewState>,
+    translation: Option<Arc<DocumentTranslations>>,
     search: Entity<DocumentFind>,
     workspace: WeakEntity<Workspace>,
     _subscriptions: [Subscription; 2],
@@ -601,9 +606,28 @@ impl DocReader {
         self.document.source.clone()
     }
 
+    pub(crate) fn set_translation(
+        &mut self,
+        translation: Option<Arc<DocumentTranslations>>,
+        cx: &mut Context<Self>,
+    ) {
+        if match (&self.translation, &translation) {
+            (Some(old), Some(new)) => Arc::ptr_eq(old, new),
+            (None, None) => true,
+            _ => false,
+        } {
+            return;
+        }
+        self.translation = translation;
+        self.text
+            .update(cx, TextViewState::invalidate_inline_layout);
+        cx.notify();
+    }
+
     pub(crate) fn toolbar_actions(
         &self,
         reader: &Entity<Self>,
+        translation: Div,
         window: &Window,
         cx: &App,
     ) -> impl IntoElement + use<> {
@@ -614,6 +638,7 @@ impl DocReader {
             .gap_1()
             .child(
                 icon_button("document-find", IconName::Search, t!("docs.search"))
+                    .debug_selector(|| "document-find".into())
                     .selected(self.search.read(cx).is_open())
                     .toggled(self.search.read(cx).is_open())
                     .on_click({
@@ -623,6 +648,7 @@ impl DocReader {
                         }
                     }),
             )
+            .child(translation)
             .child(
                 icon_button(
                     "document-outline-toggle",
@@ -1017,6 +1043,7 @@ impl DocReader {
             image_thumbnails: ImageThumbnails::new(cx),
             image_subscription,
             text,
+            translation: None,
             search,
             workspace,
             _subscriptions: [text_subscription, search_subscription],
@@ -1586,8 +1613,11 @@ impl Render for DocReader {
         let theme = cx.theme();
         let colors = Palette::for_mode(theme.mode);
         let dark = theme.mode == gpui_component::ThemeMode::Dark;
+        let body_foreground = Hsla::from(rgb(if dark { 0xc5c8d0 } else { 0x24262b }));
+        let translation_foreground = body_foreground.mix_oklab(colors.muted, 0.8);
         let reader = cx.weak_entity();
         let code_font = crate::workspace::ui_code_font(cx);
+        let inline_code = StyleRefinement::default().font_family(code_font.clone());
         let images = self.images();
         let mut table = StyleRefinement::default().rounded(px(9.));
         table.overflow.x = Some(Overflow::Scroll);
@@ -1636,20 +1666,86 @@ impl Render for DocReader {
                 || crate::language::resources::LanguageResources::installed().code_languages(),
                 |repo| repo.language_resources().code_languages(),
             );
+        let follow_link = {
+            let reader = reader.clone();
+            let workspace = self.workspace.clone();
+            let path = self.path.clone();
+            let editor_preview = self.editor_preview;
+            move |target: &SharedString, event: &ClickEvent, window: &mut Window, cx: &mut App| {
+                if event.is_right_click() {
+                    context_menu::show(
+                        reader.clone(),
+                        Some(target.clone()),
+                        None,
+                        event.position(),
+                        window,
+                        cx,
+                    );
+                    return;
+                }
+                if matches!(event, ClickEvent::Mouse(click) if matches!(click.up.button, MouseButton::Navigate(_)))
+                {
+                    return;
+                }
+                let target = target.clone();
+                let reader = reader.clone();
+                let workspace = workspace.clone();
+                let path = path.clone();
+                window.defer(cx, move |window, cx| {
+                    if editor_preview {
+                        _ = reader.update(cx, |reader, cx| {
+                            reader.follow_preview_link(&target, window, cx);
+                        });
+                    } else {
+                        _ = workspace.update(cx, |workspace, cx| {
+                            workspace.follow_document_link(&path, &target, window, cx);
+                        });
+                    }
+                });
+            }
+        };
+        let mut extensions = self.document.extensions.clone();
+        if let Some(translations) = &self.translation {
+            let translations = translations.clone();
+            let prose = self.document.prose_keys.clone();
+            let follow_link = follow_link.clone();
+            let typography = self.typography.body_font_size;
+            let style = style.clone();
+            let inline_code = inline_code.clone();
+            extensions = extensions.prose_suffix(move |offset, _, _| {
+                let markdown = translations.get(prose.get(&offset)?)?;
+                Some(
+                    div()
+                        .pt(rems(0.25))
+                        .min_w_0()
+                        .debug_selector(move || format!("document-translated-prose:{offset}"))
+                        .child(
+                            TextView::markdown(("document-translation", offset), markdown.clone())
+                                .style(style.clone())
+                                .text_color(translation_foreground)
+                                .text_size(px(typography as f32))
+                                .font_weight(FontWeight::NORMAL)
+                                .line_height(relative(1.72))
+                                .inline_code_style(inline_code.clone())
+                                .on_link_click(follow_link.clone()),
+                        ),
+                )
+            });
+        }
         let body = TextView::new(&self.text)
             .code_languages(code_languages)
             .scrollable(true)
             .wheel_line_height(px(30.))
             .style(style)
-            .inline_code_style(StyleRefinement::default().font_family(code_font))
+            .inline_code_style(inline_code)
             .text_size(px(self.typography.body_font_size as f32))
             .line_height(relative(1.72))
-            .text_color(if dark { rgb(0xc5c8d0) } else { rgb(0x24262b) })
+            .text_color(body_foreground)
             .flex_1()
             .h_full()
             .min_h_0()
             .w_full()
-            .markdown_extensions(self.document.extensions.clone())
+            .markdown_extensions(extensions)
             .image_source_with_block({
                 let images = images.clone();
                 let thumbnails = self.image_thumbnails.clone();
@@ -1686,43 +1782,7 @@ impl Render for DocReader {
                 }
             })
             .link_tooltip(|target, window, cx| Tooltip::new(target.clone()).build(window, cx))
-            .on_link_click({
-                let reader = reader.clone();
-                let workspace = self.workspace.clone();
-                let path = self.path.clone();
-                let editor_preview = self.editor_preview;
-                move |target, event, window, cx| {
-                    if event.is_right_click() {
-                        context_menu::show(
-                            reader.clone(),
-                            Some(target.clone()),
-                            None,
-                            event.position(),
-                            window,
-                            cx,
-                        );
-                        return;
-                    }
-                    if matches!(event, ClickEvent::Mouse(click) if matches!(click.up.button, MouseButton::Navigate(_))) {
-                        return;
-                    }
-                    let target = target.clone();
-                    let reader = reader.clone();
-                    let workspace = workspace.clone();
-                    let path = path.clone();
-                    window.defer(cx, move |window, cx| {
-                        if editor_preview {
-                            _ = reader.update(cx, |reader, cx| {
-                                reader.follow_preview_link(&target, window, cx);
-                            });
-                        } else {
-                            _ = workspace.update(cx, |workspace, cx| {
-                                workspace.follow_document_link(&path, &target, window, cx);
-                            });
-                        }
-                    });
-                }
-            })
+            .on_link_click(follow_link)
             .code_block_actions(|code, _, _| {
                 let code = code.code();
                 copy_button(code)
@@ -1889,6 +1949,91 @@ impl DocReader {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn document_translation_preserves_inline_code_appearance_and_prose_contrast() -> Result<()> {
+        let mut app = HeadlessAppContext::with_platform(
+            gpui_platform::current_platform(true).text_system(),
+            Arc::new(gpui_kit_assets::AllAssets),
+            || Ok(Some(Box::new(gpui_wgpu::WgpuHeadlessRenderer::new()?))),
+        );
+        for mode in [
+            gpui_component::ThemeMode::Light,
+            gpui_component::ThemeMode::Dark,
+        ] {
+            app.update(|cx| {
+                gpui_component::init(cx);
+                crate::workspace::apply_theme(mode, cx);
+            });
+            let window = app.open_window(size(px(580.), px(200.)), |window, cx| {
+                let document =
+                    PreparedDocument::new("Original prose with `value`.".into()).unwrap();
+                let source = document.prose_keys[&0].clone();
+                cx.new(|cx| {
+                    let mut reader = DocReader::new(
+                        PathBuf::new(),
+                        "translation.md".into(),
+                        document,
+                        None,
+                        WeakEntity::new_invalid(),
+                        window,
+                        cx,
+                    );
+                    reader.set_translation(
+                        Some(Arc::new(HashMap::from([(
+                            source,
+                            "Translated prose with `value`.".into(),
+                        )]))),
+                        cx,
+                    );
+                    reader
+                })
+            })?;
+            app.run_until_parked();
+            let prose = app.update_window(window.into(), |_, window, cx| {
+                window.set_scale_factor(2.);
+                window.draw(cx).clear(cx);
+                let mut code: Vec<_> = window
+                    .painted_quads()
+                    .into_iter()
+                    .filter(|quad| quad.background.as_solid() == Some(Palette::for_mode(mode).soft))
+                    .map(|quad| quad.bounds)
+                    .collect();
+                code.sort_by(|a, b| a.top().as_f32().total_cmp(&b.top().as_f32()));
+                let [original, translated] = code.as_slice() else {
+                    panic!("{mode:?}: expected two inline code backgrounds, got {code:?}");
+                };
+                assert!(original.bottom() <= translated.top());
+                assert!((original.size.width - translated.size.width).as_f32().abs() <= 1.);
+                assert!(
+                    (original.size.height - translated.size.height)
+                        .as_f32()
+                        .abs()
+                        <= 1.
+                );
+                *translated
+            })?;
+
+            let image = app.capture_screenshot(window.into())?;
+            let expected = match mode {
+                gpui_component::ThemeMode::Light => [0x31u8, 0x34, 0x3c],
+                gpui_component::ThemeMode::Dark => [0xbeu8, 0xc1, 0xc9],
+            };
+            assert!(
+                image.enumerate_pixels().any(|(x, y, pixel)| {
+                    (x as f32) < prose.left().as_f32()
+                        && (prose.top().as_f32()..prose.bottom().as_f32()).contains(&(y as f32))
+                        && pixel.0[..3]
+                            .iter()
+                            .zip(expected)
+                            .all(|(channel, expected)| channel.abs_diff(expected) <= 3)
+                }),
+                "{mode:?}: translated prose should paint close to the body foreground"
+            );
+        }
+        Ok(())
+    }
 
     #[test]
     fn outlines_nested_unicode_headings_without_parsing_code_as_headings() {

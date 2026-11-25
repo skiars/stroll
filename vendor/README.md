@@ -27,6 +27,11 @@ example and benchmark targets. The application tests live in `tests/`.
   Run the `docs::tests::markdown_` reader tests and the `documents` and
   `smooth_scroll` integration tests.
 
+- Markdown prose companions render below native paragraphs, headings, and
+  table cells at their source offsets. The companion stays outside the
+  source selection, search, and anchor model. Run the `document_translation`
+  tests for bilingual layout and editor preview behavior.
+
 - Parsed SVGs supply intrinsic image sizes during layout and rasterize on a
   background worker at the snapped device-pixel paint size. The shared cache
   coalesces identical jobs, retains the previous raster during continuous
@@ -312,8 +317,9 @@ dialogs in a Wayland window after changes to paint order or focus handling.
   verify the delayed update, layout and cancellation.
 - Paired hover paragraphs preserve the editor's code font. Applications can
   set `Theme::hover_inline_code_size` to override the default inline code
-  scaling. Run `cargo test --release --locked --test hover_font` to verify the
-  rendered font families, sizes, and prose weight.
+  scaling. Translated Markdown and plaintext use a shade close to the main
+  foreground. Run `cargo test --release --locked --test hover_font` to verify
+  the rendered font families, sizes, and prose weight.
 - Markdown file links in hover documentation use the editor's existing
   show-document hook. Web links keep their default URL behavior. Run
   `cargo test --release --locked --lib hover_source_links_use_workspace_navigation`

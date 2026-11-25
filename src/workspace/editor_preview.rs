@@ -170,6 +170,8 @@ impl Workspace {
     }
 
     pub(super) fn forget_editor_preview(&mut self, path: &Path) {
+        self.document_translation
+            .forget(TranslationView::Editor, path);
         self.editor_previews.markdown.remove(path);
         self.editor_previews.svg_source_errors.remove(path);
         if self.session.editor_previews.remove(path).is_some() {

@@ -535,7 +535,14 @@ pub(crate) mod tests {
     pub(crate) fn mock_endpoint(
         replies: Vec<(u16, &'static str)>,
     ) -> (String, JoinHandle<RequestLog>) {
-        let (provider, worker) = mock_provider("model", replies);
+        mock_endpoint_before_reply(replies, || {})
+    }
+
+    pub(crate) fn mock_endpoint_before_reply(
+        replies: Vec<(u16, &'static str)>,
+        before_reply: impl Fn() + Send + 'static,
+    ) -> (String, JoinHandle<RequestLog>) {
+        let (provider, worker) = mock_provider_before_reply("model", replies, before_reply);
         (provider.base, worker)
     }
 

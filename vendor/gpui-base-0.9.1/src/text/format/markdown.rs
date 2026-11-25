@@ -299,6 +299,7 @@ fn parse_table_cell(
 ) {
     let mut paragraph = Paragraph::default();
     parse_inline_children(source, &mut paragraph, &node.children, cx);
+    paragraph.span = new_span(node.position.clone(), cx);
     let table_cell = node::TableCell {
         children: paragraph,
         ..Default::default()

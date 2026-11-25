@@ -4,6 +4,7 @@ mod audio_preview;
 mod caret_hints;
 mod code_theme;
 mod config_watch;
+mod document_translation;
 mod documents;
 mod edit_history;
 mod editor_git;
@@ -42,6 +43,7 @@ mod window_bounds;
 #[cfg(test)]
 mod worktree_recovery_tests;
 
+pub(crate) use document_translation::TranslationView;
 pub use window_bounds::{repository_window_bounds, standalone_window_bounds};
 
 use editor_preview::{EditorPreviews, PreviewKind};
@@ -872,6 +874,7 @@ pub struct Workspace {
     image_preview_return_focus: Option<FocusHandle>,
     images: HashMap<PathBuf, image_tab::ImageTab>,
     editor_previews: EditorPreviews,
+    document_translation: document_translation::DocumentTranslation,
     audio_preview: audio_preview::AudioPreview,
     review_loads: HashMap<PathBuf, Vec<ReviewBufferCallback>>,
     saving: BTreeSet<PathBuf>,
@@ -1079,6 +1082,7 @@ impl Workspace {
             image_preview_return_focus: None,
             images: HashMap::new(),
             editor_previews: EditorPreviews::default(),
+            document_translation: Default::default(),
             audio_preview: audio_preview::AudioPreview::default(),
             review_loads: HashMap::new(),
             saving: BTreeSet::new(),
@@ -1755,6 +1759,7 @@ impl Workspace {
             image.release(window);
         }
         self.editor_previews = EditorPreviews::default();
+        self.document_translation = Default::default();
         self.audio_preview.stop();
         self.review_loads.clear();
         self.language_servers.clear();
@@ -5191,6 +5196,22 @@ impl Workspace {
                 h_flex()
                     .flex_shrink_0()
                     .gap_3()
+                    .when(docs::is_markdown(path), |bar| {
+                        bar.child(
+                            h_flex()
+                                .id("status-file-actions")
+                                .debug_selector(|| "status-file-actions".into())
+                                .flex_shrink_0()
+                                .gap_1()
+                                .mr_1()
+                                .child(self.document_translation_button(
+                                    cx.entity(),
+                                    TranslationView::Editor,
+                                    path,
+                                    colors,
+                                )),
+                        )
+                    })
                     .child(
                         baseline_aligned(
                             cx,
@@ -5563,6 +5584,7 @@ impl Render for Workspace {
             self.editor_previews.split_drag = None;
         }
         self.refresh_active_editor_preview(window, cx);
+        self.sync_document_translation(window, cx);
         self.visible_editor = if self.view == WorkspaceView::Editor
             && !self.terminal_maximized()
             && self.active_editor_preview_mode() != EditorPreviewMode::Full
