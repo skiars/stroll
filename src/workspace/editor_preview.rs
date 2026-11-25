@@ -493,14 +493,27 @@ impl Workspace {
                 |image| self.image_tab_content(path, image, cx, colors),
             ),
         };
+        let preview = v_flex()
+            .flex_1()
+            .min_h_0()
+            .min_w_0()
+            .overflow_hidden()
+            .child(preview)
+            .when(kind == PreviewKind::Markdown, |pane| {
+                pane.key_context("Reader").on_action(cx.listener(
+                    move |this, _: &FindInDocument, window, cx| {
+                        if let Some(reader) = this.active_markdown_preview().cloned() {
+                            if mode == EditorPreviewMode::Split {
+                                this.reset_markdown_scroll_follow(cx);
+                            }
+                            reader.update(cx, |reader, cx| reader.find(window, cx));
+                        }
+                    },
+                ))
+            });
         if mode == EditorPreviewMode::Full {
-            return v_flex()
+            return preview
                 .debug_selector(|| "editor-preview-full".into())
-                .flex_1()
-                .min_h_0()
-                .min_w_0()
-                .overflow_hidden()
-                .child(preview)
                 .into_any_element();
         }
         let fraction = self.editor_preview_split_fraction(kind);
@@ -549,15 +562,10 @@ impl Workspace {
                     }),
             )
             .child(
-                v_flex()
+                preview
                     .relative()
                     .debug_selector(|| "editor-preview-pane".into())
-                    .flex_1()
                     .h_full()
-                    .min_w_0()
-                    .min_h_0()
-                    .overflow_hidden()
-                    .child(preview)
                     .when(kind == PreviewKind::Markdown, |pane| {
                         pane.child(Self::markdown_scroll_input(false, cx))
                             .capture_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
@@ -847,6 +855,102 @@ mod tests {
                 .is_some_and(|reader| reader.read(cx).session_position(cx).is_some())
         });
         Ok((workspace, visual))
+    }
+
+    #[::core::prelude::v1::test]
+    fn markdown_preview_find_follows_focus_in_split_and_full_modes() -> Result<()> {
+        let fixture = tempfile::tempdir()?;
+        let mut cx = TestAppContext::build_with_text_system(
+            TestDispatcher::new(0),
+            None,
+            crate::test_support::text_system(cfg!(target_os = "linux")),
+        );
+        let (find, copy) = if cfg!(target_os = "macos") {
+            ("cmd-f", "cmd-c")
+        } else {
+            ("ctrl-f", "ctrl-c")
+        };
+        cx.update(|cx| {
+            cx.bind_keys([KeyBinding::new(
+                find,
+                FindInDocument,
+                Some("Reader && !Locator"),
+            )]);
+        });
+        let (workspace, visual) = open_markdown_scroll_fixture(&mut cx, fixture.path())?;
+        visual.update(|window, _| window.activate_window());
+
+        let source = visual.debug_bounds("workspace-editor").unwrap();
+        visual.simulate_click(source.center(), Modifiers::none());
+        visual.simulate_keystrokes(find);
+        settle(visual, &workspace, |this, cx| {
+            this.active_file()
+                .unwrap()
+                .editor
+                .read(cx)
+                .search_session()
+                .open
+        });
+        assert!(source.contains(&visual.debug_bounds("find-bar").unwrap().center()));
+        visual.simulate_keystrokes("escape");
+        settle(visual, &workspace, |this, cx| {
+            !this
+                .active_file()
+                .unwrap()
+                .editor
+                .read(cx)
+                .search_session()
+                .open
+        });
+
+        let preview = visual.debug_bounds("editor-preview-pane").unwrap();
+        visual.simulate_click(preview.center(), Modifiers::none());
+        visual.simulate_keystrokes(find);
+        settle(visual, &workspace, |_, _| true);
+        assert!(preview.contains(&visual.debug_bounds("find-bar").unwrap().center()));
+
+        visual.simulate_input("Final section");
+        let final_section = MARKDOWN_SCROLL_FIXTURE.find("## Final section").unwrap();
+        settle(visual, &workspace, |this, cx| {
+            let reader = this.active_markdown_preview().unwrap().read(cx);
+            reader
+                .editor_scroll_anchor(final_section, cx)
+                .is_some_and(|anchor| reader.editor_scroll_delta(anchor, 0., cx).is_some())
+        });
+        visual.simulate_keystrokes(find);
+        visual.simulate_keystrokes(copy);
+        visual.update(|_, cx| {
+            assert_eq!(
+                cx.read_from_clipboard()
+                    .and_then(|item| item.text())
+                    .as_deref(),
+                Some("Final section")
+            );
+        });
+        visual.simulate_keystrokes("escape");
+        settle(visual, &workspace, |_, _| true);
+        assert!(visual.debug_bounds("find-bar").is_none());
+        visual.simulate_keystrokes(find);
+        settle(visual, &workspace, |_, _| true);
+        assert!(preview.contains(&visual.debug_bounds("find-bar").unwrap().center()));
+        visual.simulate_keystrokes("escape");
+
+        for (icon, mode) in [
+            ("editor-preview-icon-split", EditorPreviewMode::Source),
+            ("editor-preview-icon-source", EditorPreviewMode::Full),
+        ] {
+            let button = visual.debug_bounds(icon).unwrap();
+            visual.simulate_click(button.center(), Modifiers::none());
+            settle(visual, &workspace, |this, _| {
+                this.active_editor_preview_mode() == mode
+            });
+        }
+        let full = visual.debug_bounds("editor-preview-full").unwrap();
+        visual.simulate_click(full.center(), Modifiers::none());
+        visual.simulate_keystrokes(find);
+        settle(visual, &workspace, |_, _| true);
+        assert!(full.contains(&visual.debug_bounds("find-bar").unwrap().center()));
+        Ok(())
     }
 
     #[::core::prelude::v1::test]
@@ -1390,6 +1494,7 @@ mod tests {
         };
 
         open(&mut visual, &workspace, first);
+        let status = visual.debug_bounds("status-file-path").unwrap();
         let icon = visual.debug_bounds("editor-preview-icon-source").unwrap();
         let actions = visual.debug_bounds("workspace-actions-trigger").unwrap();
         assert!(icon.right() <= actions.left());
@@ -1401,6 +1506,7 @@ mod tests {
         );
         click_mode(&mut visual, &workspace, "editor-preview-icon-source");
         assert!(visual.debug_bounds("editor-preview-full").is_some());
+        assert_eq!(visual.debug_bounds("status-file-path"), Some(status));
         assert!(
             visual
                 .debug_bounds("editor-preview-divider-anchor")
@@ -1409,6 +1515,7 @@ mod tests {
         assert!(visual.debug_bounds("workspace-editor").is_none());
         click_mode(&mut visual, &workspace, "editor-preview-icon-full");
         assert_split_layout(&mut visual, 0.5);
+        assert_eq!(visual.debug_bounds("status-file-path"), Some(status));
         drag_split(&mut visual, &workspace, 0.60);
         let source = visual.debug_bounds("workspace-editor").unwrap();
         let preview = visual.debug_bounds("editor-preview-pane").unwrap();

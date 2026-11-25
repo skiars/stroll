@@ -5413,16 +5413,11 @@ impl Workspace {
                             .into_any_element()
                     }),
             )
-            .when(
-                !docs
-                    && !self.terminal_maximized()
-                    && self.active_editor_preview_mode() != EditorPreviewMode::Full,
-                |body| {
-                    body.when_some(self.active_file(), |body, file| {
-                        body.child(self.status_bar(file, window, cx, colors))
-                    })
-                },
-            )
+            .when(!docs && !self.terminal_maximized(), |body| {
+                body.when_some(self.active_file(), |body, file| {
+                    body.child(self.status_bar(file, window, cx, colors))
+                })
+            })
     }
 
     /// The menu at the right edge of the tab bar.
