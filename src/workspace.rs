@@ -26,6 +26,7 @@ mod line_alignment;
 mod locator;
 mod markdown_editing;
 mod markdown_links;
+mod project_gradient;
 mod repo_sync;
 mod repository_ui;
 mod selection_highlight;
@@ -52,6 +53,7 @@ use git_panel::GitPanel;
 use language_service::{
     LanguageService, LanguageServicePanel, ServerKey, ServerProject, WorktreeLanguageState,
 };
+use project_gradient::{PaneGradient, ProjectGradient};
 use repository_ui::RepositoryUi;
 use settings::SettingsWindow;
 
@@ -70,7 +72,7 @@ use gpui::{prelude::FluentBuilder as _, *};
 use gpui_component::{
     ActiveTheme, Colorize as _, Disableable as _, Icon, Placement, Selectable as _, Sizable as _,
     StyledExt, Theme, ThemeMode, TitleBar, WindowExt as _,
-    button::{Button, ButtonVariants},
+    button::{Button, ButtonCustomVariant, ButtonVariants},
     h_flex,
     input::{Editor, EditorState, Enter, IndentInline, InputEvent, Rope, Search},
     menu::{ContextMenuExt, DropdownMenu, PopupMenuItem},
@@ -139,6 +141,7 @@ impl Render for PaneDrag {
     }
 }
 
+const TOPBAR_HEIGHT: Pixels = px(36.);
 const FILE_TOOLBAR_HEIGHT: Pixels = px(36.);
 const TAB_BAR_BUTTON_SIZE: Pixels = px(22.);
 const PANE_RESIZE_GUTTER: Pixels = px(5.);
@@ -284,6 +287,7 @@ pub(crate) struct Palette {
     pub(crate) elevated: Hsla,
     titlebar: Hsla,
     nav_track: Hsla,
+    nav_hover: Option<Hsla>,
     nav_selected: Hsla,
     pub(crate) soft: Hsla,
     pub(crate) hover: Hsla,
@@ -397,6 +401,7 @@ impl Palette {
                 0x15161a
             })
             .into(),
+            nav_hover: None,
             nav_selected: if mode.is_dark() {
                 rgb(0x383838).into()
             } else {
@@ -2142,9 +2147,11 @@ impl Workspace {
             let repo = repo.clone();
             let workspace = cx.weak_entity();
             let config = self.config.current().git;
+            let gradient_title_bar = self.config.current().appearance.gradient_title_bar;
             let inlay_hints = self.config.current().editor.inlay_hints;
             self.git = Some(cx.new(|cx| {
                 let mut panel = GitPanel::new(repo, workspace, config, &self.session, window, cx);
+                panel.set_project_gradient(gradient_title_bar, cx);
                 panel.set_inlay_hints_enabled(inlay_hints, window, cx);
                 panel
             }));
@@ -4336,7 +4343,13 @@ impl Workspace {
         self.drain_close_queue(previous.as_deref(), window, cx);
     }
 
-    fn topbar(&self, window: &Window, cx: &Context<Self>, colors: Palette) -> impl IntoElement {
+    fn topbar(
+        &self,
+        window: &Window,
+        cx: &Context<Self>,
+        colors: Palette,
+        project_gradient: bool,
+    ) -> impl IntoElement {
         let actions = self.topbar_actions(cx);
         let row = if cfg!(target_os = "macos") && self.repository.is_some() {
             centered_topbar(cx.entity(), actions, colors).into_any_element()
@@ -4361,8 +4374,12 @@ impl Workspace {
                     window.remove_window();
                 }
             }))
-            .h(px(36.))
-            .bg(colors.titlebar)
+            .h(TOPBAR_HEIGHT)
+            .bg(if project_gradient {
+                colors.titlebar.opacity(0.)
+            } else {
+                colors.titlebar
+            })
             .border_0()
             .child(row)
     }
@@ -4516,6 +4533,8 @@ impl Workspace {
         window: &Window,
         cx: &Context<Self>,
         colors: Palette,
+        gradient: Option<PaneGradient>,
+        corner: Pixels,
     ) -> impl IntoElement {
         let rows = self.rows.clone();
         let in_workspace = self.view == WorkspaceView::Editor;
@@ -4568,6 +4587,7 @@ impl Workspace {
                     weak.clone(),
                     active.clone(),
                     colors,
+                    gradient.clone(),
                 )
             });
         let rows = frame.as_ref().map_or(rows, |frame| frame.rows.clone());
@@ -4932,11 +4952,20 @@ impl Workspace {
                 HandleEdge::Trailing,
                 FILE_TOOLBAR_HEIGHT,
             ))
-            .child(pane_edge(
-                HandleEdge::Trailing,
-                FILE_TOOLBAR_HEIGHT,
-                cx.theme().mode,
-            ))
+            .when(gradient.is_some(), |pane| {
+                pane.child(project_gradient::pane_divider(
+                    corner,
+                    colors.border,
+                    cx.theme().mode,
+                ))
+            })
+            .when(gradient.is_none(), |pane| {
+                pane.child(pane_edge(
+                    HandleEdge::Trailing,
+                    FILE_TOOLBAR_HEIGHT,
+                    cx.theme().mode,
+                ))
+            })
     }
 
     fn editor_font_family(&self, cx: &App) -> SharedString {
@@ -4945,11 +4974,17 @@ impl Workspace {
             .unwrap_or_else(|| cx.theme().mono_font_family.clone())
     }
 
-    fn content(&self, window: &Window, cx: &Context<Self>, colors: Palette) -> Stateful<Div> {
+    fn content(
+        &self,
+        window: &Window,
+        cx: &Context<Self>,
+        colors: Palette,
+        corner: Pixels,
+    ) -> Stateful<Div> {
         let editor_background =
             code_theme::surface(self.config.current().appearance.code_theme, cx.theme().mode);
         let maximum = terminal::maximum_height(window);
-        let mut terminal = self.terminal_panel(maximum, colors, cx);
+        let mut terminal = self.terminal_panel(maximum, colors, corner, cx);
         let maximized = self.terminal_maximized();
         let mut main = v_flex().relative().flex_1().min_w_0().min_h_0().h_full();
         if let Some((path, image)) = self.active_image_tab()
@@ -4957,7 +4992,7 @@ impl Workspace {
         {
             main = main
                 .when(self.standalone.is_none(), |main| {
-                    main.child(self.tab_bar(cx, colors))
+                    main.child(self.tab_bar(cx, colors, corner))
                 })
                 .child(self.image_tab_content(path, image, cx, colors));
         } else if let Some(file) = self.active_file() {
@@ -5060,7 +5095,7 @@ impl Workspace {
                     .into_any_element();
             main = main
                 .when(self.standalone.is_none(), |main| {
-                    main.child(self.tab_bar(cx, colors))
+                    main.child(self.tab_bar(cx, colors, corner))
                 })
                 .child(self.editor_tab_body(path, source, cx, colors))
                 .children(if maximized { None } else { terminal.take() });
@@ -5082,14 +5117,14 @@ impl Workspace {
                 );
             main = main
                 .when(self.standalone.is_none(), |main| {
-                    main.child(self.tab_bar(cx, colors))
+                    main.child(self.tab_bar(cx, colors, corner))
                 })
                 .child(self.editor_tab_body(path, source, cx, colors));
         } else {
             main = main
                 .when(
                     self.standalone.is_none() && !self.tabs.paths().is_empty(),
-                    |main| main.child(self.tab_bar(cx, colors)),
+                    |main| main.child(self.tab_bar(cx, colors, corner)),
                 )
                 .when(
                     self.standalone.is_none() && self.tabs.paths().is_empty(),
@@ -5100,6 +5135,7 @@ impl Workspace {
                                 .h(FILE_TOOLBAR_HEIGHT)
                                 .w_full()
                                 .bg(colors.bg)
+                                .rounded_tl(corner)
                                 .px_2()
                                 .children(self.show_file_tree_button(cx))
                                 .child(div().flex_1())
@@ -5387,6 +5423,7 @@ impl Workspace {
         window: &Window,
         cx: &Context<Self>,
         colors: Palette,
+        gradient: Option<ProjectGradient>,
     ) -> impl IntoElement {
         let docs = self.view == WorkspaceView::Docs;
         let width = window.viewport_size().width;
@@ -5396,6 +5433,21 @@ impl Workspace {
         } else {
             (self.session.panels.editor_tree, self.editor_tree_width)
         };
+        let visible = self.standalone.is_none() && visible;
+        let tree_width = tree_width.min(tree_limit);
+        let tree_gradient = gradient
+            .filter(|_| visible)
+            .map(|gradient| PaneGradient::new(gradient, colors.bg));
+        let corner = if tree_gradient.is_some() {
+            project_gradient::EDITOR_CORNER
+        } else {
+            px(0.)
+        };
+        let tree_colors = if tree_gradient.is_some() {
+            ProjectGradient::controls(colors, cx.theme().mode)
+        } else {
+            colors
+        };
         v_flex()
             .flex_1()
             .min_h_0()
@@ -5403,6 +5455,7 @@ impl Workspace {
             .child(
                 h_flex()
                     .id("workspace-panes")
+                    .relative()
                     .flex_1()
                     .min_h_0()
                     .w_full()
@@ -5423,14 +5476,28 @@ impl Workspace {
                             cx.notify();
                         },
                     ))
-                    .when(self.standalone.is_none() && visible, |row| {
-                        row.child(self.sidebar(tree_width.min(tree_limit), window, cx, colors))
+                    .when_some(tree_gradient.clone(), |row, gradient| {
+                        row.child(gradient.background(tree_width, corner))
+                    })
+                    .when(visible, |row| {
+                        row.child(self.sidebar(
+                            tree_width,
+                            window,
+                            cx,
+                            tree_colors,
+                            tree_gradient,
+                            corner,
+                        ))
                     })
                     .child(if docs {
-                        self.file_drop_area(self.docs_content(window, cx, colors), cx, colors)
-                            .into_any_element()
+                        self.file_drop_area(
+                            self.docs_content(window, cx, colors, corner),
+                            cx,
+                            colors,
+                        )
+                        .into_any_element()
                     } else {
-                        self.file_drop_area(self.content(window, cx, colors), cx, colors)
+                        self.file_drop_area(self.content(window, cx, colors, corner), cx, colors)
                             .into_any_element()
                     }),
             )
@@ -5524,13 +5591,22 @@ impl Workspace {
             )
     }
 
-    fn docs_content(&self, window: &Window, cx: &Context<Self>, colors: Palette) -> Stateful<Div> {
+    fn docs_content(
+        &self,
+        window: &Window,
+        cx: &Context<Self>,
+        colors: Palette,
+        corner: Pixels,
+    ) -> Stateful<Div> {
         v_flex()
             .id("docs")
             .flex_1()
             .min_w_0()
             .min_h_0()
             .h_full()
+            .when(corner > px(0.), |pane| {
+                pane.bg(colors.bg).rounded_tl(corner)
+            })
             .when(self.standalone.is_none(), |pane| {
                 pane.child(self.document_toolbar(window, cx, colors))
             })
@@ -5622,6 +5698,13 @@ impl Render for Workspace {
             });
         }
         let colors = Palette::for_mode(cx.theme().mode);
+        let gradient = self
+            .repository
+            .as_deref()
+            .filter(|_| {
+                self.standalone.is_none() && self.config.current().appearance.gradient_title_bar
+            })
+            .map(|repo| ProjectGradient::for_repository(repo, cx.theme().mode, colors));
         let picker_opacity = self.repository_ui.picker_opacity(window, cx);
         let locator_overlay = self.locator_overlay(window, cx);
         let switching = self.repository_overlay_open();
@@ -5639,6 +5722,7 @@ impl Render for Workspace {
         }
         v_flex()
             .id("workspace")
+            .relative()
             .size_full()
             .min_h_0()
             .text_color(colors.ink)
@@ -5685,11 +5769,18 @@ impl Render for Workspace {
                     this.cycle_tabs(false, window, cx);
                 }))
             })
+            .children(gradient.map(|gradient| gradient.titlebar(TOPBAR_HEIGHT)))
             .child(if self.standalone.is_some() {
                 self.standalone_topbar(window, cx, colors)
                     .into_any_element()
             } else {
-                self.topbar(window, cx, colors).into_any_element()
+                let topbar_colors = if gradient.is_some() {
+                    ProjectGradient::controls(colors, cx.theme().mode)
+                } else {
+                    colors
+                };
+                self.topbar(window, cx, topbar_colors, gradient.is_some())
+                    .into_any_element()
             })
             .when(
                 self.repository
@@ -5732,7 +5823,8 @@ impl Render for Workspace {
                 )
                 .into_any_element()
             } else {
-                self.workspace_body(window, cx, colors).into_any_element()
+                self.workspace_body(window, cx, colors, gradient)
+                    .into_any_element()
             })
             .when_some(locator_overlay, |view, overlay| view.child(overlay))
             .when(
@@ -5899,6 +5991,16 @@ fn nav_item(
     };
 
     topbar_segment(id, active, colors)
+        .when_some(colors.nav_hover.filter(|_| !active), |button, hover| {
+            button
+                .custom(
+                    ButtonCustomVariant::new(cx)
+                        .foreground(colors.muted)
+                        .hover(hover)
+                        .active(hover.alpha(0.40)),
+                )
+                .cursor_pointer()
+        })
         .accessibility_label(label.clone())
         .child(text(
             label,

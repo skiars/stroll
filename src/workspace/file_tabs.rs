@@ -25,7 +25,12 @@ use super::{
 const TAB_BAR_GAP: Pixels = px(6.);
 
 impl Workspace {
-    pub(super) fn tab_bar(&self, cx: &Context<Self>, colors: Palette) -> impl IntoElement {
+    pub(super) fn tab_bar(
+        &self,
+        cx: &Context<Self>,
+        colors: Palette,
+        corner: Pixels,
+    ) -> impl IntoElement {
         let labels = labels(self.tabs.paths());
         let more = self.tabs_overflow || self.open_files_list;
         h_flex()
@@ -38,6 +43,7 @@ impl Workspace {
             .gap(TAB_BAR_GAP)
             .px_2()
             .bg(colors.bg)
+            .rounded_tl(corner)
             .children(self.show_file_tree_button(cx))
             .child(self.tab_strip(&labels, more, cx, colors))
             .when(more, |bar| {

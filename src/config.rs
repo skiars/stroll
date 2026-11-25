@@ -97,6 +97,7 @@ impl FileAssociations {
 #[serde(default)]
 pub(crate) struct Appearance {
     pub theme: Theme,
+    pub gradient_title_bar: bool,
     pub code_theme: CodeTheme,
     pub code_contrast: CodeContrast,
     pub language: Language,
@@ -113,6 +114,7 @@ impl Default for Appearance {
     fn default() -> Self {
         Self {
             theme: Theme::System,
+            gradient_title_bar: false,
             code_theme: CodeTheme::default(),
             code_contrast: CodeContrast::Enhanced,
             language: Language::System,
@@ -819,6 +821,7 @@ mod tests {
         assert_eq!(config.editor.font_size, 15.);
         assert_eq!(config.editor.line_height, 1.5);
         assert_eq!(config.appearance.language, Language::System);
+        assert!(!config.appearance.gradient_title_bar);
         assert!(config.appearance.ui_font_family.is_empty());
         assert_eq!(config.appearance.ui_font_size, 13.);
         assert!(config.appearance.fallback_font_family.is_empty());
@@ -827,6 +830,7 @@ mod tests {
             TextRenderingPreference::Auto
         );
         config.appearance.theme = Theme::Dark;
+        config.appearance.gradient_title_bar = true;
         config.appearance.code_theme = CodeTheme::Paper;
         config.appearance.code_contrast = CodeContrast::High;
         config.appearance.language = Language::Chinese;
@@ -856,6 +860,7 @@ mod tests {
         for expected in [
             "# User config",
             "language = \"zh-CN\"",
+            "gradient_title_bar = true",
             "code_theme = \"paper\"",
             "code_contrast = \"high\"",
             "ui_font_family = \"Inter\"",

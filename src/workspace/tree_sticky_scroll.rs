@@ -82,6 +82,7 @@ pub(super) fn overlay(
     workspace: WeakEntity<Workspace>,
     active: Option<PathBuf>,
     colors: Palette,
+    gradient: Option<PaneGradient>,
 ) -> impl IntoElement {
     canvas(
         move |bounds, window, cx| {
@@ -99,6 +100,16 @@ pub(super) fn overlay(
                 .relative()
                 .w_full()
                 .bg(colors.bg)
+                .when_some(gradient.clone(), |overlay, gradient| {
+                    overlay.child(
+                        canvas(
+                            |_, _, _| (),
+                            move |bounds, (), window, _| gradient.paint(bounds, window),
+                        )
+                        .absolute()
+                        .inset_0(),
+                    )
+                })
                 .block_mouse_except_scroll()
                 .capture_any_mouse_down(move |event, window, cx| {
                     if let MouseButton::Navigate(direction) = event.button {

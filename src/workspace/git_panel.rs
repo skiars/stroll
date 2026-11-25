@@ -49,8 +49,9 @@ use crate::{
 };
 
 use super::{
-    Palette, Workspace, action_button, compact_icon_button, icon, icon_button, quiet_button,
-    text_base_size,
+    Palette, Workspace, action_button, compact_icon_button, icon, icon_button,
+    project_gradient::{self, PaneGradient, ProjectGradient},
+    quiet_button, text_base_size,
 };
 
 const GIT_TEXT_SIZE: Pixels = px(12.);
@@ -254,7 +255,17 @@ impl Render for GitPane {
                 let layout = panel.layout(window.viewport_size().width);
                 match self.kind {
                     PaneKind::History => panel
-                        .history_panel(window, cx, colors, layout.history)
+                        .history_panel(
+                            window,
+                            cx,
+                            if layout.history_corner > px(0.) {
+                                ProjectGradient::controls(colors, cx.theme().mode)
+                            } else {
+                                colors
+                            },
+                            layout.history,
+                            layout.history_corner,
+                        )
                         .into_any_element(),
                     PaneKind::Review => panel
                         .review_panel(layout, colors, window, cx)
@@ -270,6 +281,7 @@ impl Render for GitPane {
 
 struct PaneLayout {
     history: Pixels,
+    history_corner: Pixels,
     tree: Pixels,
     center: Pixels,
     show_history: bool,
@@ -306,6 +318,7 @@ pub(super) struct GitPanel {
     repository: Arc<Repository>,
     backend: git::Backend,
     workspace: WeakEntity<Workspace>,
+    project_gradient: bool,
     focus: FocusHandle,
     branches: Entity<SelectState<Branches>>,
     commit_input: Entity<InputState>,
@@ -561,6 +574,7 @@ impl GitPanel {
             backend: repository.git_backend(),
             repository,
             workspace,
+            project_gradient: false,
             focus: cx.focus_handle(),
             branches,
             commit_input,
@@ -1271,6 +1285,15 @@ impl GitPanel {
         panels.git_tree_width = self.tree_width.into();
     }
 
+    pub(super) fn set_project_gradient(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        if self.project_gradient != enabled {
+            self.project_gradient = enabled;
+            App::notify(cx, self.history_pane.entity_id());
+            App::notify(cx, self.review_pane.entity_id());
+            cx.notify();
+        }
+    }
+
     fn set_history_visible(&mut self, visible: bool, cx: &mut Context<Self>) {
         self.show_history = visible;
         if visible {
@@ -1409,6 +1432,7 @@ impl GitPanel {
         cx: &Context<Self>,
         colors: Palette,
         width: Pixels,
+        corner: Pixels,
     ) -> impl IntoElement {
         let geometry = (width, window.text_style().font(), window.rem_size());
         if self.history_geometry.as_ref() != Some(&geometry) {
@@ -1885,11 +1909,20 @@ impl GitPanel {
                 HandleEdge::Trailing,
                 GIT_TOOLBAR_HEIGHT,
             ))
-            .child(pane_edge(
-                HandleEdge::Trailing,
-                GIT_TOOLBAR_HEIGHT,
-                cx.theme().mode,
-            ))
+            .when(corner > px(0.), |pane| {
+                pane.child(project_gradient::pane_divider(
+                    corner,
+                    colors.border,
+                    cx.theme().mode,
+                ))
+            })
+            .when(corner == px(0.), |pane| {
+                pane.child(pane_edge(
+                    HandleEdge::Trailing,
+                    GIT_TOOLBAR_HEIGHT,
+                    cx.theme().mode,
+                ))
+            })
     }
 
     fn select_worktree(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1944,6 +1977,11 @@ impl GitPanel {
             - if show_tree { tree } else { px(0.) };
         PaneLayout {
             history,
+            history_corner: if self.project_gradient && show_history {
+                project_gradient::EDITOR_CORNER
+            } else {
+                px(0.)
+            },
             tree,
             center,
             show_history,
@@ -1970,6 +2008,7 @@ impl Render for GitPanel {
         }
         h_flex()
             .id("git-panel")
+            .relative()
             .track_focus(&self.focus)
             .key_context("GitReview")
             .on_action(
@@ -2003,6 +2042,15 @@ impl Render for GitPanel {
                     cx.notify();
                 }),
             )
+            .when(layout.history_corner > px(0.), |panel| {
+                let mode = cx.theme().mode;
+                let colors = Palette::for_mode(mode);
+                let gradient = ProjectGradient::for_repository(&self.repository, mode, colors);
+                panel.child(
+                    PaneGradient::new(gradient, colors.bg)
+                        .background(layout.history, layout.history_corner),
+                )
+            })
             .when(layout.show_history, |panel| {
                 panel.child(
                     self.history_pane.clone().cached(

@@ -641,6 +641,7 @@ impl Workspace {
         &self,
         maximum: Pixels,
         colors: Palette,
+        corner: Pixels,
         cx: &Context<Self>,
     ) -> Option<AnyElement> {
         let panel = self.visible_terminal()?;
@@ -824,19 +825,22 @@ impl Workspace {
                 .aria_label(t!("common.terminal"))
                 .bg(background)
                 .when(panel.maximized, |el| {
-                    let shadow: Hsla = rgb(if dark { 0x000000 } else { 0x181a28 }).into();
                     el.absolute()
                         .inset_0()
                         .rounded(px(12.))
                         .overflow_hidden()
                         .block_mouse_except_scroll()
-                        .shadow(vec![BoxShadow {
-                            color: shadow.opacity(if dark { 0.42 } else { 0.12 }),
-                            offset: point(px(0.), px(0.)),
-                            blur_radius: px(9.),
-                            spread_radius: px(0.),
-                            inset: false,
-                        }])
+                        .when(corner > px(0.), |el| el.rounded_tl(corner))
+                        .when(corner == px(0.), |el| {
+                            let shadow: Hsla = rgb(if dark { 0x000000 } else { 0x181a28 }).into();
+                            el.shadow(vec![BoxShadow {
+                                color: shadow.opacity(if dark { 0.42 } else { 0.12 }),
+                                offset: point(px(0.), px(0.)),
+                                blur_radius: px(9.),
+                                spread_radius: px(0.),
+                                inset: false,
+                            }])
+                        })
                 })
                 .when(!panel.maximized, |el| {
                     el.flex_shrink_0()

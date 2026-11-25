@@ -562,6 +562,8 @@
   "repository.worktrees": "Worktrees",
   "repository.worktrees_failed": "Could not read worktrees: %{error}",
   "settings.appearance": "Appearance",
+  "settings.gradient_title_bar": "Gradient title bar",
+  "settings.gradient_title_bar_description": "Apply a gradient to the title bar that fades into the left sidebar. Colors are chosen automatically for the current repository.",
   "settings.auto": "Automatic",
   "settings.body_font_size": "Body font size",
   "settings.code_block_font_size": "Code block font size",

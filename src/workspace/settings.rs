@@ -550,6 +550,7 @@ impl Workspace {
         }
         let mut previous_appearance = previous.appearance.clone();
         previous_appearance.ui_font_size = config.appearance.ui_font_size;
+        previous_appearance.gradient_title_bar = config.appearance.gradient_title_bar;
         previous_appearance.file_tree_sticky_scroll = config.appearance.file_tree_sticky_scroll;
         previous_appearance.file_tree_horizontal_scroll =
             config.appearance.file_tree_horizontal_scroll;
@@ -614,6 +615,13 @@ impl Workspace {
         {
             panel.update(cx, |panel, cx| {
                 panel.apply_settings(previous.git, config.git, window, cx)
+            });
+        }
+        if previous.appearance.gradient_title_bar != config.appearance.gradient_title_bar
+            && let Some(panel) = &self.git
+        {
+            panel.update(cx, |panel, cx| {
+                panel.set_project_gradient(config.appearance.gradient_title_bar, cx);
             });
         }
         if previous.appearance.language != config.appearance.language
@@ -995,6 +1003,13 @@ impl SettingsPage {
         let default = Config::default();
         let appearance = SettingGroup::new().items([
             setting_item(t!("settings.theme"), self.theme_picker()),
+            setting_item(
+                t!("settings.gradient_title_bar"),
+                self.switch(default.appearance.gradient_title_bar, |c| {
+                    &mut c.appearance.gradient_title_bar
+                }),
+            )
+            .description(t!("settings.gradient_title_bar_description").into_owned()),
             setting_item(
                 t!("settings.code_theme"),
                 self.dropdown(

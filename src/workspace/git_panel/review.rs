@@ -3081,6 +3081,7 @@ impl GitPanel {
             .debug_selector(|| "git-toolbar".into())
             .flex_shrink_0()
             .bg(colors.elevated)
+            .rounded_tl(layout.history_corner)
             .h(super::GIT_TOOLBAR_HEIGHT)
             .px_2()
             .gap_1()

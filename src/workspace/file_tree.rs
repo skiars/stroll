@@ -1883,6 +1883,7 @@ mod tests {
         cx.update(gpui_component::init);
         let store = Arc::new(Store::new(fixture.path().join("state"))?);
         let config_path = fixture.path().join("config.toml");
+        fs::write(&config_path, "[appearance]\ngradient_title_bar = true\n")?;
         let config = ConfigFile::load(Some(config_path.clone()));
         let mut workspace = None;
         let (_, visual) = cx.add_window_view(|window, cx| {
@@ -1959,7 +1960,9 @@ mod tests {
                 let quads = window.painted_quads();
                 let guide_x = initial.left() + px(TREE_GUTTER + 7.);
                 let seam = pinned_b.bottom();
-                let guide = Palette::for_mode(mode).muted.opacity(0.35);
+                let guide = ProjectGradient::controls(Palette::for_mode(mode), mode)
+                    .muted
+                    .opacity(0.35);
                 for y in [seam - px(4.), seam] {
                     let dash = Bounds::new(point(guide_x, y), size(px(1.), px(2.))).scale(scale);
                     assert!(
@@ -1974,6 +1977,30 @@ mod tests {
                     size(initial.size.width, px(5.)),
                 )
                 .scale(scale);
+                let sticky_bounds = Bounds::from_corners(
+                    point(initial.left(), pinned_root.top()),
+                    point(initial.right(), seam),
+                )
+                .scale(scale);
+                let background = quads
+                    .iter()
+                    .find(|quad| {
+                        quad.bounds.size.height == px(120.).scale(scale)
+                            && quad.bounds.left() == sticky_bounds.left()
+                            && quad.content_mask.bounds.left() == sticky_bounds.left()
+                            && quad.content_mask.bounds.right() == sticky_bounds.right()
+                            && quad.content_mask.bounds.top() < sticky_bounds.top()
+                            && quad.background.as_solid().is_none()
+                    })
+                    .expect("project gradient behind the scrolling file tree");
+                assert!(
+                    quads.iter().any(|quad| {
+                        quad.bounds == background.bounds
+                            && quad.background == background.background
+                            && quad.content_mask.bounds == sticky_bounds
+                    }),
+                    "sticky rows should repaint the project gradient at the same coordinates"
+                );
                 let black = Hsla::black();
                 let opacity = if mode.is_dark() { 0.24 } else { 0.07 };
                 let shadow = linear_gradient(
