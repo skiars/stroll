@@ -328,7 +328,7 @@ impl Button {
         self.rounded
     }
 
-    pub(super) fn standard_height(size: Size) -> AbsoluteLength {
+    pub(crate) fn standard_height(size: Size) -> AbsoluteLength {
         match size {
             Size::XSmall => rems(1.25).into(),
             Size::Small => rems(1.5).into(),

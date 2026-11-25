@@ -10,7 +10,7 @@ use rust_i18n::t;
 use super::{CONTROL_LINE_HEIGHT, DESCRIPTION_FONT_SIZE, DESCRIPTION_LINE_HEIGHT};
 
 use crate::{
-    ActiveTheme, Icon, IconName, Sizable, StyledExt,
+    ActiveTheme, Icon, IconName, Sizable, Size, StyledExt,
     button::{Button, ButtonVariants},
     h_flex,
     label::Label,
@@ -239,6 +239,30 @@ impl SettingPage {
             }
         }
 
+        let reset_button_size = Size::Small;
+        let reset_slot = self.resettable.then(|| {
+            div()
+                .size(Button::standard_height(reset_button_size))
+                .flex_shrink_0()
+                .when(self.is_resettable(&query, cx), |slot| {
+                    slot.child(
+                        Button::new("reset")
+                            .debug_selector(|| "settings-page-reset".into())
+                            .rounded(px(5.))
+                            .icon(IconName::Undo2)
+                            .ghost()
+                            .with_size(reset_button_size)
+                            .tooltip(t!("Settings.Reset All"))
+                            .on_click({
+                                let page = self.clone();
+                                let query = query.clone();
+                                move |_, window, cx| {
+                                    page.reset_all(&query, window, cx);
+                                }
+                            }),
+                    )
+                })
+        });
         v_flex()
             .id(ix)
             .size_full()
@@ -251,6 +275,7 @@ impl SettingPage {
                     .refine_style(&self.header_style)
                     .child(
                         h_flex()
+                            .debug_selector(|| "settings-page-title-row".into())
                             .justify_between()
                             .child(
                                 h_flex()
@@ -266,23 +291,7 @@ impl SettingPage {
                                         this.child(suffix(window, cx))
                                     }),
                             )
-                            .when(self.is_resettable(&query, cx), |this| {
-                                this.child(
-                                    Button::new("reset")
-                                        .rounded(gpui::px(5.))
-                                        .icon(IconName::Undo2)
-                                        .ghost()
-                                        .small()
-                                        .tooltip(t!("Settings.Reset All"))
-                                        .on_click({
-                                            let page = self.clone();
-                                            let query = query.clone();
-                                            move |_, window, cx| {
-                                                page.reset_all(&query, window, cx);
-                                            }
-                                        }),
-                                )
-                            }),
+                            .children(reset_slot),
                     )
                     .when_some(self.description.clone(), |this, description| {
                         this.child(

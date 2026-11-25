@@ -1569,12 +1569,12 @@ impl SettingsPage {
                 mode,
                 &[colors.bg, colors.elevated, colors.soft],
             );
-            let surface = super::code_theme::surface(appearance.code_theme, mode);
             Accordion::new("settings-code-preview")
                 .bordered(false)
                 .h_auto()
                 .item(|item| {
                     item.open(open)
+                        .bg(transparent_black())
                         .title(
                             div()
                                 .debug_selector(|| "settings-code-preview-title".into())
@@ -1587,7 +1587,6 @@ impl SettingsPage {
                                 .debug_selector(|| "settings-code-preview-sample".into())
                                 .w_full()
                                 .p(px(12.))
-                                .bg(surface)
                                 .text_color(highlight.style.editor_foreground.unwrap_or(colors.ink))
                                 .border_1()
                                 .border_color(cx.theme().border)
@@ -2201,6 +2200,58 @@ mod tests {
     }
 
     #[::core::prelude::v1::test]
+    fn page_reset_keeps_settings_title_and_content_in_place() -> anyhow::Result<()> {
+        let fixture = tempfile::tempdir()?;
+        let store = Arc::new(Store::new(fixture.path().join("state"))?);
+        let config = ConfigFile::load(Some(fixture.path().join("config.toml")));
+        let mut app = TestAppContext::build_with_text_system(
+            TestDispatcher::new(0),
+            None,
+            crate::test_support::text_system(cfg!(target_os = "linux")),
+        );
+        app.update(gpui_component::init);
+        let (owner, visual) = app.add_window_view(|window, cx| {
+            Workspace::with_config(store, config, WorkspaceView::Editor, window, cx)
+        });
+        let owner_window = visual.update(|window, _| window.window_handle());
+        let draft = app.new(|_| Config::default());
+        let (_, visual) = app.add_window_view(|window, cx| {
+            let page = cx.new(|cx| {
+                SettingsPage::new(owner.clone(), owner_window, draft.clone(), window, cx)
+            });
+            Root::new(page, window, cx)
+        });
+        visual.simulate_resize(size(px(560.), px(640.)));
+        let draw = |visual: &mut VisualTestContext| {
+            visual.run_until_parked();
+            visual.update(|window, cx| window.draw(cx).clear(cx));
+        };
+        let geometry = |visual: &mut VisualTestContext| {
+            ["settings-page-title-row", "settings-code-preview-title"]
+                .map(|selector| visual.debug_bounds(selector).unwrap())
+        };
+        draw(visual);
+        let clean = geometry(visual);
+        assert!(visual.debug_bounds("settings-page-reset").is_none());
+
+        draft.update(visual, |draft, cx| {
+            draft.appearance.file_tree_sticky_scroll = !draft.appearance.file_tree_sticky_scroll;
+            cx.notify();
+        });
+        draw(visual);
+        let reset = visual.debug_bounds("settings-page-reset").unwrap();
+        assert_eq!(geometry(visual), clean);
+
+        visual.simulate_click(reset.center(), Modifiers::default());
+        draw(visual);
+        assert!(visual.debug_bounds("settings-page-reset").is_none());
+        assert!(visual.update(|_, cx| draft.read(cx).appearance.file_tree_sticky_scroll));
+        assert_eq!(geometry(visual), clean);
+
+        Ok(())
+    }
+
+    #[::core::prelude::v1::test]
     fn code_palette_preview_is_collapsed_until_opened() -> anyhow::Result<()> {
         let fixture = tempfile::tempdir()?;
         let store = Arc::new(Store::new(fixture.path().join("state"))?);
@@ -2233,6 +2284,20 @@ mod tests {
                 });
             }
         };
+        let assert_window_background = |visual: &mut VisualTestContext, position: Point<Pixels>| {
+            visual.update(|window, cx| {
+                let position = position.scale(window.scale_factor());
+                let background = window.painted_quads().into_iter().rev().find(|quad| {
+                    quad.bounds.contains(&position)
+                        && quad.content_mask.bounds.contains(&position)
+                        && !quad.background.is_transparent()
+                });
+                assert_eq!(
+                    background.map(|quad| quad.background),
+                    Some(cx.theme().tokens.background.into())
+                );
+            });
+        };
         settle(visual);
         assert!(
             visual
@@ -2245,14 +2310,14 @@ mod tests {
                 .debug_bounds("settings-code-preview-title")
                 .expect("the preview title stays visible while collapsed");
             assert_eq!(title.size.height, px(18.));
+            assert_window_background(visual, title.center());
             visual.simulate_click(title.center(), Modifiers::default());
             settle(visual);
-            assert_eq!(
-                visual
-                    .debug_bounds("settings-code-preview-sample")
-                    .is_some(),
-                open
-            );
+            let sample = visual.debug_bounds("settings-code-preview-sample");
+            assert_eq!(sample.is_some(), open);
+            if let Some(sample) = sample {
+                assert_window_background(visual, sample.center());
+            }
         }
 
         visual.simulate_resize(size(px(560.), px(400.)));

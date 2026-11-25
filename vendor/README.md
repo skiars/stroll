@@ -288,6 +288,10 @@ dialogs in a Wayland window after changes to paint order or focus handling.
   Search and field controls keep their size presets, and the number input
   passes typography overrides to its editable text. The settings typography
   test checks the instance font size and label and description line heights.
+- Resettable settings pages reserve space in the title row for the page reset
+  button, keeping the title and the content below it in place. Run `cargo test
+  --release --locked --lib page_reset_keeps_settings_title_and_content_in_place`
+  to check the layout when toggling a setting and clicking reset.
 
 - Run `cargo test --release --locked --lib editor_renders_web_theme_decorations_in_light_and_dark`
   on Linux to verify semantic underline patterns, strikethrough, and diagnostic
