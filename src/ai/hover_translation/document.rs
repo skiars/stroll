@@ -107,7 +107,7 @@ impl Snapshot {
                 &self.service.cache,
                 &provider,
                 &cancelled,
-                true,
+                TranslationFormat::Fragments,
                 |batch| {
                     if !self.is_current() {
                         return false;

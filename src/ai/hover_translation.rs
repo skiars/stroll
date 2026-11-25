@@ -22,7 +22,7 @@ use super::{
 };
 use crate::repository::Repository;
 
-const PROMPT: &str = include_str!("prompts/hover_translation.txt");
+const PROMPT: &str = include_str!("prompts/translation.txt");
 const CACHE_VERSION: &str = "zh-CN-v1";
 const HOVER_LIMIT: usize = 128_000;
 const PROSE_LIMIT: usize = 200_000;
@@ -35,6 +35,7 @@ type Translations = HashMap<String, String>;
 
 mod document;
 mod math;
+mod paragraph;
 
 pub(crate) use document::{DocumentTranslations, document_prose_keys};
 
@@ -52,7 +53,17 @@ impl Snapshot {
                 return None;
             }
             let hover = HoverText::parse(contents)?;
-            let fragments = hover.fragments();
+            let format = match hover {
+                HoverText::Plain(_) => TranslationFormat::Plain,
+                HoverText::Markdown(_) => TranslationFormat::Markdown,
+            };
+            let paragraphs = hover.inputs();
+            let mut seen = HashSet::new();
+            let fragments: Vec<_> = paragraphs
+                .iter()
+                .map(String::as_str)
+                .filter(|text| seen.insert(*text))
+                .collect();
             if fragments.is_empty()
                 || fragments.iter().map(|text| units(text)).sum::<usize>() > PROSE_LIMIT
                 || fragments.iter().any(|text| units(text) > FRAGMENT_LIMIT)
@@ -63,9 +74,16 @@ impl Snapshot {
                 return None;
             }
             let provider = Provider::open(&self.settings, &self.service.credential_scope).ok()?;
-            let translated =
-                translate(&fragments, &self.service.cache, &provider, &cancelled).ok()?;
-            self.is_current().then(|| hover.documentation(&translated))
+            let translated = translate(
+                &fragments,
+                &self.service.cache,
+                &provider,
+                &cancelled,
+                format,
+            )
+            .ok()?;
+            (!translated.is_empty() && self.is_current())
+                .then(|| hover.documentation(&paragraphs, &translated))
         })
         .await
     }
@@ -88,19 +106,7 @@ impl HoverText {
         match markup.kind {
             MarkupKind::PlainText => Some(Self::Plain(plaintext_prose(&source))),
             MarkupKind::Markdown => {
-                let mut options = markdown::ParseOptions::default();
-                options.constructs.gfm_table = true;
-                options.constructs.gfm_strikethrough = true;
-                options.gfm_strikethrough_single_tilde = false;
-                options.constructs.math_flow = true;
-                options.constructs.html_flow = false;
-                options.constructs.html_text = false;
-                let mut root = markdown::to_mdast(&source, &options).ok()?;
-                if source.contains('$') {
-                    let masked = math::mask_literal_dollars(&source, &root);
-                    options.constructs.math_text = true;
-                    root = markdown::to_mdast(&masked, &options).ok()?;
-                }
+                let root = parse_hover_markdown(&source, false)?;
                 let mut paragraphs = Vec::new();
                 let mut definitions = HashMap::new();
                 collect_definitions(&root, &mut definitions);
@@ -110,30 +116,23 @@ impl HoverText {
         }
     }
 
-    fn fragments(&self) -> Vec<&str> {
-        let mut seen = HashSet::new();
+    fn inputs(&self) -> Vec<String> {
         match self {
-            Self::Plain(items) => items
-                .iter()
-                .map(String::as_str)
-                .filter(|s| seen.insert(*s))
-                .collect(),
+            Self::Plain(items) => items.clone(),
             Self::Markdown(paragraphs) => paragraphs
                 .iter()
-                .flat_map(ProseParagraph::candidates)
-                .filter(|s| seen.insert(*s))
+                .map(ProseParagraph::markdown_input)
                 .collect(),
         }
     }
 
-    fn documentation(&self, translated: &Translations) -> HoverDocumentation {
+    fn documentation(&self, inputs: &[String], translated: &Translations) -> HoverDocumentation {
         match self {
-            Self::Plain(items) => HoverDocumentation {
+            Self::Plain(_) => HoverDocumentation {
                 plaintext: Some(
-                    items
+                    inputs
                         .iter()
-                        .filter_map(|text| translated.get(text))
-                        .cloned()
+                        .filter_map(|input| translated.get(input).map(String::as_str))
                         .collect::<Vec<_>>()
                         .join("\n")
                         .into(),
@@ -143,13 +142,39 @@ impl HoverText {
             Self::Markdown(paragraphs) => HoverDocumentation {
                 paragraphs: paragraphs
                     .iter()
-                    .filter_map(|paragraph| paragraph.render(translated))
+                    .zip(inputs)
+                    .filter_map(|(paragraph, input)| {
+                        Some((
+                            paragraph.offset,
+                            HoverParagraph {
+                                original: paragraph.original().into(),
+                                translation: translated.get(input)?.clone().into(),
+                            },
+                        ))
+                    })
                     .collect::<BTreeMap<_, _>>()
                     .into(),
                 ..Default::default()
             },
         }
     }
+}
+
+fn parse_hover_markdown(source: &str, detect_html: bool) -> Option<Node> {
+    let mut options = markdown::ParseOptions::default();
+    options.constructs.gfm_table = true;
+    options.constructs.gfm_strikethrough = true;
+    options.gfm_strikethrough_single_tilde = false;
+    options.constructs.math_flow = true;
+    options.constructs.html_flow = detect_html;
+    options.constructs.html_text = detect_html;
+    let mut root = markdown::to_mdast(source, &options).ok()?;
+    if source.contains('$') {
+        let masked = math::mask_literal_dollars(source, &root);
+        options.constructs.math_text = true;
+        root = markdown::to_mdast(&masked, &options).ok()?;
+    }
+    Some(root)
 }
 
 fn units(text: &str) -> usize {
@@ -217,15 +242,8 @@ fn plaintext_prose(source: &str) -> Vec<String> {
                 .split('\n')
                 .filter(|line| !DECLARATIONS.is_match(line))
                 .collect();
-            needs_chinese(&lines.join(" ")).then(|| {
-                unwrap(
-                    &lines
-                        .into_iter()
-                        .filter(|line| needs_chinese(line))
-                        .collect::<Vec<_>>()
-                        .join("\n"),
-                )
-            })
+            let text = unwrap(&lines.join("\n"));
+            needs_chinese(&text).then_some(text)
         })
         .filter(|text| seen.insert(text.clone()))
         .collect()
@@ -290,7 +308,7 @@ impl ProseParagraph {
                         && next.chars().next().is_some_and(is_han)
                 );
                 if !cjk {
-                    runs.push(Run::Markup(" ".into()));
+                    runs.push(Run::Text(" ".into()));
                 }
                 previous_eligible = false;
             } else {
@@ -320,6 +338,29 @@ impl ProseParagraph {
         original
     }
 
+    fn markdown_input(&self) -> String {
+        let mut input = String::new();
+        for run in &self.runs {
+            match run {
+                Run::Text(text) => {
+                    for ch in text.chars() {
+                        if matches!(
+                            ch,
+                            '\\' | '&' | '<' | '>' | '[' | ']' | '`' | '*' | '_' | '~' | '$'
+                        ) {
+                            input.push('\\');
+                        }
+                        input.push(ch);
+                    }
+                }
+                Run::Markup(markdown) => input.push_str(markdown),
+                Run::OriginalOnly(_) => {}
+                Run::Wrap => unreachable!(),
+            }
+        }
+        input
+    }
+
     fn translation(&self, translated: &Translations) -> SharedString {
         let mut translation = String::new();
         for run in &self.runs {
@@ -334,19 +375,6 @@ impl ProseParagraph {
             }
         }
         translation.into()
-    }
-
-    fn render(&self, translated: &Translations) -> Option<(usize, HoverParagraph)> {
-        if !self.candidates().any(|text| translated.contains_key(text)) {
-            return None;
-        }
-        Some((
-            self.offset,
-            HoverParagraph {
-                original: self.original().into(),
-                translation: self.translation(translated),
-            },
-        ))
     }
 }
 
@@ -502,9 +530,30 @@ struct Pending {
 
 static WORK: LazyLock<Mutex<Work>> = LazyLock::new(Mutex::default);
 
-fn cache_key(text: &str, provider: &Provider) -> CacheKey {
-    let key = serde_json::to_vec(&[CACHE_VERSION, &provider.base, &provider.model, text]).unwrap();
-    Sha256::digest(key).into()
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TranslationFormat {
+    Fragments,
+    Plain,
+    Markdown,
+}
+
+impl TranslationFormat {
+    fn cache_key(self, text: &str, provider: &Provider) -> CacheKey {
+        let version = match self {
+            Self::Fragments => CACHE_VERSION,
+            Self::Plain => "zh-CN-hover-plain-v1",
+            Self::Markdown => "zh-CN-hover-markdown-v1",
+        };
+        let key = serde_json::to_vec(&[version, &provider.base, &provider.model, text]).unwrap();
+        Sha256::digest(key).into()
+    }
+
+    fn accepts(self, source: &str, translated: &str) -> bool {
+        self == Self::Fragments
+            || (!translated.trim().is_empty()
+                && units(translated) <= 32_000
+                && (self != Self::Markdown || paragraph::same_markdown(source, translated)))
+    }
 }
 
 fn translate(
@@ -512,9 +561,10 @@ fn translate(
     cache: &TranslationCache,
     provider: &Provider,
     cancelled: &AtomicBool,
+    format: TranslationFormat,
 ) -> Result<Translations, Failure> {
     let mut output = HashMap::new();
-    translate_batches(fragments, cache, provider, cancelled, false, |batch| {
+    translate_batches(fragments, cache, provider, cancelled, format, |batch| {
         output.extend(batch);
         true
     })?;
@@ -526,7 +576,7 @@ fn translate_batches(
     cache: &TranslationCache,
     provider: &Provider,
     cancelled: &AtomicBool,
-    stop_between_requests: bool,
+    format: TranslationFormat,
     mut report: impl FnMut(Translations) -> bool,
 ) -> Result<(), Failure> {
     let mut index = 0;
@@ -552,7 +602,7 @@ fn translate_batches(
             provider,
             &mut output,
             cancelled,
-            stop_between_requests,
+            format,
         )?;
         check_cancelled(cancelled)?;
         if !report(output) {
@@ -576,11 +626,16 @@ fn translate_batch(
     provider: &Provider,
     output: &mut Translations,
     cancelled: &AtomicBool,
-    stop_between_requests: bool,
+    format: TranslationFormat,
 ) -> Result<(), Failure> {
     let mut remaining: Vec<_> = texts
         .iter()
-        .map(|text| (*text, (cache.path().clone(), cache_key(text, provider))))
+        .map(|text| {
+            (
+                *text,
+                (cache.path().clone(), format.cache_key(text, provider)),
+            )
+        })
         .collect();
     let task = loop {
         check_cancelled(cancelled)?;
@@ -635,7 +690,8 @@ fn translate_batch(
         &fragments,
         provider,
         cache,
-        stop_between_requests.then_some(cancelled),
+        (format == TranslationFormat::Fragments).then_some(cancelled),
+        format,
     );
     {
         let mut work = WORK.lock().unwrap();
@@ -654,6 +710,7 @@ fn run_batch(
     provider: &Provider,
     cache: &TranslationCache,
     cancelled: Option<&AtomicBool>,
+    format: TranslationFormat,
 ) -> Result<Translations, Failure> {
     let keys: Vec<_> = fragments.iter().map(|(_, key)| *key).collect();
     let mut hits = cache.load(&keys).unwrap_or_default();
@@ -674,27 +731,42 @@ fn run_batch(
     }
 
     let texts: Vec<_> = missing.iter().map(|(text, _)| *text).collect();
+    let mut values = match request(&texts, provider, cancelled, format) {
+        Ok(values) => Some(values),
+        Err(error)
+            if error.response_error()
+                && (texts.len() > 1 || format != TranslationFormat::Fragments) =>
+        {
+            None
+        }
+        Err(_) if format != TranslationFormat::Fragments => return Ok(output),
+        Err(error) => return Err(error),
+    }
+    .into_iter()
+    .flatten();
     let mut entries = Vec::new();
     let mut save = |(text, key): &(&str, CacheKey), value: String| {
         output.insert((*text).to_owned(), value.clone());
         entries.push((*key, value));
     };
-    let result = match request(&texts, provider, cancelled) {
-        Ok(values) => {
-            for (fragment, value) in missing.into_iter().zip(values) {
-                save(fragment, value);
+    let result = missing.into_iter().try_for_each(|fragment| {
+        let text = fragment.0;
+        if let Some(value) = values.next().filter(|value| format.accepts(text, value)) {
+            save(fragment, value);
+            return Ok(());
+        }
+        match request(&[text], provider, cancelled, format) {
+            Ok(mut values) => {
+                let value = values.pop().unwrap();
+                if format.accepts(text, &value) {
+                    save(fragment, value);
+                }
             }
-            Ok(())
+            Err(_) if format != TranslationFormat::Fragments => {}
+            Err(error) => return Err(error),
         }
-        Err(error) if texts.len() > 1 && error.response_error() => {
-            missing.into_iter().try_for_each(|fragment| {
-                let value = request(&[fragment.0], provider, cancelled)?.pop().unwrap();
-                save(fragment, value);
-                Ok(())
-            })
-        }
-        Err(error) => Err(error),
-    };
+        Ok(())
+    });
     // Keep completed fragments even when a later request fails.
     if cache.store(&entries).is_err() {
         eprintln!("stroll:hover-translation: cache-write-failed");
@@ -726,6 +798,7 @@ fn request(
     texts: &[&str],
     provider: &Provider,
     cancelled: Option<&AtomicBool>,
+    format: TranslationFormat,
 ) -> Result<Vec<String>, Failure> {
     let _active = ActiveRequest::start()?;
     let started = Instant::now();
@@ -753,10 +826,15 @@ fn request(
                 256 * 1024,
                 Thinking::Disable,
             )
-            .and_then(|text| parse_response(&text, texts.len()))
+            .and_then(|text| parse_response(&text, texts.len(), format))
         {
             Ok(output) => return Ok(output),
-            Err(error) if texts.len() > 1 && error.response_error() => return Err(error),
+            Err(error)
+                if error.response_error()
+                    && (texts.len() > 1 || format != TranslationFormat::Fragments) =>
+            {
+                return Err(error);
+            }
             Err(error) if attempt == 1 && error.retryable() => {
                 std::thread::sleep(Duration::from_millis(200))
             }
@@ -773,7 +851,11 @@ fn request(
     unreachable!()
 }
 
-fn parse_response(content: &str, count: usize) -> Result<Vec<String>, Failure> {
+fn parse_response(
+    content: &str,
+    count: usize,
+    format: TranslationFormat,
+) -> Result<Vec<String>, Failure> {
     static FENCE: LazyLock<Regex> = LazyLock::new(|| {
         Regex::new(r"(?is)^\x60\x60\x60(?:text|plaintext)?\s*\n(.*?)\n\x60\x60\x60$").unwrap()
     });
@@ -787,9 +869,10 @@ fn parse_response(content: &str, count: usize) -> Result<Vec<String>, Failure> {
         .map_or(normalized, |m| m.as_str());
     let parts: Vec<_> = PARAGRAPH_BREAK.split(output).collect();
     if parts.len() != count
-        || parts
-            .iter()
-            .any(|part| part.trim().is_empty() || units(part) > 32_000)
+        || (format == TranslationFormat::Fragments
+            && parts
+                .iter()
+                .any(|part| part.trim().is_empty() || units(part) > 32_000))
     {
         return Err(Failure::ResponseShape);
     }
@@ -803,12 +886,19 @@ mod tests {
     use super::*;
     use crate::ai::provider::tests::{mock_provider, mock_provider_before_reply};
 
+    // Loopback tests share the production request limiter.
+    static REQUEST_TESTS: Mutex<()> = Mutex::new(());
+
     fn markdown(value: &str) -> HoverText {
         HoverText::parse(HoverContents::Markup(MarkupContent {
             kind: MarkupKind::Markdown,
             value: value.into(),
         }))
         .unwrap()
+    }
+
+    fn markdown_inputs(value: &str) -> Vec<String> {
+        markdown(value).inputs()
     }
 
     #[test]
@@ -827,14 +917,13 @@ mod tests {
             assert_eq!(needs_chinese(source), needed, "{source}");
         }
         assert_eq!(
-            markdown(concat!(
+            markdown_inputs(concat!(
                 "# Current implementation\n\n## `Type definitions`\n\n",
                 "```rust\npub fn count(items: &[Item]) -> usize\n```\n\n",
                 "Threads an effectful\naccumulator from left to right.\n\n",
                 "Empty inputs return pure(initial).  \nThe receiver initializes strictly.\n\n",
                 "| Header |\n| --- |\n| Cell |\n\n- List prose\n\n> Quoted prose",
-            ))
-            .fragments(),
+            )),
             [
                 "Threads an effectful accumulator from left to right.",
                 "Empty inputs return pure(initial). The receiver initializes strictly.",
@@ -843,47 +932,48 @@ mod tests {
             ]
         );
         assert_eq!(
-            markdown(concat!(
+            markdown_inputs(concat!(
                 "```ts\nfunction secret(): void\n```\n\n",
                 "Read `secret_code()` and [guide](https://private.example).\n\n",
                 "    indented_code()\n\n$x + secret$\n\n$$\nprivate_formula\n$$",
-            ))
-            .fragments(),
-            ["Read ", " and ", "guide"]
+            )),
+            ["Read `secret_code()` and [guide](<https://private.example>)."]
         );
         for (source, fragments) in [
             (
                 "Use $HOME paths and $x$ math",
-                &["Use $HOME paths and ", " math"][..],
+                &[r"Use \$HOME paths and $x$ math"][..],
             ),
-            ("x $foo$4 word", &["x $foo$4 word"][..]),
-            ("Read foo$bar$ and after", &["Read foo$bar$ and after"][..]),
-            ("Use $$x + secret$$ here", &["Use ", " here"][..]),
+            ("x $foo$4 word", &[r"x \$foo\$4 word"][..]),
+            (
+                "Read foo$bar$ and after",
+                &[r"Read foo\$bar\$ and after"][..],
+            ),
+            ("Use $$x + secret$$ here", &["Use $$x + secret$$ here"][..]),
             (
                 "See <foo@example.com> guide",
-                &["See ", "foo@example.com", " guide"][..],
+                &["See [foo@example.com](<mailto:foo@example.com>) guide"][..],
             ),
             (
                 "Read ~strikethrough~ and ~~delete~~.",
-                &["Read ~strikethrough~ and ", "delete"][..],
+                &[r"Read \~strikethrough\~ and ~~delete~~."][..],
             ),
             ("Read\nthese\nthree\nlines", &["Read these three lines"][..]),
             ("$$unclosed\n\nAnother paragraph", &[][..]),
         ] {
-            assert_eq!(markdown(source).fragments(), fragments, "{source}");
+            assert_eq!(markdown_inputs(source), fragments, "{source}");
         }
         assert_eq!(
-            plaintext_prose("function read(): string\nRead documentation\n\n中文说明"),
-            ["Read documentation"]
+            plaintext_prose("function read(): string\nRead documentation\n123\n\n中文说明"),
+            ["Read documentation 123"]
         );
         assert_eq!(
-            markdown(
+            markdown_inputs(
                 "使用 **TypeScript** API 输出紧凑的诊断树。\n\nReturns the compact diagnostic tree."
-            )
-            .fragments(),
+            ),
             ["Returns the compact diagnostic tree."]
         );
-        assert!(markdown("生成一棵紧凑的诊断树，并在每个节点标记它在源代码中的位置。详细用法见[指南](https://example.com)。").fragments().is_empty());
+        assert!(markdown_inputs("生成一棵紧凑的诊断树，并在每个节点标记它在源代码中的位置。详细用法见[指南](https://example.com)。").is_empty());
     }
 
     #[test]
@@ -891,35 +981,122 @@ mod tests {
         let doc = markdown(
             "Read **carefully** and `code()`. [Guide](https://example.com) ![diagram](local.png)",
         );
-        let translated = HashMap::from([
-            ("Read ".into(), "阅读 ".into()),
-            ("carefully".into(), "<script>仔细</script>".into()),
-            ("Guide".into(), "指南".into()),
-        ]);
-        let pairs = doc.documentation(&translated);
+        let inputs = doc.inputs();
+        let value = "参阅[指南](https://example.com)，并 **仔细** 阅读 `code()`。";
+        assert!(paragraph::same_markdown(&inputs[0], value));
+        let translated = HashMap::from([(inputs[0].clone(), value.into())]);
+        let pairs = doc.documentation(&inputs, &translated);
         let pair = &pairs.paragraphs[&0];
         assert!(pair.original.contains("**carefully**"));
         assert!(pair.original.contains("![diagram](local.png)"));
-        assert!(
-            pair.translation
-                .contains("**&#60;script&#62;仔细&#60;&#47;script&#62;**")
-        );
-        assert!(pair.translation.contains("[指南](<https://example.com>)"));
-        assert!(pair.translation.contains("`code()`"));
-        assert!(!pair.translation.contains("local.png"));
+        assert_eq!(pair.translation.as_ref(), value);
         assert_eq!(
-            parse_response("第一段第一行\r\n第一段第二行\r\n\r\n第二段", 2).unwrap(),
+            parse_response(
+                "第一段第一行\r\n第一段第二行\r\n\r\n第二段",
+                2,
+                TranslationFormat::Markdown
+            )
+            .unwrap(),
             ["第一段第一行第一段第二行", "第二段"]
         );
         assert_eq!(
-            parse_response("```plaintext\n直接译文\n```", 1).unwrap(),
+            parse_response(
+                "```plaintext\n直接译文\n```",
+                1,
+                TranslationFormat::Markdown
+            )
+            .unwrap(),
             ["直接译文"]
         );
-        assert_eq!(parse_response("only one", 2), Err(Failure::ResponseShape));
+        assert_eq!(
+            parse_response("only one", 2, TranslationFormat::Markdown),
+            Err(Failure::ResponseShape)
+        );
+    }
+
+    #[test]
+    fn hover_markdown_preserves_code_and_links_and_rejects_added_markup() {
+        let input = "Call [`read()`](<https://example.com>) or retry.";
+        let translated = "或重试调用 [`read()`](https://example.com)。";
+        assert!(paragraph::same_markdown(input, translated));
+        for invalid in [
+            "调用 [`read()`](https://other.example)。",
+            "调用 `read()`（[说明](https://example.com)）。",
+            "调用 [`write()`](https://example.com)。",
+            "调用 [`read()`](https://example.com)。<img src='https://other.example'>",
+            "调用 [`read()`](https://example.com)。![图片](https://other.example)",
+        ] {
+            assert!(!paragraph::same_markdown(input, invalid), "{invalid}");
+        }
+    }
+
+    #[test]
+    fn hover_retries_only_invalid_paragraphs_and_caches_valid_neighbors() {
+        let _requests = REQUEST_TESTS.lock().unwrap();
+        const BATCH: &str = r#"{"choices":[{"finish_reason":"stop","message":{"content":"标题\n\n缺少代码\n\n正文"}}]}"#;
+        const INVALID: &str =
+            r#"{"choices":[{"finish_reason":"stop","message":{"content":"仍缺少代码"}}]}"#;
+        let (provider, server) = mock_provider("hover", vec![(200, BATCH), (200, INVALID)]);
+        let directory = tempfile::tempdir().unwrap();
+        let cache = TranslationCache::new(directory.path().join("translations.sqlite3"));
+        let format = TranslationFormat::Markdown;
+        let detail = "Read `value` now.";
+        let run =
+            |texts: &[&str]| translate(texts, &cache, &provider, &AtomicBool::new(false), format);
+        let output = run(&["Heading", detail, "Body"]).unwrap();
+        assert_eq!(output.len(), 2);
+        assert_eq!(output["Heading"], "标题");
+        assert_eq!(output["Body"], "正文");
+        assert_eq!(run(&["Heading", "Body"]).unwrap(), output);
+        assert!(
+            cache
+                .load(&[format.cache_key(detail, &provider)])
+                .unwrap()
+                .is_empty()
+        );
+        assert_ne!(
+            format.cache_key("Heading", &provider),
+            TranslationFormat::Fragments.cache_key("Heading", &provider),
+        );
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            requests[0]["messages"][1]["content"],
+            "Heading\n\nRead `value` now.\n\nBody"
+        );
+        assert_eq!(requests[1]["messages"][1]["content"], detail);
+        assert!(requests[0].get("response_format").is_none());
+    }
+
+    #[test]
+    fn hover_retries_each_paragraph_when_a_batch_loses_a_boundary() {
+        let _requests = REQUEST_TESTS.lock().unwrap();
+        const FIRST: &str =
+            r#"{"choices":[{"finish_reason":"stop","message":{"content":"第一段"}}]}"#;
+        const SECOND: &str =
+            r#"{"choices":[{"finish_reason":"stop","message":{"content":"第二段"}}]}"#;
+        let (provider, server) =
+            mock_provider("hover", vec![(200, SECOND), (200, FIRST), (200, SECOND)]);
+        let directory = tempfile::tempdir().unwrap();
+        let cache = TranslationCache::new(directory.path().join("translations.sqlite3"));
+        let output = translate(
+            &["First paragraph", "Second paragraph"],
+            &cache,
+            &provider,
+            &AtomicBool::new(false),
+            TranslationFormat::Markdown,
+        )
+        .unwrap();
+        assert_eq!(output["First paragraph"], "第一段");
+        assert_eq!(output["Second paragraph"], "第二段");
+        let requests = server.join().unwrap();
+        assert_eq!(requests[1]["messages"][1]["content"], "First paragraph");
+        assert_eq!(requests[2]["messages"][1]["content"], "Second paragraph");
     }
 
     #[test]
     fn translation_retries_splits_and_reuses_completed_fragments() {
+        let _requests = REQUEST_TESTS.lock().unwrap();
         const SHORT: &str =
             r#"{"choices":[{"finish_reason":"stop","message":{"content":"标题"}}]}"#;
         const BODY: &str = r#"{"choices":[{"finish_reason":"stop","message":{"content":"正文"}}]}"#;
@@ -937,11 +1114,19 @@ mod tests {
         let cache = TranslationCache::new(directory.path().join("translations.sqlite3"));
         let fragments = ["First paragraph", "Second paragraph"];
         let cancelled = AtomicBool::new(false);
-        let translate = || translate(&fragments, &cache, &provider, &cancelled);
+        let translate = || {
+            translate(
+                &fragments,
+                &cache,
+                &provider,
+                &cancelled,
+                TranslationFormat::Fragments,
+            )
+        };
         assert_eq!(translate(), Err(Failure::RateLimited));
         assert_eq!(
             cache
-                .load(&[cache_key(fragments[0], &provider)])
+                .load(&[TranslationFormat::Fragments.cache_key(fragments[0], &provider)])
                 .unwrap()
                 .len(),
             1
@@ -951,7 +1136,14 @@ mod tests {
         assert_eq!(output[fragments[1]], "正文");
         let reopened = TranslationCache::new(cache.path().as_ref().clone());
         assert_eq!(
-            super::translate(&fragments, &reopened, &provider, &cancelled).unwrap(),
+            super::translate(
+                &fragments,
+                &reopened,
+                &provider,
+                &cancelled,
+                TranslationFormat::Fragments
+            )
+            .unwrap(),
             output,
         );
         let requests = server.join().unwrap();
@@ -975,6 +1167,7 @@ mod tests {
 
     #[test]
     fn translation_deduplicates_concurrent_requests() {
+        let _requests = REQUEST_TESTS.lock().unwrap();
         let (provider, server) = mock_provider(
             "reader",
             vec![(
@@ -984,7 +1177,15 @@ mod tests {
         );
         let directory = tempfile::tempdir().unwrap();
         let cache = TranslationCache::new(directory.path().join("translations.sqlite3"));
-        let run = || translate(&["Guide"], &cache, &provider, &AtomicBool::new(false));
+        let run = || {
+            translate(
+                &["Guide"],
+                &cache,
+                &provider,
+                &AtomicBool::new(false),
+                TranslationFormat::Markdown,
+            )
+        };
         std::thread::scope(|threads| {
             let first = threads.spawn(run);
             let second = threads.spawn(run);
@@ -998,6 +1199,7 @@ mod tests {
 
     #[test]
     fn concurrent_hovers_share_translation_when_cache_write_fails() {
+        let _requests = REQUEST_TESTS.lock().unwrap();
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("translations.sqlite3");
         let cache = TranslationCache::new(path.clone());
@@ -1023,8 +1225,19 @@ mod tests {
                 reply.recv_timeout(Duration::from_secs(5)).unwrap();
             },
         );
-        let pending = (cache.path().clone(), cache_key("Guide", &provider));
-        let run = || translate(&["Guide"], &cache, &provider, &AtomicBool::new(false));
+        let pending = (
+            cache.path().clone(),
+            TranslationFormat::Markdown.cache_key("Guide", &provider),
+        );
+        let run = || {
+            translate(
+                &["Guide"],
+                &cache,
+                &provider,
+                &AtomicBool::new(false),
+                TranslationFormat::Markdown,
+            )
+        };
         std::thread::scope(|threads| {
             let first = threads.spawn(run);
             arrived.recv_timeout(Duration::from_secs(5)).unwrap();
