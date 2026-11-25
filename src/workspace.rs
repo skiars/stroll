@@ -5583,6 +5583,7 @@ impl Render for Workspace {
         if !cx.has_active_drag() {
             self.editor_previews.split_drag = None;
         }
+        self.sync_editor_preview_menu();
         self.refresh_active_editor_preview(window, cx);
         self.sync_document_translation(window, cx);
         self.visible_editor = if self.view == WorkspaceView::Editor
@@ -5985,13 +5986,20 @@ pub(crate) fn icon_button(
     label: impl Into<SharedString>,
 ) -> Button {
     let label = label.into();
+    toolbar_icon_button(id, icon, label.clone()).tooltip(label)
+}
+
+fn toolbar_icon_button(
+    id: impl Into<ElementId>,
+    icon: impl Into<Icon>,
+    label: impl Into<SharedString>,
+) -> Button {
     quiet_button(id)
         .with_size(px(20.))
         .size(px(28.))
         .p_0()
         .icon(icon.into())
-        .accessibility_label(label.clone())
-        .tooltip(label)
+        .accessibility_label(label)
 }
 
 pub(crate) fn compact_icon_button(
@@ -6009,7 +6017,16 @@ fn tab_bar_icon_button(
     icon: impl Into<Icon>,
     label: impl Into<SharedString>,
 ) -> Button {
-    icon_button(id, icon, label)
+    let label = label.into();
+    tab_bar_icon_control(id, icon, label.clone()).tooltip(label)
+}
+
+fn tab_bar_icon_control(
+    id: impl Into<ElementId>,
+    icon: impl Into<Icon>,
+    label: impl Into<SharedString>,
+) -> Button {
+    toolbar_icon_button(id, icon, label)
         .size(TAB_BAR_BUTTON_SIZE)
         .icon_size(px(15.))
 }

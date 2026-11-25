@@ -1,6 +1,7 @@
 use super::*;
 use crate::session::EditorPreviewMode;
-use gpui_base::InteractiveElementExt as _;
+use gpui_base::{InteractiveElementExt as _, Popup};
+use gpui_component::{Side, menu::PopupMenu};
 use std::borrow::Cow;
 
 mod markdown_scroll;
@@ -9,6 +10,7 @@ const DEFAULT_SPLIT_FRACTION: f32 = 0.5;
 const MIN_SPLIT_FRACTION: f32 = 0.25;
 const MAX_SPLIT_FRACTION: f32 = 0.75;
 const DIVIDER_HIT_PADDING: Pixels = px(5.);
+const MODE_MENU_CLOSE_DELAY: Duration = Duration::from_millis(180);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum PreviewKind {
@@ -69,6 +71,19 @@ impl EditorPreviewMode {
             ),
         }
     }
+
+    fn glyph(self, dark: bool) -> (Icon, &'static str) {
+        let (art, selector) = self.icon();
+        let color = match (self, dark) {
+            (Self::Source, false) => rgb(0x1756a8),
+            (Self::Source, true) => rgb(0x8bb8ff),
+            (Self::Split, false) => rgb(0x9a4d08),
+            (Self::Split, true) => rgb(0xffb366),
+            (Self::Full, false) => rgb(0x713ab0),
+            (Self::Full, true) => rgb(0xcc9bff),
+        };
+        (Icon::default().data(art).text_color(color), selector)
+    }
 }
 
 #[derive(Default)]
@@ -77,6 +92,16 @@ pub(super) struct EditorPreviews {
     pub(super) svg_source_errors: HashMap<PathBuf, SharedString>,
     pub(super) split_drag: Option<(PreviewKind, f32)>,
     scroll_follow: markdown_scroll::ScrollFollow,
+    mode_menu: Option<PreviewModeMenu>,
+}
+
+struct PreviewModeMenu {
+    path: PathBuf,
+    menu: Entity<PopupMenu>,
+    bounds: Rc<Cell<Option<(Bounds<Pixels>, Bounds<Pixels>)>>>,
+    close_task: Option<Task<()>>,
+    _dismiss: Subscription,
+    _escape: Subscription,
 }
 
 struct MarkdownPreview {
@@ -233,68 +258,271 @@ impl Workspace {
         let path = self.tabs.active()?;
         let kind = PreviewKind::for_path(path)?;
         let mode = self.editor_preview_mode(path);
-        let dark = cx.theme().mode == ThemeMode::Dark;
-        let color: Hsla = match (mode, dark) {
-            (EditorPreviewMode::Source, false) => rgb(0x1756a8),
-            (EditorPreviewMode::Source, true) => rgb(0x8bb8ff),
-            (EditorPreviewMode::Split, false) => rgb(0x9a4d08),
-            (EditorPreviewMode::Split, true) => rgb(0xffb366),
-            (EditorPreviewMode::Full, false) => rgb(0x713ab0),
-            (EditorPreviewMode::Full, true) => rgb(0xcc9bff),
-        }
-        .into();
+        let (glyph, selector) = mode.glyph(cx.theme().mode == ThemeMode::Dark);
         let path = path.to_owned();
-        let (art, selector) = mode.icon();
-        let glyph = Icon::default().data(art).text_color(color);
-        let button = if self.standalone.is_some() {
+        let standalone = self.standalone.is_some();
+        let button = if standalone {
             icon_button("editor-preview-mode", glyph, mode.label()).icon_size(px(16.))
         } else {
-            tab_bar_icon_button("editor-preview-mode", glyph, mode.label())
+            tab_bar_icon_control("editor-preview-mode", glyph, mode.label()).tab_stop(false)
         };
-        Some(
-            button
-                .tooltip_placement(Placement::Bottom)
-                .debug_selector(move || selector.into())
-                .on_click(cx.listener(move |this, _, window, cx| {
-                    if this.tabs.active() != Some(&path) {
-                        return;
-                    }
-                    let current = this.editor_preview_mode(&path);
-                    let next = current.next();
-                    if current == EditorPreviewMode::Split {
-                        this.reset_markdown_scroll_follow(cx);
-                    }
-                    if next == EditorPreviewMode::Full {
-                        this.capture_active_file_position(cx);
-                        if let Some(file) = this.files.get(&path) {
-                            file.editor
-                                .update(cx, |editor, cx| editor.dismiss_lsp_overlays(cx));
-                        }
-                    }
-                    this.set_editor_preview_mode(&path, next);
-                    if let Err(error) = this
-                        .store
-                        .save_editor_preview_preference(kind.preference_key(), next)
-                    {
-                        this.show_error(error, window, cx);
-                    }
-                    if kind == PreviewKind::Svg
-                        && next != EditorPreviewMode::Full
-                        && !this.files.contains_key(&path)
-                    {
-                        this.request_file(
-                            path.clone(),
-                            FileOpen::Select {
-                                preview: true,
-                                position: None,
-                            },
-                            window,
-                            cx,
-                        );
-                    }
-                    cx.notify();
-                })),
-        )
+        let click_path = path.clone();
+        let button = button
+            .tooltip_placement(Placement::Bottom)
+            .debug_selector(move || selector.into())
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.close_editor_preview_menu(cx);
+                let next = this.editor_preview_mode(&click_path).next();
+                this.change_editor_preview_mode(&click_path, kind, next, window, cx);
+            }));
+        Some(if standalone {
+            button.into_any_element()
+        } else {
+            self.editor_preview_menu_trigger(button, path, kind, cx)
+                .into_any_element()
+        })
+    }
+
+    fn change_editor_preview_mode(
+        &mut self,
+        path: &Path,
+        kind: PreviewKind,
+        mode: EditorPreviewMode,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let current = self.editor_preview_mode(path);
+        if self.tabs.active() != Some(path) || current == mode {
+            return;
+        }
+        if current == EditorPreviewMode::Split {
+            self.reset_markdown_scroll_follow(cx);
+        }
+        if mode == EditorPreviewMode::Full {
+            self.capture_active_file_position(cx);
+            if let Some(file) = self.files.get(path) {
+                file.editor
+                    .update(cx, |editor, cx| editor.dismiss_lsp_overlays(cx));
+            }
+        }
+        self.set_editor_preview_mode(path, mode);
+        if let Err(error) = self
+            .store
+            .save_editor_preview_preference(kind.preference_key(), mode)
+        {
+            self.show_error(error, window, cx);
+        }
+        if kind == PreviewKind::Svg
+            && mode != EditorPreviewMode::Full
+            && !self.files.contains_key(path)
+        {
+            self.request_file(
+                path.to_owned(),
+                FileOpen::Select {
+                    preview: true,
+                    position: None,
+                },
+                window,
+                cx,
+            );
+        }
+        cx.notify();
+    }
+
+    pub(super) fn sync_editor_preview_menu(&mut self) {
+        if self
+            .editor_previews
+            .mode_menu
+            .as_ref()
+            .is_some_and(|state| {
+                self.view != WorkspaceView::Editor
+                    || self.repository.is_none()
+                    || self.tabs.active() != Some(state.path.as_path())
+            })
+        {
+            self.editor_previews.mode_menu = None;
+        }
+    }
+
+    fn editor_preview_menu_trigger(
+        &self,
+        button: Button,
+        path: PathBuf,
+        kind: PreviewKind,
+        cx: &Context<Self>,
+    ) -> Popup {
+        let open = self
+            .editor_previews
+            .mode_menu
+            .as_ref()
+            .filter(|state| state.path == path);
+        let trigger = Popup::new("editor-preview-menu-trigger", button)
+            .flex_shrink_0()
+            .anchor(Anchor::TopRight)
+            .offset(px(6.))
+            .hover_listener_mode(HoverListenerMode::InputModalityIndependent)
+            .on_hover(cx.listener(move |this, &hovered, window, cx| {
+                if hovered {
+                    this.show_editor_preview_menu(&path, kind, window, cx);
+                } else if this
+                    .editor_previews
+                    .mode_menu
+                    .as_ref()
+                    .is_some_and(|state| state.bounds.get().is_none())
+                {
+                    // The pointer can leave before the popup paints its move listener.
+                    this.hover_editor_preview_menu(false, window, cx);
+                }
+            }))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| this.close_editor_preview_menu(cx)),
+            );
+
+        let Some(open) = open else {
+            return trigger;
+        };
+        let bounds = open.bounds.clone();
+        let position_bounds = bounds.clone();
+        let close_pending = open.close_task.is_some();
+        let workspace = cx.weak_entity();
+        trigger
+            .on_position(move |popup, trigger| position_bounds.set(Some((popup.bounds, trigger))))
+            .content(
+                div().relative().child(open.menu.clone()).child(
+                    canvas(
+                        |_, _, _| (),
+                        move |_, (), window, cx| {
+                            if close_pending
+                                && bounds.get().is_some_and(|(menu, _)| {
+                                    menu.contains(&window.mouse_position())
+                                })
+                            {
+                                let workspace = workspace.clone();
+                                window.defer(cx, move |window, cx| {
+                                    _ = workspace.update(cx, |this, cx| {
+                                        this.hover_editor_preview_menu(true, window, cx)
+                                    });
+                                });
+                            }
+                            // Treat the trigger and popup as one hover region.
+                            let bounds = bounds.clone();
+                            let workspace = workspace.clone();
+                            let exited = workspace.clone();
+                            window.on_mouse_event(
+                                move |event: &MouseMoveEvent, phase, window, cx| {
+                                    if phase.capture() {
+                                        let inside = bounds.get().is_some_and(|(menu, button)| {
+                                            menu.contains(&event.position)
+                                                || button.contains(&event.position)
+                                        });
+                                        _ = workspace.update(cx, |this, cx| {
+                                            this.hover_editor_preview_menu(inside, window, cx)
+                                        });
+                                    }
+                                },
+                            );
+                            window.on_mouse_event(move |_: &MouseExitEvent, phase, window, cx| {
+                                if phase.capture() {
+                                    _ = exited.update(cx, |this, cx| {
+                                        this.hover_editor_preview_menu(false, window, cx)
+                                    });
+                                }
+                            });
+                        },
+                    )
+                    .absolute()
+                    .inset_0(),
+                ),
+            )
+    }
+
+    fn show_editor_preview_menu(
+        &mut self,
+        path: &Path,
+        kind: PreviewKind,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.view != WorkspaceView::Editor
+            || self.repository.is_none()
+            || self.tabs.active() != Some(path)
+            || self.editor_previews.mode_menu.is_some()
+        {
+            return;
+        }
+
+        let mode = self.editor_preview_mode(path);
+        let dark = cx.theme().mode == ThemeMode::Dark;
+        let workspace = cx.weak_entity();
+        let menu = PopupMenu::build(window, cx, |mut menu, _, _| {
+            menu = menu.min_w(Pixels::ZERO).check_side(Side::Right);
+            for choice in [
+                EditorPreviewMode::Source,
+                EditorPreviewMode::Split,
+                EditorPreviewMode::Full,
+            ] {
+                let path = path.to_owned();
+                let workspace = workspace.clone();
+                let (icon, _) = choice.glyph(dark);
+                let item = PopupMenuItem::new(choice.label())
+                    .icon(icon.with_size(px(15.)))
+                    .on_click(move |_, window, cx| {
+                        _ = workspace.update(cx, |this, cx| {
+                            this.change_editor_preview_mode(&path, kind, choice, window, cx);
+                        });
+                    });
+                menu = menu.item_with_check(item, choice == mode);
+            }
+            menu
+        });
+        let dismiss = cx.subscribe(&menu, |this, _, _: &DismissEvent, cx| {
+            this.close_editor_preview_menu(cx);
+        });
+        let window_id = window.window_handle().window_id();
+        // The editor retains focus, so Escape must work outside the menu's key context.
+        let escape = cx.intercept_keystrokes(move |event, window, cx| {
+            if event.keystroke.key == "escape" && window.window_handle().window_id() == window_id {
+                _ = workspace.update(cx, |this, cx| {
+                    this.close_editor_preview_menu(cx);
+                    cx.stop_propagation();
+                });
+            }
+        });
+        self.editor_previews.mode_menu = Some(PreviewModeMenu {
+            path: path.to_owned(),
+            menu,
+            bounds: Rc::new(Cell::new(None)),
+            close_task: None,
+            _dismiss: dismiss,
+            _escape: escape,
+        });
+        cx.notify();
+    }
+
+    fn hover_editor_preview_menu(
+        &mut self,
+        inside: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(state) = self.editor_previews.mode_menu.as_mut() else {
+            return;
+        };
+        if inside {
+            state.close_task = None;
+        } else if state.close_task.is_none() {
+            state.close_task = Some(cx.spawn_in(window, async move |this, cx| {
+                cx.background_executor().timer(MODE_MENU_CLOSE_DELAY).await;
+                _ = this.update(cx, |this, cx| this.close_editor_preview_menu(cx));
+            }));
+        }
+    }
+
+    fn close_editor_preview_menu(&mut self, cx: &mut Context<Self>) {
+        if self.editor_previews.mode_menu.take().is_some() {
+            cx.notify();
+        }
     }
 
     pub(super) fn refresh_active_editor_preview(
@@ -1416,6 +1644,122 @@ mod tests {
         );
     }
 
+    fn preview_menu_after(
+        visual: &mut VisualTestContext,
+        elapsed: Duration,
+    ) -> Option<Bounds<Pixels>> {
+        visual.run_until_parked();
+        visual.executor().advance_clock(elapsed);
+        visual.run_until_parked();
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+        visual.debug_bounds("popup-menu-surface")
+    }
+
+    fn move_to(visual: &mut VisualTestContext, position: Point<Pixels>) {
+        visual.simulate_mouse_move(position, None, Modifiers::none());
+    }
+
+    fn assert_editor_preview_menu(visual: &mut VisualTestContext, workspace: &Entity<Workspace>) {
+        let focus = visual.update(|window, cx| {
+            let focus = workspace
+                .read(cx)
+                .active_file()
+                .unwrap()
+                .editor
+                .read(cx)
+                .focus_handle(cx);
+            focus.focus(window, cx);
+            focus
+        });
+        let button = visual.debug_bounds("editor-preview-icon-source").unwrap();
+        let actions = visual.debug_bounds("workspace-actions-trigger").unwrap();
+        let gap = point(button.center().x, button.bottom() + px(2.));
+        let millisecond = Duration::from_millis(1);
+
+        assert!(preview_menu_after(visual, Duration::ZERO).is_none());
+        move_to(visual, button.center());
+        let menu = preview_menu_after(visual, Duration::ZERO).expect("menu opens on pointer entry");
+        assert!(menu.top() > button.bottom());
+        assert_eq!(menu.right(), button.right());
+        assert_eq!(
+            visual.debug_bounds("editor-preview-icon-source"),
+            Some(button)
+        );
+        assert_eq!(
+            visual.debug_bounds("workspace-actions-trigger"),
+            Some(actions)
+        );
+        assert!(visual.update(|window, _| focus.is_focused(window)));
+
+        let font_size = visual.update(|_, cx| {
+            let font_size = cx.theme().control_font_size;
+            Theme::update(cx, |theme| theme.control_font_size = px(10.));
+            font_size
+        });
+        let compact = preview_menu_after(visual, Duration::ZERO).unwrap();
+        assert!(compact.size.width < menu.size.width);
+        assert_eq!(compact.right(), menu.right());
+        visual.update(|_, cx| Theme::update(cx, |theme| theme.control_font_size = font_size));
+        assert_eq!(preview_menu_after(visual, Duration::ZERO), Some(menu));
+
+        move_to(visual, gap);
+        assert!(preview_menu_after(visual, MODE_MENU_CLOSE_DELAY - millisecond).is_some());
+        move_to(visual, menu.center());
+        assert!(preview_menu_after(visual, MODE_MENU_CLOSE_DELAY).is_some());
+        move_to(visual, gap);
+        assert!(preview_menu_after(visual, MODE_MENU_CLOSE_DELAY).is_none());
+
+        // Pointer events may arrive back-to-back before the popup's first draw.
+        visual.update(|window, cx| {
+            window.simulate_mouse_move(button.center(), cx);
+            window.simulate_mouse_move(gap, cx);
+        });
+        assert!(preview_menu_after(visual, MODE_MENU_CLOSE_DELAY).is_none());
+        visual.update(|window, cx| {
+            window.simulate_mouse_move(button.center(), cx);
+            window.simulate_mouse_move(menu.center(), cx);
+        });
+        assert!(preview_menu_after(visual, Duration::ZERO).is_some());
+        assert!(preview_menu_after(visual, MODE_MENU_CLOSE_DELAY).is_some());
+
+        move_to(visual, button.center());
+        assert!(preview_menu_after(visual, Duration::ZERO).is_some());
+        visual.simulate_keystrokes("escape");
+        assert!(preview_menu_after(visual, Duration::ZERO).is_none());
+        move_to(visual, button.center() + point(px(1.), px(1.)));
+        assert!(preview_menu_after(visual, Duration::ZERO).is_none());
+        assert!(visual.update(|window, _| focus.is_focused(window)));
+
+        move_to(visual, gap);
+        move_to(visual, button.center());
+        assert!(preview_menu_after(visual, Duration::ZERO).is_some());
+        visual.simulate_click(gap, Modifiers::none());
+        assert!(preview_menu_after(visual, Duration::ZERO).is_none());
+
+        visual.update(|window, cx| focus.focus(window, cx));
+        move_to(visual, button.center());
+        let menu = preview_menu_after(visual, Duration::ZERO).unwrap();
+        move_to(visual, menu.center());
+        visual.simulate_click(menu.center(), Modifiers::none());
+        assert!(preview_menu_after(visual, Duration::ZERO).is_none());
+        assert!(visual.debug_bounds("editor-preview-icon-split").is_some());
+        assert!(visual.update(|window, _| focus.is_focused(window)));
+
+        move_to(visual, button.center());
+        let menu = preview_menu_after(visual, Duration::ZERO).unwrap();
+        visual.simulate_click(menu.center(), Modifiers::none());
+        assert!(preview_menu_after(visual, Duration::ZERO).is_none());
+        assert!(visual.debug_bounds("editor-preview-icon-split").is_some());
+
+        move_to(visual, gap);
+        move_to(visual, button.center());
+        assert!(preview_menu_after(visual, Duration::ZERO).is_some());
+        visual.simulate_click(button.center(), Modifiers::none());
+        assert!(preview_menu_after(visual, Duration::ZERO).is_none());
+        assert!(visual.debug_bounds("editor-preview-icon-source").is_some());
+        assert!(visual.update(|window, _| focus.is_focused(window)));
+    }
+
     #[::core::prelude::v1::test]
     fn editor_preview_cycles_renders_drafts_and_saves_modes_and_splits() -> Result<()> {
         let fixture = tempfile::tempdir()?;
@@ -1506,6 +1850,7 @@ mod tests {
                 .debug_bounds("editor-preview-divider-anchor")
                 .is_none()
         );
+        assert_editor_preview_menu(&mut visual, &workspace);
         click_mode(&mut visual, &workspace, "editor-preview-icon-source");
         assert!(visual.debug_bounds("editor-preview-full").is_some());
         assert_eq!(visual.debug_bounds("status-file-path"), Some(status));
@@ -1604,7 +1949,14 @@ mod tests {
                 && this.active_editor_preview_mode() == EditorPreviewMode::Full
         });
         assert!(visual.update(|_, cx| workspace.read(cx).active_file().is_none()));
-        click_mode(&mut visual, &workspace, "editor-preview-icon-full");
+        let button = visual.debug_bounds("editor-preview-icon-full").unwrap();
+        move_to(
+            &mut visual,
+            point(button.center().x, button.bottom() + px(2.)),
+        );
+        move_to(&mut visual, button.center());
+        let menu = preview_menu_after(&mut visual, Duration::ZERO).unwrap();
+        visual.simulate_click(menu.center(), Modifiers::none());
         settle(&mut visual, &workspace, |this, _| {
             this.active_file().is_some_and(|file| file.path == svg)
         });
@@ -1655,7 +2007,14 @@ mod tests {
                 .is_none()
         );
 
+        move_to(
+            &mut visual,
+            point(button.center().x, button.bottom() + px(2.)),
+        );
+        move_to(&mut visual, button.center());
+        assert!(preview_menu_after(&mut visual, Duration::ZERO).is_some());
         open(&mut visual, &workspace, plain);
+        assert!(preview_menu_after(&mut visual, Duration::ZERO).is_none());
         assert!(visual.debug_bounds("editor-preview-icon-source").is_none());
         assert!(visual.debug_bounds("editor-preview-icon-split").is_none());
         assert!(visual.debug_bounds("editor-preview-icon-full").is_none());
