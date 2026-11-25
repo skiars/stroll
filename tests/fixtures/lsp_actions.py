@@ -40,7 +40,7 @@ def change(replacement):
 def diagnostic(version, uri):
     if suppression_mode.exists():
         text = documents[uri][1]
-        line = next((i for i, line in enumerate(text.splitlines()) if "return n;" in line), None)
+        line = next((i for i, line in enumerate(text.splitlines()) if "return n + 42;" in line), None)
         if line is None:
             return
         location = {"start": {"line": line, "character": 8}, "end": {"line": line, "character": 9}}
@@ -53,6 +53,12 @@ def diagnostic(version, uri):
         ]
         if f"NOLINT({narrowing_check})" not in text:
             diagnostics.extend([item, item])
+        diagnostics.append({
+            **item,
+            "range": {"start": {"line": line, "character": 12}, "end": {"line": line, "character": 14}},
+            "message": "Magic number",
+            "code": "readability-magic-numbers",
+        })
         send(method="textDocument/publishDiagnostics", params={
             "uri": uri, "version": version, "diagnostics": diagnostics,
         })

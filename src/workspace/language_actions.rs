@@ -1744,8 +1744,9 @@ mod tests {
     }
 
     #[::core::prelude::v1::test]
-    fn clangd_suppression_action_preserves_server_fixes_and_uses_draft_history() -> Result<()> {
-        const ORIGINAL: &str = "float convert(int n) {\n\treturn n;\n}\n";
+    fn lightbulb_collects_same_line_clangd_actions_and_applies_suppression_as_a_draft() -> Result<()>
+    {
+        const ORIGINAL: &str = "float convert(int n) {\n\treturn n + 42;\n}\n";
         const COMMENT: &str = "// NOLINT(bugprone-narrowing-conversions)";
         let mut app = test_app();
         let (fixture, workspace, visual) = open_fixture(&mut app, None, |root| {
@@ -1767,12 +1768,19 @@ mod tests {
             let editor = workspace.read(cx).active_file().unwrap().editor.clone();
             editor.update(cx, |state, cx| {
                 state.focus(window, cx);
-                let caret = ORIGINAL.find("n;").unwrap();
+                let caret = ORIGINAL.find("n +").unwrap();
                 state.set_selected_range(caret..caret, cx);
             });
             editor
         });
-        visual.simulate_keystrokes(shortcut());
+        pump(visual, "current line lightbulb", |visual| {
+            visual.debug_bounds("code-action-lightbulb").is_some()
+        })?;
+        let bulb = visual.debug_bounds("code-action-lightbulb").unwrap();
+        visual.simulate_click(
+            point(bulb.right() - px(2.), bulb.center().y),
+            Modifiers::default(),
+        );
         pump(visual, "clang-tidy suppression menu", |visual| {
             visual.update(|_, cx| {
                 let menu = editor.read(cx).code_action_menu_state();
@@ -1782,7 +1790,7 @@ mod tests {
         visual.update(|window, cx| {
             editor.update(cx, |state, cx| {
                 let menu = state.code_action_menu_state();
-                assert_eq!(menu.items.len(), 2);
+                assert_eq!(menu.items.len(), 3);
                 assert_eq!(menu.items[0].action.title, "Insert an explicit cast");
                 let item = menu.items[1].clone();
                 assert_eq!(
@@ -1790,6 +1798,11 @@ mod tests {
                     "Suppress bugprone-narrowing-conversions on this line"
                 );
                 assert!(item.action.disabled.is_none());
+                assert_eq!(
+                    menu.items[2].action.title,
+                    "Suppress readability-magic-numbers on this line"
+                );
+                assert!(menu.items[2].action.disabled.is_none());
                 state.preview_code_action(&item, window, cx);
             });
         });
@@ -1805,7 +1818,7 @@ mod tests {
             })
         })?;
         visual.simulate_keystrokes("down enter");
-        let updated = ORIGINAL.replace("return n;", &format!("return n;  {COMMENT}"));
+        let updated = ORIGINAL.replace("return n + 42;", &format!("return n + 42;  {COMMENT}"));
         pump(
             visual,
             "clang-tidy suppression applied to the draft",
