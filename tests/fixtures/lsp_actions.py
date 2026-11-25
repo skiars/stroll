@@ -5,6 +5,9 @@ from pathlib import Path
 
 documents = {}
 format_mode = Path("format-mode")
+command_mode = Path("command-mode")
+suppression_mode = Path("suppression-mode")
+narrowing_check = "bugprone-narrowing-conversions"
 
 
 def receive():
@@ -35,6 +38,25 @@ def change(replacement):
 
 
 def diagnostic(version, uri):
+    if suppression_mode.exists():
+        text = documents[uri][1]
+        line = next((i for i, line in enumerate(text.splitlines()) if "return n;" in line), None)
+        if line is None:
+            return
+        location = {"start": {"line": line, "character": 8}, "end": {"line": line, "character": 9}}
+        item = {"range": location, "severity": 2, "message": "Narrowing conversion",
+                "source": "clang-tidy", "code": narrowing_check}
+        diagnostics = [
+            {**item, "source": "clang", "code": "-Wconversion"},
+            {**item, "code": 42},
+            {**item, "code": "bugprone-*"},
+        ]
+        if f"NOLINT({narrowing_check})" not in text:
+            diagnostics.extend([item, item])
+        send(method="textDocument/publishDiagnostics", params={
+            "uri": uri, "version": version, "diagnostics": diagnostics,
+        })
+        return
     send(method="textDocument/publishDiagnostics", params={
         "uri": uri, "version": version, "diagnostics": [{
             "range": span(), "severity": 2, "message": "Choose a descriptive name.",
@@ -59,12 +81,17 @@ while message := receive():
             "codeActionProvider": {"resolveProvider": True},
             "renameProvider": {"prepareProvider": True},
         }
+        if command_mode.exists():
+            capabilities["executeCommandProvider"] = {"commands": ["clangd.applyTweak"]}
         if format_mode.exists():
             assert params["capabilities"]["textDocument"]["formatting"]["dynamicRegistration"]
             capabilities["textDocumentSync"] = {"openClose": True, "change": 1, "save": True}
             if format_mode.read_text() == "static":
                 capabilities["documentFormattingProvider"] = {}
-        send(id=identifier, result={"capabilities": capabilities})
+        result = {"capabilities": capabilities}
+        if suppression_mode.exists():
+            result["serverInfo"] = {"name": "clangd"}
+        send(id=identifier, result=result)
     elif method == "initialized" and format_mode.exists() and format_mode.read_text() == "dynamic":
         send(id="register-format", method="client/registerCapability", params={"registrations": [{
             "id": "formatter", "method": "textDocument/formatting", "registerOptions": {
@@ -74,10 +101,23 @@ while message := receive():
     elif method is None and identifier in ("register-format", "unregister-format"):
         assert "result" in message, message
         Path(identifier).touch()
+    elif method is None and identifier == "unsolicited-edit":
+        assert message["result"]["applied"] is False, message
+        Path("unsolicited-edit-denied").touch()
+    elif method is None and identifier == "tweak-edit":
+        assert message["result"]["applied"] is False, message
+        send(id=tweak_request, error={
+            "code": -32001,
+            "message": "edits were not applied: " + message["result"]["failureReason"],
+        })
     elif method == "textDocument/didOpen":
         version = params["textDocument"]["version"]
         documents[uri] = (version, params["textDocument"]["text"])
         diagnostic(version, uri)
+        if command_mode.exists():
+            send(id="unsolicited-edit", method="workspace/applyEdit", params={
+                "edit": {"changes": {uri: [change("unexpected")]}}
+            })
     elif method == "textDocument/didChange":
         version = params["textDocument"]["version"]
         documents[uri] = (version, params["contentChanges"][0]["text"])
@@ -123,6 +163,32 @@ while message := receive():
             send(id=identifier, result=[])
             continue
         version, text = documents[uri]
+        if suppression_mode.exists():
+            diagnostics = params["context"]["diagnostics"]
+            if any(item["code"] == narrowing_check for item in diagnostics):
+                send(id=identifier, result=[{
+                    "title": "Insert an explicit cast",
+                    "kind": "quickfix",
+                    "isPreferred": True,
+                    "edit": {"changes": {uri: [{"range": diagnostics[0]["range"],
+                                               "newText": "static_cast<float>(n)"}]}},
+                }])
+            else:
+                send(id=identifier, result=None)
+            continue
+        if command_mode.exists():
+            edit = {"range": span(32, 35), "newText": "static_cast<float>(old)"}
+            send(id=identifier, result=[{
+                "title": "Insert an explicit cast",
+                "command": "clangd.applyFix",
+                "arguments": [{"changes": {uri: [edit]}}],
+            }, {
+                "title": "Use an explicit conversion",
+                "kind": "refactor",
+                "command": {"title": "Use an explicit conversion", "command": "clangd.applyTweak",
+                            "arguments": [{"file": uri, "selection": span(32, 35), "tweakID": "TestConversion"}]},
+            }])
+            continue
         if "old" not in text or (params["range"]["start"]["line"] != 0 and "int payload" not in text):
             send(id=identifier, result=[])
             continue
@@ -145,6 +211,18 @@ while message := receive():
             if item["code"] == "naming":
                 Path("received-diagnostic").touch()
         send(id=identifier, result=actions)
+    elif method == "workspace/executeCommand":
+        assert command_mode.exists()
+        assert params["command"] == "clangd.applyTweak", params
+        args, = params["arguments"]
+        assert args["tweakID"] == "TestConversion" and args["selection"] == span(32, 35)
+        assert documents[args["file"]][1][32:35] == "old"
+        with Path("executed-tweaks").open("a") as calls:
+            calls.write("tweak\n")
+        tweak_request = identifier
+        send(id="tweak-edit", method="workspace/applyEdit", params={
+            "edit": {"changes": {args["file"]: [{"range": span(32, 35), "newText": "float(old)"}]}}
+        })
     elif method == "codeAction/resolve":
         data = params["data"]
         version, text = documents[data["uri"]]

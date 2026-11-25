@@ -1,4 +1,5 @@
 pub(crate) mod actions;
+mod clangd;
 mod completion;
 mod editor;
 mod indentation;
@@ -49,6 +50,7 @@ const INITIALIZE_TIMEOUT: Duration = Duration::from_secs(12);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(4);
 const DOCUMENT_FORMATTING: &str = "textDocument/formatting";
 const WORKSPACE_CONFIGURATION_CHANGED: &str = "workspace/didChangeConfiguration";
+const COMMAND_EDIT_CAPTURED: &str = "The editor will handle the text changes";
 const DIAGNOSTIC_DEBOUNCE: Duration = Duration::from_millis(150);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(150);
 
@@ -613,6 +615,7 @@ enum Query {
     ResolveSymbol(Value),
     CodeActions(Range),
     ResolveAction(CodeAction, i32),
+    ClangdTweak(lsp_types::Command, i32),
     PrepareRename(Position),
     Rename(Position, String, Option<i32>),
     Format(FormattingOptions),
@@ -623,6 +626,7 @@ enum Query {
 #[derive(Default)]
 struct Response {
     value: Value,
+    supplemental_code_actions: Vec<CodeAction>,
     legend: Option<SemanticTokensLegend>,
     snapshot: Option<ActionSnapshot>,
 }
@@ -686,6 +690,8 @@ enum PendingKind {
         reply: Reply,
         legend: Option<SemanticTokensLegend>,
         snapshot: Option<ActionSnapshot>,
+        command_edit: Option<Result<Value>>,
+        supplemental_code_actions: Vec<CodeAction>,
     },
     Diagnostics {
         document: DocumentId,
@@ -700,9 +706,13 @@ struct Session {
     progress: ActiveProgress,
     changed: async_channel::Sender<()>,
     capabilities: ServerCapabilities,
+    clangd: bool,
     formatting_registrations: HashMap<String, Option<DocumentSelector>>,
     documents: HashMap<String, OpenDocument>,
     pending: HashMap<u64, Pending>,
+    // applyEdit carries no parent request ID. Keep the slot until clangd
+    // replies, even if the waiting editor has canceled or timed out.
+    command_request: Option<u64>,
     next_request: u64,
 }
 
@@ -721,9 +731,11 @@ impl Session {
             progress,
             changed,
             capabilities: ServerCapabilities::default(),
+            clangd: false,
             formatting_registrations: HashMap::new(),
             documents: HashMap::new(),
             pending: HashMap::new(),
+            command_request: None,
             next_request: 1,
         }
     }
@@ -811,8 +823,11 @@ impl Session {
                 Event::Incoming(message)
                     if message["id"] == 0 && message.get("method").is_none() =>
                 {
+                    let initialization = response_value(&message)?;
                     self.capabilities =
-                        serde_json::from_value(response_value(&message)?["capabilities"].clone())?;
+                        serde_json::from_value(initialization["capabilities"].clone())?;
+                    self.clangd = initialization["serverInfo"]["name"].as_str() == Some("clangd")
+                        || actions::supports_clangd_tweak(&self.capabilities);
                     ensure!(
                         self.capabilities
                             .position_encoding
@@ -1141,13 +1156,19 @@ impl Session {
             query,
             Query::CodeActions(..)
                 | Query::ResolveAction(..)
+                | Query::ClangdTweak(..)
                 | Query::PrepareRename(..)
                 | Query::Rename(..)
                 | Query::Format(..)
         );
+        let command_request = matches!(query, Query::ClangdTweak(..));
+        if command_request && self.command_request.is_some() {
+            _ = reply.send(Err(anyhow!("The previous code action is still running")));
+            return Ok(());
+        }
         let workspace_request = matches!(query, Query::Rename(..));
         let expected = match &query {
-            Query::ResolveAction(_, version) => Some(*version),
+            Query::ResolveAction(_, version) | Query::ClangdTweak(_, version) => Some(*version),
             Query::Rename(_, _, version) => *version,
             _ => None,
         };
@@ -1170,6 +1191,7 @@ impl Session {
         let mut params = json!({ "textDocument": { "uri": document.uri } });
         let open = &self.documents[&document.uri];
         let mut after_enter = None;
+        let mut supplemental_code_actions = Vec::new();
         let (method, legend) = match query {
             Query::IndentOnType(position) => {
                 let tab = gpui_component::input::TabSize::default();
@@ -1207,6 +1229,10 @@ impl Session {
                     .iter()
                     .filter(|item| item.range.start <= range.end && item.range.end >= range.start)
                     .collect();
+                if self.clangd {
+                    supplemental_code_actions =
+                        clangd::suppression_actions(&document.uri, open, &diagnostics);
+                }
                 params["range"] = json!(range);
                 params["context"] = json!({
                     "diagnostics": diagnostics,
@@ -1221,6 +1247,13 @@ impl Session {
             {
                 params = json!(action);
                 (Some("codeAction/resolve"), None)
+            }
+            Query::ClangdTweak(command, _)
+                if actions::supports_clangd_tweak(&self.capabilities)
+                    && actions::clangd_tweak(&command, &document.uri, &open.text) =>
+            {
+                params = json!({ "command": command.command, "arguments": command.arguments });
+                (Some("workspace/executeCommand"), None)
             }
             Query::PrepareRename(position)
                 if matches!(self.capabilities.rename_provider,
@@ -1371,9 +1404,14 @@ impl Session {
                         reply,
                         legend,
                         snapshot,
+                        command_edit: None,
+                        supplemental_code_actions,
                     },
                 },
             );
+            if command_request {
+                self.command_request = Some(id);
+            }
         } else {
             let _ = reply.send(if action_request {
                 Err(anyhow!(
@@ -1465,6 +1503,7 @@ impl Session {
         if let Some(method) = message["method"].as_str() {
             if let Some(id) = message.get("id") {
                 let response = match method {
+                    "workspace/applyEdit" => self.capture_command_edit(&message["params"]),
                     "workspace/configuration" => {
                         let values: Vec<_> = message["params"]["items"]
                             .as_array()
@@ -1521,16 +1560,38 @@ impl Session {
             {
                 document.publish_diagnostics(params.version, params.diagnostics);
             }
-        } else if let Some(id) = message["id"].as_u64()
-            && let Some(pending) = self.pending.remove(&id)
-        {
+        } else if let Some(id) = message["id"].as_u64() {
+            let command_request = self.command_request == Some(id);
+            if command_request {
+                self.command_request = None;
+            }
+            let Some(pending) = self.pending.remove(&id) else {
+                return Ok(());
+            };
             match pending.kind {
                 PendingKind::Query {
                     reply,
                     legend,
                     snapshot,
+                    command_edit,
+                    supplemental_code_actions,
                 } => {
-                    _ = reply.send(response_value(&message).and_then(|value| {
+                    let result = response_value(&message);
+                    let result = match command_edit {
+                        // clangd includes the applyEdit failure reason in its reply.
+                        Some(edit)
+                            if result.is_ok()
+                                || message["error"]["message"].as_str().is_some_and(
+                                    |message| message.contains(COMMAND_EDIT_CAPTURED),
+                                ) =>
+                        {
+                            edit
+                        }
+                        Some(Err(error)) => Err(error),
+                        _ if command_request => result.map(|_| Value::Null),
+                        _ => result,
+                    };
+                    _ = reply.send(result.and_then(|value| {
                         if let Some(snapshot) = &snapshot
                             && !self
                                 .documents
@@ -1546,6 +1607,7 @@ impl Session {
                             value,
                             legend,
                             snapshot,
+                            supplemental_code_actions,
                         })
                     }));
                 }
@@ -1570,6 +1632,34 @@ impl Session {
             }
         }
         Ok(())
+    }
+
+    fn capture_command_edit(&mut self, params: &Value) -> Value {
+        let mut reason = "There is no active code action";
+        if let Some(id) = self.command_request
+            && let Some(Pending {
+                kind:
+                    PendingKind::Query {
+                        reply,
+                        command_edit,
+                        ..
+                    },
+                ..
+            }) = self.pending.get_mut(&id)
+            && !reply.is_canceled()
+        {
+            if command_edit.is_some() {
+                reason = "This action sent more than one workspace edit";
+                *command_edit = Some(Err(anyhow!(reason)));
+            } else if let Some(edit) = params.get("edit").filter(|edit| edit.is_object()) {
+                *command_edit = Some(Ok(edit.clone()));
+                reason = COMMAND_EDIT_CAPTURED;
+            } else {
+                reason = "The language server returned an invalid workspace edit";
+                *command_edit = Some(Err(anyhow!(reason)));
+            }
+        }
+        json!({ "result": { "applied": false, "failureReason": reason } })
     }
 
     fn update_progress(&self, params: ProgressParams) {

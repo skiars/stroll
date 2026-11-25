@@ -13,10 +13,13 @@ use lsp_types::{
 
 use super::{Document, DocumentId, Query, Response, SessionState, lsp_position};
 
+pub(super) const CLANGD_APPLY_TWEAK: &str = "clangd.applyTweak";
+
 #[derive(Clone, Copy, Default)]
 pub(crate) struct Capabilities {
     pub list: bool,
     pub resolve: bool,
+    pub clangd_tweak: bool,
     pub rename: bool,
     pub prepare_rename: bool,
 }
@@ -30,6 +33,7 @@ impl From<&ServerCapabilities> for Capabilities {
                 .is_some_and(|cap| *cap != CodeActionProviderCapability::Simple(false)),
             resolve: matches!(&capabilities.code_action_provider,
                 Some(CodeActionProviderCapability::Options(options)) if options.resolve_provider == Some(true)),
+            clangd_tweak: supports_clangd_tweak(capabilities),
             rename: capabilities
                 .rename_provider
                 .as_ref()
@@ -38,6 +42,18 @@ impl From<&ServerCapabilities> for Capabilities {
                 Some(OneOf::Right(options)) if options.prepare_provider == Some(true)),
         }
     }
+}
+
+pub(super) fn supports_clangd_tweak(capabilities: &ServerCapabilities) -> bool {
+    capabilities
+        .execute_command_provider
+        .as_ref()
+        .is_some_and(|provider| {
+            provider
+                .commands
+                .iter()
+                .any(|name| name == CLANGD_APPLY_TWEAK)
+        })
 }
 
 #[derive(Clone)]
@@ -117,6 +133,7 @@ impl Document {
             })
             .collect::<Vec<_>>();
         actions.sort_by_key(|item| !item.is_preferred.unwrap_or_default());
+        actions.extend(response.supplemental_code_actions);
         Ok((actions, snapshot))
     }
 
@@ -130,6 +147,19 @@ impl Document {
             .request(Query::ResolveAction(action, version), text)
             .await?;
         Ok(serde_json::from_value(response.value)?)
+    }
+
+    pub(crate) async fn clangd_tweak(
+        &self,
+        text: Rope,
+        command: Command,
+        version: i32,
+    ) -> Result<WorkspaceEdit> {
+        let response = self
+            .request(Query::ClangdTweak(command, version), text)
+            .await?;
+        serde_json::from_value::<Option<WorkspaceEdit>>(response.value)?
+            .context("This action has no text changes")
     }
 
     pub(crate) async fn prepare_rename(
@@ -161,6 +191,40 @@ impl Document {
 
 pub(crate) fn stale() -> anyhow::Error {
     anyhow!("This action is out of date. Request code actions again.")
+}
+
+pub(crate) fn unpack_clangd_fix(action: &mut CodeAction) {
+    if action.edit.is_none()
+        && let Some(command) = &action.command
+        && command.command == "clangd.applyFix"
+        && let Some([edit]) = command.arguments.as_deref()
+        && let Ok(edit) = serde_json::from_value::<WorkspaceEdit>(edit.clone())
+    {
+        action.edit = Some(edit);
+        action.command = None;
+    }
+}
+
+pub(crate) fn clangd_tweak(command: &Command, uri: &str, text: &Rope) -> bool {
+    #[derive(serde::Deserialize)]
+    struct Tweak {
+        file: String,
+        selection: lsp_types::Range,
+        #[serde(rename = "tweakID")]
+        id: String,
+    }
+
+    let Some([argument]) = command.arguments.as_deref() else {
+        return false;
+    };
+    command.command == CLANGD_APPLY_TWEAK
+        && serde_json::from_value::<Tweak>(argument.clone()).is_ok_and(|tweak| {
+            tweak.file == uri
+                && !tweak.id.is_empty()
+                && tweak.selection.start <= tweak.selection.end
+                && byte_offset(text, tweak.selection.start).is_some()
+                && byte_offset(text, tweak.selection.end).is_some()
+        })
 }
 
 pub(crate) fn clangd_rename(command: &Command, uri: &str, text: &Rope) -> Option<RenameParams> {

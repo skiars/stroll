@@ -153,10 +153,13 @@ impl LanguageActions {
             cache.generation
         };
         window.spawn(cx, async move |_| {
-            let (items, snapshot) = source
+            let (mut items, snapshot) = source
                 .document
                 .code_actions(editor.text.clone(), range)
                 .await?;
+            if server == Some(LanguageServer::Clangd) {
+                items.iter_mut().for_each(actions::unpack_clangd_fix);
+            }
             let revision = editor.revision;
             let capabilities = source.document.action_capabilities();
             let display = items
@@ -176,7 +179,15 @@ impl LanguageActions {
                                 .is_some();
                             let noop = server == Some(LanguageServer::TypeScript)
                                 && actions::typescript_noop(command);
-                            if !rename && !noop {
+                            let tweak = server == Some(LanguageServer::Clangd)
+                                && capabilities.clangd_tweak
+                                && item.edit.is_none()
+                                && actions::clangd_tweak(
+                                    command,
+                                    source.document.action_uri(),
+                                    &editor.text,
+                                );
+                            if !rename && !noop && !tweak {
                                 Err(anyhow!("This action requires a server command"))
                             } else if noop && item.edit.is_none() {
                                 Err(anyhow!("This action has no text changes"))
@@ -252,23 +263,6 @@ impl LanguageActions {
                 request.ok_or_else(actions::stale)?;
             let plan = if let Some(plan) = cached {
                 plan
-            } else if server == Some(LanguageServer::Clangd)
-                && item.edit.is_none()
-                && let Some(params) = item.command.as_ref().and_then(|command| {
-                    actions::clangd_rename(command, source.document.action_uri(), &editor.text)
-                })
-            {
-                Rc::new(
-                    source
-                        .rename_plan(
-                            &editor,
-                            params.text_document_position.position,
-                            params.new_name,
-                            Some(snapshot.version),
-                            cx,
-                        )
-                        .await?,
-                )
             } else {
                 if item.edit.is_none()
                     && item.command.is_none()
@@ -278,19 +272,53 @@ impl LanguageActions {
                         .document
                         .resolve_action(editor.text.clone(), item, snapshot.version)
                         .await?;
+                    if server == Some(LanguageServer::Clangd) {
+                        actions::unpack_clangd_fix(&mut item);
+                    }
                 }
                 if let Some(disabled) = item.disabled {
                     return Err(anyhow!(disabled.reason));
                 }
-                ensure!(
-                    item.command
-                        .is_none_or(|command| server == Some(LanguageServer::TypeScript)
-                            && actions::typescript_noop(&command)),
-                    "This action requires a server command"
-                );
-                let edit = item.edit.context("This action has no text changes")?;
-                let repo = cx.update(|_, cx| source.repo(&editor, cx))??;
-                Rc::new(source.single_file_plan(edit, &editor, &snapshot, repo)?)
+                let clangd_command = item
+                    .command
+                    .as_ref()
+                    .filter(|_| server == Some(LanguageServer::Clangd) && item.edit.is_none());
+                let uri = source.document.action_uri();
+                if let Some(params) = clangd_command
+                    .and_then(|command| actions::clangd_rename(command, uri, &editor.text))
+                {
+                    Rc::new(
+                        source
+                            .rename_plan(
+                                &editor,
+                                params.text_document_position.position,
+                                params.new_name,
+                                Some(snapshot.version),
+                                cx,
+                            )
+                            .await?,
+                    )
+                } else {
+                    let repo = cx.update(|_, cx| source.repo(&editor, cx))??;
+                    let edit = if let Some(command) = clangd_command
+                        .filter(|command| actions::clangd_tweak(command, uri, &editor.text))
+                    {
+                        source
+                            .document
+                            .clangd_tweak(editor.text.clone(), command.clone(), snapshot.version)
+                            .await?
+                    } else {
+                        ensure!(
+                            item.command.is_none_or(|command| {
+                                server == Some(LanguageServer::TypeScript)
+                                    && actions::typescript_noop(&command)
+                            }),
+                            "This action requires a server command"
+                        );
+                        item.edit.context("This action has no text changes")?
+                    };
+                    Rc::new(source.single_file_plan(edit, &editor, &snapshot, repo)?)
+                }
             };
             if let Err(error) = plan.check_disk(cx).await {
                 cache.borrow_mut().preview = None;
@@ -1713,6 +1741,159 @@ mod tests {
     #[::core::prelude::v1::test]
     fn previews_and_applies_code_actions_and_renames_as_draft_transactions() -> Result<()> {
         workflow(None)
+    }
+
+    #[::core::prelude::v1::test]
+    fn clangd_suppression_action_preserves_server_fixes_and_uses_draft_history() -> Result<()> {
+        const ORIGINAL: &str = "float convert(int n) {\n\treturn n;\n}\n";
+        const COMMENT: &str = "// NOLINT(bugprone-narrowing-conversions)";
+        let mut app = test_app();
+        let (fixture, workspace, visual) = open_fixture(&mut app, None, |root| {
+            fs::write(root.join("main.cpp"), ORIGINAL)?;
+            fs::write(root.join("suppression-mode"), "")?;
+            Ok(())
+        })?;
+        let disk_path = fixture.path().join("repository/main.cpp");
+        pump(visual, "clang-tidy diagnostics", |visual| {
+            visual.update(|_, cx| {
+                workspace.read(cx).active_file().is_some_and(|file| {
+                    let editor = file.editor.read(cx);
+                    editor.can_open_code_actions()
+                        && editor.diagnostics().is_some_and(|items| !items.is_empty())
+                })
+            })
+        })?;
+        let editor = visual.update(|window, cx| {
+            let editor = workspace.read(cx).active_file().unwrap().editor.clone();
+            editor.update(cx, |state, cx| {
+                state.focus(window, cx);
+                let caret = ORIGINAL.find("n;").unwrap();
+                state.set_selected_range(caret..caret, cx);
+            });
+            editor
+        });
+        visual.simulate_keystrokes(shortcut());
+        pump(visual, "clang-tidy suppression menu", |visual| {
+            visual.update(|_, cx| {
+                let menu = editor.read(cx).code_action_menu_state();
+                menu.open && !menu.loading
+            })
+        })?;
+        visual.update(|window, cx| {
+            editor.update(cx, |state, cx| {
+                let menu = state.code_action_menu_state();
+                assert_eq!(menu.items.len(), 2);
+                assert_eq!(menu.items[0].action.title, "Insert an explicit cast");
+                let item = menu.items[1].clone();
+                assert_eq!(
+                    item.action.title,
+                    "Suppress bugprone-narrowing-conversions on this line"
+                );
+                assert!(item.action.disabled.is_none());
+                state.preview_code_action(&item, window, cx);
+            });
+        });
+        pump(visual, "clang-tidy suppression preview", |visual| {
+            visual.update(|_, cx| {
+                let state = editor.read(cx);
+                assert_eq!(state.text(), ORIGINAL);
+                state
+                    .code_action_menu_state()
+                    .preview
+                    .as_ref()
+                    .is_some_and(|(_, diff)| diff.contains(COMMENT))
+            })
+        })?;
+        visual.simulate_keystrokes("down enter");
+        let updated = ORIGINAL.replace("return n;", &format!("return n;  {COMMENT}"));
+        pump(
+            visual,
+            "clang-tidy suppression applied to the draft",
+            |visual| visual.update(|_, cx| editor.read(cx).text() == updated.as_str()),
+        )?;
+        assert_eq!(fs::read_to_string(&disk_path)?, ORIGINAL);
+        visual.update(|window, cx| window.dispatch_action(Box::new(Undo), cx));
+        visual.update(|_, cx| assert_eq!(editor.read(cx).text(), ORIGINAL));
+        visual.update(|window, cx| window.dispatch_action(Box::new(Redo), cx));
+        visual.update(|_, cx| assert_eq!(editor.read(cx).text(), updated.as_str()));
+        Ok(())
+    }
+
+    #[::core::prelude::v1::test]
+    fn clangd_command_actions_preview_and_apply_as_undoable_draft_edits() -> Result<()> {
+        const ORIGINAL: &str = "float convert(int old) { return old; }\n";
+        let mut app = test_app();
+        let (fixture, workspace, visual) = open_fixture(&mut app, None, |root| {
+            fs::write(root.join("main.cpp"), ORIGINAL)?;
+            fs::write(root.join("command-mode"), "")?;
+            Ok(())
+        })?;
+        let root = fixture.path().join("repository");
+        pump(visual, "clangd command action provider", |visual| {
+            visual.update(|_, cx| {
+                workspace
+                    .read(cx)
+                    .active_file()
+                    .is_some_and(|file| file.editor.read(cx).can_open_code_actions())
+            }) && root.join("unsolicited-edit-denied").exists()
+        })?;
+        let editor = visual.update(|window, cx| {
+            let editor = workspace.read(cx).active_file().unwrap().editor.clone();
+            editor.update(cx, |state, cx| {
+                assert_eq!(state.text(), ORIGINAL);
+                state.focus(window, cx);
+                state.set_selected_range(33..33, cx);
+            });
+            editor
+        });
+        pump(visual, "clangd command action lightbulb", |visual| {
+            visual.debug_bounds("code-action-lightbulb").is_some()
+        })?;
+        let executed = root.join("executed-tweaks");
+        assert!(!executed.exists());
+        for (index, replacement, preview) in [
+            (0, "static_cast<float>(old)", true),
+            (1, "float(old)", true),
+            (1, "float(old)", false),
+        ] {
+            visual.simulate_keystrokes(shortcut());
+            pump(visual, "clangd command action menu", |visual| {
+                visual.update(|_, cx| editor.read(cx).code_action_menu_state().items.len() == 2)
+            })?;
+            if index == 1 {
+                visual.simulate_keystrokes("down");
+            }
+            if preview {
+                visual.update(|window, cx| {
+                    editor.update(cx, |state, cx| {
+                        let item = state.code_action_menu_state().items[index].clone();
+                        assert!(item.action.disabled.is_none());
+                        state.preview_code_action(&item, window, cx);
+                    });
+                });
+                pump(visual, "clangd command action preview", |visual| {
+                    visual.update(|_, cx| {
+                        let state = editor.read(cx);
+                        assert_eq!(state.text(), ORIGINAL);
+                        state
+                            .code_action_menu_state()
+                            .preview
+                            .as_ref()
+                            .is_some_and(|(_, diff)| diff.contains(replacement))
+                    })
+                })?;
+            }
+            let updated = format!("float convert(int old) {{ return {replacement}; }}\n");
+            visual.simulate_keystrokes("enter");
+            pump(visual, "clangd command action apply", |visual| {
+                visual.update(|_, cx| editor.read(cx).text() == updated.as_str())
+            })?;
+            assert_eq!(fs::read_to_string(root.join("main.cpp"))?, ORIGINAL);
+            visual.update(|window, cx| window.dispatch_action(Box::new(Undo), cx));
+            visual.update(|_, cx| assert_eq!(editor.read(cx).text(), ORIGINAL));
+        }
+        assert_eq!(fs::read_to_string(executed)?, "tweak\ntweak\n");
+        Ok(())
     }
 
     #[::core::prelude::v1::test]
