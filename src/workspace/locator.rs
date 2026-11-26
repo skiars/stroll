@@ -3,7 +3,7 @@ use std::{
     ops::Range,
     path::{Path, PathBuf},
     sync::Arc,
-    sync::atomic::{AtomicBool, Ordering},
+    sync::atomic::{AtomicBool, AtomicU64, Ordering},
     time::Duration,
 };
 
@@ -29,9 +29,9 @@ use serde_json::Value;
 
 use crate::{
     docs,
-    locator::{self, Results, TextHit, TextQuery},
+    locator::{self, FileQuery, FileType, PathCache, Results, TextHit, TextQuery, TextSearch},
     lsp, paths,
-    remote::Request,
+    remote::{Request, SshSession},
     repository::{Document, Repository},
 };
 
@@ -110,10 +110,16 @@ enum ResultRow {
 
 #[derive(Default)]
 struct Session {
-    tabs: [Tab; 5],
+    tabs: [Tab; 7],
     recent: Vec<PathBuf>,
-    paths: Option<(std::time::Instant, Arc<Vec<PathBuf>>)>,
-    scope_open: bool,
+    paths: Arc<PathCache>,
+    path_revision: u64,
+    scope_open: [bool; 2],
+}
+
+fn next_search_id() -> u64 {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
 }
 
 #[derive(Clone)]
@@ -194,11 +200,36 @@ struct Preview {
     _decoration: RangeDecorationCollection,
 }
 
-struct CancelSearch(Arc<AtomicBool>);
+struct CancelSearch {
+    local: Arc<AtomicBool>,
+    started: Arc<AtomicBool>,
+    remote: Option<(SshSession, u64)>,
+}
 
 impl Drop for CancelSearch {
     fn drop(&mut self) {
-        self.0.store(true, Ordering::Relaxed);
+        self.local.store(true, Ordering::SeqCst);
+        if let Some((ssh, id)) = self.remote.take()
+            && self.started.load(Ordering::SeqCst)
+        {
+            ssh.cancel_workspace_search(id);
+        }
+    }
+}
+
+enum TextContinuation {
+    Local(Arc<Repository>, Box<TextSearch>),
+    Remote(SshSession, u64),
+}
+
+impl TextContinuation {
+    fn next_page(mut self, cancelled: impl Fn() -> bool) -> Result<(Results<Entry>, Option<Self>)> {
+        let result = match &mut self {
+            Self::Local(repo, search) => search.next_page(repo, cancelled)?,
+            Self::Remote(ssh, id) => ssh.call(Request::ContinueWorkspaceSearch(*id))?,
+        };
+        let continuation = result.truncated.then_some(self);
+        Ok((text_entries(result), continuation))
     }
 }
 
@@ -260,6 +291,7 @@ pub(super) struct Locator {
     preview_error: Option<String>,
     search_task: Task<()>,
     search_cancel: Option<CancelSearch>,
+    continuation: Option<TextContinuation>,
     preview_task: Task<()>,
 }
 
@@ -340,6 +372,7 @@ impl Locator {
             preview_error: None,
             search_task: Task::ready(()),
             search_cancel: None,
+            continuation: None,
             preview_task: Task::ready(()),
         }
     }
@@ -395,8 +428,31 @@ impl Workspace {
         self.locator.sessions.get_mut(key).unwrap()
     }
 
+    fn locator_tab_index(&self) -> usize {
+        let mode = self.locator.mode;
+        mode as usize
+            + if self.view == WorkspaceView::Docs && mode.has_scope() {
+                5
+            } else {
+                0
+            }
+    }
+
     fn locator_tab(&self) -> &Tab {
-        &self.locator_session().tabs[self.locator.mode as usize]
+        &self.locator_session().tabs[self.locator_tab_index()]
+    }
+
+    fn locator_tab_mut(&mut self) -> &mut Tab {
+        let index = self.locator_tab_index();
+        &mut self.locator_session_mut().tabs[index]
+    }
+
+    pub(super) fn invalidate_locator_paths(&mut self) {
+        if let Some(repo) = &self.repository
+            && let Some(session) = self.locator.sessions.get_mut(repo.storage_key())
+        {
+            session.path_revision = next_search_id();
+        }
     }
 
     pub(super) fn open_locator(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -412,7 +468,8 @@ impl Workspace {
     }
 
     pub(super) fn locator_symbols_available(&self, workspace: bool, cx: &App) -> bool {
-        self.repository.is_some()
+        self.view != WorkspaceView::Docs
+            && self.repository.is_some()
             && self.locator_source(cx).is_some_and(|path| {
                 self.files.get(path).is_some_and(|file| {
                     !file.missing
@@ -429,6 +486,9 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.view == WorkspaceView::Docs {
+            return;
+        }
         let mode = if workspace {
             Mode::WorkspaceSymbols
         } else {
@@ -542,6 +602,7 @@ impl Workspace {
         self.locator.history_origin = None;
         self.locator.drag_anchor = None;
         self.locator.search_cancel = None;
+        self.locator.continuation = None;
         self.locator.search_task = Task::ready(());
         self.locator.preview_task = Task::ready(());
         if let Some(motion) = &mut self.locator.motion {
@@ -626,11 +687,10 @@ impl Workspace {
         if self.locator.mode == Mode::References {
             return;
         }
-        let mode = self.locator.mode as usize;
         let query = self.locator.inputs().query.read(cx).value().to_string();
         let include = self.locator.inputs().include.read(cx).value().to_string();
         let exclude = self.locator.inputs().exclude.read(cx).value().to_string();
-        let tab = &mut self.locator_session_mut().tabs[mode];
+        let tab = self.locator_tab_mut();
         if tab.query.query == query
             && tab.query.scope.include == include
             && tab.query.scope.exclude == exclude
@@ -640,12 +700,15 @@ impl Workspace {
         tab.query.query = query;
         tab.query.scope.include = include;
         tab.query.scope.exclude = exclude;
+        tab.selected = 0;
+        self.locator_set_items(Vec::new());
         self.locator_search(window, cx);
     }
 
     fn locator_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.locator.search_task = Task::ready(());
         self.locator.search_cancel = None;
+        self.locator.continuation = None;
         self.locator.reset_preview();
         self.locator.error = None;
         self.locator.truncated = false;
@@ -667,12 +730,19 @@ impl Workspace {
             (search, targets)
         });
         let recent = self.locator_session().recent.clone();
-        let paths = self
-            .locator_session()
-            .paths
-            .clone()
-            .filter(|(at, _)| at.elapsed() < Duration::from_secs(3));
-        let mut fresh_paths = None;
+        let paths = self.locator_session().paths.clone();
+        let revision = self.locator_session().path_revision;
+        let file_type = if self.view == WorkspaceView::Docs {
+            FileType::Markdown
+        } else {
+            FileType::All
+        };
+        let remote = repo
+            .as_ref()
+            .and_then(|repo| repo.ssh.as_ref())
+            .filter(|ssh| mode.has_scope() && ssh.supports_workspace_locator())
+            .map(|ssh| (ssh.clone(), next_search_id()));
+        let mut continuation = None;
         let source = self.locator.source.clone();
         let lsp = source
             .as_ref()
@@ -684,13 +754,22 @@ impl Workspace {
                 ))
             });
         let cancelled = Arc::new(AtomicBool::new(false));
-        self.locator.search_cancel = Some(CancelSearch(cancelled.clone()));
+        let started = Arc::new(AtomicBool::new(false));
+        self.locator.search_cancel = Some(CancelSearch {
+            local: cancelled.clone(),
+            started: started.clone(),
+            remote: remote.clone(),
+        });
         self.locator.busy = true;
         self.locator.search_task = cx.spawn_in(window, async move |this, cx| {
             if mode != Mode::References {
                 cx.background_executor()
                     .timer(Duration::from_millis(180))
                     .await;
+            }
+            started.store(true, Ordering::SeqCst);
+            if cancelled.load(Ordering::SeqCst) {
+                return;
             }
             let result = if let Some((search, targets)) = references {
                 async {
@@ -710,44 +789,65 @@ impl Workspace {
                 .await
             } else if let Some(repo) = repo {
                 if mode == Mode::Files {
-                    async {
-                        let paths = match paths {
-                            Some((_, paths)) => paths,
-                            None => {
-                                let paths = Arc::new(
-                                    cx.background_spawn(
-                                        async move { locator::listed_paths(&repo) },
-                                    )
-                                    .await?,
-                                );
-                                fresh_paths = Some((std::time::Instant::now(), paths.clone()));
-                                paths
-                            }
-                        };
-                        cx.background_spawn(async move {
-                            locator::search_files(&paths, &query.query, &query.scope, &recent)
-                                .map(|result| map_results(result, Entry::file))
-                        })
-                        .await
-                    }
-                    .await
-                } else if mode == Mode::Text {
+                    let query = FileQuery {
+                        query: query.query,
+                        scope: query.scope,
+                        recent,
+                        file_type,
+                    };
                     cx.background_spawn(async move {
-                        let hits = if let Some(ssh) = &repo.ssh {
-                            anyhow::ensure!(ssh.supports_locator(), t!("locator.upgrade_helper"));
-                            ssh.call(Request::Locator(query))?
-                        } else {
-                            locator::search_text(&repo, &query, || {
-                                cancelled.load(Ordering::Relaxed)
+                        let cancelled = || cancelled.load(Ordering::Relaxed);
+                        let result = if let Some((ssh, id)) = remote {
+                            ssh.call(Request::SearchWorkspaceFiles {
+                                id,
+                                revision,
+                                query,
                             })?
+                        } else {
+                            let paths = paths.load(&repo, revision, &cancelled)?;
+                            locator::search_files(&paths, &query, cancelled)?
                         };
-                        Ok(map_results(hits, |hit| {
-                            let mut entry = Entry::file(hit.path.clone());
-                            entry.hit = Some(Arc::new(hit));
-                            entry
-                        }))
+                        Ok(map_results(result, Entry::file))
                     })
                     .await
+                } else if mode == Mode::Text {
+                    let page: Result<_> = cx
+                        .background_spawn(async move {
+                            let cancelled = || cancelled.load(Ordering::Relaxed);
+                            let (hits, more) = if let Some((ssh, id)) = remote {
+                                let hits: Results<TextHit> =
+                                    ssh.call(Request::SearchWorkspaceText {
+                                        id,
+                                        revision,
+                                        query,
+                                        file_type,
+                                    })?;
+                                let more =
+                                    hits.truncated.then_some(TextContinuation::Remote(ssh, id));
+                                (hits, more)
+                            } else if let Some(ssh) = &repo.ssh {
+                                anyhow::ensure!(
+                                    matches!(file_type, FileType::All) && ssh.supports_locator(),
+                                    t!("locator.upgrade_helper")
+                                );
+                                (ssh.call(Request::Locator(query))?, None)
+                            } else {
+                                let paths = paths.load(&repo, revision, &cancelled)?;
+                                let mut search =
+                                    Box::new(TextSearch::new(paths, &query, file_type, cancelled)?);
+                                let hits = search.next_page(&repo, cancelled)?;
+                                let more = hits
+                                    .truncated
+                                    .then_some(TextContinuation::Local(repo, search));
+                                (hits, more)
+                            };
+                            Ok((text_entries(hits), more))
+                        })
+                        .await;
+                    page.map(|(result, more)| {
+                        continuation = more;
+                        result
+                    })
                 } else {
                     async {
                         let source =
@@ -774,9 +874,7 @@ impl Workspace {
                     result
                 };
                 this.locator.busy = false;
-                if fresh_paths.is_some() {
-                    this.locator_session_mut().paths = fresh_paths;
-                }
+                this.locator_save_continuation(continuation);
                 let mut selected = this.locator_tab().selected;
                 let previous = this.locator.items.get(selected);
                 match result {
@@ -810,6 +908,56 @@ impl Workspace {
                     }
                 }
                 this.locator_select(selected, false, window, cx);
+            });
+        });
+        self.notify_locator(cx);
+    }
+
+    fn locator_save_continuation(&mut self, continuation: Option<TextContinuation>) {
+        if continuation.is_none()
+            && let Some(cancel) = &mut self.locator.search_cancel
+        {
+            cancel.remote = None;
+        }
+        self.locator.continuation = continuation;
+    }
+
+    fn locator_continue_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(continuation) = self.locator.continuation.take() else {
+            return;
+        };
+        let cancelled = self.locator.search_cancel.as_ref().unwrap().local.clone();
+        self.locator.busy = true;
+        self.locator.truncated = false;
+        self.locator
+            .inputs()
+            .query
+            .update(cx, |input, cx| input.focus(window, cx));
+        self.locator.search_task = cx.spawn_in(window, async move |this, cx| {
+            let page = cx
+                .background_spawn(async move {
+                    continuation.next_page(|| cancelled.load(Ordering::Relaxed))
+                })
+                .await;
+            _ = this.update_in(cx, |this, window, cx| {
+                this.locator.busy = false;
+                match page {
+                    Ok((result, continuation)) => {
+                        let selected = this.locator_tab().selected;
+                        let mut items = std::mem::take(&mut this.locator.items);
+                        items.extend(result.items);
+                        this.locator_set_items(items);
+                        this.locator.truncated = result.truncated;
+                        this.locator.skipped += result.skipped;
+                        this.locator_save_continuation(continuation);
+                        this.locator_select(selected, false, window, cx);
+                    }
+                    Err(error) => {
+                        this.locator.error = Some(error.to_string());
+                        this.locator_save_continuation(None);
+                        this.notify_locator(cx);
+                    }
+                }
             });
         });
         self.notify_locator(cx);
@@ -901,10 +1049,9 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let mode = self.locator.mode;
         let index = index.min(self.locator.items.len().saturating_sub(1));
         let row = self.locator.entry_rows.get(index).copied();
-        let tab = &mut self.locator_session_mut().tabs[mode as usize];
+        let tab = self.locator_tab_mut();
         tab.selected = index;
         if let Some(row) = row.filter(|_| show) {
             tab.scroll.scroll_to_reveal_item(row);
@@ -1077,6 +1224,12 @@ impl Workspace {
         if self.locator.busy {
             return;
         }
+        if self.locator.mode == Mode::Files {
+            if let Some(entry) = self.locator.items.get(self.locator_tab().selected) {
+                self.locator_open_target(entry.path.clone(), None, window, cx);
+            }
+            return;
+        }
         if self.locator.preview_busy {
             self.locator.open_after_preview = true;
             return;
@@ -1149,6 +1302,9 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.view == WorkspaceView::Docs && !docs::is_markdown(&path) {
+            return;
+        }
         if self.view != WorkspaceView::Docs
             && let Some((_, fingerprint)) = &position
             && self.files.get(&path).is_some_and(|file| {
@@ -1162,7 +1318,7 @@ impl Workspace {
         let from = self.locator.history_origin.take();
         self.close_locator(false, window, cx);
         self.focus.focus(window, cx);
-        if self.view == WorkspaceView::Docs && docs::is_markdown(&path) {
+        if self.view == WorkspaceView::Docs {
             self.open_doc_request(
                 path,
                 None,
@@ -1178,6 +1334,14 @@ impl Workspace {
             self.request_file(path, FileOpen::Locate { position, from }, window, cx);
         }
     }
+}
+
+fn text_entries(result: Results<TextHit>) -> Results<Entry> {
+    map_results(result, |hit| {
+        let mut entry = Entry::file(hit.path.clone());
+        entry.hit = Some(Arc::new(hit));
+        entry
+    })
 }
 
 fn map_results<A, B>(result: Results<A>, map: impl FnMut(A) -> B) -> Results<B> {
@@ -1378,6 +1542,12 @@ impl Workspace {
         let locator = &self.locator;
         let mode = locator.mode;
         let references = mode == Mode::References;
+        let markdown = self.view == WorkspaceView::Docs;
+        let modes = if markdown {
+            &Mode::ALL[..2]
+        } else {
+            &Mode::ALL[..]
+        };
         let tab = self.locator_tab();
         let line_only = locator.line_command(tab);
         let viewport = window.viewport_size();
@@ -1415,6 +1585,8 @@ impl Workspace {
             && !matches!(mode, Mode::DocumentSymbols | Mode::References)
         {
             t!("locator.query_required").into_owned()
+        } else if locator.items.is_empty() && locator.continuation.is_some() {
+            t!("locator.search_paused").into_owned()
         } else if locator.items.is_empty() {
             t!("locator.empty").into_owned()
         } else {
@@ -1451,36 +1623,29 @@ impl Workspace {
                 )
                 .on_key_down(cx.listener(move |this, event: &KeyDownEvent, window, cx| {
                     let delta = match event.keystroke.key.as_str() {
-                        "left" => 3,
+                        "left" => modes.len() - 1,
                         "right" => 1,
                         "enter" | "space" => 0,
                         _ => return,
                     };
                     window.prevent_default();
                     cx.stop_propagation();
-                    this.locator_mode(Mode::ALL[(value as usize + delta) % 4], window, cx);
+                    this.locator_mode(modes[(value as usize + delta) % modes.len()], window, cx);
                 }))
         };
         let tabs = if stacked_tabs {
             v_flex()
                 .flex_1()
-                .child(
-                    h_flex()
-                        .child(tab_button(Mode::Files).flex_1())
-                        .child(tab_button(Mode::Text).flex_1()),
-                )
-                .child(
-                    h_flex()
-                        .child(tab_button(Mode::DocumentSymbols).flex_1())
-                        .child(tab_button(Mode::WorkspaceSymbols).flex_1()),
-                )
+                .children(modes.chunks(2).map(|row| {
+                    h_flex().children(row.iter().map(|mode| tab_button(*mode).flex_1()))
+                }))
                 .into_any_element()
         } else {
             h_flex()
                 .id("locator-tabs")
                 .overflow_x_scroll()
                 .min_w_0()
-                .children(Mode::ALL.map(tab_button))
+                .children(modes.iter().copied().map(tab_button))
                 .into_any_element()
         };
         let workspace = cx.weak_entity();
@@ -1538,8 +1703,8 @@ impl Workspace {
                 .with_size(px(16.))
                 .disabled(locator.busy)
                 .on_click(cx.listener(|this, _, window, cx| {
-                    if this.locator.mode != Mode::References {
-                        this.locator_session_mut().paths = None;
+                    if this.locator.mode.has_scope() {
+                        this.invalidate_locator_paths();
                     }
                     this.locator_search(window, cx);
                 })),
@@ -1651,8 +1816,17 @@ impl Workspace {
                     .text_size(px(12.))
                     .text_color(colors.muted)
                     .child(status)
-                    .when(locator.truncated, |row| {
+                    .when(locator.truncated && locator.continuation.is_none(), |row| {
                         row.child(format!(" · {}", t!("locator.limit")))
+                    })
+                    .when(locator.continuation.is_some(), |row| {
+                        row.child(
+                            status_button("locator-continue-search")
+                                .label(t!("locator.continue_search").into_owned())
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.locator_continue_search(window, cx);
+                                })),
+                        )
                     })
                     .when(locator.skipped > 0, |row| {
                         let skipped = if references {
@@ -1708,7 +1882,14 @@ impl Workspace {
     ) -> impl IntoElement {
         let mode = self.locator.mode;
         let query = &self.locator_tab().query;
-        let scope_open = self.locator_session().scope_open;
+        let markdown = self.view == WorkspaceView::Docs;
+        let scope = usize::from(markdown);
+        let scope_open = self.locator_session().scope_open[scope];
+        let legacy = self
+            .repository
+            .as_ref()
+            .and_then(|repo| repo.ssh.as_ref())
+            .is_some_and(|ssh| !ssh.supports_workspace_locator());
         let text_size = px(12.);
         let options = [
             (query.case_sensitive, "Aa", "locator.case_sensitive"),
@@ -1754,9 +1935,7 @@ impl Workspace {
                                             .bg(colors.accent.alpha(0.15))
                                     })
                                     .on_click(cx.listener(move |this, _, window, cx| {
-                                        let query = &mut this.locator_session_mut().tabs
-                                            [Mode::Text as usize]
-                                            .query;
+                                        let query = &mut this.locator_tab_mut().query;
                                         match index {
                                             0 => query.case_sensitive = !query.case_sensitive,
                                             1 => query.whole_word = !query.whole_word,
@@ -1779,6 +1958,9 @@ impl Workspace {
                             },
                         ),
                 )
+            })
+            .when(mode.has_scope() && legacy, |area| {
+                area.child(div().px_3().child(t!("locator.legacy_scope").into_owned()))
             })
             .when(mode.has_scope(), |area| {
                 area.child(
@@ -1811,10 +1993,14 @@ impl Workspace {
                                             colors.muted,
                                             14.,
                                         ))
-                                        .child(t!("locator.scope").into_owned()),
+                                        .child(if markdown {
+                                            t!("locator.markdown_scope").into_owned()
+                                        } else {
+                                            t!("locator.scope").into_owned()
+                                        }),
                                 )
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    let scope = &mut this.locator_session_mut().scope_open;
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    let scope = &mut this.locator_session_mut().scope_open[scope];
                                     *scope = !*scope;
                                     if !*scope
                                         && [
@@ -2207,11 +2393,7 @@ impl Workspace {
         if index != self.locator_tab().selected {
             self.locator_select(index, false, window, cx);
         }
-        if self.locator.preview_busy {
-            self.locator.open_after_preview = true;
-        } else {
-            self.locator_accept(window, cx);
-        }
+        self.locator_accept(window, cx);
     }
 
     fn locator_find_here(&mut self, window: &mut Window, cx: &mut Context<Self>) {

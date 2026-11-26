@@ -530,7 +530,7 @@ pub(crate) fn worktree_paths(root: &Path) -> Result<Vec<PathBuf>> {
         .collect())
 }
 
-fn git(path: &Path, args: &[&str]) -> Result<Vec<u8>> {
+pub(crate) fn git(path: &Path, args: &[&str]) -> Result<Vec<u8>> {
     let mut command = crate::process::background("git");
     command
         .env("LC_ALL", "C")

@@ -864,6 +864,9 @@ impl Workspace {
                 .file_name()
                 .is_some_and(|name| name == ".gitignore")
         });
+        if changes.index || changes.structure || changes.refs || changes.rescan {
+            self.invalidate_locator_paths();
+        }
         let changed = |path: &Path| {
             !path.is_absolute()
                 && (changes.rescan

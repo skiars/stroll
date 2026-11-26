@@ -718,7 +718,7 @@ fn mark_ignored(root: &Path, listing: &mut BTreeMap<PathBuf, Vec<Entry>>) -> Res
     Ok(())
 }
 
-fn visit_tree_directory(
+pub(crate) fn visit_tree_directory(
     root: &Path,
     parent: &Path,
     mut visit: impl FnMut(std::ffi::OsString, fs::FileType),

@@ -7497,6 +7497,7 @@ dependencies = [
  "roxmltree 0.20.0",
  "rusqlite",
  "rust-i18n",
+ "self_cell",
  "serde",
  "serde_json",
  "sha2 0.11.1",

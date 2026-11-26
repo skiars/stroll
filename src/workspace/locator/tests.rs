@@ -54,7 +54,17 @@ fn workflow(authority: Option<String>, vim: bool) -> Result<()> {
                 }
             })
             .collect::<String>();
-        fs::write(root.join("README.md"), readme)?;
+        fs::write(root.join("README.md"), &readme)?;
+        fs::write(root.join(".gitignore"), "ignored/\n")?;
+        fs::create_dir(root.join("ignored"))?;
+        fs::write(
+            root.join("ignored/guide.MDX"),
+            readme.replace("unique_reader_term", "ignored_reader_term"),
+        )?;
+        fs::write(
+            root.join("guide.MDX.cpp"),
+            "unique_reader_term ignored_reader_term\n",
+        )?;
     }
     let script = fixture.path().join("server.py");
     fs::write(
@@ -134,7 +144,16 @@ fn workflow(authority: Option<String>, vim: bool) -> Result<()> {
             wait_for(visual, "Locator match preview", |visual| {
                 visual.update(|_, cx| {
                     let locator = &workspace.read(cx).locator;
-                    !locator.busy && !locator.preview_busy && locator.preview.is_some()
+                    let ready = !locator.busy && !locator.preview_busy && locator.preview.is_some();
+                    if ready && workspace.read(cx).view == WorkspaceView::Docs {
+                        assert!(
+                            locator
+                                .items
+                                .iter()
+                                .all(|item| docs::is_markdown(&item.path))
+                        );
+                    }
+                    ready
                 })
             })?;
             visual.simulate_keystrokes("enter");
@@ -261,11 +280,31 @@ fn workflow(authority: Option<String>, vim: bool) -> Result<()> {
         check_reader(visual, "return to the text result in the reader", false)?;
         assert_eq!(reader_position(visual), destination);
         visual.simulate_keystrokes("ctrl-o");
-        check_reader(visual, "restore reader before cross-view jump", true)?;
-        accept(visual, "space s g", Mode::Text, Some("int word"))?;
-        check_editor(visual, "source result from the reader", &declaration, 0)?;
+        check_reader(
+            visual,
+            "restore reader before opening the ignored document",
+            true,
+        )?;
+        let check_ignored = |visual: &mut VisualTestContext| {
+            wait_for(visual, "ignored document in the reader", |visual| {
+                visual.update(|_, cx| {
+                    let this = workspace.read(cx);
+                    this.view == WorkspaceView::Docs
+                        && this
+                            .doc
+                            .as_ref()
+                            .is_some_and(|doc| doc.read(cx).path == Path::new("ignored/guide.MDX"))
+                })
+            })
+        };
+        accept(visual, "space f f", Mode::Files, Some("guide.MDX"))?;
+        check_ignored(visual)?;
+        check_reader(visual, "ignored document opened at the top", true)?;
         visual.simulate_keystrokes("ctrl-o");
-        check_reader(visual, "restore reader from the source result", true)?;
+        check_reader(visual, "restore reader before ignored text jump", true)?;
+        accept(visual, "space s g", Mode::Text, Some("ignored_reader_term"))?;
+        check_ignored(visual)?;
+        check_reader(visual, "ignored text result in the reader", false)?;
 
         visual.simulate_keystrokes("space 3");
         let check_git = |visual: &mut VisualTestContext| {

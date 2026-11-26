@@ -624,6 +624,67 @@ fn helper_streams_worktree_and_index_events_without_polling() {
 }
 
 #[test]
+fn workspace_locator_searches_ignored_files_and_resumes_with_the_same_scope() {
+    use std::fs;
+
+    let repo = fixture();
+    let root = repo.path();
+    fs::write(root.join(".gitignore"), "build/\n").unwrap();
+    fs::create_dir(root.join("build")).unwrap();
+    fs::write(root.join("build/guide.MDX"), "locator_marker\n").unwrap();
+    fs::write(root.join("guide.MDX.rs"), "locator_marker\n".repeat(501)).unwrap();
+    git(root, &["add", "guide.MDX.rs"]);
+    let mut helper = Helper::start();
+    assert_eq!(helper.ok(json!({"Hello": 30})), 30);
+    helper.ok(json!({"OpenWorkspace": root}));
+    let query = json!({
+        "query": "locator_marker",
+        "scope": { "include": "", "exclude": "" },
+        "case_sensitive": false, "whole_word": false, "regex": false
+    });
+    let legacy = helper.ok(json!({"Locator": query}));
+    assert_eq!(legacy["items"].as_array().unwrap().len(), 500);
+    assert!(
+        legacy["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|hit| hit["path"] == "guide.MDX.rs")
+    );
+
+    let files = helper.ok(json!({"SearchWorkspaceFiles": {
+        "id": 1, "revision": 0, "query": {
+            "query": "guide.MDX", "scope": { "include": "", "exclude": "" },
+            "recent": [], "file_type": "Markdown"
+        }
+    }}));
+    assert_eq!(files["items"], json!(["build/guide.MDX"]));
+    let docs = helper.ok(json!({"SearchWorkspaceText": {
+        "id": 2, "revision": 0, "file_type": "Markdown", "query": query
+    }}));
+    assert_eq!(docs["truncated"], false);
+    assert_eq!(docs["items"].as_array().unwrap().len(), 1);
+    assert_eq!(docs["items"][0]["path"], "build/guide.MDX");
+
+    let first = helper.ok(json!({"SearchWorkspaceText": {
+        "id": 3, "revision": 0, "file_type": "All", "query": query
+    }}));
+    assert_eq!(first["truncated"], true);
+    assert_eq!(first["items"][499]["line"], 499);
+    let next = helper.ok(json!({"ContinueWorkspaceSearch": 3}));
+    assert_eq!(next["truncated"], false);
+    assert_eq!(next["items"][0]["line"], 500);
+    assert_eq!(next["items"][1]["path"], "build/guide.MDX");
+    helper.ok(json!({"CancelWorkspaceSearch": 3}));
+    assert!(
+        helper
+            .call(json!({"ContinueWorkspaceSearch": 3}))
+            .get("Err")
+            .is_some()
+    );
+}
+
+#[test]
 fn document_paths_include_ignored_and_nested_repository_markdown() {
     use std::fs;
 

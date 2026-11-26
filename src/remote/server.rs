@@ -23,6 +23,7 @@ use crate::{
         tools::Tools,
         worktree::{WorktreeLsp, WorktreeServer},
     },
+    locator::{self, PathCache, Results, TextHit, TextSearch},
     pty,
     repository::{Repository, RepositoryInfo, files::WorkspaceImport, write_checked},
 };
@@ -34,6 +35,8 @@ struct Server {
     imports: Mutex<HashMap<u64, WorkspaceImport>>,
     next_import: AtomicU64,
     documents: Mutex<Option<(u64, crate::repository::files::DocumentScan)>>,
+    locator_paths: PathCache,
+    locator: Mutex<ActiveSearch>,
     watch: Mutex<Option<git::watch::RepoWatcher>>,
     watch_replies: Option<mpsc::SyncSender<Reply>>,
     review_commit: Mutex<Option<Arc<git::Changes>>>,
@@ -44,6 +47,13 @@ struct Server {
     lsp_memory: Mutex<HashMap<u64, tempfile::TempDir>>,
     #[cfg(target_os = "linux")]
     next_lsp_memory: AtomicU64,
+}
+
+#[derive(Default)]
+struct ActiveSearch {
+    id: u64,
+    cancelled: bool,
+    continuation: Option<TextSearch>,
 }
 
 #[cfg(target_os = "linux")]
@@ -175,6 +185,35 @@ struct TerminalDirectory {
 }
 
 impl Server {
+    fn begin_search(&self, id: u64) -> Result<()> {
+        let mut current = self.locator.lock().unwrap();
+        ensure!(id > current.id, "The workspace search was superseded");
+        *current = ActiveSearch {
+            id,
+            ..Default::default()
+        };
+        Ok(())
+    }
+
+    fn search_cancelled(&self, id: u64) -> bool {
+        let current = self.locator.lock().unwrap();
+        current.id != id || current.cancelled
+    }
+
+    fn text_page(
+        &self,
+        repo: &Repository,
+        id: u64,
+        mut search: TextSearch,
+    ) -> Result<Results<TextHit>> {
+        let result = search.next_page(repo, || self.search_cancelled(id))?;
+        let mut current = self.locator.lock().unwrap();
+        if result.truncated && current.id == id && !current.cancelled {
+            current.continuation = Some(search);
+        }
+        Ok(result)
+    }
+
     fn request(&self, request: Request) -> Result<Value> {
         match request {
             Request::Hello(version) => {
@@ -211,6 +250,7 @@ impl Server {
                             | super::TERMINAL_DIRECTORY_VERSION
                             | super::WORKSPACE_IMPORT_VERSION
                             | super::WORKTREE_IDENTITY_VERSION
+                            | super::WORKSPACE_LOCATOR_VERSION
                     ),
                     "SSH workspace protocol version mismatch. Update the remote helper."
                 );
@@ -448,7 +488,54 @@ impl Server {
             Request::Exists(path) => value(repo.exists(path.as_path())),
             Request::Openable(paths) => value(git::openable(root, &paths)),
             Request::LocatorPaths => value(crate::repository::worktree_paths(root)?),
-            Request::Locator(query) => value(crate::locator::search_text(&repo, &query, || false)?),
+            Request::Locator(query) => value(locator::search_visible_text(&repo, &query)?),
+            Request::SearchWorkspaceFiles {
+                id,
+                revision,
+                query,
+            } => {
+                self.begin_search(id)?;
+                let cancelled = || self.search_cancelled(id);
+                let paths = self.locator_paths.load(&repo, revision, &cancelled)?;
+                value(locator::search_files(&paths, &query, cancelled)?)
+            }
+            Request::SearchWorkspaceText {
+                id,
+                revision,
+                query,
+                file_type,
+            } => {
+                self.begin_search(id)?;
+                let cancelled = || self.search_cancelled(id);
+                let paths = self.locator_paths.load(&repo, revision, &cancelled)?;
+                let search = TextSearch::new(paths, &query, file_type, cancelled)?;
+                value(self.text_page(&repo, id, search)?)
+            }
+            Request::ContinueWorkspaceSearch(id) => {
+                let search = {
+                    let mut current = self.locator.lock().unwrap();
+                    ensure!(
+                        current.id == id && !current.cancelled,
+                        "The workspace search was superseded"
+                    );
+                    current
+                        .continuation
+                        .take()
+                        .context("The workspace search has finished")?
+                };
+                value(self.text_page(&repo, id, search)?)
+            }
+            Request::CancelWorkspaceSearch(id) => {
+                let mut current = self.locator.lock().unwrap();
+                if current.id <= id {
+                    *current = ActiveSearch {
+                        id,
+                        cancelled: true,
+                        continuation: None,
+                    };
+                }
+                value(())
+            }
             Request::ReadForSync(path) => value(repo.bytes_if_present(path.as_path())?.map(Bytes)),
             Request::Read(path, asset) => value(Bytes(repo.bytes(path.as_path(), asset)?)),
             Request::ReadResource {

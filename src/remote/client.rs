@@ -91,6 +91,8 @@ struct Connection {
     #[cfg(feature = "desktop")]
     locator: AtomicBool,
     #[cfg(feature = "desktop")]
+    workspace_locator: AtomicBool,
+    #[cfg(feature = "desktop")]
     workspace_files: AtomicBool,
     #[cfg(feature = "desktop")]
     workspace_transfer: AtomicBool,
@@ -321,6 +323,18 @@ impl SshSession {
     }
 
     #[cfg(feature = "desktop")]
+    pub(crate) fn supports_workspace_locator(&self) -> bool {
+        self.0.workspace_locator.load(Ordering::Relaxed)
+    }
+
+    #[cfg(feature = "desktop")]
+    pub(crate) fn cancel_workspace_search(&self, id: u64) {
+        let _ = self
+            .0
+            .try_call(Request::CancelWorkspaceSearch(id), Duration::from_secs(5));
+    }
+
+    #[cfg(feature = "desktop")]
     pub(crate) fn watch_repository(&self) -> Result<crate::git::watch::RepoEvents> {
         let version = super::WATCH_VERSION;
         ensure!(
@@ -462,6 +476,8 @@ impl Connection {
             review: AtomicBool::new(false),
             #[cfg(feature = "desktop")]
             locator: AtomicBool::new(false),
+            #[cfg(feature = "desktop")]
+            workspace_locator: AtomicBool::new(false),
             failure: failure.clone(),
             #[cfg(feature = "desktop")]
             resource_schedule: Default::default(),
@@ -629,6 +645,13 @@ impl Connection {
                 .call::<u32>(Request::Hello(version))
                 .is_ok_and(|reply| reply == version);
             connection.locator.store(supported, Ordering::Relaxed);
+            let version = super::WORKSPACE_LOCATOR_VERSION;
+            let supported = connection
+                .call::<u32>(Request::Hello(version))
+                .is_ok_and(|reply| reply == version);
+            connection
+                .workspace_locator
+                .store(supported, Ordering::Relaxed);
         }
         Ok(connection)
     }

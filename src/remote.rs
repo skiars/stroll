@@ -52,6 +52,7 @@ pub(crate) const TERMINAL_DIRECTORY_VERSION: u32 = 26;
 pub(crate) const WORKSPACE_IMPORT_VERSION: u32 = 27;
 pub(crate) const LSP_MEMORY_VERSION: u32 = 28;
 pub(crate) const WORKTREE_IDENTITY_VERSION: u32 = 29;
+pub(crate) const WORKSPACE_LOCATOR_VERSION: u32 = 30;
 const MAX_FRAME: usize = 40 * 1024 * 1024;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -239,6 +240,19 @@ pub(crate) enum Request {
     CheckResources(Vec<crate::repository::resources::ResourceCheck>),
     Locator(crate::locator::TextQuery),
     LocatorPaths,
+    SearchWorkspaceFiles {
+        id: u64,
+        revision: u64,
+        query: crate::locator::FileQuery,
+    },
+    SearchWorkspaceText {
+        id: u64,
+        revision: u64,
+        query: crate::locator::TextQuery,
+        file_type: crate::locator::FileType,
+    },
+    ContinueWorkspaceSearch(u64),
+    CancelWorkspaceSearch(u64),
     Save {
         path: RepoPath,
         baseline: [u8; 32],
