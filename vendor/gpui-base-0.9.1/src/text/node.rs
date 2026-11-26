@@ -736,16 +736,16 @@ impl BlockNode {
                 }
             }
             BlockNode::Surface { name, children, .. } => {
-                let block_text = Self::children_text(children, kind);
                 if matches!(kind, BlockTextKind::SelectedSource) {
-                    // Quoted under its marker, as a blockquote's selection is
-                    // quoted, so that it round-trips as the same surface.
-                    if !block_text.is_empty() {
-                        text.push_str(&quoted_source(Some(name), &block_text));
+                    let (title, body) = split_surface_title(children);
+                    let title = title.map_or_else(String::new, |title| title.text_by_kind(kind));
+                    let body = Self::children_text(body, kind);
+                    if !title.is_empty() || !body.is_empty() {
+                        text.push_str(&surface_source(name, &title, &body));
                         text.push('\n');
                     }
                 } else {
-                    text.push_str(&block_text);
+                    text.push_str(&Self::children_text(children, kind));
                 }
             }
             BlockNode::Table(table) => {
@@ -1503,12 +1503,28 @@ fn table_selected_source(table: &Table) -> String {
     lines.join("\n")
 }
 
-/// `text` as the source of a blockquote, each line prefixed with `> ` so it
-/// round-trips as Markdown, under a block surface's `[!marker]` line when it has
-/// one.
-fn quoted_source(marker: Option<&SharedString>, text: &str) -> String {
-    marker
-        .map(|name| format!("[!{name}]"))
+fn split_surface_title(children: &[BlockNode]) -> (Option<&BlockNode>, &[BlockNode]) {
+    match children {
+        [title @ BlockNode::Paragraph(paragraph), body @ ..] if paragraph.is_surface_title => {
+            (Some(title), body)
+        }
+        _ => (None, children),
+    }
+}
+
+fn surface_source(name: &str, title: &str, text: &str) -> String {
+    let title = title.trim_end();
+    let mut header = format!("[!{name}]");
+    if !title.is_empty() {
+        header.push(' ');
+        header.push_str(title);
+    }
+    quoted_source(Some(header), text)
+}
+
+/// Prefixes each source line of a quote, with a surface header when present.
+fn quoted_source(header: Option<String>, text: &str) -> String {
+    header
         .into_iter()
         .chain(text.trim_end_matches('\n').lines().map(str::to_string))
         .map(|line| {
@@ -1692,6 +1708,7 @@ impl InlineNode {
 #[derive(Debug, Clone, Default)]
 pub struct Paragraph {
     pub(super) span: Option<Span>,
+    pub(super) is_surface_title: bool,
     pub(super) children: Vec<InlineNode>,
     pub(super) html_anchors: Vec<(SharedString, usize)>,
     /// The link references in this paragraph, used for reference links.
@@ -1750,6 +1767,7 @@ struct ParagraphRender {
 impl PartialEq for Paragraph {
     fn eq(&self, other: &Self) -> bool {
         self.span == other.span
+            && self.is_surface_title == other.is_surface_title
             && self.children == other.children
             && self.html_anchors == other.html_anchors
             && self.link_refs == other.link_refs
@@ -1760,6 +1778,7 @@ impl Paragraph {
     pub(crate) fn new(text: String) -> Self {
         Self {
             span: None,
+            is_surface_title: false,
             children: vec![InlineNode::new(&text)],
             html_anchors: Vec::new(),
             link_refs: HashMap::new(),
@@ -2501,6 +2520,7 @@ impl Paragraph {
             self,
             Paragraph {
                 span: None,
+                is_surface_title: false,
                 children: vec![],
                 html_anchors: Vec::new(),
                 link_refs: Default::default(),
@@ -3901,12 +3921,14 @@ impl BlockNode {
                     .join("\n")
             }
             BlockNode::Surface { name, children, .. } => {
-                let content = children
+                let (title, body) = split_surface_title(children);
+                let content = body
                     .iter()
                     .map(|child| child.to_markdown())
                     .collect::<Vec<_>>()
                     .join("\n\n");
-                quoted_source(Some(name), &content)
+                let title = title.map_or_else(String::new, BlockNode::to_markdown);
+                surface_source(name, &title, &content)
             }
             BlockNode::List {
                 children,
@@ -4786,16 +4808,20 @@ impl BlockNode {
                 )
             }
             BlockNode::Surface { name, children, .. } => {
-                if children.iter().all(Self::draws_nothing) {
+                let (title, children) = split_surface_title(children);
+                let has_body = children.iter().any(|child| !child.draws_nothing());
+                if title.is_none() && !has_body {
                     // Nothing to hold, as when a stream has only sent the marker.
                     return div().into_any_element();
                 }
+                let title = title
+                    .map(|title| title.render_block(options.is_last(true), node_cx, window, cx));
                 // Unless the container sets its own width, it takes the row's,
                 // as a blockquote does, so lists and tables in it wrap to the
                 // view instead of measuring at their unwrapped width.
                 let mut container = node_cx
                     .markdown_extensions
-                    .render_block_surface(name, window, cx)
+                    .render_block_surface(name, title, has_body, window, cx)
                     .unwrap_or_else(div)
                     .map(|mut this| {
                         let style = this.style();
@@ -6099,12 +6125,8 @@ mod tests {
     fn paragraph_with_children(children: Vec<InlineNode>) -> Paragraph {
         let combined: String = children.iter().map(|c| c.text.to_string()).collect();
         let paragraph = Paragraph {
-            span: None,
             children,
-            html_anchors: Vec::new(),
-            link_refs: HashMap::new(),
-            state: Arc::new(Mutex::new(InlineState::default())),
-            render_cache: ParagraphRenderCache::default(),
+            ..Default::default()
         };
         if let Ok(mut state) = paragraph.state.lock() {
             state.set_text(combined.into());
@@ -6767,12 +6789,8 @@ mod tests {
             ..Default::default()
         };
         Paragraph {
-            span: None,
             children: vec![InlineNode::image(image)],
-            html_anchors: Vec::new(),
-            link_refs: HashMap::new(),
-            state: Arc::new(Mutex::new(InlineState::default())),
-            render_cache: ParagraphRenderCache::default(),
+            ..Default::default()
         }
     }
 

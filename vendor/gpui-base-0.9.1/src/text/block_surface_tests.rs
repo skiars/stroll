@@ -117,6 +117,37 @@ fn a_surface_writes_markdown_as_its_marker_and_quoted_blocks() {
 }
 
 #[test]
+fn titled_surfaces_keep_title_and_body_as_separate_selectable_blocks() {
+    let source = "> [!SUMMARY] **Title** and details\r\n> Body text\r\n";
+    let titled = extensions().titled_block_surface("summary", |_, _, _, _| div());
+    assert!(!titled.has_same_parser_configuration(&extensions()));
+    let blocks = parsed(source, titled);
+    let [surface @ BlockNode::Surface { children, .. }] = blocks.as_slice() else {
+        panic!("expected a surface");
+    };
+    let [BlockNode::Paragraph(title), BlockNode::Paragraph(body)] = children.as_slice() else {
+        panic!("expected a title and a body");
+    };
+    assert_eq!(body.span.unwrap().start, source.find("Body text").unwrap());
+    assert_eq!(
+        surface.to_markdown(),
+        "> [!summary] **Title** and details\n> Body text",
+    );
+
+    title.state.lock().unwrap().selection = Some((0..5).into());
+    body.state.lock().unwrap().selection = Some((0..4).into());
+    assert_eq!(
+        surface.selected_text(SelectionFormat::Source),
+        "> [!summary] **Title**\n> Body\n",
+    );
+    title.state.lock().unwrap().selection = None;
+    assert_eq!(
+        surface.selected_text(SelectionFormat::Source),
+        "> [!summary]\n> Body\n",
+    );
+}
+
+#[test]
 fn registered_surfaces_are_part_of_the_parser_configuration() {
     let plain = MarkdownExtensions::default().parser_revision(1);
     assert!(!plain.has_same_parser_configuration(&extensions()));

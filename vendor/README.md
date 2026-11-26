@@ -431,6 +431,11 @@ dialogs in a Wayland window after changes to paint order or focus handling.
   `cargo test --release --locked --lib markdown_alerts` for source mapping,
   theme colors, and offscreen rule alignment.
 
+- Stroll's alerts accept an inline title after the type marker. The native
+  text view keeps the title and body as separate source-backed paragraphs so
+  links, search, selection, and source copy use the normal Markdown paths.
+  The `markdown_alerts` and `markdown_preview_find` tests cover these paths.
+
 - The Markdown highlight query exposes separate captures for heading text and
   heading markers so code themes can style them independently.
 - Scrollable Markdown text views can align a rendered range below the top edge.

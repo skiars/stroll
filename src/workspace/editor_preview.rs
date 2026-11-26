@@ -1180,7 +1180,9 @@ mod tests {
                 Some("Reader && !Locator"),
             )]);
         });
-        let markdown = format!("> [!NOTE]\n> An alert in split view.\n\n{MARKDOWN_SCROLL_FIXTURE}");
+        let markdown = format!(
+            "> [!NOTE] **Split preview title**\n> An alert in split view.\n\n{MARKDOWN_SCROLL_FIXTURE}"
+        );
         let (workspace, visual) =
             open_markdown_preview_fixture(&mut cx, fixture.path(), &markdown)?;
         visual.update(|window, _| window.activate_window());
@@ -1255,6 +1257,18 @@ mod tests {
         visual.simulate_keystrokes(find);
         settle(visual, &workspace, |_, _| true);
         assert!(preview.contains(&visual.debug_bounds("find-bar").unwrap().center()));
+        visual.simulate_input("Split preview title");
+        settle(visual, &workspace, |_, _| true);
+        visual.simulate_keystrokes(find);
+        visual.simulate_keystrokes(copy);
+        visual.update(|_, cx| {
+            assert_eq!(
+                cx.read_from_clipboard()
+                    .and_then(|item| item.text())
+                    .as_deref(),
+                Some("Split preview title")
+            );
+        });
         visual.simulate_keystrokes("escape");
 
         for (icon, mode) in [

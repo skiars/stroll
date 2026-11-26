@@ -38,6 +38,21 @@ type ProseSuffixFn =
 /// Builds the container of a [block surface](MarkdownExtensions::block_surface).
 pub type BlockSurfaceRenderFn = dyn Fn(&mut Window, &mut App) -> Div + Send + Sync;
 
+type TitledSurfaceRenderFn =
+    dyn Fn(Option<AnyElement>, bool, &mut Window, &mut App) -> Div + Send + Sync;
+
+#[derive(Clone)]
+enum BlockSurfaceRenderer {
+    Plain(Arc<BlockSurfaceRenderFn>),
+    Titled(Arc<TitledSurfaceRenderFn>),
+}
+
+impl BlockSurfaceRenderer {
+    fn accepts_title(&self) -> bool {
+        matches!(self, Self::Titled(_))
+    }
+}
+
 /// Parser for a single inline AST node; follows the block parser contract.
 type MarkdownInlineParserFn = MarkdownBlockParserFn;
 
@@ -256,7 +271,7 @@ pub struct MarkdownExtensions {
     block_renderers: HashMap<SharedString, Arc<MarkdownBlockRenderFn>>,
     inline_parsers: Vec<Arc<MarkdownInlineParserFn>>,
     inline_renderers: HashMap<SharedString, Arc<MarkdownInlineRenderFn>>,
-    block_surfaces: HashMap<SharedString, Arc<BlockSurfaceRenderFn>>,
+    block_surfaces: HashMap<SharedString, BlockSurfaceRenderer>,
     blockquote_left_rule: Option<gpui::Pixels>,
     prose_suffix: Option<Arc<ProseSuffixFn>>,
     revision: u64,
@@ -283,8 +298,24 @@ impl MarkdownExtensions {
         &self,
         source: &str,
         quote: &mut mdast::Blockquote,
-    ) -> Option<SharedString> {
+    ) -> Option<(SharedString, bool)> {
         super::format::markdown::take_surface_marker(source, quote, self)
+    }
+
+    /// Parses the source AST used by both the renderer and document readers
+    /// that also extract Markdown prose.
+    #[doc(hidden)]
+    pub fn parse_mdast(&self, source: &str) -> Result<mdast::Node, markdown::message::Message> {
+        let options = self.parse_options();
+        let root = markdown::to_mdast(source, &options)?;
+        if !self
+            .block_surfaces
+            .values()
+            .any(BlockSurfaceRenderer::accepts_title)
+        {
+            return Ok(root);
+        }
+        super::format::markdown::isolate_surface_titles(source, root, self, &options)
     }
 
     /// Change this revision when parser captures or plugin configuration change.
@@ -399,15 +430,30 @@ impl MarkdownExtensions {
     where
         F: Fn(&mut Window, &mut App) -> Div + Send + Sync + 'static,
     {
-        let name = name.into();
+        self.insert_block_surface(name.into(), BlockSurfaceRenderer::Plain(Arc::new(render)));
+        self
+    }
+
+    /// Registers a block surface accepting a source-backed inline title after
+    /// its marker. The renderer receives the title element and whether there
+    /// are visible body blocks to follow it.
+    #[doc(hidden)]
+    pub fn titled_block_surface<F>(mut self, name: impl Into<SharedString>, render: F) -> Self
+    where
+        F: Fn(Option<AnyElement>, bool, &mut Window, &mut App) -> Div + Send + Sync + 'static,
+    {
+        self.insert_block_surface(name.into(), BlockSurfaceRenderer::Titled(Arc::new(render)));
+        self
+    }
+
+    fn insert_block_surface(&mut self, name: SharedString, renderer: BlockSurfaceRenderer) {
         let name = if name.bytes().any(|byte| byte.is_ascii_uppercase()) {
             name.to_ascii_lowercase().into()
         } else {
             name
         };
-        self.block_surfaces.insert(name, Arc::new(render));
+        self.block_surfaces.insert(name, renderer);
         self.bump_revision();
-        self
     }
 
     /// Apply a reusable Markdown plugin.
@@ -460,10 +506,12 @@ impl MarkdownExtensions {
             && self.inline_parsers.len() == other.inline_parsers.len()
             && self.inline_renderers.len() == other.inline_renderers.len()
             && self.block_surfaces.len() == other.block_surfaces.len()
-            && self
-                .block_surfaces
-                .keys()
-                .all(|name| other.block_surfaces.contains_key(name))
+            && self.block_surfaces.iter().all(|(name, renderer)| {
+                other
+                    .block_surfaces
+                    .get(name)
+                    .is_some_and(|other| renderer.accepts_title() == other.accepts_title())
+            })
             && self
                 .inline_renderers
                 .keys()
@@ -531,15 +579,26 @@ impl MarkdownExtensions {
         name.map(|(name, _)| name.clone())
     }
 
+    pub(crate) fn block_surface_accepts_title(&self, name: &str) -> bool {
+        self.block_surfaces
+            .get(name)
+            .is_some_and(BlockSurfaceRenderer::accepts_title)
+    }
+
     pub(crate) fn render_block_surface(
         &self,
         name: &str,
+        title: Option<AnyElement>,
+        has_body: bool,
         window: &mut Window,
         cx: &mut App,
     ) -> Option<Div> {
         self.block_surfaces
             .get(name)
-            .map(|render| render(window, cx))
+            .map(|renderer| match renderer {
+                BlockSurfaceRenderer::Plain(render) => render(window, cx),
+                BlockSurfaceRenderer::Titled(render) => render(title, has_body, window, cx),
+            })
     }
 
     pub(crate) fn parse_block(

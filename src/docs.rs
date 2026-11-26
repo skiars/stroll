@@ -293,11 +293,9 @@ fn scrollable_inline_text(node: &Node) -> bool {
 }
 
 pub(crate) fn parse_markdown(source: &str) -> Result<Node> {
-    let mut options = markdown::ParseOptions::gfm();
-    options.constructs.math_flow = true;
-    options.constructs.math_text = true;
-    options.constructs.frontmatter = true;
-    markdown::to_mdast(source, &options).map_err(|error| anyhow::anyhow!("{error}"))
+    markdown_alerts::parser()
+        .parse_mdast(source)
+        .map_err(|error| anyhow::anyhow!("{error}"))
 }
 
 fn headings(ast: &Node) -> Vec<Heading> {
@@ -2117,18 +2115,30 @@ mod tests {
             "> [!nOtE]\n> **First paragraph**\n>\n> - Another item\n",
             "\n> [!OTHER]\n> Unknown type\n",
             "\n> > [!TIP]\n> > Nested quote\n",
-            "\n> [!WARNING] Custom title\n> Ordinary quote\n",
+            "\n> [!WARNING]No separator\n> Ordinary quote\n",
             "\n> \\[!CAUTION]\n> Escaped marker\n",
+            "\n> [!WARNING] **Prepare** `config.toml` [guide][setup]\r\n> Alert body.\r\n",
+            "\r\n> [!TIP] Title without a body\r\n",
+            "\n> [!IMPORTANT] *Open emphasis\n> Body ends with punctuation*\n",
+            "\n> [!NOTE] Lazy continuation example\nUnquoted body text.\n",
+            "\n[setup]: ./setup.md\n",
         );
         let paragraph = source.find("First paragraph").unwrap();
         let paragraph_range = paragraph..paragraph + "First paragraph".len();
         let marker = source.find("[!nOtE]").unwrap();
+        let title_source = "**Prepare** `config.toml` [guide][setup]";
+        let title_start = source.find(title_source).unwrap();
+        let title_range = title_start..title_start + title_source.len();
+        let warning_marker = source.find("[!WARNING] **").unwrap();
+        let body_start = source.find("Alert body.").unwrap();
 
         for document in [
             PreparedDocument::new(source.into()).unwrap(),
             PreparedDocument::from_editor(source.into(), None).unwrap(),
         ] {
             assert_eq!(document.prose_keys[&(paragraph - 2)], "**First paragraph**");
+            assert!(document.prose_keys[&title_start].contains("Prepare"));
+            assert_eq!(document.prose_keys[&body_start], "Alert body&#46;");
             let state = cx.update(|cx| {
                 cx.new(|cx| {
                     TextViewState::markdown_with_extensions(
@@ -2148,12 +2158,26 @@ mod tests {
                 );
                 let range = rendered.range_for_source(paragraph_range.clone()).unwrap();
                 assert_eq!(&rendered.as_str()[range], "First paragraph");
+                assert!(
+                    rendered
+                        .range_for_source(warning_marker..warning_marker + "[!WARNING]".len())
+                        .is_none()
+                );
+                let title = rendered.range_for_source(title_range.clone()).unwrap();
+                assert_eq!(&rendered.as_str()[title], "Prepare config.toml guide");
+                let body = rendered
+                    .range_for_source(body_start..body_start + "Alert body.".len())
+                    .unwrap();
+                assert_eq!(&rendered.as_str()[body], "Alert body.");
                 for text in [
                     "Another item",
                     "[!OTHER]",
                     "[!TIP]",
-                    "[!WARNING] Custom title",
+                    "[!WARNING]No separator",
                     "[!CAUTION]",
+                    "Title without a body",
+                    "*Open emphasis\nBody ends with punctuation*",
+                    "Lazy continuation example\nUnquoted body text.",
                 ] {
                     assert!(rendered.as_str().contains(text), "{text}: {rendered:?}");
                 }
@@ -2170,10 +2194,10 @@ mod tests {
         const SOURCE: &str = concat!(
             "Opening paragraph.\n",
             "\n> A quote with enough words to wrap in a narrow preview.\n>\n> A second paragraph.\n",
-            "\n> [!NOTE]\n> Read the full chapter before moving on to the next steps.\n>\n> Keep reading.\n",
+            "\n> [!NOTE] Read `setup.md`\n> Read the full chapter before moving on to the next steps.\n>\n> Keep reading.\n",
             "\n> [!TIP]\n> Preview the changes.\n",
             "\n> [!IMPORTANT]\n> Add the images.\n",
-            "\n> [!WARNING]\n> Check the links.\n",
+            "\n> [!WARNING] Check the links from the new location before sharing\n",
             "\n> [!CAUTION]\n> Review the screenshots.\n",
             "\nEnd of document.\n",
         );
@@ -2183,6 +2207,7 @@ mod tests {
             Arc::new(gpui_kit_assets::AllAssets),
             || Ok(Some(Box::new(WgpuHeadlessRenderer::new()?))),
         );
+        let mut wide_title_height = None;
         for (mode, width, scale, colors) in [
             (
                 ThemeMode::Light,
@@ -2241,6 +2266,15 @@ mod tests {
                 })
             };
             let rails = app.update_window(window.into(), |_, window, cx| read_rails(window, cx))?;
+            let title_height = rails[4].size.height.as_f32() / scale;
+            if let Some(wide) = wide_title_height {
+                assert!(
+                    title_height - wide > 12.,
+                    "the title wraps in the narrow pane"
+                );
+            } else {
+                wide_title_height = Some(title_height);
+            }
             let screenshot = app.capture_screenshot(window.into())?;
             assert!(
                 rails

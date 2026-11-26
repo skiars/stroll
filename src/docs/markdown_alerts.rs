@@ -1,4 +1,9 @@
-use gpui::{App, Div, FontWeight, ParentElement as _, Styled as _, Window, div, px, rgb};
+use std::sync::OnceLock;
+
+use gpui::{
+    AnyElement, App, Div, FontWeight, IntoElement as _, ParentElement as _, Styled as _, Window,
+    div, px, rgb,
+};
 use gpui_component::{
     ActiveTheme as _, Icon, h_flex,
     text::{MarkdownExtensions, markdown_ast::Node},
@@ -55,24 +60,36 @@ const ALERTS: [Alert; 5] = [
 
 pub(super) fn register(extensions: MarkdownExtensions) -> MarkdownExtensions {
     ALERTS.iter().fold(extensions, |extensions, alert| {
-        extensions.block_surface(alert.marker, |window, cx| alert.render(window, cx))
+        extensions.titled_block_surface(alert.marker, |title, has_body, window, cx| {
+            alert.render(title, has_body, window, cx)
+        })
     })
+}
+
+pub(super) fn parser() -> &'static MarkdownExtensions {
+    static PARSER: OnceLock<MarkdownExtensions> = OnceLock::new();
+    PARSER.get_or_init(|| register(MarkdownExtensions::default().frontmatter()))
 }
 
 pub(crate) fn strip_markers(root: &mut Node, source: &str) {
     let Node::Root(root) = root else {
         return;
     };
-    let extensions = register(MarkdownExtensions::default());
     for child in &mut root.children {
         if let Node::Blockquote(quote) = child {
-            extensions.take_block_surface_marker(source, quote);
+            parser().take_block_surface_marker(source, quote);
         }
     }
 }
 
 impl Alert {
-    fn render(&self, window: &mut Window, cx: &App) -> Div {
+    fn render(
+        &self,
+        title: Option<AnyElement>,
+        has_body: bool,
+        window: &mut Window,
+        cx: &App,
+    ) -> Div {
         let color = rgb(if cx.theme().mode.is_dark() {
             self.dark
         } else {
@@ -80,17 +97,29 @@ impl Alert {
         })
         .into();
         let font_size = window.text_style().font_size.to_pixels(window.rem_size());
+        let mut title_row = h_flex()
+            .items_start()
+            .gap(font_size * 0.5)
+            .text_color(color)
+            .font_weight(FontWeight::SEMIBOLD)
+            .child(
+                h_flex()
+                    .h(window.line_height())
+                    .flex_shrink_0()
+                    .child(Icon::new(self.icon).size(font_size)),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .child(title.unwrap_or_else(|| div().child(self.title).into_any_element())),
+            );
+        if has_body {
+            title_row = title_row.pb(px(4.));
+        }
         div()
             .pl(px(2.) + font_size * 0.9)
             .content_left_rule(RAIL_WIDTH, color)
-            .child(
-                h_flex()
-                    .gap(font_size * 0.5)
-                    .pb(px(4.))
-                    .text_color(color)
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .child(Icon::new(self.icon).size(font_size))
-                    .child(self.title),
-            )
+            .child(title_row)
     }
 }

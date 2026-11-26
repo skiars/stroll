@@ -9,7 +9,7 @@ use markdown::{
 
 use crate::text::{
     document::ParsedDocument,
-    markdown_ext::MarkdownParseContext,
+    markdown_ext::{MarkdownExtensions, MarkdownParseContext},
     node::{
         self, BlockNode, CodeBlock, ImageNode, InlineNode, LinkMark, NodeContext, Paragraph,
         SourceSegment, Span, Table, TableRow, TextMark,
@@ -18,10 +18,11 @@ use crate::text::{
 
 /// Parse Markdown into a tree of nodes.
 pub(crate) fn parse(source: &str, cx: &mut NodeContext) -> Result<ParsedDocument, SharedString> {
-    let options = cx.markdown_extensions.parse_options();
-    let mut root =
-        markdown::to_mdast(source, &options).map_err(|e| SharedString::from(e.to_string()))?;
-    let mut prose = options;
+    let mut root = cx
+        .markdown_extensions
+        .parse_mdast(source)
+        .map_err(|e| SharedString::from(e.to_string()))?;
+    let mut prose = cx.markdown_extensions.parse_options();
     prose.constructs.math_text = false;
     prose.constructs.math_flow = false;
     flatten_unclaimed_math(&mut root, source, &prose, cx);
@@ -1030,17 +1031,20 @@ fn blockquote_to_node(
     mut quote: mdast::Blockquote,
     cx: &mut NodeContext,
 ) -> BlockNode {
-    let Some(name) = cx
+    let Some((name, has_title)) = cx
         .markdown_extensions
         .take_block_surface_marker(source, &mut quote)
     else {
         return ast_to_node(source, Node::Blockquote(quote), cx);
     };
-    let children = quote
+    let mut children = quote
         .children
         .into_iter()
         .map(|child| ast_to_node(source, child, cx))
-        .collect();
+        .collect::<Vec<_>>();
+    if has_title && let Some(BlockNode::Paragraph(title)) = children.first_mut() {
+        title.is_surface_title = true;
+    }
     BlockNode::Surface {
         name,
         children,
@@ -1048,20 +1052,173 @@ fn blockquote_to_node(
     }
 }
 
-/// Removes the marker line that names a registered block surface from the
-/// start of `quote`, and returns that name.
+struct SurfaceTitle {
+    name: SharedString,
+    marker_end: usize,
+    start: usize,
+}
+
+fn surface_title(
+    source: &str,
+    paragraph: &mdast::Paragraph,
+    extensions: &MarkdownExtensions,
+) -> Option<SurfaceTitle> {
+    let Node::Text(text) = paragraph.children.first()? else {
+        return None;
+    };
+    let start = text.position.as_ref()?.start.offset;
+    let line = source.get(start..)?.split(['\r', '\n']).next()?;
+    let (name, remainder) = line.strip_prefix("[!")?.split_once(']')?;
+    let title = remainder.trim_start_matches([' ', '\t']);
+    let marker_end = start + name.len() + 3;
+    if title.is_empty()
+        || title.len() == remainder.len()
+        || !text.value.starts_with(source.get(start..marker_end)?)
+        || source.get(..start)?.ends_with('\\')
+    {
+        return None;
+    }
+    let name = extensions.block_surface_name(name)?;
+    extensions
+        .block_surface_accepts_title(&name)
+        .then_some(SurfaceTitle {
+            name,
+            marker_end,
+            start: start + line.len() - title.len(),
+        })
+}
+
+/// A custom title is its own line of inline Markdown, even when CommonMark
+/// initially reads it and the body as a single paragraph. Reparse those
+/// quotes with a virtual blank quote line so the body still has the document's
+/// normal block syntax and reference definitions. Restore original positions
+/// before any consumers see the AST.
+pub(in crate::text) fn isolate_surface_titles(
+    source: &str,
+    root: Node,
+    extensions: &MarkdownExtensions,
+    options: &ParseOptions,
+) -> Result<Node, markdown::message::Message> {
+    struct Separator {
+        augmented_end: usize,
+        added_bytes: usize,
+        body_line: usize,
+        body_prefix: usize,
+    }
+
+    fn restore_positions(node: &mut Node, separators: &[Separator]) {
+        if let Some(position) = node.position_mut() {
+            for point in [&mut position.start, &mut position.end] {
+                let count = separators.partition_point(|gap| gap.augmented_end <= point.offset);
+                if let Some(gap) = count.checked_sub(1).map(|index| &separators[index]) {
+                    point.offset -= gap.added_bytes;
+                    point.line -= count;
+                    if point.line == gap.body_line {
+                        point.column -= gap.body_prefix;
+                    }
+                }
+            }
+        }
+        if let Some(children) = node.children_mut() {
+            for child in children {
+                restore_positions(child, separators);
+            }
+        }
+    }
+
+    let Node::Root(document) = &root else {
+        return Ok(root);
+    };
+    let mut separators = Vec::new();
+    let mut augmented = String::new();
+    let mut copied = 0;
+    for child in &document.children {
+        let Node::Blockquote(quote) = child else {
+            continue;
+        };
+        let Some(Node::Paragraph(paragraph)) = quote.children.first() else {
+            continue;
+        };
+        let Some(position) = &paragraph.position else {
+            continue;
+        };
+        if position.start.line == position.end.line
+            || surface_title(source, paragraph, extensions).is_none()
+        {
+            continue;
+        }
+        let Some((relative_break, newline)) = source[position.start.offset..]
+            .char_indices()
+            .find(|(_, ch)| matches!(ch, '\r' | '\n'))
+        else {
+            continue;
+        };
+        let line_break = position.start.offset + relative_break;
+        let newline_len = if newline == '\r' && source[line_break..].starts_with("\r\n") {
+            2
+        } else {
+            1
+        };
+        let body = line_break + newline_len;
+        let lazy = !source[body..]
+            .trim_start_matches([' ', '\t'])
+            .starts_with('>');
+        augmented.push_str(&source[copied..body]);
+        augmented.push_str(">\n");
+        if lazy {
+            augmented.push_str("> ");
+        }
+        separators.push(Separator {
+            augmented_end: augmented.len(),
+            added_bytes: augmented.len() - body,
+            body_line: position.start.line + 1,
+            body_prefix: if lazy { 2 } else { 0 },
+        });
+        copied = body;
+    }
+    if separators.is_empty() {
+        return Ok(root);
+    }
+    augmented.push_str(&source[copied..]);
+    let mut root = markdown::to_mdast(&augmented, options)?;
+    restore_positions(&mut root, &separators);
+    Ok(root)
+}
+
+/// Removes the marker at the start of `quote` and returns the surface name
+/// and whether its first paragraph is a custom title.
 ///
-/// As in a GitHub alert, the marker `[!name]` is alone on the first line of
-/// the first paragraph, and the lines after it are that paragraph's text. The
-/// name matches ASCII-case-insensitively.
+/// In a GitHub alert, the marker `[!name]` is alone on the first line and the
+/// lines after it form the body. A titled surface keeps the rest of its first
+/// line as a separate paragraph. The name matches ASCII-case-insensitively.
 pub(in crate::text) fn take_surface_marker(
     source: &str,
     quote: &mut mdast::Blockquote,
-    extensions: &super::super::MarkdownExtensions,
-) -> Option<SharedString> {
+    extensions: &MarkdownExtensions,
+) -> Option<(SharedString, bool)> {
     let Some(Node::Paragraph(paragraph)) = quote.children.first_mut() else {
         return None;
     };
+    if let Some(title) = surface_title(source, paragraph, extensions) {
+        let Node::Text(text) = &mut paragraph.children[0] else {
+            unreachable!("a surface marker starts in text");
+        };
+        let position = text.position.as_mut()?;
+        let value = text
+            .value
+            .strip_prefix(&source[position.start.offset..title.marker_end])?;
+        let delimiter = &source[title.marker_end..title.start];
+        text.value = value.strip_prefix(delimiter).unwrap_or(value).to_owned();
+        position.start.column += title.start - position.start.offset;
+        position.start.offset = title.start;
+        if let Some(paragraph_position) = &mut paragraph.position {
+            paragraph_position.start = position.start.clone();
+        }
+        if text.value.is_empty() {
+            paragraph.children.remove(0);
+        }
+        return Some((title.name, true));
+    }
     let Some(Node::Text(text)) = paragraph.children.first_mut() else {
         return None;
     };
@@ -1120,7 +1277,7 @@ pub(in crate::text) fn take_surface_marker(
             quote.children.remove(0);
         }
     }
-    Some(name)
+    Some((name, false))
 }
 
 fn new_span(pos: Option<markdown::unist::Position>, cx: &NodeContext) -> Option<Span> {
