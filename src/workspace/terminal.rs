@@ -239,6 +239,36 @@ impl Workspace {
         })
     }
 
+    pub(super) fn focus_open_terminal(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(panel) = self
+            .current_terminal_mut()
+            .filter(|panel| panel.open && !panel.maximized)
+        else {
+            return false;
+        };
+        panel.previous_focus = window.focused(cx);
+        focus_session(&panel.tabs[panel.active].session, window, cx);
+        true
+    }
+
+    pub(super) fn focus_above_terminal(&self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let Some(panel) = self.visible_terminal().filter(|panel| !panel.maximized) else {
+            return false;
+        };
+        if let Some(focus) = panel.previous_focus.as_ref().filter(|previous| {
+            self.focus.contains(previous, window) && !panel.focus.contains(previous, window)
+        }) {
+            focus.focus(window, cx);
+        } else {
+            self.focus_workspace_content(None, window, cx);
+        }
+        true
+    }
+
     pub(super) fn terminal_maximized(&self) -> bool {
         self.visible_terminal().is_some_and(|panel| panel.maximized)
     }
@@ -347,11 +377,7 @@ impl Workspace {
         if self.repository_overlay_open() || self.confirming_close || window.has_active_dialog(cx) {
             return;
         }
-        if self.terminal_focused(window, cx)
-            && self
-                .current_terminal()
-                .is_some_and(|panel| panel.tabs[panel.active].session.read(cx).composing())
-        {
+        if self.terminal_focused(window, cx) && self.terminal_composing(cx) {
             return;
         }
         if self.terminal_focused(window, cx) {
@@ -359,6 +385,12 @@ impl Workspace {
         } else {
             self.show_terminal(window, cx);
         }
+    }
+
+    pub(super) fn terminal_composing(&self, cx: &App) -> bool {
+        self.current_terminal()
+            .and_then(|panel| panel.tabs.get(panel.active))
+            .is_some_and(|tab| tab.session.read(cx).composing())
     }
 
     pub(super) fn toggle_terminal_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {

@@ -31,11 +31,18 @@ pub(crate) struct Config {
     pub appearance: Appearance,
     pub docs: Docs,
     pub editor: Editor,
+    pub keyboard: Keyboard,
     pub files: Files,
     pub git: Git,
     pub terminal: Terminal,
     pub lsp: Lsp,
     pub ai: crate::ai::Settings,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Serialize)]
+#[serde(default)]
+pub(crate) struct Keyboard {
+    pub vim_mode: bool,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]

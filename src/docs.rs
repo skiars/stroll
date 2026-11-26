@@ -1170,6 +1170,86 @@ impl DocReader {
         self.text.read(cx).focus_handle().clone().focus(window, cx);
     }
 
+    pub(crate) fn content_focused(&self, window: &Window, cx: &App) -> bool {
+        self.text.read(cx).focus_handle().is_focused(window)
+    }
+
+    fn scroll_or_jump(&mut self, key: char, cx: &mut Context<Self>) -> bool {
+        match key {
+            'j' | 'k' => {
+                let direction = if key == 'j' { 1. } else { -1. };
+                let list = self.text.read(cx).list_state();
+                list.navigate_by(px(self.typography.body_font_size as f32
+                    * 1.72
+                    * 3.
+                    * direction));
+                cx.notify();
+            }
+            'h' | 'l' => {
+                let position = self.selected_heading;
+                let index = if key == 'h' {
+                    position.and_then(|index| index.checked_sub(1))
+                } else {
+                    let text = self.text.read(cx);
+                    let before_first = self.document.headings.first().is_some_and(|heading| {
+                        text.block_for_source_offset(heading.source.start)
+                            .is_some_and(|first| {
+                                text.list_state().logical_scroll_top().item_ix < first
+                            })
+                    });
+                    Some(if before_first {
+                        0
+                    } else {
+                        position.map_or(0, |index| index + 1)
+                    })
+                };
+                if let Some(index) = index.filter(|index| *index < self.document.headings.len()) {
+                    self.jump_to_heading(index, true, cx);
+                }
+            }
+            _ => return false,
+        }
+        true
+    }
+
+    pub(crate) fn vim_key(
+        &mut self,
+        stroke: &Keystroke,
+        key: Option<char>,
+        top: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if top {
+            self.text
+                .read(cx)
+                .list_state()
+                .scroll_to(ListOffset::default());
+        } else if stroke.modifiers
+            == (Modifiers {
+                control: true,
+                ..Default::default()
+            })
+            && matches!(stroke.key.as_str(), "d" | "u")
+        {
+            let list = self.text.read(cx).list_state();
+            let direction = if stroke.key == "d" { 0.5 } else { -0.5 };
+            list.navigate_by(list.viewport_bounds().size.height * direction);
+        } else {
+            match key {
+                Some('G') => self.text.read(cx).list_state().scroll_to_end(),
+                Some('/') => self.find(window, cx),
+                Some('n' | 'N') => self
+                    .search
+                    .update(cx, |search, cx| search.step(key == Some('N'), cx)),
+                Some(key) => return self.scroll_or_jump(key, cx),
+                None => return false,
+            }
+        }
+        cx.notify();
+        true
+    }
+
     pub(crate) fn session_position(&self, cx: &App) -> Option<DocumentPosition> {
         if self.pending_position.is_some()
             || self.pending_fragment.is_some()
@@ -1813,12 +1893,20 @@ impl Render for DocReader {
                 if event.keystroke.modifiers.modified() || !text.focus_handle().is_focused(window) {
                     return;
                 }
+                if let Some(key) = event.keystroke.key.chars().next()
+                    && event.keystroke.key.len() == 1
+                    && this.scroll_or_jump(key, cx)
+                {
+                    window.prevent_default();
+                    cx.stop_propagation();
+                    return;
+                }
                 let direction = match event.keystroke.key.as_str() {
                     "pageup" => -1.,
                     "pagedown" => 1.,
                     _ => return,
                 };
-                let list = text.list_state();
+                let list = this.text.read(cx).list_state();
                 list.navigate_by(list.viewport_bounds().size.height * (direction * 0.9));
                 cx.stop_propagation();
                 cx.notify();

@@ -403,6 +403,12 @@ impl Workspace {
         }
     }
 
+    pub(super) fn open_text_locator(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.show_locator(Mode::Text, window, cx) {
+            self.locator_mode(Mode::Text, window, cx);
+        }
+    }
+
     pub(super) fn find_references(
         &mut self,
         _: &super::FindReferences,

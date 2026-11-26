@@ -410,6 +410,15 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> Subscription {
         cx.observe_in(editor, window, |this, editor, window, cx| {
+            if this.config.current().keyboard.vim_mode
+                && editor.read(cx).focus_handle(cx).is_focused(window)
+                && let Some(file) = this.tabs.active().and_then(|path| this.files.get_mut(path))
+                && file.editor == editor
+                && file.vim.sync_selection(editor.read(cx))
+            {
+                editor.update(cx, |editor, cx| file.vim.adopt_selection(editor, cx));
+                cx.notify();
+            }
             this.track_source_caret(&editor, window, cx);
             this.refresh_caret_hints(&editor, false, window, cx);
             this.refresh_selection_highlight(&editor, window, cx);

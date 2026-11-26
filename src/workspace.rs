@@ -40,6 +40,7 @@ mod toast;
 mod tree_motion;
 mod tree_sticky_scroll;
 mod tree_transfer;
+mod vim;
 mod window_bounds;
 #[cfg(test)]
 mod worktree_recovery_tests;
@@ -724,6 +725,7 @@ struct OpenFile {
     wrap: bool,
     git: editor_git::EditorGit,
     restore_position: Option<FilePosition>,
+    vim: vim::Source,
 }
 
 impl OpenFile {
@@ -791,6 +793,8 @@ struct TreeRow {
 pub struct Workspace {
     store: Arc<Store>,
     config: ConfigFile,
+    vim: vim::WorkspaceState,
+    _vim_key_interceptor: Subscription,
     ai: crate::ai::Service,
     settings: Option<SettingsWindow>,
     startup_lsp: Lsp,
@@ -998,6 +1002,7 @@ impl Workspace {
         let editor_font = Self::configured_editor_font(config.current(), cx);
         let startup_lsp = config.current().lsp.clone();
         let ai = store.ai(&config);
+        let vim_key_interceptor = Self::intercept_vim_keys(window, cx);
         let mut workspace = Self {
             ai,
             locator: locator::Locator::new(),
@@ -1005,6 +1010,8 @@ impl Workspace {
             terminals: terminal::Terminals::new(repository_mode.then_some(store.as_ref())),
             store,
             config,
+            vim: Default::default(),
+            _vim_key_interceptor: vim_key_interceptor,
             settings: None,
             startup_lsp,
             lsp_window: window.window_handle(),
@@ -1122,6 +1129,9 @@ impl Workspace {
         workspace.observe_window_geometry(window, cx);
         cx.observe_window_activation(window, |this, window, cx| {
             this.refresh_active_selection_highlight(window, cx);
+            if !window.is_window_active() {
+                this.cancel_vim_keys(cx);
+            }
             if window.is_window_active() {
                 if this.repository_watch_active {
                     this.sync_document_paths(this.files.keys().cloned().collect(), window, cx);
@@ -1838,6 +1848,7 @@ impl Workspace {
                     self.open_doc(path, None, window, cx);
                 }
                 self.load_docs_tree(window, cx);
+                self.focus_document_content(window, cx);
             }
             WorkspaceView::Git => self.open_git_panel(window, cx),
             WorkspaceView::Editor => {
@@ -2072,6 +2083,8 @@ impl Workspace {
         if self.repository_ui.picker_open || self.repository_ui.opening.is_some() {
             return;
         }
+        self.cancel_vim_keys(cx);
+        self.vim.forget_tree_origin();
         self.close_locator(false, window, cx);
         self.repository_ui.menu_open = false;
         self.language_rename = Task::ready(());
@@ -2126,10 +2139,11 @@ impl Workspace {
                     self.open_doc(path, None, window, cx);
                 }
             }
-            self.focus.focus(window, cx);
+            self.focus_document_content(window, cx);
         } else if view == WorkspaceView::Git {
             self.open_git_panel(window, cx);
         } else {
+            self.focus.focus(window, cx);
             self.load_expanded_tree_directories(window, cx);
             self.restore_active_file(window, cx);
         }
@@ -2151,10 +2165,12 @@ impl Workspace {
             let config = self.config.current().git;
             let gradient_title_bar = self.config.current().appearance.gradient_title_bar;
             let inlay_hints = self.config.current().editor.inlay_hints;
+            let vim_mode = self.config.current().keyboard.vim_mode;
             self.git = Some(cx.new(|cx| {
                 let mut panel = GitPanel::new(repo, workspace, config, &self.session, window, cx);
                 panel.set_project_gradient(gradient_title_bar, cx);
                 panel.set_inlay_hints_enabled(inlay_hints, window, cx);
+                panel.set_diff_vim(vim_mode, cx);
                 panel
             }));
         }
@@ -2163,6 +2179,14 @@ impl Workspace {
                 panel.focus(window, cx);
                 panel.schedule_snapshot_alignment(cx);
             });
+        }
+    }
+
+    fn focus_document_content(&self, window: &mut Window, cx: &mut App) {
+        if let Some(doc) = &self.doc {
+            doc.update(cx, |doc, cx| doc.focus_content(window, cx));
+        } else {
+            self.focus.focus(window, cx);
         }
     }
 
@@ -2363,6 +2387,14 @@ impl Workspace {
         let saved_position = self.session.documents.get(&path).copied();
         self.pause_document_images(true, cx);
         if navigation.is_none() {
+            if self.view == WorkspaceView::Docs
+                && self
+                    .doc
+                    .as_ref()
+                    .is_some_and(|doc| doc.read(cx).content_focused(window, cx))
+            {
+                self.focus.focus(window, cx);
+            }
             self.session.select_document(&path);
             self.session_revision += 1;
             self.doc = None;
@@ -2445,8 +2477,17 @@ impl Workspace {
                             }
                             reader
                         });
+                        let focus_reader = this.view == WorkspaceView::Docs
+                            && (this.focus.is_focused(window)
+                                || this
+                                    .doc
+                                    .as_ref()
+                                    .is_some_and(|doc| doc.read(cx).content_focused(window, cx)));
                         cx.observe(&reader, |_, _, cx| cx.notify()).detach();
                         this.doc = Some(reader);
+                        if focus_reader {
+                            this.focus_document_content(window, cx);
+                        }
                         if let Some(navigation) = navigation {
                             this.finish_document_navigation(navigation, window, cx);
                         }
@@ -3170,6 +3211,7 @@ impl Workspace {
             .copied()
             .unwrap_or(self.config.current().editor.soft_wrap);
         let line_numbers = self.config.current().editor.line_numbers;
+        let vim_mode = self.config.current().keyboard.vim_mode;
         let stale_project = self.repository.as_ref().is_some_and(|repo| {
             if path.is_absolute() {
                 return false;
@@ -3202,6 +3244,7 @@ impl Workspace {
         let restore_position = self.session.files.get(path).copied();
         let history = self.history_handler(path, cx);
         editor.update(cx, |editor, cx| {
+            editor.set_modal_editing(vim_mode, cx);
             if docs::is_markdown(path)
                 && let Some(handler) = markdown_editing::newline_edit_handler()
             {
@@ -3228,6 +3271,11 @@ impl Workspace {
             window,
             move |this, editor, event: &InputEvent, window, cx| match event {
                 InputEvent::Change => this.editor_changed(editor.clone(), window, cx),
+                InputEvent::Focus if this.config.current().keyboard.vim_mode => cx.notify(),
+                InputEvent::Blur if this.config.current().keyboard.vim_mode => {
+                    this.cancel_vim_keys(cx);
+                    cx.notify();
+                }
                 InputEvent::PressEnter {
                     secondary: false,
                     shift: false,
@@ -3282,6 +3330,7 @@ impl Workspace {
                 wrap,
                 git,
                 restore_position,
+                vim: Default::default(),
             },
         );
         if self.startup_lsp.enabled
@@ -4061,6 +4110,13 @@ impl Workspace {
         }
         let changed = self.tabs.active() != previous;
         if changed {
+            self.cancel_vim_keys(cx);
+            if let Some(file) = previous.and_then(|path| self.files.get_mut(path)) {
+                file.vim.reset(&file.editor, cx);
+                file.editor.update(cx, |editor, cx| {
+                    editor.set_modal_editing(self.config.current().keyboard.vim_mode, cx);
+                });
+            }
             self.reset_markdown_scroll_follow(cx);
             self.language_rename = Task::ready(());
             self.language_format = Task::ready(());
@@ -4150,9 +4206,24 @@ impl Workspace {
     }
 
     fn close_tabs(&mut self, paths: Vec<PathBuf>, window: &mut Window, cx: &mut Context<Self>) {
+        self.close_tabs_preferring(paths, None, window, cx);
+    }
+
+    fn close_tabs_preferring(
+        &mut self,
+        paths: Vec<PathBuf>,
+        preferred: Option<PathBuf>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.confirming_close || self.repository_ui.opening.is_some() {
             return;
         }
+        self.vim.close_preference = preferred.and_then(|preferred| {
+            self.tabs
+                .active()
+                .map(|active| (active.to_owned(), preferred))
+        });
         if self
             .loading_file
             .as_ref()
@@ -4207,6 +4278,16 @@ impl Workspace {
             self.capture_active_file_position(cx);
         }
         self.tabs.close(path);
+        if self
+            .vim
+            .close_preference
+            .as_ref()
+            .is_some_and(|(closing, _)| closing == path)
+            && let Some((_, preferred)) = self.vim.close_preference.take()
+            && self.tabs.index(&preferred).is_some()
+        {
+            self.tabs.open(preferred, true);
+        }
         self.files.remove(path);
         self.remove_image_tab(path, window);
         self.forget_editor_preview(path);
@@ -4290,6 +4371,7 @@ impl Workspace {
 
     fn cancel_tab_close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.confirming_close = false;
+        self.vim.close_preference = None;
         self.closing_standalone_window = false;
         self.close_queue.clear();
         if self.active_file().is_none() && self.active_image_tab().is_none() {
@@ -4753,11 +4835,14 @@ impl Workspace {
             .h_full()
             .flex_shrink_0()
             .track_focus(&self.tree_focus)
-            .key_context(if in_workspace {
-                "FileTree WorkspaceFileTree"
-            } else {
-                "FileTree"
-            })
+            .key_context(
+                match (in_workspace, self.config.current().keyboard.vim_mode) {
+                    (true, true) => "FileTree WorkspaceFileTree VimTree",
+                    (false, true) => "FileTree VimTree",
+                    (true, false) => "FileTree WorkspaceFileTree",
+                    (false, false) => "FileTree",
+                },
+            )
             .on_action(
                 cx.listener(|this, action: &file_tree::OpenTreeFile, window, cx| {
                     this.open_tree_file(action.preview, window, cx);
@@ -5176,6 +5261,14 @@ impl Workspace {
         )
     }
 
+    fn status_file(&self) -> Option<&OpenFile> {
+        if self.view == WorkspaceView::Editor && !self.terminal_maximized() {
+            self.active_file()
+        } else {
+            None
+        }
+    }
+
     fn status_bar(
         &self,
         file: &OpenFile,
@@ -5183,10 +5276,23 @@ impl Workspace {
         cx: &Context<Self>,
         colors: Palette,
     ) -> impl IntoElement {
-        let path = &file.path;
         let radii = window_corner_radii(window, cx);
-        let locked = self.file_editor_locked(file);
         let status_size = text_base_size(cx) - 0.5;
+        let controls = h_flex()
+            .debug_selector(|| "status-file-controls".into())
+            .gap_3();
+        let left = h_flex()
+            .h_full()
+            .flex_1()
+            .min_w_0()
+            .relative()
+            .overflow_hidden()
+            .gap_3()
+            .children(self.measure_vim_status(cx, status_size))
+            .child(self.vim_status(file, window, cx, colors, status_size));
+        let right = h_flex().flex_shrink_0().gap_3();
+        let path = &file.path;
+        let locked = self.file_editor_locked(file);
         let caret = file.editor.read(cx).cursor_position();
         let position = format!("Ln {}:{}", caret.line + 1, caret.character + 1);
         let line_ending = file.document.line_ending_label();
@@ -5196,131 +5302,116 @@ impl Workspace {
             .or_else(|| self.source_resources(path).display_name_for_path(path))
             .unwrap_or_else(|| language_for(path).into());
         let progress = self.language_service_progress(file, status_size, colors, cx);
-        // Text in this row goes through `baseline_aligned`,
-        // so new status content with a different size still shares the
-        // row's baseline without forcing one font size everywhere.
+
+        let left = left
+            .child(
+                baseline_aligned(
+                    cx,
+                    status_size,
+                    status_size,
+                    div().truncate().child(paths::display(path)),
+                )
+                .min_w_0()
+                .debug_selector(|| "status-file-path".into()),
+            )
+            .children(progress);
+        let right = right
+            .when(docs::is_markdown(path), |bar| {
+                bar.child(
+                    h_flex()
+                        .id("status-file-actions")
+                        .debug_selector(|| "status-file-actions".into())
+                        .flex_shrink_0()
+                        .gap_1()
+                        .mr_1()
+                        .child(self.document_translation_button(
+                            cx.entity(),
+                            TranslationView::Editor,
+                            path,
+                            colors,
+                        )),
+                )
+            })
+            .child(
+                baseline_aligned(
+                    cx,
+                    status_size,
+                    status_size,
+                    div()
+                        .min_w(px(status_size * 5.5))
+                        .text_right()
+                        .child(position.clone()),
+                )
+                .debug_selector(|| format!("status-file-position: {position}")),
+            )
+            .child(
+                baseline_aligned(cx, status_size, status_size, language)
+                    .debug_selector(|| "status-file-language".into()),
+            )
+            .child(
+                baseline_aligned(cx, status_size, status_size, "UTF-8")
+                    .debug_selector(|| "status-file-encoding".into()),
+            )
+            .when(self.loading_file.is_some(), |bar| {
+                bar.child(baseline_aligned(
+                    cx,
+                    status_size,
+                    status_size,
+                    t!("workspace.opening_file"),
+                ))
+            })
+            .when(locked, |bar| {
+                bar.child(baseline_aligned(
+                    cx,
+                    status_size,
+                    status_size,
+                    div()
+                        .text_color(colors.warning)
+                        .child(t!("workspace.read_only")),
+                ))
+            })
+            .child(
+                controls
+                    .child(
+                        h_flex()
+                            .gap(px(4.))
+                            .child(
+                                baseline_aligned(cx, status_size, status_size, line_ending)
+                                    .debug_selector(|| {
+                                        format!("status-file-line-ending: {line_ending}")
+                                    }),
+                            )
+                            .child(self.status_wrap_button(file, colors, cx)),
+                    )
+                    .when(
+                        self.standalone.is_none() || file.server_project.is_some(),
+                        |bar| {
+                            bar.child(
+                                baseline_aligned(
+                                    cx,
+                                    status_size,
+                                    status_size,
+                                    self.language_service_status(file, px(status_size), colors, cx),
+                                )
+                                .debug_selector(|| "status-language-service".into())
+                                .flex_shrink_0(),
+                            )
+                        },
+                    ),
+            );
         h_flex()
-            .h(px(26.))
+            .h(px(vim::STATUS_HEIGHT))
+            .debug_selector(|| "workspace-status".into())
             .flex_shrink_0()
             .bg(colors.soft)
             .rounded_bl(radii.bottom_left)
             .rounded_br(radii.bottom_right)
-            .px_3()
+            .pr_3()
             .gap_3()
             .text_size(px(status_size))
             .text_color(colors.muted)
-            .child(
-                h_flex()
-                    .flex_1()
-                    .min_w_0()
-                    .gap_3()
-                    .child(
-                        baseline_aligned(
-                            cx,
-                            status_size,
-                            status_size,
-                            div().truncate().child(paths::display(path)),
-                        )
-                        .min_w_0()
-                        .debug_selector(|| "status-file-path".into()),
-                    )
-                    .children(progress),
-            )
-            .child(
-                h_flex()
-                    .flex_shrink_0()
-                    .gap_3()
-                    .when(docs::is_markdown(path), |bar| {
-                        bar.child(
-                            h_flex()
-                                .id("status-file-actions")
-                                .debug_selector(|| "status-file-actions".into())
-                                .flex_shrink_0()
-                                .gap_1()
-                                .mr_1()
-                                .child(self.document_translation_button(
-                                    cx.entity(),
-                                    TranslationView::Editor,
-                                    path,
-                                    colors,
-                                )),
-                        )
-                    })
-                    .child(
-                        baseline_aligned(
-                            cx,
-                            status_size,
-                            status_size,
-                            div()
-                                .min_w(px(status_size * 5.5))
-                                .text_right()
-                                .child(position.clone()),
-                        )
-                        .debug_selector(|| format!("status-file-position: {position}")),
-                    )
-                    .child(
-                        baseline_aligned(cx, status_size, status_size, language)
-                            .debug_selector(|| "status-file-language".into()),
-                    )
-                    .child(
-                        baseline_aligned(cx, status_size, status_size, "UTF-8")
-                            .debug_selector(|| "status-file-encoding".into()),
-                    )
-                    .when(self.loading_file.is_some(), |bar| {
-                        bar.child(baseline_aligned(
-                            cx,
-                            status_size,
-                            status_size,
-                            t!("workspace.opening_file"),
-                        ))
-                    })
-                    .when(locked, |bar| {
-                        bar.child(baseline_aligned(
-                            cx,
-                            status_size,
-                            status_size,
-                            div()
-                                .text_color(colors.warning)
-                                .child(t!("workspace.read_only")),
-                        ))
-                    })
-                    .child(
-                        h_flex()
-                            .debug_selector(|| "status-file-controls".into())
-                            .gap_3()
-                            .child(
-                                h_flex()
-                                    .gap(px(4.))
-                                    .child(
-                                        baseline_aligned(cx, status_size, status_size, line_ending)
-                                            .debug_selector(|| {
-                                                format!("status-file-line-ending: {line_ending}")
-                                            }),
-                                    )
-                                    .child(self.status_wrap_button(file, colors, cx)),
-                            )
-                            .when(
-                                self.standalone.is_none() || file.server_project.is_some(),
-                                |bar| {
-                                    bar.child(
-                                        baseline_aligned(
-                                            cx,
-                                            status_size,
-                                            status_size,
-                                            self.language_service_status(
-                                                file,
-                                                px(status_size),
-                                                colors,
-                                                cx,
-                                            ),
-                                        )
-                                        .debug_selector(|| "status-language-service".into())
-                                        .flex_shrink_0(),
-                                    )
-                                },
-                            ),
-                    ),
-            )
+            .child(left)
+            .child(right)
     }
 
     fn status_wrap_button(
@@ -5446,64 +5537,50 @@ impl Workspace {
         } else {
             colors
         };
-        v_flex()
-            .flex_1()
-            .min_h_0()
-            .w_full()
-            .child(
-                h_flex()
-                    .id("workspace-panes")
-                    .relative()
-                    .flex_1()
-                    .min_h_0()
-                    .w_full()
-                    .overflow_hidden()
-                    .on_drag_move(cx.listener(
-                        move |this, event: &DragMoveEvent<PaneDrag>, _, cx| {
-                            if event.drag(cx).edge != HandleEdge::Trailing {
-                                return;
-                            }
-                            let pointer = event.event.position.x
-                                - event.bounds.left()
-                                - event.drag(cx).offset();
-                            if docs {
-                                this.docs_tree_width = pointer.clamp(px(160.), tree_limit);
-                            } else {
-                                this.editor_tree_width = pointer.clamp(px(160.), tree_limit);
-                            }
-                            cx.notify();
-                        },
-                    ))
-                    .when_some(tree_gradient.clone(), |row, gradient| {
-                        row.child(gradient.background(tree_width, corner))
-                    })
-                    .when(visible, |row| {
-                        row.child(self.sidebar(
-                            tree_width,
-                            window,
-                            cx,
-                            tree_colors,
-                            tree_gradient,
-                            corner,
-                        ))
-                    })
-                    .child(if docs {
-                        self.file_drop_area(
-                            self.docs_content(window, cx, colors, corner),
-                            cx,
-                            colors,
-                        )
-                        .into_any_element()
-                    } else {
-                        self.file_drop_area(self.content(window, cx, colors, corner), cx, colors)
-                            .into_any_element()
+        v_flex().flex_1().min_h_0().w_full().child(
+            h_flex()
+                .id("workspace-panes")
+                .relative()
+                .flex_1()
+                .min_h_0()
+                .w_full()
+                .overflow_hidden()
+                .on_drag_move(
+                    cx.listener(move |this, event: &DragMoveEvent<PaneDrag>, _, cx| {
+                        if event.drag(cx).edge != HandleEdge::Trailing {
+                            return;
+                        }
+                        let pointer =
+                            event.event.position.x - event.bounds.left() - event.drag(cx).offset();
+                        if docs {
+                            this.docs_tree_width = pointer.clamp(px(160.), tree_limit);
+                        } else {
+                            this.editor_tree_width = pointer.clamp(px(160.), tree_limit);
+                        }
+                        cx.notify();
                     }),
-            )
-            .when(!docs && !self.terminal_maximized(), |body| {
-                body.when_some(self.active_file(), |body, file| {
-                    body.child(self.status_bar(file, window, cx, colors))
+                )
+                .when_some(tree_gradient.clone(), |row, gradient| {
+                    row.child(gradient.background(tree_width, corner))
                 })
-            })
+                .when(visible, |row| {
+                    row.child(self.sidebar(
+                        tree_width,
+                        window,
+                        cx,
+                        tree_colors,
+                        tree_gradient,
+                        corner,
+                    ))
+                })
+                .child(if docs {
+                    self.file_drop_area(self.docs_content(window, cx, colors, corner), cx, colors)
+                        .into_any_element()
+                } else {
+                    self.file_drop_area(self.content(window, cx, colors, corner), cx, colors)
+                        .into_any_element()
+                }),
+        )
     }
 
     /// The menu at the right edge of the tab bar.
@@ -5705,6 +5782,7 @@ impl Render for Workspace {
             .map(|repo| ProjectGradient::for_repository(repo, cx.theme().mode, colors));
         let picker_opacity = self.repository_ui.picker_opacity(window, cx);
         let locator_overlay = self.locator_overlay(window, cx);
+        let vim_overlay = self.vim_overlay(window, cx);
         let switching = self.repository_overlay_open();
         let mut key_context = KeyContext::default();
         if !switching {
@@ -5744,6 +5822,13 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::switch_view_shortcut))
             .on_action(cx.listener(Self::source_back))
             .on_action(cx.listener(Self::source_forward))
+            .capture_key_down(cx.listener(Self::vim_key_down))
+            .capture_action(
+                cx.listener(|this, _: &gpui_component::input::Escape, window, cx| {
+                    this.vim_escape(window, cx);
+                }),
+            )
+            .capture_any_mouse_down(cx.listener(|this, _, _, cx| this.cancel_vim_keys(cx)))
             .capture_any_mouse_down(cx.listener(Self::source_mouse_down))
             .capture_any_mouse_up(cx.listener(Self::finish_editor_preview_resize))
             .on_mouse_up_out(
@@ -5824,7 +5909,11 @@ impl Render for Workspace {
                 self.workspace_body(window, cx, colors, gradient)
                     .into_any_element()
             })
+            .when_some(self.status_file(), |view, file| {
+                view.child(self.status_bar(file, window, cx, colors))
+            })
             .when_some(locator_overlay, |view, overlay| view.child(overlay))
+            .when_some(vim_overlay, |view, overlay| view.child(overlay))
             .when(
                 self.repository.is_some()
                     && (self.repository_ui.picker_open || picker_opacity > 0.),

@@ -24,6 +24,7 @@ use std::{
     rc::Rc,
     time::Duration,
 };
+use sum_tree::Bias;
 
 use crate::{
     Scrollbar, ScrollbarMode,
@@ -978,15 +979,16 @@ fn prioritize_gutter_marks(marks: Vec<GutterMark>) -> Vec<GutterMark> {
     if marks.iter().all(|mark| !mark.fallback) {
         return marks;
     }
-    let (fallback, foreground): (Vec<_>, Vec<_>) = marks
-        .into_iter()
-        .partition(|mark| mark.fallback);
+    let (fallback, foreground): (Vec<_>, Vec<_>) =
+        marks.into_iter().partition(|mark| mark.fallback);
     let mut occupied = foreground
         .iter()
         .map(|mark| {
             let bounds = mark.quad.bounds;
             let padding = if mark.action.is_some() {
-                (GUTTER_MIN_HIT_HEIGHT - bounds.size.height).max(px(0.)).half()
+                (GUTTER_MIN_HIT_HEIGHT - bounds.size.height)
+                    .max(px(0.))
+                    .half()
             } else {
                 px(0.)
             };
@@ -1524,14 +1526,22 @@ impl<M: InputModeKind> TextElement<M> {
 
         for selection in state.selections.iter() {
             let is_active = selection.id == active_selection.id;
+            if !is_active && state.modal_block.is_some() {
+                continue;
+            }
             let mut selected_range = if is_active {
                 active_selection
             } else {
                 *selection
             };
-            let mut cursor = selected_range.cursor_offset();
+            let mut cursor = if is_active {
+                state.cursor()
+            } else {
+                selected_range.cursor_offset()
+            };
             let selection_changed = state.last_selected_range != Some(selected_range);
-            let is_selected_all = selected_range.len() == state.text.len();
+            let is_selected_all =
+                state.modal_head.is_none() && selected_range.len() == state.text.len();
 
             // Buffer rows from the raw (pre-mask) offsets, used to locate the cursor line.
             let cursor_row = state.text.offset_to_point(cursor).row;
@@ -1544,6 +1554,14 @@ impl<M: InputModeKind> TextElement<M> {
                 continue;
             }
 
+            let block_end = state.modal_editing.then(|| {
+                let end = state.grapheme_boundary(cursor.saturating_add(1), Bias::Right);
+                if state.masked {
+                    masked_display_offset(&state.text, end)
+                } else {
+                    end
+                }
+            });
             let sel_start_row = state.text.offset_to_point(selected_range.start).row;
             let sel_end_row = state.text.offset_to_point(selected_range.end).row;
             if state.masked {
@@ -1596,7 +1614,7 @@ impl<M: InputModeKind> TextElement<M> {
                     }
 
                     // For selection to move scroll
-                    if !edited && selected_range.reversed {
+                    if state.modal_head.is_none() && !edited && selected_range.reversed {
                         if selection_changed && scroll_offset.x + cursor_start.x < px(0.) {
                             // selection start is out of left
                             scroll_offset.x = -cursor_start.x;
@@ -1608,7 +1626,7 @@ impl<M: InputModeKind> TextElement<M> {
                             // selection start is out of top
                             scroll_offset.y = -cursor_start.y;
                         }
-                    } else if !edited {
+                    } else if state.modal_head.is_none() && !edited {
                         // TODO: Consider to remove this part,
                         // maybe is not necessary (But selection_reversed is needed).
                         if selection_changed && scroll_offset.x + cursor_end.x <= px(0.) {
@@ -1628,16 +1646,45 @@ impl<M: InputModeKind> TextElement<M> {
 
             // Apply the final horizontal offset to every caret after cursor-follow and
             // deferred scrolling have been resolved, regardless of selection order.
-            let cursor_x = bounds.left() + cursor_pos.x + line_number_width;
+            let extra_columns = state
+                .modal_block
+                .as_ref()
+                .map_or(0, |block| block.caret_columns);
+            let cursor_x = bounds.left()
+                + cursor_pos.x
+                + line_number_width
+                + extra_columns * last_layout.space_width;
+            let mut block_glyphs = None;
+            let cursor_width = if state.modal_editing && extra_columns > 0 {
+                last_layout.space_width
+            } else if let Some(next) = block_end {
+                visible_buffer_lines
+                    .iter()
+                    .position(|&row| row == cursor_row)
+                    .and_then(|index| {
+                        let line = &lines[index];
+                        let start = last_layout.visible_line_byte_offsets[index];
+                        let local = cursor.checked_sub(start)?;
+                        let end = next.checked_sub(start)?;
+                        let (wrapped_row, glyphs, width) =
+                            line.block_caret(local, end, affinity)?;
+                        block_glyphs = Some((index, wrapped_row, glyphs));
+                        Some(width)
+                    })
+                    .unwrap_or(last_layout.space_width)
+            } else {
+                CURSOR_WIDTH
+            };
             cursor_infos.push(CursorRenderInfo {
                 bounds: Bounds::new(
                     point(
                         cursor_x,
                         bounds.top() + cursor_pos.y + ((line_height - cursor_height) / 2.),
                     ),
-                    size(CURSOR_WIDTH, cursor_height),
+                    size(cursor_width, cursor_height),
                 ),
                 is_active,
+                block_glyphs,
             });
         }
 
@@ -1895,6 +1942,57 @@ impl<M: InputModeKind> TextElement<M> {
         let state = self.state.read(cx);
         if !state.has_selection_focus(window, cx) {
             return vec![];
+        }
+
+        if let Some(block) = &state.modal_block {
+            let mut paths = Vec::new();
+            let origin = bounds.origin + point(last_layout.line_number_width, px(0.));
+            for (index, &row) in last_layout.visible_buffer_lines.iter().enumerate() {
+                let Some((range, (leading, trailing))) = row
+                    .checked_sub(block.first_row)
+                    .and_then(|row| block.rows.get(row))
+                else {
+                    continue;
+                };
+                let line = &last_layout.lines[index];
+                let y = last_layout.line_top(index);
+                let span = last_layout.line_height;
+                let space = last_layout.space_width;
+                let mut corners = if range.is_empty() {
+                    let x = line
+                        .position_for_index(line.len(), last_layout, false)
+                        .unwrap_or_default();
+                    vec![Corners {
+                        top_left: point(x.x, y + x.y),
+                        top_right: point(x.x, y + x.y),
+                        bottom_left: point(x.x, y + x.y + span),
+                        bottom_right: point(x.x, y + x.y + span),
+                    }]
+                } else if let Some(corners) = Self::layout_range_corners(range, last_layout) {
+                    corners
+                } else {
+                    continue;
+                };
+                let first = corners.first_mut().unwrap();
+                first.top_left.x += space * *leading;
+                first.bottom_left.x += space * *leading;
+                let last = corners.last_mut().unwrap();
+                last.top_right.x += space * *trailing;
+                last.bottom_right.x += space * *trailing;
+                for row in corners {
+                    if row.top_right.x <= row.top_left.x {
+                        continue;
+                    }
+                    let mut builder = gpui::PathBuilder::fill();
+                    builder.move_to(origin + row.top_left);
+                    builder.line_to(origin + row.top_right);
+                    builder.line_to(origin + row.bottom_right);
+                    builder.line_to(origin + row.bottom_left);
+                    builder.close();
+                    paths.extend(builder.build());
+                }
+            }
+            return paths;
         }
 
         let active_id = state.active_selection().id;
@@ -2320,8 +2418,7 @@ impl<M: InputModeKind> TextElement<M> {
             hunk.toolbar_hover = Some(hover);
         }
         if let Some(hover) = hunk.toolbar_hover
-            && let Some(mut toolbar) =
-                render(hover.contains(&window.mouse_position()), window, cx)
+            && let Some(mut toolbar) = render(hover.contains(&window.mouse_position()), window, cx)
         {
             toolbar.layout_as_root(
                 size(
@@ -4065,6 +4162,7 @@ impl<M: InputModeKind> TextElement<M> {
 struct CursorRenderInfo {
     bounds: Bounds<Pixels>,
     is_active: bool,
+    block_glyphs: Option<(usize, usize, Range<usize>)>,
 }
 
 pub(super) struct PrepaintState {
@@ -4119,7 +4217,7 @@ impl PrepaintState {
                 bounds.origin.y += self.cursor_scroll_offset.y;
                 CursorRenderInfo {
                     bounds,
-                    is_active: info.is_active,
+                    ..info.clone()
                 }
             })
             .collect()
@@ -5193,12 +5291,13 @@ impl<M: InputModeKind> Element for TextElement<M> {
         window: &mut Window,
         cx: &mut App,
     ) {
-        let (focus_handle, show_cursor, disabled, editor_style, editor_paddings) = {
+        let (focus_handle, show_cursor, disabled, modal_editing, editor_style, editor_paddings) = {
             let state = self.state.read(cx);
             (
                 state.focus_handle.clone(),
                 state.show_cursor(window, cx),
                 state.disabled,
+                state.modal_editing,
                 state.editor_style.clone(),
                 state.editor_paddings,
             )
@@ -5207,13 +5306,15 @@ impl<M: InputModeKind> Element for TextElement<M> {
         let bounds = prepaint.bounds;
         let text_align = prepaint.last_layout.text_align;
 
-        window.handle_input(
-            &focus_handle,
-            ElementInputHandler::new(bounds, self.state.clone()),
-            cx,
-        );
+        if !modal_editing {
+            window.handle_input(
+                &focus_handle,
+                ElementInputHandler::new(bounds, self.state.clone()),
+                cx,
+            );
+        }
         // The platform's IME panel opens at the caret; tell it when that moves.
-        if focused {
+        if focused && !modal_editing {
             let anchor = (bounds.origin, prepaint.last_layout.cursor_bounds);
             let moved = self.state.update(cx, |state, _| {
                 state.ime_anchor.replace(anchor) != Some(anchor)
@@ -5478,10 +5579,33 @@ impl<M: InputModeKind> Element for TextElement<M> {
         // Paint blinking cursors (shared blink state for all carets)
         if focused && show_cursor {
             for cursor_info in prepaint.cursor_infos_with_scroll() {
-                window.paint_quad(fill(
-                    snap_caret_to_device_pixels(cursor_info.bounds, window.scale_factor()),
-                    editor_style.caret,
-                ));
+                let rect = snap_caret_to_device_pixels(cursor_info.bounds, window.scale_factor());
+                if modal_editing {
+                    let (block, glyph) = if editor_style.background.l > 0.5 {
+                        (gpui::rgb(0x585a61), gpui::Hsla::white())
+                    } else {
+                        (gpui::rgb(0xd4d6da), gpui::Hsla::black())
+                    };
+                    window.paint_quad(fill(rect, block));
+                    if let Some((line, row, range)) = cursor_info.block_glyphs {
+                        let line = &prepaint.last_layout.lines[line].wrapped_lines[row];
+                        window.with_content_mask(Some(ContentMask { bounds: rect }), |window| {
+                            line.paint_block_glyphs(
+                                cursor_info.bounds.origin
+                                    - point(
+                                        px(0.),
+                                        (line_height - cursor_info.bounds.size.height) / 2.,
+                                    ),
+                                line_height,
+                                range,
+                                glyph,
+                                window,
+                            );
+                        });
+                    }
+                } else {
+                    window.paint_quad(fill(rect, editor_style.caret));
+                }
             }
         }
 

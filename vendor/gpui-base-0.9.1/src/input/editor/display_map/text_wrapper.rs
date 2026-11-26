@@ -1386,6 +1386,37 @@ impl LineLayout {
         self.source_offset(self.len)
     }
 
+    /// Resolve both ends of a block glyph on the same shaped row, including at wraps.
+    pub(crate) fn block_caret(
+        &self,
+        start: usize,
+        end: usize,
+        affinity: bool,
+    ) -> Option<(usize, Range<usize>, Pixels)> {
+        if end <= start || end > self.len() {
+            return None;
+        }
+        let start = self.display_offset(start, true);
+        let end = self.display_offset(end, false);
+        let mut offset = 0;
+        for (index, line) in self.wrapped_lines.iter().enumerate() {
+            let limit = offset + line.len;
+            if start == limit && affinity {
+                return None;
+            }
+            if start < limit {
+                if end > limit || end <= start {
+                    return None;
+                }
+                let range = start - offset..end - offset;
+                let width = line.x_for_index(range.end) - line.x_for_index(range.start);
+                return (width > px(0.)).then_some((index, range, width));
+            }
+            offset = limit;
+        }
+        None
+    }
+
     /// Get the position (x, y) for the given index in this line layout.
     ///
     /// - The `offset` is a local byte index in this line layout.
@@ -1507,6 +1538,27 @@ impl LineLayout {
             source,
             line_end_affinity && display == self.display_offset(source, true),
         ))
+    }
+
+    /// Hit-test a modal caret against glyph cells. The returned source index
+    /// is an end boundary when the pointer hits a visual row's trailing space
+    /// or trailing hint, and the caller should then use the previous grapheme.
+    pub(crate) fn block_index_for_position(
+        &self,
+        pos: Point<Pixels>,
+        last_layout: &LastLayout,
+    ) -> Option<(usize, bool)> {
+        let (row, start, x) = self.wrapped_line_at(pos, last_layout)?;
+        let line = &self.wrapped_lines[row];
+        let end = start + line.len;
+        let display = start + line.index_for_x(x.max(px(0.))).unwrap_or(line.len);
+        let source = self.source_offset(display);
+        let at_end = source > 0
+            && (source == self.len()
+                || source == self.source_offset(end)
+                    && source > self.source_offset(start)
+                    && self.display_offset(source, true) >= end);
+        Some((source, at_end))
     }
 
     /// How many columns the given position sits past the end of the line under it.

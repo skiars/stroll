@@ -426,6 +426,12 @@ pub(super) fn search_has_focus(
         .is_some_and(|(_, host)| host.search.read(cx).has_focus(window, cx))
 }
 
+pub(super) fn search_is_composing(state: &Entity<crate::input::EditorState>, cx: &App) -> bool {
+    cx.try_global::<InputOverlayRegistry<crate::input::EditorMode>>()
+        .and_then(|registry| registry.hosts.get(&state.entity_id()))
+        .is_some_and(|(_, host)| host.search.read(cx).is_composing(cx))
+}
+
 pub(super) fn render_overlays<M: OverlayMode>(
     state: &Entity<InputBaseState<M>>,
     window: &mut Window,

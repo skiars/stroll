@@ -421,6 +421,32 @@ impl Workspace {
         }
     }
 
+    pub(super) fn toggle_vim_mode(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let base = self.config.current().clone();
+        let mut draft = base.clone();
+        let enabled = !base.keyboard.vim_mode;
+        draft.keyboard.vim_mode = enabled;
+        match self.commit_settings(draft, window, cx) {
+            Ok(()) => {
+                if let Some(settings) = &self.settings {
+                    _ = settings.page.update(cx, |page, cx| {
+                        if page.base == base {
+                            page.base.keyboard.vim_mode = enabled;
+                            page.draft.update(cx, |draft, cx| {
+                                draft.keyboard.vim_mode = enabled;
+                                cx.notify();
+                            });
+                        }
+                    });
+                }
+                if self.view == WorkspaceView::Editor {
+                    self.focus_workspace_content(None, window, cx);
+                }
+            }
+            Err(error) => self.show_error(error, window, cx),
+        }
+    }
+
     pub(super) fn commit_settings(
         &mut self,
         draft: Config,
@@ -508,8 +534,11 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let config = self.config.current();
         let previous = previous_file.current();
+        if previous.keyboard != self.config.current().keyboard {
+            self.reset_vim(cx);
+        }
+        let config = self.config.current();
         if previous.files != config.files {
             let associations = &self.config.file_associations;
             for (path, file) in &self.files {
@@ -1149,6 +1178,10 @@ impl SettingsPage {
             t!("settings.filter_fonts")
         };
         let editor = SettingGroup::new().items([
+            setting_item(
+                t!("settings.vim_mode"),
+                self.switch(default.keyboard.vim_mode, |c| &mut c.keyboard.vim_mode),
+            ),
             setting_item(
                 t!("settings.code_font_family"),
                 self.font_picker(

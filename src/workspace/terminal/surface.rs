@@ -1721,6 +1721,25 @@ mod tests {
             reader.update(cx, |reader, cx| reader.focus_content(window, cx));
             window.focused(cx).unwrap()
         });
+        visual.update(|window, cx| {
+            workspace.update(cx, |view, cx| {
+                let mut config = view.config.current().clone();
+                config.keyboard.vim_mode = true;
+                view.commit_settings(config, window, cx).unwrap();
+            });
+        });
+        visual.simulate_keystrokes("ctrl-j");
+        visual.update(|window, cx| assert!(workspace.read(cx).terminal_focused(window, cx)));
+        visual.simulate_keystrokes("ctrl-k");
+        visual.update(|window, cx| {
+            assert!(workspace.read(cx).terminal_open());
+            assert!(reader_focus.is_focused(window));
+        });
+        assert!(
+            !commands
+                .try_iter()
+                .any(|command| matches!(command, Command::Input(_)))
+        );
         visual.simulate_keystrokes("ctrl-` ctrl-`");
         visual.update(|window, cx| {
             assert!(!workspace.read(cx).terminal_open());

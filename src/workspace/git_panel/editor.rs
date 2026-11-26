@@ -1086,27 +1086,8 @@ impl ReviewEditor {
                     });
                 });
             });
-            let model = model.clone();
-            editor.set_edit_guard(move |ranges, cx| {
-                weak.read_with(cx, |workspace, _| {
-                    ranges.iter().all(|range| {
-                        let projection = model.borrow();
-                        let Some((path, source)) = projection.source_range(range) else {
-                            return false;
-                        };
-                        workspace.files.get(&path).is_some_and(|file| {
-                            !file.document.conflict
-                                && !file.document.mixed_newlines
-                                && !workspace.git_edit.contains(&path)
-                                && source.end <= file.committed.len()
-                                && file.committed.is_char_boundary(source.start)
-                                && file.committed.is_char_boundary(source.end)
-                                && projection.source_rows_match(range, &file.committed)
-                        })
-                    })
-                })
-                .unwrap_or(false)
-            });
+            let guard = self.vim_edit_guard(weak);
+            editor.set_edit_guard(move |ranges, cx| guard(ranges, cx));
         });
         cx.subscribe_in(
             &self.modified.editor,
@@ -1136,6 +1117,7 @@ impl ReviewEditor {
                 _ = workspace.update(cx, |workspace, cx| {
                     for (path, edits) in edits {
                         if let Some(file) = workspace.files.get(&path) {
+                            panel.group_diff_insert_history(&file.editor, cx);
                             file.editor.update(cx, |source, cx| {
                                 source.apply_editor_edits(&edits, false, window, cx)
                             });
@@ -1145,6 +1127,34 @@ impl ReviewEditor {
                 App::notify(cx, panel.review_pane.entity_id());
             },
         )
+    }
+
+    pub(super) fn vim_edit_guard(
+        &self,
+        workspace: WeakEntity<Workspace>,
+    ) -> crate::workspace::vim::source::EditGuard {
+        let model = self.modified.projection.clone();
+        Rc::new(move |ranges, cx| {
+            workspace
+                .read_with(cx, |workspace, _| {
+                    ranges.iter().all(|range| {
+                        let projection = model.borrow();
+                        let Some((path, source)) = projection.source_range(range) else {
+                            return false;
+                        };
+                        workspace.files.get(&path).is_some_and(|file| {
+                            !file.document.conflict
+                                && !file.document.mixed_newlines
+                                && !workspace.git_edit.contains(&path)
+                                && source.end <= file.committed.len()
+                                && file.committed.is_char_boundary(source.start)
+                                && file.committed.is_char_boundary(source.end)
+                                && projection.source_rows_match(range, &file.committed)
+                        })
+                    })
+                })
+                .unwrap_or(false)
+        })
     }
 
     pub(super) fn clear_hover(&self, cx: &mut App) {
@@ -1242,14 +1252,30 @@ impl ReviewEditor {
         })
     }
 
-    #[cfg(test)]
     pub(super) fn original_state(&self) -> &Entity<EditorState> {
         &self.original.editor
     }
 
-    #[cfg(test)]
     pub(super) fn modified_state(&self) -> &Entity<EditorState> {
         &self.modified.editor
+    }
+
+    pub(super) fn hunk_caret_offset(
+        &self,
+        editor: &Entity<EditorState>,
+        row: usize,
+    ) -> Option<usize> {
+        let column = if editor == &self.original.editor {
+            &self.original
+        } else {
+            &self.modified
+        };
+        let projection = column.projection.borrow();
+        let row = match &projection.row_mapping {
+            Some(mapping) => mapping.projected(row)?,
+            None => row,
+        };
+        (row < projection.lines.len()).then(|| projection.text.line_start_offset(row))
     }
 
     pub(super) fn close_other_search(&self, active: &Entity<EditorState>, cx: &mut App) {

@@ -50,6 +50,12 @@ type ViewportObserver = Rc<dyn Fn(&[usize], u64, &App)>;
 
 pub(super) const EDITOR_ELEMENT_ID: &str = "input-state";
 
+pub(super) struct ModalBlock {
+    pub first_row: usize,
+    pub rows: Vec<(Range<usize>, (f32, f32))>,
+    pub caret_columns: usize,
+}
+
 /// Vertical clearance to retain when revealing a text position.
 pub(crate) enum ScrollPadding {
     Minimal,
@@ -578,6 +584,9 @@ pub struct InputBaseState<M: InputModeKind> {
     /// containers to reveal it in, while focused. `None` while unfocused.
     pub(super) revealed_viewport: Option<Bounds<Pixels>>,
     pub(super) last_selected_range: Option<CursorSelection>,
+    pub(super) modal_editing: bool,
+    pub(super) modal_head: Option<usize>,
+    pub(super) modal_block: Option<ModalBlock>,
     /// The current edit batch, copied into an event when a change is emitted.
     pub(super) last_input_edits: Vec<(InputEdit, Rope)>,
     pub(super) selecting: bool,
@@ -1140,6 +1149,9 @@ impl<M: InputModeKind> InputBaseState<M> {
             last_bounds: None,
             revealed_viewport: None,
             last_selected_range: None,
+            modal_editing: false,
+            modal_head: None,
+            modal_block: None,
             edit_guard: None,
             newline_edit_handler: None,
             source_editor: None,
@@ -1263,6 +1275,26 @@ impl<M: InputModeKind> InputBaseState<M> {
     pub fn set_editor_style(&mut self, style: InputEditorStyle) {
         self.editor_style = style.clone();
         self.projected_editor_style = style;
+    }
+
+    /// Show a block caret and suspend native character input in a command mode.
+    pub fn set_modal_editing(&mut self, modal: bool, cx: &mut Context<Self>) {
+        if self.modal_editing != modal {
+            self.modal_editing = modal;
+            self.modal_head = None;
+            self.modal_block = None;
+            cx.notify();
+        }
+    }
+
+    /// Collect a series of edits into a single entry in the regular undo history.
+    pub fn begin_edit_transaction(&mut self) {
+        self.undo_manager.begin_transaction();
+    }
+
+    /// Finish the matching edit transaction.
+    pub fn end_edit_transaction(&mut self) {
+        self.undo_manager.commit_transaction();
     }
 
     /// Draws a placeholder right after the text of each folded line, given its
@@ -1878,6 +1910,7 @@ impl<M: InputModeKind> InputBaseState<M> {
         let offset = self.text.position_to_offset(&position);
 
         self.move_to(offset, None, cx);
+        self.scroll_for_keyboard_navigation(None, cx);
         self.update_preferred_column();
         self.focus(window, cx);
     }
@@ -2338,6 +2371,8 @@ impl<M: InputModeKind> InputBaseState<M> {
         self.undo_manager.begin_transaction_with(intent);
         self.undo_manager
             .record_selections(cursors.clone(), cursors.clone());
+        self.modal_head = None;
+        self.modal_block = None;
         self.selections.replace_all(new_selections);
         self.undo_manager.set_pending_intent(intent);
 
@@ -2996,6 +3031,8 @@ impl<M: InputModeKind> InputBaseState<M> {
             new_selections.push(CursorSelection::new(id, sel_start, sel_end));
         }
 
+        self.modal_head = None;
+        self.modal_block = None;
         self.selections.replace_all(new_selections);
         cx.notify();
     }
@@ -3069,8 +3106,12 @@ impl<M: InputModeKind> InputBaseState<M> {
         }
 
         self.selecting = true;
+        let block_caret = self.modal_editing
+            && event.button == MouseButton::Left
+            && event.click_count == 1
+            && !event.modifiers.modified();
         let (offset, line_end_affinity, columns_past_line_end) =
-            self.resolve_mouse_position(event.position);
+            self.resolve_mouse_position_for_caret(event.position, block_caret);
 
         if M::on_click(self, event, offset, window, cx) {
             return;
@@ -3897,6 +3938,18 @@ impl<M: InputModeKind> InputBaseState<M> {
             self.replay_tokens(&range, text.len(), change.token_delta.as_deref(), undo);
         }
         self.restore_selections(replay.selections);
+        if self.modal_editing {
+            let at = self
+                .selections
+                .iter()
+                .map(|selection| selection.start)
+                .min()
+                .unwrap_or(0);
+            self.selections.remove_all_but_active();
+            self.set_cursor_to(at);
+            self.cursor_line_end_affinity = false;
+            self.scroll_for_keyboard_navigation(None, cx);
+        }
         self.mode
             .restore_auto_closed_pairs(replay.auto_closed_pairs.unwrap_or_default());
         if token_aware {
@@ -3934,6 +3987,8 @@ impl<M: InputModeKind> InputBaseState<M> {
                 sel
             })
             .collect();
+        self.modal_head = None;
+        self.modal_block = None;
         self.selections.replace_all(restored);
         self.selections.merge_overlapping();
     }
@@ -3946,7 +4001,8 @@ impl<M: InputModeKind> InputBaseState<M> {
             return ime_marked_range.end;
         }
 
-        self.selections.active().cursor_offset()
+        self.modal_head
+            .unwrap_or_else(|| self.selections.active().cursor_offset())
     }
 
     /// Returns the active selection.
@@ -3956,6 +4012,8 @@ impl<M: InputModeKind> InputBaseState<M> {
 
     /// Returns a mutable reference to the active selection.
     pub(super) fn active_selection_mut(&mut self) -> &mut CursorSelection {
+        self.modal_head = None;
+        self.modal_block = None;
         self.selections.active_mut()
     }
 
@@ -4437,6 +4495,17 @@ impl<M: InputModeKind> InputBaseState<M> {
         cx.notify();
     }
 
+    /// Animate the caret row to a viewport inset, continuing any active arrival.
+    pub fn animate_caret_to_inset(&mut self, inset: Pixels, cx: &mut Context<Self>) {
+        self.pending_projected_scroll = Some(ProjectedScroll::Caret {
+            context_lines: 0,
+            leading_block: None,
+            inset: Some(inset),
+        });
+        self.animate_pending_scroll();
+        cx.notify();
+    }
+
     /// Animate the queued scroll when the editor already has a viewport.
     pub fn animate_pending_scroll(&mut self) {
         self.pending_scroll_navigation = self.is_code_editor()
@@ -4495,13 +4564,18 @@ impl<M: InputModeKind> InputBaseState<M> {
         endpoints: &[(usize, usize)],
         cx: &mut Context<Self>,
     ) {
-        let mut current = self.selections.iter().copied().collect::<Vec<_>>().into_iter();
+        let mut current = self
+            .selections
+            .iter()
+            .copied()
+            .collect::<Vec<_>>()
+            .into_iter();
         let selections = endpoints
             .iter()
             .map(|&(anchor, head)| {
-                let mut selection = current.next().unwrap_or_else(|| {
-                    CursorSelection::new(self.selections.generate_id(), 0, 0)
-                });
+                let mut selection = current
+                    .next()
+                    .unwrap_or_else(|| CursorSelection::new(self.selections.generate_id(), 0, 0));
                 selection.start = self.cursor_boundary(anchor.min(head), Bias::Left);
                 selection.end = self.cursor_boundary(anchor.max(head), Bias::Left);
                 selection.reversed = head < anchor && selection.start != selection.end;
@@ -4520,6 +4594,71 @@ impl<M: InputModeKind> InputBaseState<M> {
         self.selections.remove_all_but_active();
         self.set_selection(0, self.text.len());
         cx.notify();
+    }
+
+    /// Install oriented modal ranges and reveal their inclusive caret position.
+    /// Ranges still use the editor's half-open byte coordinates.
+    pub fn set_modal_selection(
+        &mut self,
+        endpoints: &[(usize, usize)],
+        head: usize,
+        cx: &mut Context<Self>,
+    ) {
+        self.undo_manager.break_transaction_coalescing();
+        self.cursor_line_end_affinity = false;
+        self.find_generated_selection = None;
+        self.selected_word_range = None;
+        self.restore_projected_selections(endpoints, cx);
+        self.modal_head = Some(self.grapheme_boundary(head, Bias::Left));
+        self.pause_blink_cursor(cx);
+        self.queue_scroll_to(
+            self.cursor(),
+            None,
+            ScrollPadding::SurroundingLines,
+            true,
+            cx,
+        );
+        self.animate_pending_scroll();
+    }
+
+    /// Extend modal selection drawing for tabs split at visual columns and short rows.
+    /// Each pair specifies the leading and trailing adjustments in space advances.
+    pub fn set_modal_block(
+        &mut self,
+        first_row: usize,
+        rows: Vec<(Range<usize>, (f32, f32))>,
+        caret_columns: usize,
+        cx: &mut Context<Self>,
+    ) {
+        self.modal_block = Some(ModalBlock {
+            first_row,
+            rows,
+            caret_columns,
+        });
+        cx.notify();
+    }
+
+    /// Vertical position of the caret relative to the viewport, for page navigation.
+    pub fn cursor_viewport_inset(&self) -> Option<Pixels> {
+        let height = self.line_height()?;
+        let row = self
+            .display_map
+            .offset_to_display_row(self.cursor(), self.cursor_line_end_affinity);
+        let max = (self.input_bounds.size.height - height).max(px(0.));
+        Some(
+            (self.display_map.display_row_top(row, height) + self.scroll_offset().y)
+                .clamp(px(0.), max),
+        )
+    }
+
+    /// Whether the current ranges and caret were installed by the modal editor.
+    pub fn has_modal_selection(&self) -> bool {
+        self.modal_head.is_some()
+    }
+
+    /// Configured number of columns per tab stop.
+    pub fn tab_width(&self) -> usize {
+        self.mode.tab_size().tab_size.max(1)
     }
 
     /// Set the selected range using UTF-8 byte offsets, removing additional cursors.
@@ -4635,6 +4774,14 @@ impl<M: InputModeKind> InputBaseState<M> {
     /// the end of a row means the end of that row, and
     /// [`Self::index_for_mouse_position`] is the call to make.
     pub(super) fn resolve_mouse_position(&self, position: Point<Pixels>) -> (usize, bool, usize) {
+        self.resolve_mouse_position_for_caret(position, false)
+    }
+
+    fn resolve_mouse_position_for_caret(
+        &self,
+        position: Point<Pixels>,
+        block_caret: bool,
+    ) -> (usize, bool, usize) {
         // If the text is empty, always return 0
         if self.text.len() == 0 {
             return (0, false, 0);
@@ -4690,6 +4837,22 @@ impl<M: InputModeKind> InputBaseState<M> {
                 );
             }
 
+            if block_caret
+                && let Some((index, at_end)) =
+                    line_layout.block_index_for_position(pos, last_layout)
+            {
+                let offset = self.resolve_index(line_start_offset + index);
+                return (
+                    if at_end {
+                        self.previous_boundary(offset)
+                    } else {
+                        offset
+                    },
+                    false,
+                    0,
+                );
+            }
+
             // Check if mouse is in this line's bounds
             if let Some((local_index, line_end_affinity)) =
                 line_layout.closest_index_for_position(pos, last_layout)
@@ -4717,8 +4880,12 @@ impl<M: InputModeKind> InputBaseState<M> {
             .map(|((line_layout, pos), line_start)| {
                 let last_row_top = (line_layout.size(line_height).height - line_height).max(px(0.));
                 let pos = point(pos.x, last_row_top);
+                let mut offset = self.resolve_index(line_start + line_layout.len());
+                if block_caret && line_layout.len() > 0 {
+                    offset = self.previous_boundary(offset);
+                }
                 (
-                    self.resolve_index(line_start + line_layout.len()),
+                    offset,
                     false,
                     line_layout.columns_past_line_end(pos, last_layout),
                 )
@@ -4855,6 +5022,8 @@ impl<M: InputModeKind> InputBaseState<M> {
             })
             .collect();
         self.cursor_line_end_affinity = active_affinity;
+        self.modal_head = None;
+        self.modal_block = None;
         self.selections.replace_all(new_selections);
         self.selections.merge_overlapping();
 
@@ -5584,6 +5753,8 @@ impl<M: InputModeKind> InputBaseState<M> {
             }
             new_selections
         };
+        self.modal_head = None;
+        self.modal_block = None;
         self.selections.replace_all(new_selections);
         self.selections.merge_overlapping();
 

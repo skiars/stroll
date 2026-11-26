@@ -80,7 +80,7 @@ impl Workspace {
             KeyBinding::new(
                 "space",
                 file_tree::OpenTreeFile { preview: true },
-                navigation,
+                Some("FileTree && !Input && !VimTree"),
             ),
             KeyBinding::new(
                 if cfg!(target_os = "macos") {

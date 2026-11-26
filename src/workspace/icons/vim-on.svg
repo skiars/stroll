@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100" fill="currentColor">
+  <defs>
+    <path id="vim-letter" d="M7.6 8.5h2.95l1.2 6.7 3.35-6.7h2.95l-5.23 9.25h-2.96Z" transform="translate(-21.833333333 -21.875) scale(5.833333333)"/>
+    <mask id="around-letter" maskUnits="userSpaceOnUse" x="0" y="0" width="100" height="100">
+      <path d="M0 0H100V100H0Z" fill="white"/>
+      <use href="#vim-letter" fill="black" stroke="black" stroke-width="1" stroke-linejoin="round"/>
+    </mask>
+  </defs>
+  <g mask="url(#around-letter)" fill-opacity=".77">
+    <path d="M50 6.5 66.4 22.9 62.3 27 50 14.7 37.7 27 33.6 22.9Z"/>
+    <path d="M50 6.5 66.4 22.9 62.3 27 50 14.7 37.7 27 33.6 22.9Z" transform="rotate(90 50 50)"/>
+    <path d="M50 6.5 62.2 18.7 58.1 22.8 50 14.7 41.9 22.8 37.8 18.7Z" transform="rotate(180 50 50)"/>
+    <path d="M50 6.5 66.4 22.9 62.3 27 50 14.7 37.7 27 33.6 22.9Z" transform="rotate(270 50 50)"/>
+  </g>
+  <use href="#vim-letter"/>
+</svg>

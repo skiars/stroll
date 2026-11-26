@@ -68,6 +68,11 @@ impl Editor {
         super::overlay::search_has_focus(state, window, cx)
     }
 
+    /// Whether the built-in Find panel is composing text through the input method.
+    pub fn search_is_composing(state: &Entity<EditorState>, cx: &App) -> bool {
+        super::overlay::search_is_composing(state, cx)
+    }
+
     pub fn search_panel(
         state: &Entity<EditorState>,
         window: &mut Window,

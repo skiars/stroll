@@ -235,6 +235,13 @@ impl SearchField {
         }
     }
 
+    fn is_composing(&self, cx: &App) -> bool {
+        match self {
+            Self::Single(field) => field.read(cx).is_composing(),
+            Self::Multi(field) => field.read(cx).is_composing(),
+        }
+    }
+
     fn focus_handle(&self, cx: &App) -> FocusHandle {
         match self {
             Self::Single(field) => field.read(cx).focus_handle(cx),
@@ -305,6 +312,10 @@ pub struct SearchPanel<T: SearchTarget> {
 }
 
 impl<T: SearchTarget> SearchPanel<T> {
+    pub(super) fn is_composing(&self, cx: &App) -> bool {
+        self.search_input.is_composing(cx) || self.replace_input.is_composing(cx)
+    }
+
     pub(super) fn replace_mode(&self) -> bool {
         self.session.replace_mode
     }
@@ -496,7 +507,8 @@ impl<T: SearchTarget> SearchPanel<T> {
         cx.notify();
     }
 
-    fn step(&mut self, previous: bool, cx: &mut Context<Self>) {
+    /// Navigate the retained query in the current target.
+    pub fn step(&mut self, previous: bool, cx: &mut Context<Self>) {
         _ = self.target.update(cx, |target, cx| {
             target.step_match(previous, &mut self.session, cx);
         });

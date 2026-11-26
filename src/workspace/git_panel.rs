@@ -10,6 +10,7 @@ mod operations;
 mod review;
 mod revisions;
 mod tree;
+mod vim;
 
 use std::{
     borrow::Cow,
@@ -212,6 +213,7 @@ struct Snapshot {
     editor: Option<Entity<EditorState>>,
     notice: Option<gpui::SharedString>,
     loading: bool,
+    vim_subscriptions: Option<[Subscription; 3]>,
 }
 
 #[derive(Clone, Copy)]
@@ -349,6 +351,10 @@ pub(super) struct GitPanel {
     history_pane: Entity<GitPane>,
     review_pane: Entity<GitPane>,
     tree_pane: Entity<GitPane>,
+    vim_tree_focus: FocusHandle,
+    vim_tree_path: Option<String>,
+    vim_tree_return: Option<FocusHandle>,
+    diff_vim: vim::DiffVim,
     tree_scroll: UniformListScrollHandle,
     tree_followed_file: Option<String>,
     worktree_directories: Arc<BTreeSet<String>>,
@@ -566,6 +572,18 @@ impl GitPanel {
                 App::notify(cx, this.tree_pane.entity_id());
             }));
         }
+        subscriptions.extend(Self::observe_vim_diff(
+            editor.original_state(),
+            vim::Column::Original,
+            window,
+            cx,
+        ));
+        subscriptions.extend(Self::observe_vim_diff(
+            editor.modified_state(),
+            vim::Column::Modified,
+            window,
+            cx,
+        ));
         let history_scroll =
             ListState::new(0, ListAlignment::Top, px(0.)).with_width_independent_heights();
         history_scroll.set_pixel_aligned_scroll(true);
@@ -573,7 +591,7 @@ impl GitPanel {
             root: repository.root.clone(),
             backend: repository.git_backend(),
             repository,
-            workspace,
+            workspace: workspace.clone(),
             project_gradient: false,
             focus: cx.focus_handle(),
             branches,
@@ -605,6 +623,10 @@ impl GitPanel {
             history_pane,
             review_pane,
             tree_pane,
+            vim_tree_focus: cx.focus_handle(),
+            vim_tree_path: None,
+            vim_tree_return: None,
+            diff_vim: vim::DiffVim::new(editor.vim_edit_guard(workspace.clone())),
             tree_scroll: UniformListScrollHandle::new(),
             tree_followed_file: None,
             worktree_directories: session
@@ -1300,6 +1322,132 @@ impl GitPanel {
             self.compact_pane = CompactPane::History;
         }
         cx.notify();
+    }
+
+    pub(super) fn vim_focused(&self, window: &Window, cx: &App) -> bool {
+        self.focus.is_focused(window)
+            || self.history_focus.is_focused(window)
+            || self.vim_tree_focus.is_focused(window)
+            || self.vim_diff_accepts_leader(window, cx)
+    }
+
+    pub(super) fn vim_toggle_tree(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.vim_tree_focus.is_focused(window) {
+            if let Some(focus) = self.vim_tree_return.take() {
+                focus.focus(window, cx);
+            } else {
+                self.focus(window, cx);
+            }
+        } else if self.review.is_some() {
+            self.focus_vim_file_tree(window, cx);
+        }
+    }
+
+    pub(super) fn vim_focus_adjacent_pane(
+        &mut self,
+        key: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let history = self.history_focus.is_focused(window);
+        let tree = self.vim_tree_focus.is_focused(window);
+        let editor = self.search_editor(window, cx);
+        let diff =
+            self.focus.is_focused(window) || editor.read(cx).focus_handle(cx).is_focused(window);
+        match key {
+            "h" if tree => editor.read(cx).focus_handle(cx).focus(window, cx),
+            "h" if diff => self.vim_history(window, cx),
+            "l" if history => editor.read(cx).focus_handle(cx).focus(window, cx),
+            "l" if diff && self.vim_has_tree() => self.focus_vim_file_tree(window, cx),
+            _ => return false,
+        }
+        true
+    }
+
+    pub(super) fn vim_has_tree(&self) -> bool {
+        self.review.is_some()
+    }
+
+    pub(super) fn vim_has_worktree_changes(&self) -> bool {
+        self.history
+            .as_ref()
+            .is_none_or(|history| !history.changes.is_empty())
+    }
+
+    pub(super) fn vim_worktree(
+        &mut self,
+        diff: bool,
+        path: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let selection = Selection::Worktree(Mode::All);
+        if self.selection.as_ref() == Some(&selection)
+            && let Some(review) = &self.review
+            && review.is_uncommitted()
+        {
+            if diff
+                && let Some(index) = path
+                    .as_ref()
+                    .and_then(|path| review.by_path.get(path))
+                    .copied()
+                    .or(review.active)
+                    .or_else(|| (!review.detail.files.is_empty()).then_some(0))
+            {
+                self.reveal_file(index, true, window, cx);
+            }
+        } else {
+            let position = path.filter(|_| diff).map(|path| DiffPosition {
+                path,
+                line: None,
+                inset: 0.,
+                horizontal: 0.,
+            });
+            self.load_review_at(selection, false, position, false, window, cx);
+        }
+        if diff {
+            self.editor.focus(window, cx);
+        } else {
+            self.set_tree_visible(true, cx);
+            self.vim_tree_focus.focus(window, cx);
+        }
+    }
+
+    pub(super) fn vim_history(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.set_history_visible(true, cx);
+        self.history_focus.focus(window, cx);
+    }
+
+    pub(super) fn vim_key(
+        &mut self,
+        event: &KeyDownEvent,
+        key: Option<char>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if self.vim_tree_focus.is_focused(window) {
+            return key.is_some_and(|key| self.vim_move_tree(key, window, cx));
+        }
+        if self.history_focus.is_focused(window) {
+            match key {
+                Some('k')
+                    if self.selection.as_ref().and_then(Selection::target_commit)
+                        == self.commits.first().map(|row| row.oid.as_str()) =>
+                {
+                    self.select_worktree(window, cx);
+                    self.vim_history(window, cx);
+                }
+                Some('j' | 'k') => {
+                    let mut event = event.clone();
+                    event.keystroke.key = if key == Some('j') { "down" } else { "up" }.into();
+                    self.history_key_down(&event, window, cx);
+                    self.vim_history(window, cx);
+                }
+                _ => return false,
+            }
+            return true;
+        }
+        false
     }
 
     fn set_tree_visible(&mut self, visible: bool, cx: &mut Context<Self>) {
@@ -2970,6 +3118,229 @@ mod tests {
                 }
             });
         }
+    }
+
+    #[::core::prelude::v1::test]
+    fn vim_diff_uses_modal_carets_and_edits_only_live_source() {
+        use gpui_component::{Root, input::RopeExt as _};
+
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path().join("repo");
+        fs::create_dir(&root).unwrap();
+        git(&root, &["init", "-q", "-b", "main"]);
+        git(&root, &["config", "user.name", "Reviewer"]);
+        git(&root, &["config", "user.email", "reviewer@example.invalid"]);
+        git(&root, &["config", "commit.gpgsign", "false"]);
+        let path = PathBuf::from("review.txt");
+        let original = "old alpha beta\n".repeat(85);
+        let modified = "new alpha beta\n".repeat(85);
+        fs::write(root.join(&path), &original).unwrap();
+        git(&root, &["add", "."]);
+        git(&root, &["commit", "-qm", "initial"]);
+        fs::write(root.join(&path), &modified).unwrap();
+        let config_path = fixture.path().join("config.toml");
+        fs::write(
+            &config_path,
+            "[keyboard]\nvim_mode = true\n[lsp]\nenabled = false\n",
+        )
+        .unwrap();
+        let store = Arc::new(Store::new(fixture.path().join("state")).unwrap());
+        let mut app = TestAppContext::build_with_text_system(
+            TestDispatcher::new(0),
+            None,
+            crate::test_support::text_system(true),
+        );
+        app.update(gpui_component::init);
+        let mut workspace = None;
+        let (_, visual) = app.add_window_view(|window, cx| {
+            let view = cx.new(|cx| {
+                Workspace::with_config(
+                    store,
+                    crate::config::ConfigFile::load(Some(config_path)),
+                    WorkspaceView::Git,
+                    window,
+                    cx,
+                )
+            });
+            workspace = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        let workspace = workspace.unwrap();
+        visual.simulate_resize(size(px(1280.), px(560.)));
+        visual.update(|window, cx| {
+            workspace.update(cx, |workspace, cx| {
+                workspace.open_repository(Location { root, file: None }, window, cx);
+            });
+            cx.set_smooth_scrolling(true);
+            cx.set_reduce_motion(false);
+        });
+        let draw = |visual: &mut VisualTestContext| {
+            for _ in 0..3 {
+                visual.run_until_parked();
+                visual.update(|window, cx| window.draw(cx).clear(cx));
+            }
+        };
+        draw(visual);
+        let panel = visual.update(|window, cx| {
+            let panel = workspace.read(cx).git.clone().unwrap();
+            panel.update(cx, |panel, cx| {
+                panel.show_history = false;
+                panel.show_tree = false;
+                panel.split = true;
+                panel.load_review(Selection::Worktree(Mode::All), false, window, cx);
+            });
+            panel
+        });
+        draw(visual);
+
+        visual.update(|window, cx| {
+            let panel = panel.read(cx);
+            assert_eq!(panel.diff.read(cx).mode(), DiffMode::Split);
+            assert!(
+                panel
+                    .editor
+                    .modified_state()
+                    .read(cx)
+                    .focus_handle(cx)
+                    .is_focused(window)
+            );
+        });
+        let place = |visual: &mut VisualTestContext, side, word: &str| {
+            visual.update(|window, cx| {
+                let panel = panel.read(cx);
+                let editor = match side {
+                    DiffSide::Original => panel.editor.original_state(),
+                    DiffSide::Modified => panel.editor.modified_state(),
+                }
+                .clone();
+                let start = editor.read(cx).text().to_string().find(word).unwrap();
+                editor.update(cx, |editor, cx| {
+                    editor.set_selected_range(start..start, cx);
+                    editor.focus(window, cx);
+                });
+                (editor, start)
+            })
+        };
+        let (left, start) = place(visual, DiffSide::Original, "old alpha beta");
+        draw(visual);
+        let before = visual.update(|_, cx| left.read(cx).text().clone());
+        visual.simulate_keystrokes("w v e");
+        draw(visual);
+        assert!(visual.debug_bounds("workspace-status").is_none());
+        assert!(visual.debug_bounds("status-vim-toggle").is_none());
+        visual.update(|_, cx| {
+            let editor = left.read(cx);
+            assert_eq!(editor.cursor(), start + 8);
+            assert_eq!(
+                editor.text().slice(editor.selected_range()).to_string(),
+                "alpha"
+            );
+        });
+        visual.simulate_keystrokes("d");
+        visual.update(|_, cx| {
+            assert_eq!(left.read(cx).text(), &before);
+            assert_eq!(left.read(cx).selected_range(), start + 4..start + 9);
+        });
+        visual.simulate_keystrokes("y i");
+        draw(visual);
+        visual.update(|_, cx| {
+            assert_eq!(left.read(cx).text(), &before);
+            assert_eq!(
+                cx.read_from_clipboard()
+                    .and_then(|item| item.text())
+                    .as_deref(),
+                Some("alpha")
+            );
+        });
+        visual.simulate_keystrokes("ctrl-d");
+        visual.update(|_, cx| {
+            assert!(left.read(cx).cursor() > start + 9);
+            assert!(left.read(cx).is_scroll_navigating());
+        });
+        visual.simulate_keystrokes("g g");
+        assert_eq!(visual.update(|_, cx| left.read(cx).cursor()), 0);
+        visual.simulate_keystrokes("] c");
+        draw(visual);
+        assert_eq!(visual.update(|_, cx| left.read(cx).cursor()), start);
+        visual.simulate_keystrokes("/");
+        draw(visual);
+        visual.simulate_input("alpha");
+        visual.simulate_keystrokes("enter");
+        draw(visual);
+        assert_eq!(visual.update(|_, cx| left.read(cx).cursor()), start + 4);
+        visual.simulate_keystrokes("n");
+        assert_eq!(
+            visual.update(|_, cx| left.read(cx).cursor()),
+            start + 4 + "old alpha beta\n".len()
+        );
+
+        let (right, start) = place(visual, DiffSide::Modified, "new alpha beta");
+        draw(visual);
+        visual.simulate_keystrokes("w v e");
+        draw(visual);
+        visual.update(|_, cx| {
+            assert_eq!(right.read(cx).cursor(), start + 8);
+            assert_eq!(right.read(cx).selected_range(), start + 4..start + 9);
+        });
+        visual.simulate_keystrokes("c");
+        draw(visual);
+        visual.update(|window, cx| {
+            assert!(!panel.read(cx).vim_diff_command_mode(window, cx));
+        });
+        visual.simulate_input("omega");
+        visual.simulate_keystrokes("escape");
+        draw(visual);
+        assert!(visual.debug_bounds("workspace-status").is_none());
+        visual.update(|window, cx| {
+            assert!(panel.read(cx).vim_diff_command_mode(window, cx));
+        });
+        visual.update(|_, cx| {
+            let editor = right.read(cx);
+            let first = editor.text().offset_to_point(start).row;
+            assert_eq!(
+                editor.text().slice_line(first).to_string(),
+                "new omega beta"
+            );
+            assert_eq!(editor.cursor(), start + 8);
+            let file = &workspace.read(cx).files[&path];
+            assert_eq!(
+                file.editor.read(cx).value(),
+                modified.replacen("alpha", "omega", 1)
+            );
+            assert_eq!(left.read(cx).text(), &before);
+        });
+        visual.simulate_keystrokes("u");
+        draw(visual);
+        visual.update(|_, cx| {
+            let file = &workspace.read(cx).files[&path];
+            assert_eq!(file.editor.read(cx).value(), modified);
+        });
+
+        visual.update(|window, cx| {
+            panel.update(cx, |panel, cx| {
+                let commit = panel.commits.first().unwrap().oid.to_string();
+                panel.split = false;
+                panel.load_review(Selection::Commit(commit, None), false, window, cx);
+            });
+        });
+        draw(visual);
+        visual.update(|_, cx| assert_eq!(panel.read(cx).diff.read(cx).mode(), DiffMode::Unified));
+        let (history, start) = place(visual, DiffSide::Modified, "old alpha beta");
+        draw(visual);
+        let before = visual.update(|_, cx| history.read(cx).text().clone());
+        visual.simulate_keystrokes("w v e c");
+        draw(visual);
+        assert!(visual.debug_bounds("workspace-status").is_none());
+        visual.update(|_, cx| {
+            let editor = history.read(cx);
+            assert_eq!(editor.cursor(), start + 8);
+            assert_eq!(editor.selected_range(), start + 4..start + 9);
+            assert_eq!(editor.text(), &before);
+            assert_eq!(
+                workspace.read(cx).files[&path].editor.read(cx).value(),
+                modified
+            );
+        });
     }
 
     #[::core::prelude::v1::test]

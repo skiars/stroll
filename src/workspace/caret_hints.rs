@@ -203,8 +203,13 @@ impl Workspace {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if event.keystroke.key == "escape"
-            && let Some(path) = self.tabs.active()
+        if event.keystroke.key == "escape" && self.dismiss_active_signature(cx) {
+            cx.stop_propagation();
+        }
+    }
+
+    pub(super) fn dismiss_active_signature(&mut self, cx: &mut Context<Self>) -> bool {
+        if let Some(path) = self.tabs.active()
             && let Some(file) = self.files.get_mut(path)
             && file.caret_hints.signature_active
             && !file.editor.read(cx).completion_menu_state().open
@@ -212,8 +217,9 @@ impl Workspace {
         {
             file.caret_hints.dismiss_signature();
             cx.notify();
-            cx.stop_propagation();
+            return true;
         }
+        false
     }
 
     pub(super) fn refresh_caret_hints(

@@ -54,6 +54,11 @@ pub(super) fn init(cx: &mut App) {
 type LineReplacement = (Range<usize>, String);
 
 impl<M: InputModeKind> InputBaseState<M> {
+    /// Toggle the configured line comment on the selected lines.
+    pub fn toggle_line_comment(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.edit_lines(&EditLines(Operation::ToggleComment), window, cx);
+    }
+
     pub(super) fn edit_lines(
         &mut self,
         command: &EditLines,

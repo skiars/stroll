@@ -92,11 +92,66 @@ impl InputLine {
     pub(crate) fn index_for_x(&self, x: Pixels) -> Option<usize> {
         match &self.content {
             Content::Text(line) => line.index_for_x(x),
-            Content::Inline(_) => {
-                (x >= px(0.) && x <= self.width).then(|| self.closest_index_for_x(x))
+            Content::Inline(fragments) => {
+                let fragment = fragments.iter().find(|f| x >= f.x && x < f.x + f.width)?;
+                Some(
+                    fragment.range.start
+                        + fragment
+                            .text
+                            .as_ref()
+                            .and_then(|line| line.index_for_x(x - fragment.x))
+                            .unwrap_or(0),
+                )
             }
         }
     }
+    /// Repaint the shaped glyphs under a block caret using its foreground.
+    pub(crate) fn paint_block_glyphs(
+        &self,
+        origin: Point<Pixels>,
+        height: Pixels,
+        range: Range<usize>,
+        color: gpui::Hsla,
+        window: &mut Window,
+    ) {
+        let left = self.x_for_index(range.start);
+        let mut paint = |line: &ShapedLine, x, byte| {
+            let origin = origin
+                + point(
+                    x - left,
+                    (height - line.ascent - line.descent) / 2. + line.ascent,
+                );
+            for run in &line.runs {
+                for glyph in &run.glyphs {
+                    if range.contains(&(byte + glyph.index)) {
+                        let pos = origin + glyph.position;
+                        if glyph.is_emoji {
+                            _ = window.paint_emoji(pos, run.font_id, glyph.id, line.font_size);
+                        } else {
+                            _ = window.paint_glyph(
+                                pos,
+                                run.font_id,
+                                glyph.id,
+                                line.font_size,
+                                color,
+                            );
+                        }
+                    }
+                }
+            }
+        };
+        match &self.content {
+            Content::Text(line) => paint(line, px(0.), 0),
+            Content::Inline(fragments) => {
+                for fragment in fragments {
+                    if let Some(line) = &fragment.text {
+                        paint(line, fragment.x, fragment.range.start);
+                    }
+                }
+            }
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn paint(
         &self,

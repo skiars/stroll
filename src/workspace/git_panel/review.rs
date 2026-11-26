@@ -1143,7 +1143,11 @@ impl GitPanel {
                         let projection_changed =
                             this.diff.read(cx).editor_row_revision() != revision;
                         if !keep {
+                            this.reset_diff_vim(cx);
                             this.editor.restore_viewport();
+                        }
+                        if active.is_some() {
+                            this.focus_loaded_vim_diff(window, cx);
                         }
                         this.load_review_metadata(needs_stats, window, cx);
                         if let Some(anchor) = viewport {
@@ -2748,6 +2752,7 @@ impl GitPanel {
             editor: None,
             notice: None,
             loading: true,
+            vim_subscriptions: None,
         });
         self.read_snapshot(side, line, window, cx);
     }
@@ -2765,6 +2770,7 @@ impl GitPanel {
         snapshot.side = side;
         snapshot.loading = true;
         snapshot.editor = None;
+        snapshot.vim_subscriptions = None;
         snapshot.notice = None;
         let detail = snapshot.detail.clone();
         let ix = snapshot.file;
@@ -2831,7 +2837,9 @@ impl GitPanel {
                         editor.update(cx, |editor, cx| {
                             editor.set_cursor_position(Position::new(line as u32, 0), window, cx)
                         });
-                        snapshot.editor = Some(editor);
+                        snapshot.editor = Some(editor.clone());
+                        let subscriptions = this.install_snapshot_vim(&editor, window, cx);
+                        this.snapshot.as_mut().unwrap().vim_subscriptions = Some(subscriptions);
                     }
                     Ok(git::Snapshot::Text { .. }) => {
                         snapshot.notice = Some(t!("git.empty_snapshot").into())
@@ -2891,7 +2899,7 @@ impl GitPanel {
         });
     }
 
-    fn search_editor(&self, window: &Window, cx: &App) -> Entity<EditorState> {
+    pub(super) fn search_editor(&self, window: &Window, cx: &App) -> Entity<EditorState> {
         self.snapshot
             .as_ref()
             .and_then(|snapshot| snapshot.editor.clone())
