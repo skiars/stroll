@@ -6214,7 +6214,7 @@ fn language_for(path: &Path) -> &'static str {
             "C" | "cc" | "cpp" | "cxx" | "c++" | "h" | "H" | "hh" | "hpp" | "hxx" | "h++" | "mm",
         ) => "cpp",
         Some("css") => "css",
-        Some("html") => "html",
+        Some("html" | "htm") => "html",
         _ => {
             crate::language::resources::LanguageResources::builtin_for_path(path).unwrap_or("text")
         }

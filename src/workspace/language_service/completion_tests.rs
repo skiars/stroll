@@ -538,6 +538,51 @@ fn workspace_python_with_pylsp() -> Result<()> {
 }
 
 #[test]
+#[ignore = "requires vscode-html-language-server on PATH"]
+fn workspace_builtin_html_supports_hover_and_formatting() -> Result<()> {
+    let fixture = tempfile::tempdir()?;
+    let source = "<main><div>hello</div></main>\n";
+    with_workspace_editor(
+        fixture.path(),
+        "index.htm",
+        "",
+        source,
+        source.find("div").unwrap(),
+        |visual, workspace, editor| {
+            let document = visual.update(|_, cx| {
+                let file = workspace.read(cx).active_file().unwrap();
+                let project = file.server_project.as_ref().unwrap();
+                assert!(matches!(
+                    project.key.server,
+                    super::ServiceServer::Builtin(crate::language::LanguageServer::Html)
+                ));
+                assert_eq!(editor.read(cx).language_name().as_str(), "html");
+                file.language_server.as_ref().unwrap().document.clone()
+            });
+            ensure!(
+                futures_lite::future::block_on(
+                    document.hover(source.into(), source.find("div").unwrap())
+                )?
+                .is_some(),
+                "HTML hover returned no documentation"
+            );
+            visual.update(|window, cx| {
+                workspace.update(cx, |workspace, cx| {
+                    workspace.format_document(&FormatDocument, window, cx);
+                });
+            });
+            wait(visual, "HTML formatted in the editor", |visual| {
+                visual.update(|_, cx| {
+                    editor.read(cx).text().to_string().lines().any(|line| {
+                        line.starts_with(char::is_whitespace) && line.trim() == "<div>hello</div>"
+                    })
+                })
+            })
+        },
+    )
+}
+
+#[test]
 #[ignore = "requires clangd on PATH"]
 fn workspace_completion_with_clangd() -> Result<()> {
     let fixture = tempfile::tempdir()?;

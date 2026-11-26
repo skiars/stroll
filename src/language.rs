@@ -30,6 +30,7 @@ pub enum LanguageServer {
     TypeScript,
     Python,
     Vue,
+    Html,
 }
 
 #[derive(Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -79,15 +80,17 @@ impl LanguageServer {
             Self::TypeScript => "tsc",
             Self::Python => "pylsp",
             Self::Vue => "vue-language-server",
+            Self::Html => "vscode-html-language-server",
         }
     }
 
-    pub(crate) const ALL: [Self; 5] = [
+    pub(crate) const ALL: [Self; 6] = [
         Self::Rust,
         Self::Clangd,
         Self::TypeScript,
         Self::Python,
         Self::Vue,
+        Self::Html,
     ];
 
     pub(crate) fn languages(self) -> &'static [(&'static str, &'static str)] {
@@ -118,6 +121,7 @@ impl LanguageServer {
             ],
             Self::Python => &[(".py", "python"), (".pyi", "python")],
             Self::Vue => &[(".vue", "vue")],
+            Self::Html => &[(".html", "html"), (".htm", "html")],
         }
     }
 
@@ -167,7 +171,7 @@ impl LanguageServer {
 
     #[cfg(feature = "desktop")]
     pub(crate) fn supports_legacy_remote(self) -> bool {
-        self != Self::Vue
+        !matches!(self, Self::Vue | Self::Html)
     }
 
     pub(crate) fn executable_variable(self) -> &'static str {
@@ -177,13 +181,14 @@ impl LanguageServer {
             Self::TypeScript => "STROLL_TYPESCRIPT_LSP",
             Self::Python => "STROLL_PYTHON_LSP",
             Self::Vue => "STROLL_VUE_NODE",
+            Self::Html => "STROLL_HTML_LSP",
         }
     }
 
     pub(crate) fn command_for(self, executable: OsString) -> Command {
         let mut command = crate::process::background(executable);
         match self {
-            Self::TypeScript => {
+            Self::TypeScript | Self::Html => {
                 command.arg("--stdio");
             }
             Self::Vue => vue::bridge_args(&mut command),
@@ -196,6 +201,10 @@ impl LanguageServer {
         match self {
             Self::TypeScript => typescript_command(if cfg!(windows) { "tsc.cmd" } else { "tsc" }),
             Self::Vue => self.command_for("node".into()),
+            Self::Html if cfg!(windows) => {
+                self.command_for("vscode-html-language-server.cmd".into())
+            }
+            Self::Html => self.command_for(self.name().into()),
             _ => crate::process::background(self.name()),
         }
     }
@@ -230,7 +239,7 @@ impl LanguageServer {
             return vue::project_root(repository, file).unwrap_or_else(|| repository.to_owned());
         }
         let markers: &[_] = match self {
-            Self::Rust => return repository.to_owned(),
+            Self::Rust | Self::Html => return repository.to_owned(),
             Self::Clangd => &["compile_commands.json", "compile_flags.txt", ".clangd"],
             Self::TypeScript => &["tsconfig.json", "jsconfig.json", "package.json"],
             Self::Python => &["pyproject.toml", "setup.py"],
@@ -262,6 +271,7 @@ impl LanguageServer {
                 "procMacro": { "enable": false }
             }),
             Self::TypeScript => json!({ "disableAutomaticTypingAcquisition": true }),
+            Self::Html => json!({ "provideFormatter": true }),
             _ => Value::Null,
         }
     }
@@ -409,6 +419,24 @@ mod tests {
         assert!(resolve("packages/app/src/App.vue", &[LanguageServer::Vue]).is_none());
         assert!(resolve("packages/plain/main.ts", &[LanguageServer::TypeScript]).is_none());
         Ok(())
+    }
+
+    #[test]
+    fn html_is_a_builtin_stdio_server_for_html_documents() {
+        let root = Path::new("/worktree");
+        let server = LanguageServer::Html;
+        for file in ["public/index.html", "public/about.htm"] {
+            let path = Path::new(file);
+            let project = BuiltinProject::resolve(root, path, &[]).unwrap();
+            assert_eq!(project.server, server);
+            assert_eq!(project.language_id, "html");
+            assert_eq!(project.root, root);
+            assert!(BuiltinProject::resolve(root, path, &[server]).is_none());
+        }
+        assert!(LanguageServer::for_path(Path::new("page.xhtml")).is_none());
+        let command = server.default_command();
+        assert_eq!(command.get_args().collect::<Vec<_>>(), ["--stdio"]);
+        assert_eq!(server.initialization_options()["provideFormatter"], true);
     }
 
     #[test]

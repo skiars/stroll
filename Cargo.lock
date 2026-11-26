@@ -7450,6 +7450,7 @@ dependencies = [
  "tree-sitter",
  "tree-sitter-less",
  "tree-sitter-vue-next",
+ "tree-sitter-xml",
  "ureq",
  "url",
 ]
@@ -8198,6 +8199,16 @@ name = "tree-sitter-vue-next"
 version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e9ac89acaa8165aaabfa8ae9683aa423b0d2bf42c815dae5ca031a36a75525f1"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
+name = "tree-sitter-xml"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e670041f591d994f54d597ddcd8f4ebc930e282c4c76a42268743b71f0c8b6b3"
 dependencies = [
  "cc",
  "tree-sitter-language",

@@ -1272,6 +1272,7 @@ impl SettingsPage {
             (LanguageServer::Python, "Python", |c| {
                 &mut c.lsp.python.command
             }),
+            (LanguageServer::Html, "HTML", |c| &mut c.lsp.html.command),
         ] {
             let (command, source) = server
                 .local_command(startup_lsp.map_or("", |lsp| &lsp.server(server).command))

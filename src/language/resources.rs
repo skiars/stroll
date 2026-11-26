@@ -602,6 +602,102 @@ mod tests {
         highlighter::{HighlightTheme, SyntaxHighlighter},
     };
 
+    #[test]
+    fn xml_and_dtd_highlight_their_native_syntax() {
+        builtin::register_grammars();
+        let resources = LanguageResources::default();
+        for file in [
+            "logo.SVG",
+            "feed.rss",
+            "feed.atom",
+            "schema.xsd",
+            "style.xslt",
+            "page.xhtml",
+            "MainWindow.xaml",
+            "Program.csproj.user",
+            "Ui.vcxproj.filters",
+            "Info.plist",
+            "messages.xlf",
+            "Web.config",
+            ".classpath",
+        ] {
+            assert_eq!(
+                resources.for_path(Path::new(file)).as_deref(),
+                Some("xml"),
+                "{file}"
+            );
+        }
+        assert_eq!(
+            resources.for_path(Path::new("chars.ent")).as_deref(),
+            Some("dtd")
+        );
+        for file in [
+            "go.mod",
+            "config",
+            "settings.config",
+            "logo.svgz",
+            "archive.docx",
+        ] {
+            assert!(resources.for_path(Path::new(file)).is_none(), "{file}");
+        }
+
+        struct Mark<'a>(&'a str);
+        impl HighlightStyleResolver for Mark<'_> {
+            fn style(&self, name: &str) -> Option<HighlightStyle> {
+                (name == self.0).then_some(HighlightStyle {
+                    color: Some(rgb(0xffffff).into()),
+                    ..Default::default()
+                })
+            }
+        }
+
+        let svg = r#"<?xml version="1.0"?>
+<svg xmlns:art="urn:art">
+  <!-- caption -->
+  <art:shape fill="red" />
+  <text><![CDATA[a < b]]></text>
+</svg>"#;
+        let dtd = r#"<!ELEMENT artwork (#PCDATA)>
+<!ENTITY color "blue">"#;
+        for (file, source, tokens) in [
+            (
+                "logo.svg",
+                svg,
+                &[
+                    ("xml", "keyword"),
+                    ("art:shape", "tag"),
+                    ("xmlns:art", "property"),
+                    ("red", "string"),
+                    ("caption", "comment"),
+                    ("a < b", "markup.raw"),
+                ][..],
+            ),
+            (
+                "artwork.dtd",
+                dtd,
+                &[
+                    ("artwork", "tag"),
+                    ("color", "constant"),
+                    ("blue", "string"),
+                ][..],
+            ),
+        ] {
+            let language = resources.for_path(Path::new(file)).unwrap();
+            let mut syntax = SyntaxHighlighter::new(&language);
+            assert!(syntax.update(None, &Rope::from(source), None));
+            for &(token, capture) in tokens {
+                let offset = source.find(token).unwrap();
+                assert!(
+                    syntax
+                        .styles(&(0..source.len()), &Mark(capture))
+                        .iter()
+                        .any(|(range, _)| range.contains(&offset)),
+                    "missing {capture} for {token} in {file}",
+                );
+            }
+        }
+    }
+
     #[gpui::test]
     fn vue_highlighting_resolves_embedded_syntax(cx: &mut gpui::TestAppContext) {
         struct Mark(&'static str);

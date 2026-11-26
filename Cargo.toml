@@ -8,7 +8,7 @@ default-run = "stroll"
 
 [features]
 default = ["desktop"]
-desktop = ["dep:glob", "dep:alacritty_terminal", "dep:gpui", "dep:gpui_platform", "dep:gpui-base", "dep:gpui-component", "dep:gpui-kit-assets", "dep:toml_edit", "dep:markdown", "dep:merman", "dep:ratex-layout", "dep:ratex-parser", "dep:ratex-svg", "dep:percent-encoding", "dep:ratex-types", "dep:roxmltree", "dep:sys-locale", "dep:blocking", "dep:image", "dep:ureq", "dep:shlex", "dep:similar", "dep:chrono", "dep:keyring", "dep:giallo", "dep:tree-sitter", "dep:tree-sitter-vue-next", "dep:tree-sitter-less", "dep:arborium-scss", "dep:objc2", "dep:objc2-app-kit", "dep:objc2-foundation"]
+desktop = ["dep:glob", "dep:alacritty_terminal", "dep:gpui", "dep:gpui_platform", "dep:gpui-base", "dep:gpui-component", "dep:gpui-kit-assets", "dep:toml_edit", "dep:markdown", "dep:merman", "dep:ratex-layout", "dep:ratex-parser", "dep:ratex-svg", "dep:percent-encoding", "dep:ratex-types", "dep:roxmltree", "dep:sys-locale", "dep:blocking", "dep:image", "dep:ureq", "dep:shlex", "dep:similar", "dep:chrono", "dep:keyring", "dep:giallo", "dep:tree-sitter", "dep:tree-sitter-vue-next", "dep:tree-sitter-xml", "dep:tree-sitter-less", "dep:arborium-scss", "dep:objc2", "dep:objc2-app-kit", "dep:objc2-foundation"]
 
 [[bin]]
 name = "stroll"
@@ -83,6 +83,7 @@ tree-sitter = { version = "0.26.13", optional = true }
 tree-sitter-vue-next = { version = "0.1.0", optional = true }
 arborium-scss = { version = "2.18.2", optional = true }
 tree-sitter-less = { version = "1.0.0", optional = true }
+tree-sitter-xml = { version = "0.7", optional = true }
 
 [dev-dependencies]
 futures-lite = "2.6"

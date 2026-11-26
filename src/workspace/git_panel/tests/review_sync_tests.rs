@@ -109,6 +109,65 @@ fn open<'a>(
 }
 
 #[::core::prelude::v1::test]
+fn svg_uses_xml_in_source_and_git_snapshots() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("repo");
+    fs::create_dir(&root).unwrap();
+    setup(&root);
+    let path = "icon.svg";
+    fs::write(root.join(path), "<svg>\n  <!-- old -->\n</svg>\n").unwrap();
+    command(&root, &["add", path]);
+    command(&root, &["commit", "-qm", "Initial"]);
+    fs::write(root.join(path), "<svg>\n  <!-- new -->\n</svg>\n").unwrap();
+
+    let mut app = test_context();
+    let (panel, visual) = open(&mut app, temp.path(), &root);
+    visual.update(|window, cx| {
+        panel.update(cx, |panel, cx| {
+            panel.load_review(Selection::Worktree(Mode::All), false, window, cx);
+        });
+    });
+    wait_for_review(visual, "the SVG source in the Git diff", |visual| {
+        visual.update(|_, cx| {
+            let Some(review) = panel.read(cx).review.as_ref() else {
+                return false;
+            };
+            review.by_path.get(path).is_some_and(|ix| {
+                review.sources.get(ix).is_some_and(|sources| {
+                    sources
+                        .get(&(path.into(), DiffSide::Original))
+                        .is_some_and(|source| {
+                            assert_eq!(source.editor().read(cx).language_name().as_str(), "xml");
+                            true
+                        })
+                })
+            })
+        })
+    });
+    let workspace = visual.update(|window, cx| {
+        let workspace = panel.read(cx).workspace.upgrade().unwrap();
+        workspace.update(cx, |workspace, cx| {
+            workspace.switch_view(WorkspaceView::Editor, window, cx);
+            workspace.open_file(path.into(), false, window, cx);
+        });
+        workspace
+    });
+    wait_for_review(visual, "the SVG source editor", |visual| {
+        visual.update(|_, cx| {
+            workspace
+                .read(cx)
+                .files
+                .get(Path::new(path))
+                .is_some_and(|file| {
+                    let editor = file.editor.read(cx);
+                    assert_eq!(editor.language_name().as_str(), "xml");
+                    true
+                })
+        })
+    });
+}
+
+#[::core::prelude::v1::test]
 fn file_association_highlights_ux_in_source_and_git_snapshots() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("repo");

@@ -309,6 +309,7 @@ pub(crate) struct Lsp {
     pub typescript: Server,
     pub python: Server,
     pub vue: Server,
+    pub html: Server,
 }
 
 impl Default for Lsp {
@@ -320,6 +321,7 @@ impl Default for Lsp {
             typescript: Server::default(),
             python: Server::default(),
             vue: Server::default(),
+            html: Server::default(),
         }
     }
 }
@@ -332,6 +334,7 @@ impl Lsp {
             LanguageServer::TypeScript => &self.typescript,
             LanguageServer::Python => &self.python,
             LanguageServer::Vue => &self.vue,
+            LanguageServer::Html => &self.html,
         }
     }
 }
@@ -420,6 +423,7 @@ impl Config {
             ("lsp.typescript.command", &self.lsp.typescript.command),
             ("lsp.python.command", &self.lsp.python.command),
             ("lsp.vue.command", &self.lsp.vue.command),
+            ("lsp.html.command", &self.lsp.html.command),
         ] {
             ensure!(
                 command.is_empty() || parse_command_line(command).is_some(),
