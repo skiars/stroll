@@ -197,7 +197,7 @@ fn vim_status_keeps_geometry_and_leader_does_not_take_focus() -> anyhow::Result<
             draw(visual);
             visual.update(|_, cx| assert!(workspace.read(cx).locator.open));
             assert!(visual.debug_bounds("vim-leader").is_none());
-            visual.update(|_, cx| assert!(workspace.read(cx).vim.leader.is_none()));
+            visual.update(|_, cx| assert!(workspace.read(cx).vim.hint.is_none()));
             visual.simulate_keystrokes("escape v l");
             draw(visual);
             let selected = visual.update(|_, cx| {
@@ -288,6 +288,199 @@ fn assert_source(
         assert_eq!((position.line, position.character), cursor, "{keys} caret");
         assert_eq!(editor.value().as_str(), contents, "{keys} edit");
     });
+}
+
+#[::core::prelude::v1::test]
+fn vim_go_hint_uses_the_leader_layout_and_preserves_modal_commands() -> anyhow::Result<()> {
+    let text = "one\n two\nthree\nfour\n";
+    with_vim_repository(
+        "source.rs",
+        text,
+        &[("other.rs", "other\n")],
+        |visual, workspace| {
+            let focus = visual.update(|window, cx| window.focused(cx).unwrap());
+            visual.simulate_keystrokes("G g g");
+            draw(visual);
+            assert!(visual.debug_bounds("vim-go").is_none());
+            visual.update(|_, cx| {
+                assert_eq!(
+                    workspace
+                        .read(cx)
+                        .active_file()
+                        .unwrap()
+                        .editor
+                        .read(cx)
+                        .cursor(),
+                    0
+                )
+            });
+
+            visual.simulate_keystrokes("v l g");
+            visual.simulate_event(KeyDownEvent {
+                keystroke: Keystroke::parse("g").unwrap(),
+                is_held: true,
+                prefer_character_input: false,
+            });
+            draw(visual);
+            assert!(visual.debug_bounds("vim-go").is_none());
+            visual.executor().advance_clock(HINT_DELAY);
+            draw(visual);
+            let menu = visual.debug_bounds("vim-go").unwrap();
+            let status = visual.debug_bounds("workspace-status").unwrap();
+            assert_eq!(status.right() - menu.right(), px(12.));
+            assert_eq!(status.top() - menu.bottom(), px(8.));
+            assert!(visual.debug_bounds("vim-go-key-g").is_some());
+            assert!(visual.debug_bounds("vim-go-key-d").is_none());
+            assert!(visual.debug_bounds("vim-go-key-r").is_none());
+            assert!(visual.debug_bounds("vim-go-key-t").is_none());
+            visual.update(|window, _| assert!(focus.is_focused(window)));
+            visual.simulate_keystrokes("escape");
+            draw(visual);
+            assert!(visual.debug_bounds("vim-go").is_none());
+            visual.update(|_, cx| {
+                let this = workspace.read(cx);
+                let file = this.active_file().unwrap();
+                assert!(this.vim.hint.is_none());
+                assert!(file.vim.mode() == source::Mode::Visual);
+                assert_eq!(file.editor.read(cx).selected_range(), 0..2);
+            });
+
+            visual.simulate_keystrokes("escape g");
+            visual.executor().advance_clock(HINT_DELAY);
+            draw(visual);
+            visual.simulate_keystrokes("c");
+            draw(visual);
+            assert!(visual.debug_bounds("vim-go-key-c").is_some());
+            assert!(visual.debug_bounds("vim-go-key-g").is_none());
+            assert!(visual.debug_bounds("status-vim-pending: g c").is_some());
+            visual.simulate_keystrokes("c");
+            draw(visual);
+            assert!(visual.debug_bounds("vim-go").is_none());
+            visual.update(|_, cx| {
+                assert_eq!(
+                    workspace
+                        .read(cx)
+                        .active_file()
+                        .unwrap()
+                        .editor
+                        .read(cx)
+                        .text(),
+                    "// one\n two\nthree\nfour\n"
+                );
+            });
+
+            visual.simulate_keystrokes("u 3 g g d g g");
+            draw(visual);
+            visual.update(|_, cx| {
+                assert_eq!(
+                    workspace
+                        .read(cx)
+                        .active_file()
+                        .unwrap()
+                        .editor
+                        .read(cx)
+                        .text(),
+                    "four\n"
+                );
+            });
+            visual.simulate_keystrokes("i g");
+            visual.executor().advance_clock(HINT_DELAY);
+            draw(visual);
+            assert!(visual.debug_bounds("vim-go").is_none());
+            visual.update(|_, cx| {
+                assert_eq!(
+                    workspace
+                        .read(cx)
+                        .active_file()
+                        .unwrap()
+                        .editor
+                        .read(cx)
+                        .text(),
+                    "gfour\n"
+                );
+            });
+
+            visual.simulate_keystrokes("escape g");
+            visual.update(|window, cx| {
+                workspace.update(cx, |this, cx| {
+                    this.open_file("other.rs".into(), false, window, cx);
+                });
+            });
+            visual.executor().advance_clock(HINT_DELAY);
+            draw(visual);
+            assert!(visual.debug_bounds("vim-go").is_none());
+            for (keys, path) in [("g t", "source.rs"), ("g shift-t", "other.rs")] {
+                visual.simulate_keystrokes(keys);
+                draw(visual);
+                visual.update(|_, cx| {
+                    assert_eq!(
+                        workspace.read(cx).tabs.active(),
+                        Some(std::path::Path::new(path))
+                    );
+                });
+            }
+        },
+    )
+}
+
+#[::core::prelude::v1::test]
+fn vim_go_from_docs_opens_source_at_the_reading_position() -> anyhow::Result<()> {
+    use gpui_component::input::RopeExt as _;
+
+    let document = (0..45)
+        .map(|section| format!("## Section {section}\n\nParagraph {section}.\n\n"))
+        .collect::<String>();
+    with_vim_repository("guide.md", &document, &[], |visual, workspace| {
+        visual.simulate_resize(size(px(1000.), px(460.)));
+        visual.update(|_, cx| cx.set_reduce_motion(true));
+        visual.simulate_keystrokes("space 1");
+        draw(visual);
+        visual.simulate_keystrokes("G g");
+        visual.executor().advance_clock(HINT_DELAY);
+        draw(visual);
+        assert!(visual.debug_bounds("vim-go-key-g").is_some());
+        assert!(visual.debug_bounds("vim-go-key-f").is_some());
+        assert!(visual.debug_bounds("vim-go-key-r").is_none());
+        let (origin, row) = visual.update(|_, cx| {
+            let this = workspace.read(cx);
+            let reader = this.doc.as_ref().unwrap().read(cx);
+            let position = reader.session_position(cx).unwrap();
+            let offset = position
+                .line
+                .map(|line| line.source_offset)
+                .or(position.source_offset)
+                .unwrap();
+            let row = document.as_bytes()[..offset]
+                .iter()
+                .filter(|&&byte| byte == b'\n')
+                .count();
+            assert!(row > 0);
+            (this.document_history_location(cx), row as u32)
+        });
+        visual.simulate_keystrokes("f");
+        draw(visual);
+        visual.update(|window, cx| {
+            let this = workspace.read(cx);
+            let file = this.vim_source(window, cx).unwrap();
+            let editor = file.editor.read(cx);
+            assert!(file.vim.mode() == source::Mode::Normal);
+            assert_eq!(editor.text().offset_to_position(editor.cursor()).line, row);
+        });
+        visual.simulate_keystrokes("ctrl-o");
+        draw(visual);
+        visual.update(|window, cx| {
+            let this = workspace.read(cx);
+            assert!(this.vim_reader(window, cx).is_some());
+            assert_eq!(this.document_history_location(cx), origin);
+        });
+        visual.simulate_keystrokes("ctrl-i");
+        draw(visual);
+        visual.update(|window, cx| {
+            let file = workspace.read(cx).vim_source(window, cx).unwrap();
+            let editor = file.editor.read(cx);
+            assert_eq!(editor.text().offset_to_position(editor.cursor()).line, row);
+        });
+    })
 }
 
 #[::core::prelude::v1::test]

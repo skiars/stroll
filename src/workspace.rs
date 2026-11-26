@@ -567,6 +567,10 @@ enum FileOpen {
         preview: bool,
     },
     ImageBrowse,
+    Jump {
+        position: Option<SourcePosition>,
+        from: SourceLocation,
+    },
     Locate {
         position: Option<(std::ops::Range<usize>, [u8; 32])>,
         from: Option<crate::session::SourceLocation>,
@@ -2642,6 +2646,20 @@ impl Workspace {
         }
     }
 
+    fn open_source_jump(
+        &mut self,
+        path: PathBuf,
+        position: Option<SourcePosition>,
+        from: SourceLocation,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.switch_view(WorkspaceView::Editor, window, cx);
+        if self.view == WorkspaceView::Editor {
+            self.request_file(path, FileOpen::Jump { position, from }, window, cx);
+        }
+    }
+
     fn open_file(
         &mut self,
         path: PathBuf,
@@ -2705,7 +2723,7 @@ impl Workspace {
                     position: None,
                 } => match pending {
                     FileOpen::Select { preview, .. } => *preview = false,
-                    FileOpen::Locate { .. } => {}
+                    FileOpen::Jump { .. } | FileOpen::Locate { .. } => {}
                     FileOpen::Tree { .. }
                     | FileOpen::ImageBrowse
                     | FileOpen::DocumentLink { .. }
@@ -2822,6 +2840,7 @@ impl Workspace {
                             FileOpen::Select { .. }
                             | FileOpen::Tree { .. }
                             | FileOpen::ImageBrowse
+                            | FileOpen::Jump { .. }
                             | FileOpen::Locate { .. }
                             | FileOpen::History { .. } => {}
                             FileOpen::DocumentLink { .. } => {
@@ -2841,7 +2860,7 @@ impl Workspace {
     fn select_loaded_file(
         &mut self,
         path: PathBuf,
-        request: FileOpen,
+        mut request: FileOpen,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -2850,9 +2869,10 @@ impl Workspace {
                 request,
                 FileOpen::Startup | FileOpen::Restore { from: None }
             );
-        let locator_jump = matches!(&request, FileOpen::Locate { .. });
+        let source_jump = matches!(&request, FileOpen::Jump { .. });
+        let explicit_jump = source_jump || matches!(&request, FileOpen::Locate { .. });
         let source = match &request {
-            FileOpen::DocumentLink { from, .. } => Some(from.clone()),
+            FileOpen::DocumentLink { from, .. } | FileOpen::Jump { from, .. } => Some(from.clone()),
             FileOpen::Restore { from } | FileOpen::Locate { from, .. } => from.clone(),
             _ => navigate.then(|| self.source_location(cx)).flatten(),
         };
@@ -2863,6 +2883,17 @@ impl Workspace {
                 .files
                 .get(&path)
                 .is_some_and(|file| Some(file.editor.entity_id()) == self.visible_editor);
+        if (source_jump || !animate)
+            && self.files.contains_key(&path)
+            && let FileOpen::Select { position, .. } | FileOpen::Jump { position, .. } =
+                &mut request
+            && let Some(SourcePosition::Diff(source)) = position
+            && let Some(snapshot) = source.snapshot.take()
+        {
+            let row = source.row;
+            self.prepare_file_diff_position(path, request, row, snapshot, window, cx);
+            return;
+        }
         let tree_preview = match &request {
             FileOpen::Tree { preview } => Some(*preview),
             _ => None,
@@ -2872,6 +2903,7 @@ impl Workspace {
         let (preview, position, location, replay) = match request {
             FileOpen::Select { preview, position } => (preview, position, None, None),
             FileOpen::Tree { preview } => (preview, None, None, None),
+            FileOpen::Jump { position, .. } => (true, position, None, None),
             FileOpen::ImageBrowse => (true, None, None, None),
             FileOpen::DocumentLink { line, .. } => (
                 true,
@@ -2883,20 +2915,11 @@ impl Workspace {
             FileOpen::History { index, position } => (true, None, None, Some((index, position))),
             FileOpen::Startup | FileOpen::Restore { .. } => (true, None, None, None),
         };
-        let position = match position {
-            Some(SourcePosition::Diff(DiffSource {
-                row,
-                snapshot: Some(snapshot),
-            })) if !animate && self.files.contains_key(&path) => {
-                self.prepare_file_diff_position(path, preview, row, snapshot, window, cx);
-                return;
-            }
-            position => position,
-        };
         self.remember_editor_preview(&path);
         if open_as_image {
             self.set_editor_preview_mode(&path, EditorPreviewMode::Full);
-        } else if (position.is_some()
+        } else if ((source_jump && self.files.contains_key(&path))
+            || position.is_some()
             || location.is_some()
             || replay
                 .as_ref()
@@ -2946,6 +2969,15 @@ impl Workspace {
                 });
             }
         }
+        if source_jump && let Some(file) = self.files.get_mut(&path) {
+            let modal = self.config.current().keyboard.vim_mode;
+            file.editor.update(cx, |editor, cx| {
+                if modal {
+                    file.vim.locate(editor, editor.cursor(), window, cx);
+                }
+                editor.focus(window, cx);
+            });
+        }
         if let Some((range, fingerprint)) = location
             && let Some(file) = self.files.get_mut(&path)
         {
@@ -2976,7 +3008,7 @@ impl Workspace {
         }
         if let Some((index, position)) = replay {
             self.complete_source_replay(&path, index, position, source, animate, cx);
-        } else if locator_jump && navigate {
+        } else if explicit_jump && navigate {
             self.record_source_jump(source, cx);
         } else if navigate {
             self.record_source_navigation(source, cx);
@@ -2987,7 +3019,7 @@ impl Workspace {
     fn prepare_file_diff_position(
         &mut self,
         path: PathBuf,
-        preview: bool,
+        request: FileOpen,
         row: usize,
         snapshot: Task<Option<Rope>>,
         window: &mut Window,
@@ -2996,26 +3028,16 @@ impl Workspace {
         let editor = self.files[&path].editor.clone();
         let revision = editor.read(cx).document_revision();
         let mapping = map_diff_source_row(row, snapshot, editor.read(cx).text().clone(), cx);
-        self.loading_file = Some((
-            path,
-            FileOpen::Select {
-                preview,
-                position: Some(SourcePosition::Diff(DiffSource {
-                    row,
-                    snapshot: None,
-                })),
-            },
-        ));
+        self.loading_file = Some((path, request));
         self.file_task = cx.spawn_in(window, async move |this, cx| {
             let mapped = mapping.await;
             _ = this.update_in(cx, |this, window, cx| {
                 let Some((path, mut request)) = this.loading_file.take() else {
                     return;
                 };
-                if let FileOpen::Select {
-                    position: Some(SourcePosition::Diff(source)),
-                    ..
-                } = &mut request
+                if let FileOpen::Select { position, .. } | FileOpen::Jump { position, .. } =
+                    &mut request
+                    && let Some(SourcePosition::Diff(source)) = position
                     && source.snapshot.is_none()
                     && source.row == row
                     && this

@@ -246,10 +246,24 @@ impl TreeRows {
 
 impl GitPanel {
     pub(super) fn focus_vim_file_tree(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.focus_vim_file_tree_at(None, window, cx);
+    }
+
+    pub(super) fn focus_vim_file_tree_at(
+        &mut self,
+        path: Option<&str>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.vim_tree_return = window.focused(cx);
         let active = self.active_file(cx);
-        let review = self.review.as_mut().unwrap();
-        self.vim_tree_path = active.map(|index| review.detail.files[index].path.clone());
+        let Some(review) = &mut self.review else {
+            return;
+        };
+        let selected = path
+            .and_then(|path| review.by_path.get(path).copied())
+            .or(active);
+        self.vim_tree_path = selected.map(|ix| review.detail.files[ix].path.clone());
         if let Some(path) = &self.vim_tree_path {
             let directories = Arc::make_mut(&mut review.directories);
             let count = directories.len();
@@ -259,6 +273,18 @@ impl GitPanel {
             }
         }
         self.tree_followed_file = None;
+        if let Some(selected) = selected.filter(|selected| Some(*selected) != active)
+            && let Some(review) = &self.review
+        {
+            let rows = TreeRows::build(review, &self.filter);
+            if let Some(row) = rows.file_rows[selected] {
+                self.tree_scroll
+                    .scroll_to_item(row, ScrollStrategy::Nearest);
+                self.tree_followed_file = active
+                    .filter(|&ix| rows.file_rows[ix].is_some())
+                    .map(|ix| review.detail.files[ix].path.clone());
+            }
+        }
         self.set_tree_visible(true, cx);
         self.vim_tree_focus.focus(window, cx);
         App::notify(cx, self.tree_pane.entity_id());

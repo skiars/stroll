@@ -796,14 +796,15 @@ fn diff_file_and_row_menus_reveal_worktree_lines() {
         assert_editor(visual, path, 27);
     }
 
-    for (split, history, side, line, opposite_padding, wrapped, expected) in [
+    let row_cases = [
         (false, false, DiffSide::Modified, 34, false, true, 33),
         (true, false, DiffSide::Modified, 36, false, false, 35),
         (false, false, DiffSide::Original, 37, false, false, 37),
         (true, false, DiffSide::Original, 37, true, false, 37),
         (true, true, DiffSide::Original, 32, false, false, 32),
         (true, true, DiffSide::Original, 33, false, false, 33),
-    ] {
+    ];
+    for (split, history, side, line, opposite_padding, wrapped, expected) in row_cases {
         show_diff(visual, split, history);
         let position = DiffLinePosition::new(path, side, line);
         let column = visual.update(|window, cx| {
@@ -869,7 +870,13 @@ fn diff_file_and_row_menus_reveal_worktree_lines() {
     visual.update(|window, cx| {
         assert_eq!(workspace.read(cx).view, WorkspaceView::Git);
         panel.update(cx, |panel, cx| {
-            assert_eq!(panel.pending_editor_open.as_deref(), Some(guide));
+            assert_eq!(
+                panel
+                    .pending_editor_open
+                    .as_ref()
+                    .map(|request| request.path.as_str()),
+                Some(guide)
+            );
             let review = panel.review.as_ref().unwrap();
             assert!(review.collapsed.contains(guide));
             assert!(
@@ -893,6 +900,100 @@ fn diff_file_and_row_menus_reveal_worktree_lines() {
         assert_eq!(owner.view, WorkspaceView::Docs);
         assert_eq!(owner.doc.as_ref().unwrap().read(cx).path, Path::new(guide));
     });
+
+    visual.update(|window, cx| {
+        workspace.update(cx, |workspace, cx| workspace.toggle_vim_mode(window, cx));
+    });
+    for (split, history, side, line, opposite_padding, _, expected) in row_cases {
+        show_diff(visual, split, history);
+        let position = DiffLinePosition::new(path, side, line);
+        let (column, caret) = visual.update(|window, cx| {
+            let panel = panel.read(cx);
+            let column = if split && (side == DiffSide::Original) != opposite_padding {
+                panel.editor.original_state()
+            } else {
+                panel.editor.modified_state()
+            }
+            .clone();
+            let bounds = panel.review_source_bounds(&position, cx).unwrap();
+            let caret = column.update(cx, |editor, cx| {
+                let row = editor
+                    .visible_row_range()
+                    .unwrap()
+                    .find(|&row| editor.projected_line_bounds(row).unwrap().top() == bounds.top())
+                    .unwrap();
+                let caret = editor.text().line_start_offset(row);
+                editor.set_selected_range(caret..caret, cx);
+                editor.focus(window, cx);
+                caret
+            });
+            (column, caret)
+        });
+        visual.simulate_keystrokes("g");
+        assert!(visual.debug_bounds("vim-go").is_none());
+        visual.executor().advance_clock(Duration::from_millis(300));
+        settle(visual);
+        assert!(visual.debug_bounds("vim-go-key-f").is_some());
+        assert!(visual.debug_bounds("vim-go-key-D").is_none());
+        visual.simulate_keystrokes("f");
+        settle(visual);
+        assert_editor(visual, path, expected);
+        assert!(visual.debug_bounds("status-vim-mode: NORMAL").is_some());
+        assert!(visual.debug_bounds("vim-go").is_none());
+
+        visual.simulate_keystrokes("ctrl-o");
+        settle(visual);
+        visual.update(|window, cx| {
+            assert_eq!(workspace.read(cx).view, WorkspaceView::Git);
+            let editor = column.read(cx);
+            assert!(editor.focus_handle(cx).is_focused(window));
+            assert_eq!(editor.cursor(), caret);
+        });
+        visual.simulate_keystrokes("ctrl-i");
+        settle(visual);
+        assert_editor(visual, path, expected);
+        assert!(visual.debug_bounds("status-vim-mode: NORMAL").is_some());
+    }
+
+    show_diff(visual, false, false);
+    visual.update(|window, cx| {
+        panel.update(cx, |panel, cx| panel.focus_vim_file_tree(window, cx));
+    });
+    visual.simulate_keystrokes("j g");
+    visual.executor().advance_clock(Duration::from_millis(300));
+    settle(visual);
+    assert!(visual.debug_bounds("vim-go-key-f").is_some());
+    assert!(visual.debug_bounds("vim-go-key-D").is_some());
+    visual.simulate_keystrokes("f");
+    settle(visual);
+    assert_editor(visual, guide, 2);
+    visual.simulate_keystrokes("ctrl-o");
+    settle(visual);
+    let assert_guide_in_tree = |visual: &mut VisualTestContext| {
+        visual.update(|window, cx| {
+            assert_eq!(workspace.read(cx).view, WorkspaceView::Git);
+            let panel = panel.read(cx);
+            assert!(panel.vim_tree_focus.is_focused(window));
+            assert_eq!(panel.vim_tree_path.as_deref(), Some(guide));
+        });
+    };
+    assert_guide_in_tree(visual);
+    visual.simulate_keystrokes("ctrl-i");
+    settle(visual);
+    assert_editor(visual, guide, 2);
+
+    visual.simulate_keystrokes("ctrl-o g shift-d");
+    settle(visual);
+    visual.update(|window, cx| {
+        let owner = workspace.read(cx);
+        assert_eq!(owner.view, WorkspaceView::Docs);
+        let doc = owner.doc.as_ref().unwrap().read(cx);
+        assert_eq!(doc.path, Path::new(guide));
+        assert!(doc.content_focused(window, cx));
+    });
+    visual.simulate_keystrokes("ctrl-o");
+    settle(visual);
+    assert_guide_in_tree(visual);
 }
 
 #[::core::prelude::v1::test]

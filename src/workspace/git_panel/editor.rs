@@ -1316,6 +1316,39 @@ impl ReviewEditor {
                 .projected_line_bounds(row)
                 .is_some_and(|bounds| point.y >= bounds.top() && point.y < bounds.bottom())
         })?;
+        self.source_at_row(row, left)
+    }
+
+    pub(super) fn source_at_caret(
+        &self,
+        editor: &Entity<EditorState>,
+        cx: &App,
+    ) -> (Option<DiffLinePosition>, Option<&str>) {
+        let left = editor == &self.original.editor;
+        let column = if left { &self.original } else { &self.modified };
+        let row = editor
+            .read(cx)
+            .text()
+            .offset_to_point(editor.read(cx).cursor())
+            .row;
+        let position = self.source_at_row(row, left);
+        let path = match &*column.projection.borrow() {
+            projection if projection.edited => None,
+            _ => match self.rows.get(row) {
+                Some(
+                    DiffEditorRow::File(path)
+                    | DiffEditorRow::Notice(path)
+                    | DiffEditorRow::Hunk(path, ..)
+                    | DiffEditorRow::Fold(path, ..),
+                ) => Some(path.as_str()),
+                _ => None,
+            },
+        };
+        (position, path)
+    }
+
+    fn source_at_row(&self, row: usize, left: bool) -> Option<DiffLinePosition> {
+        let column = if left { &self.original } else { &self.modified };
         let position = |column: &Column| {
             Some(
                 column

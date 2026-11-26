@@ -369,7 +369,7 @@ pub(super) struct GitPanel {
     editor: editor::ReviewEditor,
     pending_file_reveal: Option<FileReveal>,
     pending_hunk_navigation: Option<review::HunkNavigation>,
-    pending_editor_open: Option<String>,
+    pending_editor_open: Option<review::PendingEditorOpen>,
     pending_position: Option<DiffLinePosition>,
     pending_review_anchor: Option<DiffViewportAnchor>,
     loading_session_diff: Option<DiffPosition>,

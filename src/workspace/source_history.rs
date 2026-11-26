@@ -217,6 +217,7 @@ impl Workspace {
         if !forward {
             let pending_origin = match self.view {
                 WorkspaceView::Editor => match &self.loading_file {
+                    Some((_, FileOpen::Jump { from, .. })) => Some(from),
                     Some((_, FileOpen::Restore { from } | FileOpen::Locate { from, .. })) => {
                         from.as_ref()
                     }
@@ -288,7 +289,13 @@ impl Workspace {
             self.switch_view(WorkspaceView::Git, window, cx);
             if let Some(panel) = &self.git {
                 panel.update(cx, |panel, cx| {
-                    panel.restore_history_location(pane, location.position, window, cx);
+                    panel.restore_history_location(
+                        pane,
+                        location.path.as_deref(),
+                        location.position,
+                        window,
+                        cx,
+                    );
                 });
             }
             self.complete_navigation_replay(index);

@@ -4,6 +4,7 @@ use std::path::Path;
 use rust_i18n::t;
 
 use super::*;
+use crate::session::SourceLocation;
 use crate::workspace::{
     FindInDocument, SourcePosition, WorkspaceView, baseline_shift,
     editor_git::{HunkDirection, HunkNavigationAnchor, hunk_toolbar},
@@ -28,6 +29,11 @@ pub(super) struct CommitSummaryLayout {
     whitespace: bool,
     show_details: bool,
     message: Option<Rope>,
+}
+
+pub(super) struct PendingEditorOpen {
+    pub(super) path: String,
+    from: Option<SourceLocation>,
 }
 
 pub(super) struct LivePatch {
@@ -1216,8 +1222,13 @@ impl GitPanel {
                     }
                     Err(error) => {
                         this.detail_error = Some(error.to_string());
-                        if let Some(path) = this.pending_editor_open.take() {
-                            this.open_diff_file_in_editor(&path, window, cx);
+                        if let Some(request) = this.pending_editor_open.take() {
+                            this.open_review_file_in_editor(
+                                &request.path,
+                                request.from,
+                                window,
+                                cx,
+                            );
                         }
                     }
                 }
@@ -1268,8 +1279,8 @@ impl GitPanel {
                     this.preload_working_buffers(window, cx);
                     App::notify(cx, this.review_pane.entity_id());
                 }
-                if let Some(path) = this.pending_editor_open.take() {
-                    this.open_diff_file_in_editor(&path, window, cx);
+                if let Some(request) = this.pending_editor_open.take() {
+                    this.open_review_file_in_editor(&request.path, request.from, window, cx);
                 }
             });
         });
@@ -1603,15 +1614,26 @@ impl GitPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.open_review_file_in_editor(path, None, window, cx);
+    }
+
+    pub(super) fn open_review_file_in_editor(
+        &mut self,
+        path: &str,
+        from: Option<SourceLocation>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.pending_editor_open = None;
         if let Some(ix) = self.openable_review_file(path) {
-            self.open_first_hunk_in_editor(ix, window, cx);
+            self.open_first_hunk_in_editor(ix, from, window, cx);
         }
     }
 
     fn open_first_hunk_in_editor(
         &mut self,
         ix: usize,
+        from: Option<SourceLocation>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -1624,7 +1646,10 @@ impl GitPanel {
                 PatchState::Pending | PatchState::Loading
             )
         {
-            self.pending_editor_open = Some(review.detail.files[ix].path.clone());
+            self.pending_editor_open = Some(PendingEditorOpen {
+                path: review.detail.files[ix].path.clone(),
+                from,
+            });
             self.request_patch(ix, window, cx);
             return;
         }
@@ -1642,7 +1667,11 @@ impl GitPanel {
             None
         };
         self.open_worktree_file(ix, window, cx, move |workspace, path, window, cx| {
-            workspace.open_document_source_at(path, source, window, cx);
+            if let Some(from) = from {
+                workspace.open_source_jump(path, source, from, window, cx);
+            } else {
+                workspace.open_document_source_at(path, source, window, cx);
+            }
         });
     }
 
@@ -1674,7 +1703,7 @@ impl GitPanel {
         }
     }
 
-    fn open_worktree_file(
+    pub(super) fn open_worktree_file(
         &self,
         ix: usize,
         window: &mut Window,
@@ -1851,7 +1880,7 @@ impl GitPanel {
         let editor_request = self
             .pending_editor_open
             .as_ref()
-            .and_then(|path| review.by_path.get(path))
+            .and_then(|request| review.by_path.get(&request.path))
             .copied();
         let hunk_request = self
             .hunk_load_path()
@@ -1897,7 +1926,10 @@ impl GitPanel {
             let Some(ix) = queue.pop_front() else { break };
             let path = &review.detail.files[ix].path;
             if matches!(review.patches[ix], PatchState::Pending)
-                && (self.pending_editor_open.as_ref() == Some(path)
+                && (self
+                    .pending_editor_open
+                    .as_ref()
+                    .is_some_and(|request| &request.path == path)
                     || hunk_request.as_ref() == Some(path)
                     || !review.collapsed.contains(path))
             {
@@ -2098,12 +2130,11 @@ impl GitPanel {
         App::notify(cx, self.review_pane.entity_id());
         App::notify(cx, self.tree_pane.entity_id());
         let file = &self.review.as_ref().unwrap().detail.files[ix];
-        if self
+        if let Some(request) = self
             .pending_editor_open
-            .take_if(|path| *path == file.path)
-            .is_some()
+            .take_if(|request| request.path == file.path)
         {
-            self.open_first_hunk_in_editor(ix, window, cx);
+            self.open_first_hunk_in_editor(ix, request.from, window, cx);
         }
         self.resume_hunk_navigation(ix, window, cx);
     }

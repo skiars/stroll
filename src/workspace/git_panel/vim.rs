@@ -1,10 +1,15 @@
+use std::path::{Path, PathBuf};
+
 use gpui::*;
-use gpui_component::input::{self, EditorState};
+use gpui_component::{
+    diff::DiffLinePosition,
+    input::{self, EditorState, RopeExt as _},
+};
 
 use super::{GitPanel, review::has_live_target};
 use crate::session::{FilePosition, GitHistoryPane, SourceLocation};
 use crate::workspace::{
-    SaveFile,
+    DiffSource, DocumentNavigation, SaveFile, SourcePosition,
     session::{restore_file_selection, source_file_position},
     vim::{
         plain_key,
@@ -91,7 +96,11 @@ impl GitPanel {
             .history_diff_editor(pane)
             .map(|editor| source_file_position(editor.read(cx), None));
         SourceLocation {
-            path: None,
+            path: if pane == GitHistoryPane::ChangedFiles {
+                self.vim_tree_path.as_deref().map(PathBuf::from)
+            } else {
+                None
+            },
             position,
             document: None,
             git: Some(pane),
@@ -101,6 +110,7 @@ impl GitPanel {
     pub(in crate::workspace) fn restore_history_location(
         &mut self,
         pane: GitHistoryPane,
+        path: Option<&Path>,
         position: Option<FilePosition>,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -124,7 +134,9 @@ impl GitPanel {
         }
         match pane {
             GitHistoryPane::History => self.history_focus.focus(window, cx),
-            GitHistoryPane::ChangedFiles => self.focus_vim_file_tree(window, cx),
+            GitHistoryPane::ChangedFiles => {
+                self.focus_vim_file_tree_at(path.and_then(Path::to_str), window, cx);
+            }
             _ => self.focus(window, cx),
         }
     }
@@ -235,12 +247,132 @@ impl GitPanel {
         changed
     }
 
-    pub(super) fn vim_diff_accepts_leader(&self, window: &Window, cx: &App) -> bool {
+    pub(in crate::workspace) fn vim_diff_accepts_leader(&self, window: &Window, cx: &App) -> bool {
         self.focused_diff_column(window, cx).is_some_and(|column| {
             self.diff_vim.hunk_prefix.is_none()
                 && self.diff_vim.columns[column as usize].accepts_leader()
-                && !self.vim_diff_composing(window, cx)
+                && self.diff_editor(column).is_some_and(|editor| {
+                    let editor = editor.read(cx);
+                    !editor.is_composing()
+                        && !editor.completion_menu_state().open
+                        && !editor.code_action_menu_state().open
+                })
         })
+    }
+
+    pub(in crate::workspace) fn vim_diff_go_available(
+        &self,
+        join: bool,
+        window: &Window,
+        cx: &App,
+    ) -> bool {
+        let editor = self.search_editor(window, cx);
+        let editor = editor.read(cx);
+        if join {
+            editor.is_editable() && self.editing_path(window, cx).is_some()
+        } else {
+            editor.context_menu_capabilities().has_definition()
+        }
+    }
+
+    pub(in crate::workspace) fn vim_changed_file(&self, window: &Window, cx: &App) -> Option<&str> {
+        if !self.vim_tree_focus.is_focused(window) {
+            return None;
+        }
+        let review = self.review.as_ref()?;
+        let path = match self.vim_tree_path.as_deref() {
+            Some(path) => path,
+            None => &review.detail.files[self.active_file(cx)?].path,
+        };
+        self.openable_review_file(path)?;
+        Some(path)
+    }
+
+    fn vim_diff_file(
+        &self,
+        window: &Window,
+        cx: &App,
+    ) -> Option<(usize, Option<DiffLinePosition>)> {
+        let column = self.focused_diff_column(window, cx)?;
+        let review = self.review.as_ref()?;
+        if let Some(snapshot) = &self.snapshot {
+            let ix = self.openable_review_file(&snapshot.detail.files[snapshot.file].path)?;
+            return Some((ix, None));
+        }
+        let (position, header) = self.editor.source_at_caret(self.diff_editor(column)?, cx);
+        let index = if let Some(position) = &position {
+            self.openable_review_file(position.path())?
+        } else if let Some(path) = header {
+            self.openable_review_file(path)?
+        } else {
+            self.active_file(cx).filter(|&ix| review.openable[ix])?
+        };
+        Some((index, position))
+    }
+
+    pub(in crate::workspace) fn vim_diff_has_file(&self, window: &Window, cx: &App) -> bool {
+        self.vim_diff_file(window, cx).is_some()
+    }
+
+    pub(in crate::workspace) fn vim_open_git_file(
+        &mut self,
+        docs: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let from = self.navigation_history_location(window, cx);
+        if let Some(path) = self.vim_changed_file(window, cx) {
+            let path = path.to_owned();
+            if docs {
+                let Some(ix) = self.openable_review_file(&path) else {
+                    return;
+                };
+                self.pending_editor_open = None;
+                self.open_worktree_file(ix, window, cx, move |workspace, path, window, cx| {
+                    workspace.open_doc_request(
+                        path,
+                        None,
+                        None,
+                        None,
+                        Some(DocumentNavigation::Record(Some(from))),
+                        window,
+                        cx,
+                    );
+                });
+            } else {
+                self.open_review_file_in_editor(&path, Some(from), window, cx);
+            }
+            return;
+        }
+        let Some((ix, position)) = self.vim_diff_file(window, cx) else {
+            return;
+        };
+        let source = if let Some(snapshot) = &self.snapshot {
+            let editor = snapshot.editor.as_ref().unwrap().read(cx);
+            Some(DiffSource {
+                row: editor.text().offset_to_point(editor.cursor()).row,
+                snapshot: Some(Task::ready(Some(editor.text().clone()))),
+            })
+        } else {
+            position
+                .as_ref()
+                .and_then(|position| self.diff_source(position, cx))
+        };
+        if let Some(source) = source {
+            self.pending_editor_open = None;
+            self.open_worktree_file(ix, window, cx, move |workspace, path, window, cx| {
+                workspace.open_source_jump(
+                    path,
+                    Some(SourcePosition::Diff(source)),
+                    from,
+                    window,
+                    cx,
+                );
+            });
+        } else if let Some(review) = &self.review {
+            let path = review.detail.files[ix].path.clone();
+            self.open_review_file_in_editor(&path, Some(from), window, cx);
+        }
     }
 
     pub(in crate::workspace) fn vim_diff_command_mode(&self, window: &Window, cx: &App) -> bool {

@@ -1,3 +1,4 @@
+mod go;
 pub(super) mod source;
 
 use std::{path::PathBuf, time::Duration};
@@ -26,7 +27,7 @@ const PENDING_SAMPLE: &str = "…0000000␣";
 
 #[derive(Default)]
 pub(super) struct WorkspaceState {
-    leader: Option<Leader>,
+    hint: Option<KeyHint>,
     return_from_tree: Option<FocusHandle>,
     reader_prefix: bool,
     wide_status: bool,
@@ -40,7 +41,22 @@ impl WorkspaceState {
     }
 }
 
-struct Leader {
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HintKind {
+    Leader,
+    Go(GoScope),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum GoScope {
+    Source,
+    Reader,
+    Diff,
+    ChangedFiles,
+}
+
+struct KeyHint {
+    kind: HintKind,
     focus: FocusHandle,
     prefix: String,
     visible: bool,
@@ -66,6 +82,19 @@ enum Command {
     CodeActions,
     Rename,
     Format,
+    Go(GoCommand),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum GoCommand {
+    Top,
+    Definition,
+    References,
+    Comment,
+    Join,
+    Tab(bool),
+    File,
+    Docs,
 }
 
 struct Binding {
@@ -74,7 +103,7 @@ struct Binding {
     label: &'static str,
 }
 
-const BINDINGS: &[Binding] = &[
+const LEADER_BINDINGS: &[Binding] = &[
     Binding {
         keys: " ",
         command: Command::Files,
@@ -172,6 +201,81 @@ const BINDINGS: &[Binding] = &[
     },
 ];
 
+const GO_BINDINGS: &[Binding] = &[
+    Binding {
+        keys: "g",
+        command: Command::Go(GoCommand::Top),
+        label: "vim.go_top",
+    },
+    Binding {
+        keys: "d",
+        command: Command::Go(GoCommand::Definition),
+        label: "vim.go_to_definition",
+    },
+    Binding {
+        keys: "r",
+        command: Command::Go(GoCommand::References),
+        label: "lsp.find_references",
+    },
+    Binding {
+        keys: "cc",
+        command: Command::Go(GoCommand::Comment),
+        label: "vim.comment",
+    },
+    Binding {
+        keys: "J",
+        command: Command::Go(GoCommand::Join),
+        label: "vim.join_without_spaces",
+    },
+    Binding {
+        keys: "t",
+        command: Command::Go(GoCommand::Tab(true)),
+        label: "vim.next_tab",
+    },
+    Binding {
+        keys: "T",
+        command: Command::Go(GoCommand::Tab(false)),
+        label: "vim.previous_tab",
+    },
+    Binding {
+        keys: "f",
+        command: Command::Go(GoCommand::File),
+        label: "git.open_in_editor",
+    },
+    Binding {
+        keys: "D",
+        command: Command::Go(GoCommand::Docs),
+        label: "tabs.open_in_docs",
+    },
+];
+
+impl HintKind {
+    fn bindings(self) -> &'static [Binding] {
+        match self {
+            Self::Leader => LEADER_BINDINGS,
+            Self::Go(_) => GO_BINDINGS,
+        }
+    }
+
+    fn display(self, prefix: &str, space: &str) -> String {
+        display_prefix(
+            prefix,
+            space,
+            match self {
+                Self::Leader => space,
+                Self::Go(_) => "g",
+            },
+        )
+    }
+
+    fn selector(self) -> &'static str {
+        match self {
+            Self::Leader => "vim-leader",
+            Self::Go(_) => "vim-go",
+        }
+    }
+}
+
 fn group_label(key: char) -> &'static str {
     match key {
         'b' => "vim.buffers",
@@ -193,7 +297,7 @@ fn visible_suffix(text: &str, capacity: usize) -> String {
         .collect()
 }
 
-fn display_prefix(prefix: &str, space: &str) -> String {
+fn display_prefix(prefix: &str, space: &str, first: &str) -> String {
     let keys = prefix.chars().map(|key| {
         if key == ' ' {
             space.to_owned()
@@ -201,7 +305,7 @@ fn display_prefix(prefix: &str, space: &str) -> String {
             key.to_string()
         }
     });
-    std::iter::once(space.to_owned())
+    std::iter::once(first.to_owned())
         .chain(keys)
         .collect::<Vec<_>>()
         .join(" ")
@@ -254,7 +358,9 @@ impl Workspace {
                         (!window.default_prevented()
                             && this.view == WorkspaceView::Git
                             && this.config.current().keyboard.vim_mode
-                            && this.vim.leader.is_none()
+                            && this.vim.hint.is_none()
+                            && !(plain_key(&event.keystroke) == Some('g')
+                                && this.vim_go_scope(window, cx) == Some(GoScope::Diff))
                             && !this.locator.open
                             && !this.repository_overlay_open()
                             && !this.confirming_close
@@ -301,9 +407,9 @@ impl Workspace {
         }
         if self
             .vim
-            .leader
+            .hint
             .as_ref()
-            .is_some_and(|leader| leader.focus.is_focused(window))
+            .is_some_and(|hint| hint.focus.is_focused(window))
             && plain_key(key).is_none()
             && key.key != "escape"
             && !key.is_modifier_key()
@@ -391,7 +497,7 @@ impl Workspace {
     }
 
     pub(super) fn cancel_vim_keys(&mut self, cx: &mut Context<Self>) {
-        let mut changed = self.vim.leader.take().is_some();
+        let mut changed = self.vim.hint.take().is_some();
         changed |= std::mem::take(&mut self.vim.reader_prefix);
         if let Some(file) = self.tabs.active().and_then(|path| self.files.get_mut(path)) {
             changed |= file.vim.clear_pending();
@@ -489,15 +595,15 @@ impl Workspace {
         }
         if !self
             .vim
-            .leader
+            .hint
             .as_ref()
-            .is_none_or(|leader| leader.focus.is_focused(window))
+            .is_none_or(|hint| hint.focus.is_focused(window))
         {
             self.cancel_vim_keys(cx);
         }
-        if self.vim.leader.is_some() {
+        if self.vim.hint.is_some() {
             if !event.is_held {
-                self.advance_vim_leader(plain, window, cx);
+                self.advance_vim_hint(key, plain, window, cx);
             }
             consume(window, cx);
             return;
@@ -505,7 +611,7 @@ impl Workspace {
         if self.vim_eligible(window, cx) {
             if plain == Some(' ') {
                 if !event.is_held {
-                    self.start_vim_leader(window, cx);
+                    self.start_vim_hint(HintKind::Leader, window, cx);
                 }
                 consume(window, cx);
                 return;
@@ -517,6 +623,15 @@ impl Workspace {
                 consume(window, cx);
                 return;
             }
+        }
+        if plain == Some('g')
+            && let Some(scope) = self.vim_go_scope(window, cx)
+        {
+            if !event.is_held {
+                self.start_vim_hint(HintKind::Go(scope), window, cx);
+            }
+            consume(window, cx);
+            return;
         }
         if self.vim_tree_key(plain, window, cx) {
             return;
@@ -591,17 +706,15 @@ impl Workspace {
         {
             return;
         }
-        if self.vim_source(window, cx).is_some() && self.dismiss_active_signature(cx) {
-            consume(window, cx);
-            return;
-        }
         if self
             .vim
-            .leader
+            .hint
             .as_ref()
-            .is_some_and(|leader| leader.focus.is_focused(window))
+            .is_some_and(|hint| hint.focus.is_focused(window))
         {
             self.cancel_vim_keys(cx);
+            consume(window, cx);
+        } else if self.vim_source(window, cx).is_some() && self.dismiss_active_signature(cx) {
             consume(window, cx);
         } else if self.config.current().keyboard.vim_mode
             && let Some(path) = self.vim_source(window, cx).map(|file| file.path.clone())
@@ -634,10 +747,11 @@ impl Workspace {
         true
     }
 
-    fn start_vim_leader(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !BINDINGS
+    fn start_vim_hint(&mut self, kind: HintKind, window: &mut Window, cx: &mut Context<Self>) {
+        if !kind
+            .bindings()
             .iter()
-            .any(|binding| self.vim_command_available(binding.command, window, cx))
+            .any(|binding| self.vim_hint_command_available(kind, binding.command, window, cx))
         {
             return;
         }
@@ -646,7 +760,8 @@ impl Workspace {
         };
         self.vim.reader_prefix = false;
         let focus_out = cx.on_focus_out(&focus, window, |this, _, _, cx| this.cancel_vim_keys(cx));
-        self.vim.leader = Some(Leader {
+        self.vim.hint = Some(KeyHint {
+            kind,
             focus,
             prefix: String::new(),
             visible: false,
@@ -657,19 +772,19 @@ impl Workspace {
         cx.notify();
     }
 
-    fn schedule_vim_hint(&mut self, window: &Window, cx: &mut Context<Self>) {
-        let Some(leader) = &mut self.vim.leader else {
+    fn schedule_vim_hint(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(hint) = &mut self.vim.hint else {
             return;
         };
-        if !leader.visible {
+        if !hint.visible {
             let timer = cx.background_executor().timer(HINT_DELAY);
-            leader.timer = cx.spawn_in(window, async move |this, cx| {
+            hint.timer = cx.spawn_in(window, async move |this, cx| {
                 timer.await;
                 _ = this.update_in(cx, |this, window, cx| {
-                    if let Some(leader) = &mut this.vim.leader
-                        && leader.focus.is_focused(window)
+                    if let Some(hint) = &mut this.vim.hint
+                        && hint.focus.is_focused(window)
                     {
-                        leader.visible = true;
+                        hint.visible = true;
                         cx.notify();
                     }
                 });
@@ -677,29 +792,50 @@ impl Workspace {
         }
     }
 
-    fn advance_vim_leader(
+    fn advance_vim_hint(
         &mut self,
+        stroke: &Keystroke,
         key: Option<char>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let mut leader = self.vim.leader.take().unwrap();
+        let mut hint = self.vim.hint.take().unwrap();
         if let Some(key) = key {
-            leader.prefix.push(key);
-            let mut matches = BINDINGS.iter().filter(|binding| {
-                binding.keys.starts_with(&leader.prefix)
-                    && self.vim_command_available(binding.command, window, cx)
-            });
-            if let Some(binding) = matches.next() {
-                if binding.keys == leader.prefix {
-                    self.run_vim_command(binding.command, window, cx);
+            hint.prefix.push(key);
+            if let Some(binding) = hint.kind.bindings().iter().find(|binding| {
+                binding.keys.starts_with(&hint.prefix)
+                    && self.vim_hint_command_available(hint.kind, binding.command, window, cx)
+            }) {
+                if binding.keys == hint.prefix {
+                    match (hint.kind, binding.command) {
+                        (HintKind::Go(scope), Command::Go(command)) => {
+                            self.run_vim_go(scope, command, stroke, window, cx);
+                        }
+                        _ => self.run_vim_command(binding.command, window, cx),
+                    }
                 } else {
-                    self.vim.leader = Some(leader);
+                    self.vim.hint = Some(hint);
                     self.schedule_vim_hint(window, cx);
                 }
             }
         }
         cx.notify();
+    }
+
+    fn vim_hint_command_available(
+        &self,
+        kind: HintKind,
+        command: Command,
+        window: &Window,
+        cx: &App,
+    ) -> bool {
+        match (kind, command) {
+            (HintKind::Go(scope), Command::Go(command)) => {
+                self.vim_go_scope(window, cx) == Some(scope)
+                    && self.vim_go_available(scope, command, window, cx)
+            }
+            _ => self.vim_command_available(command, window, cx),
+        }
     }
 
     fn vim_command_available(&self, command: Command, window: &Window, cx: &App) -> bool {
@@ -782,6 +918,7 @@ impl Workspace {
             Command::CodeActions => window.dispatch_action(Box::new(input::ToggleCodeActions), cx),
             Command::Rename => window.dispatch_action(Box::new(gpui_base::input::RenameSymbol), cx),
             Command::Format => self.format_document(&super::FormatDocument, window, cx),
+            Command::Go(_) => unreachable!("g commands are dispatched by scope"),
         }
     }
 
@@ -790,39 +927,39 @@ impl Workspace {
         window: &Window,
         cx: &Context<Self>,
     ) -> Option<impl IntoElement + use<>> {
-        let leader = self.vim.leader.as_ref()?;
-        if !leader.visible || !leader.focus.is_focused(window) {
+        let hint = self.vim.hint.as_ref()?;
+        if !hint.visible || !hint.focus.is_focused(window) {
             return None;
         }
         let mut items = Vec::new();
-        for binding in BINDINGS {
-            let Some(suffix) = binding.keys.strip_prefix(&leader.prefix) else {
+        for binding in hint.kind.bindings() {
+            let Some(suffix) = binding.keys.strip_prefix(&hint.prefix) else {
                 continue;
             };
             let Some(key) = suffix.chars().next() else {
                 continue;
             };
-            if !self.vim_command_available(binding.command, window, cx)
+            if !self.vim_hint_command_available(hint.kind, binding.command, window, cx)
                 || items.iter().any(|(existing, _)| *existing == key)
             {
                 continue;
             }
             items.push((
                 key,
-                if suffix.len() == key.len_utf8() {
-                    binding.label
-                } else {
-                    group_label(key)
+                match hint.kind {
+                    HintKind::Leader if suffix.len() > key.len_utf8() => group_label(key),
+                    _ => binding.label,
                 },
             ));
         }
         if items.is_empty() {
             return None;
         }
+        let selector = hint.kind.selector();
         let panel = v_flex()
-            .id("vim-leader")
+            .id(selector)
             .occlude()
-            .debug_selector(|| "vim-leader".into())
+            .debug_selector(move || selector.into())
             .popover_style(cx)
             .w(px(320.).min(window.viewport_size().width - px(24.)))
             .max_h((window.viewport_size().height * 0.75).max(px(60.)))
@@ -834,7 +971,7 @@ impl Workspace {
             .child(
                 div()
                     .font_semibold()
-                    .child(display_prefix(&leader.prefix, "Space")),
+                    .child(hint.kind.display(&hint.prefix, "Space")),
             )
             .children(items.into_iter().map(|(key, label)| {
                 let key = if key == ' ' {
@@ -843,6 +980,7 @@ impl Workspace {
                     key.to_string()
                 };
                 h_flex()
+                    .debug_selector(|| format!("{selector}-key-{key}"))
                     .gap_2()
                     .child(div().w(px(52.)).child(key))
                     .child(t!(label).into_owned())
@@ -1060,8 +1198,8 @@ impl Workspace {
         let mode = file.vim.mode();
         let label = mode.label();
         let (background, foreground) = mode_colors(mode, cx.theme().mode.is_dark());
-        let pending = if let Some(leader) = &self.vim.leader {
-            display_prefix(&leader.prefix, SPACE)
+        let pending = if let Some(hint) = &self.vim.hint {
+            hint.kind.display(&hint.prefix, SPACE)
         } else if self.vim_source(window, cx).is_some() {
             file.vim.pending().to_owned()
         } else {
