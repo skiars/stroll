@@ -1348,7 +1348,7 @@ fn vim_ctrl_v_selects_and_edits_rectangles() -> anyhow::Result<()> {
         assert_source(
             visual,
             workspace,
-            "shift-g p",
+            "4 shift-g p",
             &[],
             (3, 1),
             "abcd\nxy\n1234\nlbconger\n y\n 23\n",
@@ -1596,6 +1596,42 @@ fn vim_surround_join_replace_and_match_integrate_with_undo_and_repeat() -> anyho
         assert_source(visual, workspace, "%", &[], (0, 10), "(one [two])\n");
         assert_source(visual, workspace, "%", &[], (0, 0), "(one [two])\n");
         assert_source(visual, workspace, "d %", &[], (0, 0), "\n");
+    })
+}
+
+#[::core::prelude::v1::test]
+fn vim_navigation_reaches_the_final_empty_line() -> anyhow::Result<()> {
+    with_vim_workspace("abc\n", |visual, workspace| {
+        for wrap in [true, false] {
+            visual.update(|window, cx| {
+                workspace.update(cx, |this, cx| {
+                    let file = this.files.get_mut(this.tabs.active().unwrap()).unwrap();
+                    file.apply_wrap(wrap, window, cx);
+                });
+            });
+            let text = "abc\n";
+            reset_editor(visual, workspace, text);
+            assert_source(visual, workspace, "l l j", &[], (1, 0), text);
+            assert_source(visual, workspace, "j", &[], (1, 0), text);
+            assert_source(visual, workspace, "k 0", &[], (0, 0), text);
+            assert_source(visual, workspace, "g g shift-g", &[], (1, 0), text);
+            assert_source(visual, workspace, "d j", &[], (1, 0), text);
+            assert_source(visual, workspace, "k d j", &[], (0, 0), text);
+
+            let text = "abc\n\n";
+            reset_editor(visual, workspace, text);
+            assert_source(visual, workspace, "j", &[], (1, 0), text);
+            assert_source(visual, workspace, "j", &[], (2, 0), text);
+            assert_source(visual, workspace, "g g 2 j", &[], (2, 0), text);
+            assert_source(visual, workspace, "g g 3 shift-g", &[], (2, 0), text);
+            assert_source(visual, workspace, "g g v shift-g", &[text], (2, 0), text);
+            assert_source(visual, workspace, "escape", &[], (2, 0), text);
+
+            let text = "abc\n  def";
+            reset_editor(visual, workspace, text);
+            assert_source(visual, workspace, "2 j", &[], (1, 0), text);
+            assert_source(visual, workspace, "g g shift-g", &[], (1, 2), text);
+        }
     })
 }
 

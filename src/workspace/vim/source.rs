@@ -1103,7 +1103,7 @@ impl Source {
             } else {
                 row.saturating_sub(count)
             };
-            let row = row.min(last_row(text));
+            let row = row.min(text.lines_len() - 1);
             let dest = Row::new(text, row, tab);
             if let Some((_, h_col)) = &mut self.block_columns {
                 if self.block_end {
@@ -1116,7 +1116,7 @@ impl Source {
             }
         } else {
             self.goal_column = None;
-            let Some((mut to, _)) = motion(text, head, target, count) else {
+            let Some((mut to, _)) = motion(text, head, target, count, text.lines_len() - 1) else {
                 return;
             };
             if let Some((_, h_col)) = &mut self.block_columns {

@@ -94,11 +94,12 @@ pub(super) fn motion(
     at: usize,
     target: Target,
     count: usize,
+    last_row: usize,
 ) -> Option<(usize, bool)> {
     let row = text.offset_to_point(at).row;
     let start = line(text, at).start;
     let end = line_end(text, at);
-    let row_start = |row: usize| text.line_start_offset(row.min(last_row(text)));
+    let row_start = |row: usize| text.line_start_offset(row.min(last_row));
     let steps = count.min(text.len().saturating_add(1));
     let to = match target {
         Target::FirstLine | Target::Key('G') => {
@@ -128,7 +129,7 @@ pub(super) fn motion(
         Target::Key('0') => start,
         Target::Key('^') => first_non_blank(text, at),
         Target::PercentLine if count <= 100 => {
-            let total = last_row(text) + 1;
+            let total = last_row + 1;
             first_non_blank(
                 text,
                 row_start((total * count).div_ceil(100).saturating_sub(1)),
@@ -292,7 +293,7 @@ impl Motion {
         } else {
             count
         };
-        let (mut to, inclusive) = motion(text, at, target, count)?;
+        let (mut to, inclusive) = motion(text, at, target, count, last_row(text).max(row))?;
         if matches!(
             target,
             Target::FirstLine
@@ -377,6 +378,7 @@ pub(super) fn selection_range(
     })
 }
 
+/// Last row counted by linewise edits. The empty row after a final newline has no bytes.
 pub(super) fn last_row(text: &Rope) -> usize {
     let eof = text.offset_to_point(text.len());
     eof.row.saturating_sub(usize::from(eof.column == 0))

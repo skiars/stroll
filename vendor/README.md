@@ -27,7 +27,8 @@ example and benchmark targets. The application tests live in `tests/`.
   last character at a nonempty row end, including around inlay hints and
   soft wraps. Modal selections keep an inclusive caret independently of edit
   ranges, including rectangular spans through tabs and short lines. Modal
-  line navigation uses the shared scroll animation and honors reduced motion.
+  vertical navigation reaches the empty row after a final line break. It uses
+  the shared scroll animation and honors reduced motion.
   Edit transactions group modal changes in the shared undo history. Run
   the `vim_` workspace tests and the `vim_caret` integration test.
 

@@ -127,13 +127,21 @@ fn vim_block_caret_uses_shaped_cells_and_inverts_the_glyph() -> anyhow::Result<(
         );
         let (space, blank) = inspect(1)?;
         assert_eq!(blank, 0, "a space has no glyph");
-        for offset in [2, 3] {
+        let mut previous_top = space.top();
+        for offset in [2, 3, 4] {
             let (bounds, glyph) = inspect(offset)?;
             assert!(
                 (bounds.size.width - space.size.width).abs() < px(0.01),
                 "line tail and empty line use a shaped space"
             );
             assert_eq!(glyph, 0);
+            if offset > 2 {
+                assert!(
+                    bounds.top() > previous_top,
+                    "empty lines have distinct rows"
+                );
+            }
+            previous_top = bounds.top();
         }
         assert!(letter.size.width > px(2.));
         assert_eq!(

@@ -319,15 +319,6 @@ impl<M: InputModeKind> InputBaseState<M> {
                 } else {
                     s.vertical_target(effective, anchor, affinity, move_lines)
                 };
-                let offset = if s.modal_editing
-                    && offset == s.text.len()
-                    && s.text.len() > 0
-                    && s.text.char_at(offset - 1) == Some('\n')
-                {
-                    s.previous_boundary(offset)
-                } else {
-                    offset
-                };
                 let row = s.text.offset_to_point(offset).row;
                 if s.modal_editing
                     && (affinity
