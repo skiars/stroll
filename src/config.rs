@@ -23,6 +23,9 @@ pub(crate) const FONT_SIZE_MIN: f64 = 10.;
 pub(crate) const FONT_SIZE_MAX: f64 = 32.;
 pub(crate) const UI_FONT_SIZE_MIN: f64 = 12.;
 pub(crate) const UI_FONT_SIZE_MAX: f64 = 14.;
+pub(crate) const UI_SCALE_DEFAULT: u16 = 100;
+pub(crate) const UI_SCALE_MIN: u16 = 80;
+pub(crate) const UI_SCALE_MAX: u16 = 160;
 pub(crate) const EDITOR_LINE_HEIGHT_RANGE: std::ops::RangeInclusive<f64> = 1.0..=3.0;
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
@@ -110,6 +113,7 @@ pub(crate) struct Appearance {
     pub language: Language,
     pub ui_font_family: String,
     pub ui_font_size: f64,
+    pub ui_scale_percent: u16,
     pub fallback_font_family: String,
     pub smooth_scroll: bool,
     pub file_tree_sticky_scroll: bool,
@@ -127,6 +131,7 @@ impl Default for Appearance {
             language: Language::System,
             ui_font_family: String::new(),
             ui_font_size: 13.,
+            ui_scale_percent: UI_SCALE_DEFAULT,
             fallback_font_family: String::new(),
             smooth_scroll: true,
             file_tree_sticky_scroll: true,
@@ -363,6 +368,14 @@ pub(crate) struct Server {
 
 impl Config {
     fn validate(&self) -> Result<()> {
+        ensure!(
+            (UI_SCALE_MIN..=UI_SCALE_MAX).contains(&self.appearance.ui_scale_percent),
+            t!(
+                "config.ui_scale_range",
+                min = UI_SCALE_MIN,
+                max = UI_SCALE_MAX
+            )
+        );
         for (key, size, min, max) in [
             (
                 "appearance.ui_font_size",
@@ -910,6 +923,23 @@ mod tests {
             loaded.load_error
         );
         assert_eq!(loaded.current(), &config);
+        Ok(())
+    }
+
+    #[test]
+    fn ui_scale_defaults_to_system_and_validates_integer_percentages() -> Result<()> {
+        assert_eq!(decode(b"[appearance]")?.appearance.ui_scale_percent, 100);
+        for percent in [80, 117, 160] {
+            let source = format!("[appearance]\nui_scale_percent = {percent}\n");
+            assert_eq!(
+                decode(source.as_bytes())?.appearance.ui_scale_percent,
+                percent
+            );
+        }
+        for invalid in ["79", "161", "100.5", "-100"] {
+            let source = format!("[appearance]\nui_scale_percent = {invalid}\n");
+            assert!(decode(source.as_bytes()).is_err(), "{invalid}");
+        }
         Ok(())
     }
 

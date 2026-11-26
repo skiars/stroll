@@ -40,6 +40,7 @@ mod toast;
 mod tree_motion;
 mod tree_sticky_scroll;
 mod tree_transfer;
+mod ui_scale;
 mod vim;
 mod window_bounds;
 #[cfg(test)]
@@ -1030,6 +1031,7 @@ impl Workspace {
             })
             .detach();
         let config = config_watch::subscribe(config, window, cx);
+        ui_scale::apply(config.current().appearance.ui_scale_percent, window, cx);
         let editor_font = Self::configured_editor_font(config.current(), cx);
         let startup_lsp = config.current().lsp.clone();
         let ai = store.ai(&config);

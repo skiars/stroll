@@ -4,6 +4,12 @@ The patched crates are the crates.io releases selected in Cargo.lock.
 The published Apache-2.0 licenses are included. The local manifests omit
 example and benchmark targets. The application tests live in `tests/`.
 
+- GPUI windows multiply display DPI by an independent UI scale, with native
+  input and IME geometry converted at the platform boundary. Menus use the
+  scaled viewport. Client window shadows, resize zones, and the space
+  reserved for native title-bar buttons retain their native sizes. Run the
+  `ui_scale` tests along with the popup and scrolling integration tests.
+
 | Crate | Release | Local changes |
 | --- | --- | --- |
 | gpui-pre | 0.3.12 | Backdrop draw ordering, cached scene replay, paint-only exit frames, smooth wheel scrolling, touchpad momentum estimated from input timestamps with per-frame scroll delta coalescing, device-pixel alignment for scrolled document content, paint boundaries for overlays and scroll regions, detection of solid vector paths reusable as document content moves, per-frame atlas and bounds lookup reuse for repeated glyphs, document thumbnail caching by draw size, per-image linear or nearest-neighbor sampling, skipped texture atlas allocation for images outside the clip region, element bounds in release tests with `test-support`, client decorations in test windows, Linux and Windows text rendering presets with cached fractional glyph positions, dashed and dotted text underlines with device-pixel clipping, and typed file clipboard helpers |

@@ -1,8 +1,8 @@
 use std::rc::Rc;
 
 use crate::{
-    ActiveTheme, Colorize as _, Icon, IconName, InteractiveElementExt as _, Sizable as _, StyledExt,
-    h_flex,
+    ActiveTheme, Colorize as _, Icon, IconName, InteractiveElementExt as _, Sizable as _,
+    StyledExt, h_flex,
 };
 use gpui::{
     AnyElement, App, Background, ClickEvent, Context, Decorations, Hsla, InteractiveElement,
@@ -346,7 +346,11 @@ impl RenderOnce for TitleBar {
                 .items_center()
                 .justify_between()
                 .h(TITLE_BAR_HEIGHT)
-                .pl(TITLE_BAR_LEFT_PADDING)
+                .pl(if cfg!(target_os = "macos") {
+                    TITLE_BAR_LEFT_PADDING / window.ui_scale()
+                } else {
+                    TITLE_BAR_LEFT_PADDING
+                })
                 .rounded_tl(radii.top_left)
                 .rounded_tr(radii.top_right)
                 .border_b_1()

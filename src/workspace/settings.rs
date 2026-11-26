@@ -22,12 +22,13 @@ use gpui_component::{
 
 use super::{
     CloseSettings, ToggleSettings, Workspace, WorkspaceView, action_button, apply_theme_with_fonts,
-    associated_highlight, config_watch, source_highlighter_factory,
+    associated_highlight, config_watch, source_highlighter_factory, ui_scale,
 };
 use crate::{
     config::{
         CodeContrast, CodeTheme, Config, ConfigFile, DiffLayout, EDITOR_LINE_HEIGHT_RANGE,
-        FONT_SIZE_MAX, FONT_SIZE_MIN, Theme, UI_FONT_SIZE_MAX, UI_FONT_SIZE_MIN,
+        FONT_SIZE_MAX, FONT_SIZE_MIN, Theme, UI_FONT_SIZE_MAX, UI_FONT_SIZE_MIN, UI_SCALE_DEFAULT,
+        UI_SCALE_MAX, UI_SCALE_MIN,
     },
     language::CommandSource,
     locale::Language,
@@ -162,7 +163,7 @@ pub(super) struct SettingsWindow {
     page: WeakEntity<SettingsPage>,
 }
 
-struct SettingsPage {
+pub(super) struct SettingsPage {
     owner: WeakEntity<Workspace>,
     owner_window: AnyWindowHandle,
     draft: Entity<Config>,
@@ -577,7 +578,9 @@ impl Workspace {
                 panel.update(cx, |panel, cx| panel.ai_settings_changed(cx));
             }
         }
+        ui_scale::apply_and_notify(config.appearance.ui_scale_percent, window, cx);
         let mut previous_appearance = previous.appearance.clone();
+        previous_appearance.ui_scale_percent = config.appearance.ui_scale_percent;
         previous_appearance.ui_font_size = config.appearance.ui_font_size;
         previous_appearance.gradient_title_bar = config.appearance.gradient_title_bar;
         previous_appearance.file_tree_sticky_scroll = config.appearance.file_tree_sticky_scroll;
@@ -693,6 +696,7 @@ impl SettingsPage {
     ) -> Self {
         let focus = cx.focus_handle();
         focus.focus(window, cx);
+        ui_scale::apply(draft.read(cx).appearance.ui_scale_percent, window, cx);
         let changes = cx.observe_in(&draft, window, |page, _, window, cx| {
             page.save_task = cx.spawn_in(window, async move |page, cx| {
                 cx.background_executor()
@@ -703,6 +707,9 @@ impl SettingsPage {
             cx.notify();
         });
         let owner_changes = cx.observe_in(&owner, window, |page, owner, window, cx| {
+            let percent = owner.read(cx).config.current().appearance.ui_scale_percent;
+            ui_scale::apply_and_notify(percent, window, cx);
+            page.sync_ui_scale(&owner, cx);
             let config = &owner.read(cx).config;
             if page.conflicts_with(config, cx) {
                 page.save_task = Task::ready(());
@@ -758,6 +765,32 @@ impl SettingsPage {
             error: None,
             save_task: Task::ready(()),
             _subscriptions: [changes, owner_changes, base_changes, key_changes],
+        }
+    }
+
+    pub(super) fn workspace(&self) -> (AnyWindowHandle, WeakEntity<Workspace>) {
+        (self.owner_window, self.owner.clone())
+    }
+
+    fn sync_ui_scale(&mut self, owner: &Entity<Workspace>, cx: &mut Context<Self>) {
+        let config = &owner.read(cx).config;
+        let current = config.current();
+        let previous = self.base.appearance.ui_scale_percent;
+        let next = current.appearance.ui_scale_percent;
+        if next == previous || config.load_error.is_some() {
+            return;
+        }
+        let mut base = self.base.clone();
+        base.appearance.ui_scale_percent = next;
+        let draft = self.draft.read(cx).appearance.ui_scale_percent;
+        if &base == current && (draft == previous || draft == next) {
+            self.base = base;
+            if draft != next {
+                self.draft.update(cx, |draft, cx| {
+                    draft.appearance.ui_scale_percent = next;
+                    cx.notify();
+                });
+            }
         }
     }
 
@@ -1077,6 +1110,8 @@ impl SettingsPage {
                 t!("settings.interface_language", locale = "zh-CN"),
                 Cow::Borrowed("interface language"),
             ]),
+            setting_item(t!("settings.ui_scale"), self.ui_scale_field())
+                .description(t!("settings.ui_scale_description").into_owned()),
             setting_item(
                 t!("settings.ui_font_family"),
                 self.font_picker(
@@ -1691,6 +1726,20 @@ impl SettingsPage {
         .default_value(default)
     }
 
+    fn ui_scale_field(&self) -> SettingField<f64> {
+        let (read, write) = self.field(|config| &mut config.appearance.ui_scale_percent);
+        SettingField::number_input(
+            NumberFieldOptions {
+                min: f64::from(UI_SCALE_MIN),
+                max: f64::from(UI_SCALE_MAX),
+                step: 1.,
+            },
+            move |cx| f64::from(read(cx)),
+            move |value, cx| write(value.round() as u16, cx),
+        )
+        .default_value(f64::from(UI_SCALE_DEFAULT))
+    }
+
     fn input(&self, field: fn(&mut Config) -> &mut String) -> SettingField<SharedString> {
         let (read, write) = self.field(field);
         SettingField::input(
@@ -1894,6 +1943,137 @@ mod tests {
     use super::*;
     use crate::{config::ConfigFile, repository::Store, workspace::WorkspaceView};
     use std::sync::Arc;
+
+    #[::core::prelude::v1::test]
+    fn ui_scale_shortcuts_update_all_windows_and_show_a_bottom_popup() -> anyhow::Result<()> {
+        use gpui_component::WindowExt as _;
+
+        let fixture = tempfile::tempdir()?;
+        let path = fixture.path().join("config.toml");
+        std::fs::write(&path, "[appearance]\nui_scale_percent = 115 # keep\n")?;
+        let config = ConfigFile::load(Some(path.clone()));
+        let store = Arc::new(Store::new(fixture.path().join("state"))?);
+        let mut app = TestAppContext::build_with_text_system(
+            TestDispatcher::new(0),
+            None,
+            crate::test_support::text_system(cfg!(target_os = "linux")),
+        );
+        app.update(|cx| {
+            gpui_component::init(cx);
+            Workspace::bind_ui_scale_keys(cx);
+        });
+        let mut owner = None;
+        let (_, main) = app.add_window_view(|window, cx| {
+            let workspace = cx.new(|cx| {
+                Workspace::with_config(
+                    store.clone(),
+                    config.clone(),
+                    WorkspaceView::Editor,
+                    window,
+                    cx,
+                )
+            });
+            owner = Some(workspace.clone());
+            Root::new(workspace, window, cx)
+        });
+        let owner = owner.unwrap();
+        let owner_window = main.update(|window, _| window.window_handle());
+        let (_, second) = app.add_window_view(|window, cx| {
+            let workspace =
+                cx.new(|cx| Workspace::with_config(store, config, WorkspaceView::Docs, window, cx));
+            Root::new(workspace, window, cx)
+        });
+        let second_window = second.update(|window, _| window.window_handle());
+        let mut draft = None;
+        let (_, settings) = app.add_window_view(|window, cx| {
+            let config = cx.new(|cx| owner.read(cx).config.current().clone());
+            draft = Some(config.clone());
+            let page = cx.new(|cx| SettingsPage::new(owner, owner_window, config, window, cx));
+            Root::new(page, window, cx)
+        });
+        let settings_window = settings.update(|window, _| window.window_handle());
+        let draft = draft.unwrap();
+        for handle in [owner_window, second_window, settings_window] {
+            app.update_window(handle, |_, window, cx| {
+                assert_eq!(window.ui_scale(), 1.15);
+                assert!(window.notifications(cx).is_empty());
+                window.draw(cx).clear(cx);
+            })?;
+            let mut visual = VisualTestContext::from_window(handle, &app);
+            assert!(visual.debug_bounds("ui-scale-popup").is_none());
+        }
+
+        let (increase, decrease, reset) = if cfg!(target_os = "macos") {
+            ("cmd-=", "cmd--", "cmd-0")
+        } else {
+            ("ctrl-=", "ctrl--", "ctrl-0")
+        };
+        let focus = app.update_window(settings_window, |_, window, cx| {
+            window.activate_window();
+            window.draw(cx).clear(cx);
+            window.focused(cx).unwrap()
+        })?;
+        let pending_wrap = draft.update(&mut app, |draft, cx| {
+            draft.editor.soft_wrap = !draft.editor.soft_wrap;
+            cx.notify();
+            draft.editor.soft_wrap
+        });
+        app.simulate_keystrokes(settings_window, increase);
+        app.simulate_keystrokes(settings_window, increase);
+        app.update_window(settings_window, |_, window, cx| {
+            assert!(focus.is_focused(window));
+            assert!(window.notifications(cx).is_empty());
+            assert_eq!(draft.read(cx).appearance.ui_scale_percent, 135);
+            assert_eq!(draft.read(cx).editor.soft_wrap, pending_wrap);
+        })?;
+        let mut main_visual = VisualTestContext::from_window(owner_window, &app);
+        main_visual.update(|window, cx| window.draw(cx).clear(cx));
+        assert!(main_visual.debug_bounds("ui-scale-popup").is_none());
+
+        let mut settings_visual = VisualTestContext::from_window(settings_window, &app);
+        let viewport = settings_visual.update(|window, cx| {
+            window.draw(cx).clear(cx);
+            window.viewport_size()
+        });
+        let popup = settings_visual.debug_bounds("ui-scale-popup").unwrap();
+        assert!((popup.center().x - viewport.width / 2.).abs() < px(1.));
+        assert!(popup.bottom() >= viewport.height - px(40.));
+        for handle in [owner_window, second_window, settings_window] {
+            app.update_window(handle, |_, window, _| assert_eq!(window.ui_scale(), 1.35))?;
+        }
+        assert!(std::fs::read_to_string(&path)?.contains("ui_scale_percent = 135 # keep"));
+        assert_eq!(
+            ConfigFile::load(Some(path))
+                .current()
+                .appearance
+                .ui_scale_percent,
+            135
+        );
+
+        app.update_window(owner_window, |_, window, cx| {
+            window.activate_window();
+            window.draw(cx).clear(cx);
+        })?;
+        app.simulate_keystrokes(owner_window, decrease);
+        app.update_window(owner_window, |_, window, _| {
+            assert_eq!(window.ui_scale(), 1.25)
+        })?;
+        app.executor().advance_clock(Duration::from_secs(4));
+        app.simulate_keystrokes(owner_window, reset);
+        app.update_window(second_window, |_, window, _| {
+            assert_eq!(window.ui_scale(), 1.)
+        })?;
+        app.executor().advance_clock(Duration::from_secs(2));
+        app.run_until_parked();
+        main_visual.update(|window, cx| window.draw(cx).clear(cx));
+        assert!(main_visual.debug_bounds("ui-scale-popup").is_some());
+        app.executor().advance_clock(Duration::from_secs(4));
+        app.run_until_parked();
+        main_visual.update(|window, cx| window.draw(cx).clear(cx));
+        assert!(main_visual.debug_bounds("ui-scale-popup").is_none());
+
+        Ok(())
+    }
 
     #[::core::prelude::v1::test]
     fn reloads_config_in_open_windows_and_protects_a_conflicting_settings_draft()

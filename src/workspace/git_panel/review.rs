@@ -26,6 +26,7 @@ pub(super) struct CommitSummaryLayout {
     font: Font,
     locale: String,
     only_matching: bool,
+    has_visible_files: bool,
     whitespace: bool,
     show_details: bool,
     message: Option<Rope>,
@@ -2984,6 +2985,7 @@ impl GitPanel {
                 font: window.text_style().font(),
                 locale: rust_i18n::locale().to_string(),
                 only_matching: self.only_matching,
+                has_visible_files: !self.diff.read(cx).files().is_empty(),
                 whitespace: self.whitespace,
                 show_details: self.show_details,
                 message: self
@@ -3347,8 +3349,10 @@ impl GitPanel {
             .py_3()
             .gap_2()
             .bg(colors.elevated)
-            .border_b_1()
-            .border_color(colors.border)
+            .when(
+                self.snapshot.is_some() || self.diff.read(cx).files().is_empty(),
+                |summary| summary.border_b_1().border_color(colors.border),
+            )
             .child(
                 h_flex()
                     .w_full()

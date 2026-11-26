@@ -183,6 +183,7 @@ fn launch() -> Result<()> {
         .run(move |cx| {
             gpui_component::init(cx);
             Workspace::bind_terminal_keys(cx);
+            Workspace::bind_ui_scale_keys(cx);
             bind_workspace_keys(cx);
             if let Some(path) = standalone {
                 if let Err(error) = Workspace::open_standalone(store, config, path, None, cx) {

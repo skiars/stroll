@@ -854,6 +854,53 @@ pub enum PlatformInput {
 }
 
 impl PlatformInput {
+    /// Convert native window coordinates at the platform boundary. Events
+    /// synthesized by GPUI already use UI coordinates.
+    pub(crate) fn for_ui_scale(mut self, ui_scale: f32) -> Self {
+        if ui_scale == 1. {
+            return self;
+        }
+
+        let position = match &mut self {
+            Self::MouseDown(event) => &mut event.position,
+            Self::MouseUp(event) => &mut event.position,
+            Self::MouseMove(event) => &mut event.position,
+            Self::MousePressure(event) => &mut event.position,
+            Self::MouseExited(event) => &mut event.position,
+            Self::Pinch(event) => &mut event.position,
+            Self::BackGesture(event) => &mut event.start_position,
+            Self::Scroll(event) => {
+                if let ScrollDelta::Pixels(delta) = &mut event.delta {
+                    *delta = *delta / ui_scale;
+                }
+                &mut event.position
+            }
+            Self::Touch(event) => {
+                event.predicted_position = event.predicted_position.map(|point| point / ui_scale);
+                &mut event.position
+            }
+            Self::TouchDrag(event) => {
+                event.start_position = event.start_position / ui_scale;
+                &mut event.position
+            }
+            Self::LongPress(event) => {
+                event.start_position = event.start_position / ui_scale;
+                &mut event.position
+            }
+            Self::FileDrop(
+                FileDropEvent::Entered { position, .. }
+                | FileDropEvent::Pending { position }
+                | FileDropEvent::Submit { position },
+            ) => position,
+            Self::KeyDown(_)
+            | Self::KeyUp(_)
+            | Self::ModifiersChanged(_)
+            | Self::FileDrop(FileDropEvent::Exited | FileDropEvent::Ended) => return self,
+        };
+        *position = *position / ui_scale;
+        self
+    }
+
     pub(crate) fn mouse_event(&self) -> Option<&dyn Any> {
         match self {
             PlatformInput::KeyDown { .. } => None,

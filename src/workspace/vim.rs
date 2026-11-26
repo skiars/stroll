@@ -352,7 +352,9 @@ impl Workspace {
         let workspace = cx.weak_entity();
         let owner = window.window_handle().window_id();
         cx.intercept_keystrokes(move |event, window, cx| {
-            if window.window_handle().window_id() == owner {
+            if window.window_handle().window_id() == owner
+                && !super::ui_scale::is_shortcut(&event.keystroke)
+            {
                 if let Ok(Some(panel)) = workspace.update(cx, |this, cx| {
                         this.vim_intercept(&event.keystroke, window, cx);
                         (!window.default_prevented()

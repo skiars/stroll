@@ -22,9 +22,10 @@ use crate::{
     StrikethroughStyle, Style, SubpixelSprite, Subscription, SystemWindowTab,
     SystemWindowTabController, TabStopMap, Task, TextInputConfiguration, TextInputStateChange,
     TextRenderingMode, TextRenderingPreference, TextStyle, TextStyleRefinement, ThermalState,
-    TransformationMatrix, Underline, UnderlinePattern, UnderlineStyle, WindowAppearance, WindowBackgroundAppearance,
-    WindowBounds, WindowControls, WindowDecorations, WindowInsets, WindowOptions, WindowParams,
-    WindowTextSystem, WindowVisibility, point, prelude::*, px, rems, size, transparent_black,
+    TransformationMatrix, Underline, UnderlinePattern, UnderlineStyle, WindowAppearance,
+    WindowBackgroundAppearance, WindowBounds, WindowControls, WindowDecorations, WindowInsets,
+    WindowOptions, WindowParams, WindowTextSystem, WindowVisibility, point, prelude::*, px, rems,
+    size, transparent_black,
 };
 
 use crate::ImageSampling;
@@ -1239,7 +1240,7 @@ pub struct Window {
     /// This is used by `with_rem_size` to allow rendering an element tree with
     /// a given rem size.
     rem_size_override_stack: SmallVec<[Pixels; 8]>,
-    pub(crate) viewport_size: Size<Pixels>,
+    platform_viewport_size: Size<Pixels>,
     layout_engine: Option<TaffyLayoutEngine>,
     pub(crate) root: Option<AnyView>,
     pub(crate) element_id_stack: ElementIdStack,
@@ -1275,7 +1276,8 @@ pub struct Window {
     mouse_hit_test: HitTest,
     modifiers: Modifiers,
     capslock: Capslock,
-    scale_factor: f32,
+    display_scale_factor: f32,
+    ui_scale: f32,
     pub(crate) bounds_observers: SingleSubscriberSet<AnyObserver>,
     appearance: WindowAppearance,
     pub(crate) appearance_observers: SingleSubscriberSet<AnyObserver>,
@@ -2282,7 +2284,9 @@ impl Window {
             let mut cx = cx.to_async();
             Box::new(move |event| {
                 handle
-                    .update(&mut cx, |_, window, cx| window.dispatch_event(event, cx))
+                    .update(&mut cx, |_, window, cx| {
+                        window.dispatch_event(event.for_ui_scale(window.ui_scale), cx)
+                    })
                     .with_context(|| {
                         format!("dispatching input for window {:?}", handle.window_id())
                     })
@@ -2404,7 +2408,7 @@ impl Window {
             text_rendering_preference: cx.text_rendering_preference.clone(),
             rem_size: px(16.),
             rem_size_override_stack: SmallVec::new(),
-            viewport_size: content_size,
+            platform_viewport_size: content_size,
             layout_engine: Some(TaffyLayoutEngine::new()),
             root: None,
             element_id_stack: ElementIdStack::default(),
@@ -2436,7 +2440,8 @@ impl Window {
             mouse_hit_test: HitTest::default(),
             modifiers,
             capslock,
-            scale_factor,
+            display_scale_factor: scale_factor,
+            ui_scale: 1.,
             bounds_observers: SingleSubscriberSet::new(),
             appearance,
             appearance_observers: SingleSubscriberSet::new(),
@@ -2778,7 +2783,17 @@ impl Window {
     /// - `Some(&[])` is an empty region, so the window receives no pointer or touch input.
     /// - `None` resets the region to the default, so the whole window receives input again.
     pub fn set_input_region(&self, region: Option<&[Bounds<Pixels>]>) {
-        self.platform_window.set_input_region(region);
+        if self.ui_scale == 1. {
+            self.platform_window.set_input_region(region);
+        } else {
+            let regions = region.map(|regions| {
+                regions
+                    .iter()
+                    .map(|bounds| bounds.map(|length| length * self.ui_scale))
+                    .collect::<Vec<_>>()
+            });
+            self.platform_window.set_input_region(regions.as_deref());
+        }
     }
 
     /// Return the `WindowBounds` to indicate that how a window should be opened
@@ -3048,9 +3063,9 @@ impl Window {
     /// the platform window, then notifies observers. Normally called automatically
     /// by the platform's resize callback, but exposed publicly for test infrastructure.
     pub fn bounds_changed(&mut self, cx: &mut App) {
-        self.scale_factor = self.platform_window.scale_factor();
-        self.viewport_size = self.platform_window.content_size();
-        self.mouse_position = self.platform_window.mouse_position();
+        self.display_scale_factor = self.platform_window.scale_factor();
+        self.platform_viewport_size = self.platform_window.content_size();
+        self.mouse_position = self.platform_window.mouse_position() / self.ui_scale;
 
         self.refresh();
 
@@ -3061,7 +3076,10 @@ impl Window {
 
     fn display_changed(handle: AnyWindowHandle, cx: &mut App) {
         let moved_to = handle
-            .update(cx, |_, window, _| {
+            .update(cx, |_, window, cx| {
+                if window.display_scale_factor != window.platform_window.scale_factor() {
+                    window.bounds_changed(cx);
+                }
                 let display_id = window.platform_window.display().map(|display| display.id());
                 let moved = display_id != window.display_id;
                 window.display_id = display_id;
@@ -3132,7 +3150,12 @@ impl Window {
 
     /// Returns the regions of this window obscured by system UI and the keyboard.
     pub fn insets(&self) -> WindowInsets {
-        self.platform_window.insets()
+        let insets = self.platform_window.insets();
+        WindowInsets {
+            safe_area: insets.safe_area.map(|edge| *edge / self.ui_scale),
+            ime: insets.ime.map(|edge| *edge / self.ui_scale),
+            corner_radii: insets.corner_radii.map(|radius| *radius / self.ui_scale),
+        }
     }
 
     /// Renders the current frame's scene to a texture and returns the pixel data as an RGBA image.
@@ -3210,7 +3233,8 @@ impl Window {
 
     /// Returns the size of the drawable area within the window.
     pub fn viewport_size(&self) -> Size<Pixels> {
-        self.viewport_size
+        self.platform_viewport_size
+            .map(|length| length / self.ui_scale)
     }
 
     /// Returns the platform's visible viewport in window-local logical pixels.
@@ -3219,7 +3243,7 @@ impl Window {
     /// During drawing this is a consistent frame snapshot. Outside drawing it
     /// reflects the latest platform sample, not a synchronous geometry query.
     pub fn visual_viewport_bounds(&self) -> Bounds<Pixels> {
-        self.platform_window.visual_viewport_bounds()
+        self.platform_window.visual_viewport_bounds() / self.ui_scale
     }
 
     /// Returns a conservative rectangle avoiding platform-known obscured content.
@@ -3227,7 +3251,7 @@ impl Window {
     /// Intersects the visual viewport with the full layout area inset by system
     /// safe areas and keyboard occlusion. Unknown overlays cannot be excluded.
     pub fn fully_visible_bounds(&self) -> Bounds<Pixels> {
-        let insets = self.platform_window.insets().effective();
+        let insets = self.insets().effective();
         let viewport = self.viewport_size();
         let left = insets.left.max(Pixels::ZERO).min(viewport.width);
         let top = insets.top.max(Pixels::ZERO).min(viewport.height);
@@ -3280,7 +3304,8 @@ impl Window {
 
     /// Opens the native title bar context menu, useful when implementing client side decorations (Wayland and X11)
     pub fn show_window_menu(&self, position: Point<Pixels>) {
-        self.platform_window.show_window_menu(position)
+        self.platform_window
+            .show_window_menu(position * self.ui_scale)
     }
 
     /// Handle window movement for Linux and macOS.
@@ -3294,12 +3319,13 @@ impl Window {
     /// When using client side decorations, set this to the width of the invisible decorations (Wayland and X11)
     pub fn set_client_inset(&mut self, inset: Pixels) {
         self.client_inset = Some(inset);
-        self.platform_window.set_client_inset(inset);
+        self.platform_window.set_client_inset(inset * self.ui_scale);
     }
 
     /// Sets the client-drawn corner radii so platform effects can match the window's shape.
     pub fn set_client_corner_radii(&mut self, radii: Corners<Pixels>) {
-        self.platform_window.set_client_corner_radii(radii);
+        self.platform_window
+            .set_client_corner_radii(radii.map(|radius| *radius * self.ui_scale));
     }
 
     /// Returns the client_inset value by [`Self::set_client_inset`].
@@ -3374,17 +3400,37 @@ impl Window {
         self.platform_window.show_character_palette();
     }
 
-    /// The scale factor of the display associated with the window. For example, it could
-    /// return 2.0 for a "retina" display, indicating that each logical pixel should actually
-    /// be rendered as two pixels on screen.
+    /// The number of device pixels in one logical UI pixel. Includes both the
+    /// display's scale factor and the window's UI scale.
     pub fn scale_factor(&self) -> f32 {
-        self.scale_factor
+        self.display_scale_factor * self.ui_scale
+    }
+
+    /// The UI scale relative to the display's scale factor.
+    pub fn ui_scale(&self) -> f32 {
+        self.ui_scale
+    }
+
+    /// Rescales the window contents while preserving the native window size.
+    pub fn set_ui_scale(&mut self, scale: f32, cx: &mut App) {
+        assert!(scale.is_finite() && scale > 0.);
+        if self.ui_scale == scale {
+            return;
+        }
+
+        self.mouse_position = self.mouse_position * (self.ui_scale / scale);
+        self.ui_scale = scale;
+        self.last_pointer_event_position = None;
+        self.smooth_scroll.cancel();
+        self.touchpad_scroll.cancel();
+        cx.cancel_internal_drag(self);
+        self.refresh();
     }
 
     /// Overrides the display scale factor for tests.
     #[cfg(any(test, feature = "test-support"))]
     pub fn set_scale_factor(&mut self, scale_factor: f32) {
-        self.scale_factor = scale_factor;
+        self.display_scale_factor = scale_factor;
         self.refresh();
     }
 
@@ -3544,10 +3590,8 @@ impl Window {
         let mut paint_span = |start: ScaledPixels, end: ScaledPixels| {
             let mut paint = |start, end| {
                 let mut segment = underline;
-                segment.content_mask.bounds = Bounds::from_corners(
-                    point(start, bounds.top()),
-                    point(end, bounds.bottom()),
-                );
+                segment.content_mask.bounds =
+                    Bounds::from_corners(point(start, bounds.top()), point(end, bounds.bottom()));
                 if pattern != UnderlinePattern::Solid {
                     segment.bounds.origin.x = start;
                     segment.bounds.size.width = end - start;
@@ -3787,7 +3831,7 @@ impl Window {
             self.draw_roots(cx);
             #[cfg(feature = "profiler")]
             {
-                let viewport_size = self.viewport_size;
+                let viewport_size = self.viewport_size();
                 let scale_factor = self.scale_factor();
                 self.debug_frame_overlay.paint(
                     &mut self.next_frame.scene,
@@ -4003,16 +4047,16 @@ impl Window {
             #[cfg(any(feature = "inspector", debug_assertions))]
             {
                 if self.inspector.is_some() {
-                    let mut size = self.viewport_size;
+                    let mut size = self.viewport_size();
                     size.width = (size.width - _inspector_width).max(px(0.0));
                     size
                 } else {
-                    self.viewport_size
+                    self.viewport_size()
                 }
             }
             #[cfg(not(any(feature = "inspector", debug_assertions)))]
             {
-                self.viewport_size
+                self.viewport_size()
             }
         };
 
@@ -4103,8 +4147,8 @@ impl Window {
             // Harvest frame metadata for the debug dump while the live window
             // and frame are still in scope.
             let frame_info = crate::window::a11y::debug::FrameDebugInfo {
-                viewport_size: self.viewport_size,
-                scale_factor: self.scale_factor,
+                viewport_size: self.viewport_size(),
+                scale_factor: self.scale_factor(),
                 tab_stop_count: self.next_frame.tab_stops.tab_stop_count(),
             };
             // clear the builder state regardless
@@ -4677,7 +4721,7 @@ impl Window {
             .unwrap_or_else(|| ContentMask {
                 bounds: Bounds {
                     origin: Point::default(),
-                    size: self.viewport_size,
+                    size: self.viewport_size(),
                 },
             })
     }
@@ -6343,7 +6387,7 @@ impl Window {
         if mouse_move.pressed_button != Some(MouseButton::Left) {
             return;
         }
-        if Bounds::new(Point::default(), self.viewport_size).contains(&mouse_move.position) {
+        if Bounds::new(Point::default(), self.viewport_size()).contains(&mouse_move.position) {
             return;
         }
         if !self.platform_window.can_start_external_drag() {
@@ -7757,8 +7801,8 @@ impl Window {
         if let Some(inspector) = self.inspector.take() {
             let mut inspector_element = AnyView::from(inspector.clone()).into_any_element();
             inspector_element.prepaint_as_root(
-                point(self.viewport_size.width - inspector_width, px(0.0)),
-                size(inspector_width, self.viewport_size.height).into(),
+                point(self.viewport_size().width - inspector_width, px(0.0)),
+                size(inspector_width, self.viewport_size().height).into(),
                 self,
                 cx,
             );

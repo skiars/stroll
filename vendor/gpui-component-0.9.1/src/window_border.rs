@@ -115,7 +115,9 @@ fn client_frame_insets(shadow_size: Pixels, tiling: &Tiling) -> Edges<Pixels> {
 
 /// Get the window paddings.
 pub fn window_paddings(window: &Window) -> Edges<Pixels> {
-    let shadow_size = window.client_inset().unwrap_or(SHADOW_SIZE);
+    let shadow_size = window
+        .client_inset()
+        .unwrap_or(SHADOW_SIZE / window.ui_scale());
     match window.window_decorations() {
         Decorations::Server => Edges::all(px(0.0)),
         Decorations::Client { tiling } => client_frame_insets(shadow_size, &tiling),
@@ -128,7 +130,9 @@ pub fn window_paddings(window: &Window) -> Edges<Pixels> {
 /// wrapper draws on every side it is not tiled against. Allows to lay an element
 /// flush against the inside of the window frame.
 pub(crate) fn window_content_insets(window: &Window) -> Edges<Pixels> {
-    let shadow_size = window.client_inset().unwrap_or(SHADOW_SIZE);
+    let shadow_size = window
+        .client_inset()
+        .unwrap_or(SHADOW_SIZE / window.ui_scale());
     match window.window_decorations() {
         Decorations::Server => Edges::all(px(0.0)),
         Decorations::Client { tiling } => {
@@ -193,18 +197,18 @@ impl RenderOnce for WindowBorder {
         // shadow padding, but `set_client_inset` must still use the full shadow size. Clearing it
         // makes the first resize after restore double-count the shadow in `compute_outer_size`, and
         // the window jumps larger.
-        let platform_inset = self.shadow_size;
+        let shadow_inset = self.shadow_size / window.ui_scale();
         let visual_shadow = if tiling.top && tiling.bottom && tiling.left && tiling.right {
             px(0.0)
         } else {
-            self.shadow_size
+            shadow_inset
         };
-        let resize_hit_size = self.resize_hit_size;
-        window.set_client_inset(platform_inset);
+        let resize_hit_size = self.resize_hit_size / window.ui_scale();
+        window.set_client_inset(shadow_inset);
         let radii = corner_radii(cx.theme().window_radius, decorations);
         // Lets the compositor treat the rounded corners as transparent.
         window.set_client_corner_radii(radii);
-        let window_size = window.window_bounds().get_bounds().size;
+        let window_size = window.viewport_size();
         let is_window_active = window.is_window_active();
         let border_color = cx.theme().window_border;
 
@@ -234,7 +238,7 @@ impl RenderOnce for WindowBorder {
                 }
                 let size = window.window_bounds().get_bounds().size;
                 let pos = window.mouse_position();
-                let insets = client_frame_insets(platform_inset, &tiling);
+                let insets = client_frame_insets(shadow_inset, &tiling);
 
                 match resize_edge(pos, size, insets, &tiling, resize_hit_size) {
                     Some(edge) => window.start_window_resize(edge),
@@ -303,7 +307,7 @@ impl RenderOnce for WindowBorder {
             .when(window.is_resizable(), |parent| {
                 parent.child(div().absolute().size_full().children(resize_hit_zones(
                     window_size,
-                    platform_inset,
+                    shadow_inset,
                     resize_hit_size,
                     &tiling,
                 )))
