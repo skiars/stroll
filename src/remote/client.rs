@@ -26,7 +26,7 @@ pub(crate) struct PendingCall {
     id: u64,
     pending: Pending,
     response: mpsc::Receiver<Response>,
-    deadline: Instant,
+    deadline: Option<Instant>,
 }
 
 impl PendingCall {
@@ -40,7 +40,13 @@ impl PendingCall {
     pub(crate) fn try_reply<T: DeserializeOwned>(&self) -> Result<Option<T>> {
         match self.response.try_recv() {
             Ok(response) => Self::decode(response).map(Some),
-            Err(mpsc::TryRecvError::Empty) if Instant::now() < self.deadline => Ok(None),
+            Err(mpsc::TryRecvError::Empty)
+                if self
+                    .deadline
+                    .is_none_or(|deadline| Instant::now() < deadline) =>
+            {
+                Ok(None)
+            }
             Err(error) => Err(error).context(t!("ssh.timeout")),
         }
     }
@@ -92,6 +98,8 @@ struct Connection {
     locator: AtomicBool,
     #[cfg(feature = "desktop")]
     workspace_locator: AtomicBool,
+    #[cfg(feature = "desktop")]
+    locator_globs: AtomicBool,
     #[cfg(feature = "desktop")]
     workspace_files: AtomicBool,
     #[cfg(feature = "desktop")]
@@ -328,10 +336,16 @@ impl SshSession {
     }
 
     #[cfg(feature = "desktop")]
+    pub(crate) fn supports_locator_globs(&self) -> bool {
+        self.0.locator_globs.load(Ordering::Relaxed)
+    }
+
+    #[cfg(feature = "desktop")]
     pub(crate) fn cancel_workspace_search(&self, id: u64) {
-        let _ = self
-            .0
-            .try_call(Request::CancelWorkspaceSearch(id), Duration::from_secs(5));
+        let _ = self.0.try_call(
+            Request::CancelWorkspaceSearch(id),
+            Some(Duration::from_secs(5)),
+        );
     }
 
     #[cfg(feature = "desktop")]
@@ -408,7 +422,7 @@ impl SshSession {
         &self,
         request: Request,
     ) -> Result<Result<PendingCall, Request>> {
-        self.0.try_call(request, Duration::from_secs(35))
+        self.0.try_call(request, Some(Duration::from_secs(35)))
     }
 }
 
@@ -478,6 +492,8 @@ impl Connection {
             locator: AtomicBool::new(false),
             #[cfg(feature = "desktop")]
             workspace_locator: AtomicBool::new(false),
+            #[cfg(feature = "desktop")]
+            locator_globs: AtomicBool::new(false),
             failure: failure.clone(),
             #[cfg(feature = "desktop")]
             resource_schedule: Default::default(),
@@ -652,6 +668,12 @@ impl Connection {
             connection
                 .workspace_locator
                 .store(supported, Ordering::Relaxed);
+            let version = super::LOCATOR_GLOB_VERSION;
+            let supported = supported
+                && connection
+                    .call::<u32>(Request::Hello(version))
+                    .is_ok_and(|reply| reply == version);
+            connection.locator_globs.store(supported, Ordering::Relaxed);
         }
         Ok(connection)
     }
@@ -679,8 +701,13 @@ impl Connection {
             Request::TerminalInput(..)
             | Request::TerminalResize(..)
             | Request::TerminalPoll(_)
-            | Request::TerminalClose(_) => Duration::from_secs(5),
-            _ => Duration::from_secs(35),
+            | Request::TerminalClose(_) => Some(Duration::from_secs(5)),
+            Request::Locator(_)
+            | Request::LocatorPaths
+            | Request::SearchWorkspaceFiles { .. }
+            | Request::SearchWorkspaceText { .. }
+            | Request::ContinueWorkspaceSearch(_) => None,
+            _ => Some(Duration::from_secs(35)),
         };
         let call = self.try_call(request, timeout)?.map_err(|request| {
             anyhow!(
@@ -691,17 +718,20 @@ impl Connection {
                 .into_owned()
             )
         })?;
-        let response = call
-            .response
-            .recv_timeout(call.deadline.saturating_duration_since(Instant::now()))
-            .context(t!("ssh.timeout"))?;
+        let response = if let Some(deadline) = call.deadline {
+            call.response
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .context(t!("ssh.timeout"))?
+        } else {
+            call.response.recv().context(t!("ssh.closed"))?
+        };
         PendingCall::decode(response)
     }
 
     fn try_call(
         &self,
         request: Request,
-        timeout: Duration,
+        timeout: Option<Duration>,
     ) -> Result<Result<PendingCall, Request>> {
         let failure = self.failure.lock().unwrap();
         if let Some(error) = failure.as_ref() {
@@ -715,8 +745,14 @@ impl Connection {
             id,
             pending: self.pending.clone(),
             response,
-            deadline: Instant::now() + timeout,
+            deadline: timeout.map(|timeout| Instant::now() + timeout),
         };
+        if timeout.is_none() {
+            self.writer
+                .send(Call { id, request })
+                .context(t!("ssh.closed"))?;
+            return Ok(Ok(call));
+        }
         match self.writer.try_send(Call { id, request }) {
             Ok(()) => Ok(Ok(call)),
             Err(mpsc::TrySendError::Full(call)) => Ok(Err(call.request)),

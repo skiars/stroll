@@ -59,8 +59,15 @@ fn workflow(authority: Option<String>, vim: bool) -> Result<()> {
         fs::create_dir(root.join("ignored"))?;
         fs::write(
             root.join("ignored/guide.MDX"),
-            readme.replace("unique_reader_term", "ignored_reader_term"),
+            readme.replace("unique_reader_term", "ignored_reader_term")
+                + &"ignored_reader_term\n".repeat(500),
         )?;
+        for index in 0..260 {
+            fs::write(
+                root.join(format!("ignored/before-{index:03}.md")),
+                "# Other guide\n",
+            )?;
+        }
         fs::write(
             root.join("guide.MDX.cpp"),
             "unique_reader_term ignored_reader_term\n",
@@ -144,7 +151,14 @@ fn workflow(authority: Option<String>, vim: bool) -> Result<()> {
             wait_for(visual, "Locator match preview", |visual| {
                 visual.update(|_, cx| {
                     let locator = &workspace.read(cx).locator;
-                    let ready = !locator.busy && !locator.preview_busy && locator.preview.is_some();
+                    let ready = !locator.busy
+                        && !locator.streaming
+                        && !locator.preview_busy
+                        && locator.preview.is_some();
+                    if ready && query == Some("ignored_reader_term") {
+                        assert_eq!(locator.items.len(), 501);
+                        assert_eq!(locator.rows.len(), 502);
+                    }
                     if ready && workspace.read(cx).view == WorkspaceView::Docs {
                         assert!(
                             locator

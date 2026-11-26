@@ -53,6 +53,7 @@ pub(crate) const WORKSPACE_IMPORT_VERSION: u32 = 27;
 pub(crate) const LSP_MEMORY_VERSION: u32 = 28;
 pub(crate) const WORKTREE_IDENTITY_VERSION: u32 = 29;
 pub(crate) const WORKSPACE_LOCATOR_VERSION: u32 = 30;
+pub(crate) const LOCATOR_GLOB_VERSION: u32 = 31;
 const MAX_FRAME: usize = 40 * 1024 * 1024;
 
 #[derive(Clone, Debug, Eq, PartialEq)]

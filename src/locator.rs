@@ -7,7 +7,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result};
 use fancy_regex::{Matches, Regex, RegexBuilder};
 use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 use rust_i18n::t;
@@ -28,8 +28,13 @@ pub(crate) struct TextQuery {
 }
 
 impl TextQuery {
+    #[cfg(feature = "desktop")]
     pub(crate) fn pattern(&self) -> Result<Regex> {
-        ensure!(self.query.len() <= 4096, t!("locator.query_length"));
+        anyhow::ensure!(self.query.len() <= 4096, t!("locator.query_length"));
+        self.compile_pattern(100_000)
+    }
+
+    fn compile_pattern(&self, backtrack_limit: usize) -> Result<Regex> {
         let mut pattern = if self.regex {
             self.query.clone()
         } else {
@@ -40,7 +45,7 @@ impl TextQuery {
         }
         let flags = if self.case_sensitive { "(?m)" } else { "(?im)" };
         RegexBuilder::new(&format!("{flags}{pattern}"))
-            .backtrack_limit(100_000)
+            .backtrack_limit(backtrack_limit)
             .build()
             .with_context(|| t!("locator.invalid_regex").into_owned())
     }
@@ -54,27 +59,80 @@ pub(crate) struct Scope {
 
 impl Scope {
     fn patterns(&self) -> Result<(GlobSet, GlobSet)> {
-        fn compile(raw: &str) -> Result<GlobSet> {
-            ensure!(raw.len() <= 4096, t!("locator.query_length"));
-            let mut builder = GlobSetBuilder::new();
-            for pattern in raw
-                .split(',')
-                .map(str::trim)
-                .filter(|part| !part.is_empty())
-            {
-                builder.add(
-                    GlobBuilder::new(pattern)
-                        .literal_separator(true)
-                        .build()
-                        .with_context(|| {
-                            t!("locator.invalid_glob", pattern = pattern).into_owned()
-                        })?,
-                );
-            }
-            Ok(builder.build()?)
-        }
-        Ok((compile(&self.include)?, compile(&self.exclude)?))
+        Ok((compile_globs(&self.include)?, compile_globs(&self.exclude)?))
     }
+}
+
+fn split_globs(raw: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut start = 0;
+    let mut braces = 0usize;
+    let mut chars = raw.char_indices().peekable();
+    while let Some((index, ch)) = chars.next() {
+        match ch {
+            '[' => {
+                if matches!(chars.peek(), Some((_, '!' | '^'))) {
+                    chars.next();
+                }
+                // The first character in a class can be a literal closing bracket.
+                chars.next();
+                for (_, ch) in chars.by_ref() {
+                    if ch == ']' {
+                        break;
+                    }
+                }
+            }
+            '{' => braces += 1,
+            '}' => braces = braces.saturating_sub(1),
+            ',' if braces == 0 => {
+                parts.push(&raw[start..index]);
+                start = index + 1;
+            }
+            _ => {}
+        }
+    }
+    parts.push(&raw[start..]);
+    parts
+}
+
+fn compile_globs(raw: &str) -> Result<GlobSet> {
+    let mut builder = GlobSetBuilder::new();
+    for input in split_globs(raw)
+        .into_iter()
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+    {
+        let rooted = input == "." || input.starts_with("./");
+        let pattern = input
+            .strip_prefix("./")
+            .unwrap_or(input)
+            .trim_end_matches('/');
+        let pattern = if rooted && matches!(pattern, "" | ".") {
+            "**".to_owned()
+        } else if rooted || pattern == "**" || pattern.starts_with("**/") {
+            pattern.to_owned()
+        } else if pattern.starts_with('.') {
+            format!("**/*{pattern}")
+        } else {
+            format!("**/{pattern}")
+        };
+        let mut add = |pattern: &str| -> Result<()> {
+            builder.add(
+                GlobBuilder::new(pattern)
+                    .literal_separator(true)
+                    .backslash_escape(false)
+                    .case_insensitive(cfg!(any(windows, target_os = "macos")))
+                    .build()
+                    .with_context(|| t!("locator.invalid_glob", pattern = input).into_owned())?,
+            );
+            Ok(())
+        };
+        add(&pattern)?;
+        if pattern != "**" && !pattern.ends_with("/**") {
+            add(&format!("{pattern}/**"))?;
+        }
+    }
+    Ok(builder.build()?)
 }
 
 #[derive(Clone, Copy, Default, Serialize, Deserialize)]
@@ -385,7 +443,7 @@ pub(crate) fn search_visible_text(
         return Ok(Results::default());
     }
     let paths = visible_candidates(crate::repository::worktree_paths(&repo.root)?);
-    TextSearch::new(paths.into(), query, FileType::All, || false)?.next_page(repo, || false)
+    TextSearch::new(paths.into(), query, FileType::All, || false)?.page(repo, || false, 5000)
 }
 
 struct FileMatches<'a> {
@@ -425,7 +483,9 @@ impl SearchFile {
             let Some(hit) = file.hits.next() else {
                 return Ok(MatchStep::End);
             };
-            let hit = hit.with_context(|| t!("locator.search_timeout").into_owned())?;
+            let hit = hit.with_context(|| {
+                t!("locator.regex_match_failed", path = path.display()).into_owned()
+            })?;
             if hit.start() == hit.end() {
                 return Ok(MatchStep::Empty);
             }
@@ -465,7 +525,7 @@ impl TextSearch {
         cancelled: impl Fn() -> bool,
     ) -> Result<Self> {
         let filter = PathFilter::new(&query.scope, file_type)?;
-        let pattern = Arc::new(query.pattern()?);
+        let pattern = Arc::new(query.compile_pattern(usize::MAX)?);
         let mut matching = Vec::new();
         if !query.query.is_empty() {
             for (index, candidate) in paths.iter().enumerate() {
@@ -491,8 +551,16 @@ impl TextSearch {
         repo: &Repository,
         cancelled: impl Fn() -> bool,
     ) -> Result<Results<TextHit>> {
+        self.page(repo, cancelled, 256)
+    }
+
+    fn page(
+        &mut self,
+        repo: &Repository,
+        cancelled: impl Fn() -> bool,
+        file_batch: usize,
+    ) -> Result<Results<TextHit>> {
         let mut result = Results::default();
-        let started = Instant::now();
         let mut files = 0;
         let mut bytes = 0;
         loop {
@@ -502,7 +570,7 @@ impl TextSearch {
             if self.current.is_none() && self.matching.len() == 0 {
                 break;
             }
-            if result.items.len() == 500 || started.elapsed() >= Duration::from_secs(5) {
+            if result.items.len() == 500 {
                 result.truncated = true;
                 break;
             }
@@ -513,7 +581,8 @@ impl TextSearch {
                     MatchStep::End => self.current = None,
                 }
             } else {
-                if files >= 5000 || bytes >= 32 * 1024 * 1024 {
+                // Yield between batches so the client can show results and cancel the search.
+                if files >= file_batch || bytes >= 32 * 1024 * 1024 {
                     result.truncated = true;
                     break;
                 }
@@ -547,6 +616,46 @@ mod tests {
                 .status()?
                 .success()
         );
+        Ok(())
+    }
+
+    #[test]
+    fn glob_search_matches_folders_at_each_depth_and_preserves_groups() -> Result<()> {
+        let globs = compile_globs("*.{md,rs}, configs/, file[,].toml, []]file")?;
+        for path in [
+            "README.md",
+            "src/lib.rs",
+            "nested/configs/settings.toml",
+            "file,.toml",
+            "nested/]file",
+        ] {
+            assert!(globs.is_match(path), "missing {path}");
+        }
+        assert!(!globs.is_match("README.md.bak"));
+        assert!(!globs.is_match("nested/configs-other/settings.toml"));
+        let globs = compile_globs("./docs, .toml")?;
+        assert!(globs.is_match("docs/nested/guide.md"));
+        assert!(globs.is_match("deep/config.toml"));
+        assert!(!globs.is_match("nested/docs/guide.md"));
+        assert!(compile_globs("./")?.is_match("nested/docs/guide.md"));
+        assert!(compile_globs("*.{md,rs").is_err());
+        assert_eq!(
+            compile_globs("*.MD")?.is_match("nested/file.md"),
+            cfg!(any(windows, target_os = "macos"))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn locator_regex_continues_past_the_editor_backtracking_budget() -> Result<()> {
+        let query = TextQuery {
+            query: r"^(?:(a)|(aa))+\1b".into(),
+            regex: true,
+            ..Default::default()
+        };
+        let text = format!("{}!", "a".repeat(25));
+        assert!(query.compile_pattern(100_000)?.find(&text).is_err());
+        assert!(query.compile_pattern(usize::MAX)?.find(&text)?.is_none());
         Ok(())
     }
 
@@ -740,13 +849,16 @@ mod tests {
             regex: true,
             ..Default::default()
         };
-        let found = query.pattern()?.find("xfoo\nbar")?.unwrap();
+        let found = query
+            .compile_pattern(usize::MAX)?
+            .find("xfoo\nbar")?
+            .unwrap();
         assert_eq!(found.range(), 1..8);
         let invalid = TextQuery {
             query: "[".into(),
             ..query
         };
-        assert!(invalid.pattern().is_err());
+        assert!(invalid.compile_pattern(usize::MAX).is_err());
         Ok(())
     }
 }

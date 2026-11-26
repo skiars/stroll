@@ -108,6 +108,15 @@ enum ResultRow {
     Entry(usize),
 }
 
+impl ResultRow {
+    fn height(&self) -> Pixels {
+        match self {
+            Self::Heading(_) => px(36.),
+            Self::Entry(_) => px(51.),
+        }
+    }
+}
+
 #[derive(Default)]
 struct Session {
     tabs: [Tab; 7],
@@ -291,7 +300,7 @@ pub(super) struct Locator {
     preview_error: Option<String>,
     search_task: Task<()>,
     search_cancel: Option<CancelSearch>,
-    continuation: Option<TextContinuation>,
+    streaming: bool,
     preview_task: Task<()>,
 }
 
@@ -372,7 +381,7 @@ impl Locator {
             preview_error: None,
             search_task: Task::ready(()),
             search_cancel: None,
-            continuation: None,
+            streaming: false,
             preview_task: Task::ready(()),
         }
     }
@@ -602,7 +611,7 @@ impl Workspace {
         self.locator.history_origin = None;
         self.locator.drag_anchor = None;
         self.locator.search_cancel = None;
-        self.locator.continuation = None;
+        self.locator.streaming = false;
         self.locator.search_task = Task::ready(());
         self.locator.preview_task = Task::ready(());
         if let Some(motion) = &mut self.locator.motion {
@@ -708,7 +717,7 @@ impl Workspace {
     fn locator_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.locator.search_task = Task::ready(());
         self.locator.search_cancel = None;
-        self.locator.continuation = None;
+        self.locator.streaming = false;
         self.locator.reset_preview();
         self.locator.error = None;
         self.locator.truncated = false;
@@ -789,6 +798,7 @@ impl Workspace {
                 .await
             } else if let Some(repo) = repo {
                 if mode == Mode::Files {
+                    let cancelled = cancelled.clone();
                     let query = FileQuery {
                         query: query.query,
                         scope: query.scope,
@@ -811,6 +821,7 @@ impl Workspace {
                     })
                     .await
                 } else if mode == Mode::Text {
+                    let cancelled = cancelled.clone();
                     let page: Result<_> = cx
                         .background_spawn(async move {
                             let cancelled = || cancelled.load(Ordering::Relaxed);
@@ -867,14 +878,18 @@ impl Workspace {
             } else {
                 Err(anyhow::anyhow!(t!("locator.unavailable")))
             };
-            _ = this.update_in(cx, |this, window, cx| {
+            let has_more = continuation.is_some();
+            let updated = this.update_in(cx, |this, window, cx| {
                 let result = if mode == Mode::References && !this.reference_source_is_current(cx) {
                     Err(anyhow::anyhow!(t!("lsp.references_source_changed")))
                 } else {
                     result
                 };
                 this.locator.busy = false;
-                this.locator_save_continuation(continuation);
+                this.locator.streaming = has_more;
+                if !has_more {
+                    this.locator_disarm_remote_cancel();
+                }
                 let mut selected = this.locator_tab().selected;
                 let previous = this.locator.items.get(selected);
                 match result {
@@ -899,7 +914,7 @@ impl Workspace {
                                 .unwrap_or(selected);
                         }
                         this.locator_set_items(result.items);
-                        this.locator.truncated = result.truncated;
+                        this.locator.truncated = result.truncated && !has_more;
                         this.locator.skipped = result.skipped;
                     }
                     Err(error) => {
@@ -909,58 +924,56 @@ impl Workspace {
                 }
                 this.locator_select(selected, false, window, cx);
             });
+            if updated.is_err() {
+                return;
+            }
+            while let Some(search) = continuation {
+                if cancelled.load(Ordering::Relaxed) {
+                    break;
+                }
+                let cancelled = cancelled.clone();
+                let page = cx
+                    .background_spawn(async move {
+                        search.next_page(|| cancelled.load(Ordering::Relaxed))
+                    })
+                    .await;
+                let (result, more) = match page {
+                    Ok((result, more)) => (Ok(result), more),
+                    Err(error) => (Err(error), None),
+                };
+                continuation = more;
+                if this
+                    .update_in(cx, |this, window, cx| {
+                        this.locator.streaming = continuation.is_some();
+                        if !this.locator.streaming {
+                            this.locator_disarm_remote_cancel();
+                        }
+                        match result {
+                            Ok(result) => {
+                                let was_empty = this.locator.items.is_empty();
+                                this.locator.skipped += result.skipped;
+                                this.locator_append_items(result.items);
+                                if was_empty && !this.locator.items.is_empty() {
+                                    this.locator_select(0, false, window, cx);
+                                }
+                            }
+                            Err(error) => this.locator.error = Some(error.to_string()),
+                        }
+                        this.notify_locator(cx);
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
         });
         self.notify_locator(cx);
     }
 
-    fn locator_save_continuation(&mut self, continuation: Option<TextContinuation>) {
-        if continuation.is_none()
-            && let Some(cancel) = &mut self.locator.search_cancel
-        {
+    fn locator_disarm_remote_cancel(&mut self) {
+        if let Some(cancel) = &mut self.locator.search_cancel {
             cancel.remote = None;
         }
-        self.locator.continuation = continuation;
-    }
-
-    fn locator_continue_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(continuation) = self.locator.continuation.take() else {
-            return;
-        };
-        let cancelled = self.locator.search_cancel.as_ref().unwrap().local.clone();
-        self.locator.busy = true;
-        self.locator.truncated = false;
-        self.locator
-            .inputs()
-            .query
-            .update(cx, |input, cx| input.focus(window, cx));
-        self.locator.search_task = cx.spawn_in(window, async move |this, cx| {
-            let page = cx
-                .background_spawn(async move {
-                    continuation.next_page(|| cancelled.load(Ordering::Relaxed))
-                })
-                .await;
-            _ = this.update_in(cx, |this, window, cx| {
-                this.locator.busy = false;
-                match page {
-                    Ok((result, continuation)) => {
-                        let selected = this.locator_tab().selected;
-                        let mut items = std::mem::take(&mut this.locator.items);
-                        items.extend(result.items);
-                        this.locator_set_items(items);
-                        this.locator.truncated = result.truncated;
-                        this.locator.skipped += result.skipped;
-                        this.locator_save_continuation(continuation);
-                        this.locator_select(selected, false, window, cx);
-                    }
-                    Err(error) => {
-                        this.locator.error = Some(error.to_string());
-                        this.locator_save_continuation(None);
-                        this.notify_locator(cx);
-                    }
-                }
-            });
-        });
-        self.notify_locator(cx);
     }
 
     fn reference_source_is_current(&self, cx: &App) -> bool {
@@ -1011,27 +1024,48 @@ impl Workspace {
             .collect())
     }
 
-    fn locator_set_items(&mut self, items: Vec<Entry>) {
+    fn locator_push_rows(&mut self, items: Vec<Entry>) {
         let locator = &mut self.locator;
-        locator.rows.clear();
-        locator.entry_rows.clear();
-        for (index, entry) in items.iter().enumerate() {
-            if locator.mode == Mode::Text && (index == 0 || items[index - 1].path != entry.path) {
+        for entry in items {
+            let index = locator.items.len();
+            if locator.mode == Mode::Text
+                && locator
+                    .items
+                    .last()
+                    .is_none_or(|last| last.path != entry.path)
+            {
                 locator.rows.push(ResultRow::Heading(index));
             }
             locator.entry_rows.push(locator.rows.len());
             locator.rows.push(ResultRow::Entry(index));
+            locator.items.push(entry);
         }
-        locator.items = items;
+    }
+
+    fn locator_append_items(&mut self, items: Vec<Entry>) {
+        if items.is_empty() {
+            return;
+        }
+        let start = self.locator.rows.len();
+        self.locator_push_rows(items);
+        self.locator_tab().scroll.splice_with_height_hints(
+            start..start,
+            self.locator.rows[start..].iter().map(ResultRow::height),
+        );
+    }
+
+    fn locator_set_items(&mut self, items: Vec<Entry>) {
+        let locator = &mut self.locator;
+        locator.rows.clear();
+        locator.entry_rows.clear();
+        locator.items.clear();
+        self.locator_push_rows(items);
 
         let scroll = &self.locator_tab().scroll;
         let anchor = scroll.logical_scroll_top();
         scroll.splice_with_height_hints(
             0..scroll.item_count(),
-            self.locator.rows.iter().map(|row| match row {
-                ResultRow::Heading(_) => px(36.),
-                ResultRow::Entry(_) => px(51.),
-            }),
+            self.locator.rows.iter().map(ResultRow::height),
         );
         let count = self.locator.rows.len();
         if count > 0 {
@@ -1572,8 +1606,12 @@ impl Workspace {
         let origin = clamp_position(locator.position.unwrap_or_else(|| point(limit.x / 2., top)));
         let status = if let Some(error) = &locator.error {
             error.clone()
-        } else if locator.busy {
-            t!("locator.searching").into_owned()
+        } else if locator.busy || locator.streaming {
+            if locator.items.is_empty() {
+                t!("locator.searching").into_owned()
+            } else {
+                format!("{} · {}", t!("locator.searching"), locator.items.len())
+            }
         } else if line_only {
             locator
                 .source
@@ -1585,8 +1623,6 @@ impl Workspace {
             && !matches!(mode, Mode::DocumentSymbols | Mode::References)
         {
             t!("locator.query_required").into_owned()
-        } else if locator.items.is_empty() && locator.continuation.is_some() {
-            t!("locator.search_paused").into_owned()
         } else if locator.items.is_empty() {
             t!("locator.empty").into_owned()
         } else {
@@ -1816,17 +1852,8 @@ impl Workspace {
                     .text_size(px(12.))
                     .text_color(colors.muted)
                     .child(status)
-                    .when(locator.truncated && locator.continuation.is_none(), |row| {
+                    .when(locator.truncated, |row| {
                         row.child(format!(" · {}", t!("locator.limit")))
-                    })
-                    .when(locator.continuation.is_some(), |row| {
-                        row.child(
-                            status_button("locator-continue-search")
-                                .label(t!("locator.continue_search").into_owned())
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.locator_continue_search(window, cx);
-                                })),
-                        )
                     })
                     .when(locator.skipped > 0, |row| {
                         let skipped = if references {
@@ -1889,7 +1916,7 @@ impl Workspace {
             .repository
             .as_ref()
             .and_then(|repo| repo.ssh.as_ref())
-            .is_some_and(|ssh| !ssh.supports_workspace_locator());
+            .is_some_and(|ssh| !ssh.supports_locator_globs());
         let text_size = px(12.);
         let options = [
             (query.case_sensitive, "Aa", "locator.case_sensitive"),

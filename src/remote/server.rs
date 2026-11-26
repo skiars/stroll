@@ -251,6 +251,7 @@ impl Server {
                             | super::WORKSPACE_IMPORT_VERSION
                             | super::WORKTREE_IDENTITY_VERSION
                             | super::WORKSPACE_LOCATOR_VERSION
+                            | super::LOCATOR_GLOB_VERSION
                     ),
                     "SSH workspace protocol version mismatch. Update the remote helper."
                 );

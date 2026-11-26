@@ -636,6 +636,7 @@ fn workspace_locator_searches_ignored_files_and_resumes_with_the_same_scope() {
     git(root, &["add", "guide.MDX.rs"]);
     let mut helper = Helper::start();
     assert_eq!(helper.ok(json!({"Hello": 30})), 30);
+    assert_eq!(helper.ok(json!({"Hello": 31})), 31);
     helper.ok(json!({"OpenWorkspace": root}));
     let query = json!({
         "query": "locator_marker",
@@ -654,7 +655,7 @@ fn workspace_locator_searches_ignored_files_and_resumes_with_the_same_scope() {
 
     let files = helper.ok(json!({"SearchWorkspaceFiles": {
         "id": 1, "revision": 0, "query": {
-            "query": "guide.MDX", "scope": { "include": "", "exclude": "" },
+            "query": "guide.MDX", "scope": { "include": "*.{MDX,md}", "exclude": "./docs" },
             "recent": [], "file_type": "Markdown"
         }
     }}));
