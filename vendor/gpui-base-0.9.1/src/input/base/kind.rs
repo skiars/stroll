@@ -301,7 +301,19 @@ pub trait InputModeKind: sealed::Sealed + Sized + 'static {
     }
 
     #[doc(hidden)]
-    fn cancel_pending_pointer_hover(_state: &gpui::Entity<InputBaseState<Self>>, _cx: &mut App) {}
+    fn leave_hover_hitbox(_state: &gpui::Entity<InputBaseState<Self>>, _cx: &mut App) {}
+
+    #[doc(hidden)]
+    fn cancel_pending_keyboard_hover(_state: &gpui::Entity<InputBaseState<Self>>, _cx: &mut App) {}
+
+    #[doc(hidden)]
+    fn dismiss_hover(
+        _state: &mut InputBaseState<Self>,
+        _window: &mut Window,
+        _cx: &mut gpui::Context<InputBaseState<Self>>,
+    ) -> bool {
+        false
+    }
 
     #[doc(hidden)]
     fn validate_hover_anchor(
@@ -382,7 +394,6 @@ pub trait InputModeKind: sealed::Sealed + Sized + 'static {
     /// Reacts to the pointer moving, for the hover popover.
     fn on_mouse_move(
         _state: &mut InputBaseState<Self>,
-        _offset: usize,
         _event: &gpui::MouseMoveEvent,
         _window: &mut Window,
         _cx: &mut gpui::Context<InputBaseState<Self>>,
@@ -431,6 +442,7 @@ pub struct EditorExtras {
     pub(crate) inline_completion: InlineCompletion,
     pub(crate) context_menu_content: ContextMenuContent,
     pub(crate) hover_popover: Option<HoverPopoverState>,
+    pub(crate) dismissed_hover_target: Option<std::ops::Range<usize>>,
     pub(crate) hover_definition: HoverDefinition,
     pub(crate) context_menu_task: Task<anyhow::Result<()>>,
 }
@@ -450,6 +462,7 @@ impl Default for EditorExtras {
             inline_completion: InlineCompletion::default(),
             context_menu_content: ContextMenuContent::default(),
             hover_popover: None,
+            dismissed_hover_target: None,
             hover_definition: HoverDefinition::default(),
             context_menu_task: Task::ready(Ok(())),
         }

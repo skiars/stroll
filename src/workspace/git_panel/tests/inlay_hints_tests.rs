@@ -399,9 +399,14 @@ fn check_historical_diff_lsp(arbitrary: bool) {
     );
     app.update(gpui_component::init);
     let store = Arc::new(Store::new(fixture.path().join("state")).unwrap());
-    let (workspace, visual) = app.add_window_view(|window, cx| {
-        Workspace::with_config(store, config, WorkspaceView::Git, window, cx)
+    let mut workspace = None;
+    let (_, visual) = app.add_window_view(|window, cx| {
+        let view =
+            cx.new(|cx| Workspace::with_config(store, config, WorkspaceView::Git, window, cx));
+        workspace = Some(view.clone());
+        gpui_component::Root::new(view, window, cx)
     });
+    let workspace = workspace.unwrap();
     visual.simulate_resize(size(px(1250.), px(1000.)));
     visual.update(|window, cx| {
         workspace.update(cx, |workspace, cx| {
@@ -563,6 +568,42 @@ fn check_historical_diff_lsp(arbitrary: bool) {
             }
         }
     }
+    visual.update(|window, cx| {
+        workspace.update(cx, |workspace, cx| workspace.toggle_vim_mode(window, cx));
+    });
+    for (editor, line) in visual.update(|_, cx| {
+        let panel = panel.read(cx);
+        [
+            (panel.editor.original_state().clone(), cases[0].1),
+            (panel.editor.modified_state().clone(), cases[1].2),
+        ]
+    }) {
+        let caret = visual.update(|window, cx| {
+            editor.update(cx, |editor, cx| {
+                let caret =
+                    editor.text().to_string().find(line).unwrap() + line.find("anchor").unwrap();
+                editor.set_selected_range(caret..caret, cx);
+                editor.focus(window, cx);
+                caret
+            })
+        });
+        visual.simulate_keystrokes("shift-k");
+        wait_for(visual, "documentation at the diff caret", |_, cx| {
+            editor.read(cx).hover_popover().is_some_and(|popover| {
+                matches!(popover.hover.as_ref().map(|hover| &hover.contents),
+                    Some(lsp_types::HoverContents::Markup(markup)) if markup.value == line)
+            })
+        });
+        visual.simulate_keystrokes("escape");
+        visual.update(|window, cx| {
+            assert!(editor.read(cx).hover_popover().is_none());
+            assert!(editor.read(cx).focus_handle(cx).is_focused(window));
+            assert_eq!(editor.read(cx).cursor(), caret);
+        });
+    }
+    visual.update(|window, cx| {
+        workspace.update(cx, |workspace, cx| workspace.toggle_vim_mode(window, cx));
+    });
     if arbitrary {
         let (editor, before) = visual.update(|window, cx| {
             let editor = panel.read(cx).editor.focused_column(window, cx).clone();

@@ -103,6 +103,7 @@ impl GitPanel {
             },
             position,
             document: None,
+            editor_preview: None,
             git: Some(pane),
         }
     }
@@ -413,6 +414,7 @@ impl GitPanel {
         if state.is_composing()
             || state.completion_menu_state().open
             || state.code_action_menu_state().open
+            || (key.key == "escape" && !key.modifiers.modified() && state.has_language_hover())
         {
             return false;
         }

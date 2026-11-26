@@ -1101,6 +1101,143 @@ fn lsp_hover_stays_open_during_pointer_handoff_and_copies_documentation(
     }
 }
 
+#[gpui::test]
+fn escape_dismisses_editor_hover(cx: &mut gpui::TestAppContext) {
+    use std::{cell::Cell, rc::Rc};
+
+    use gpui::{App, AppContext as _, Context, Entity, Render, Styled as _, Task, Window, px};
+    use gpui_component::{
+        Root,
+        input::{Editor, EditorState, HoverProvider, Rope},
+    };
+    use lsp_types::{CompletionItem, Hover, HoverContents, MarkedString};
+
+    struct Documentation(Rc<Cell<usize>>);
+    impl HoverProvider for Documentation {
+        fn hover(
+            &self,
+            _: &Rope,
+            _: usize,
+            _: &mut Window,
+            cx: &mut App,
+        ) -> Task<anyhow::Result<Option<Hover>>> {
+            self.0.set(self.0.get() + 1);
+            let delay = cx.background_executor().timer(Duration::from_millis(200));
+            cx.background_spawn(async move {
+                delay.await;
+                Ok(Some(Hover {
+                    contents: HoverContents::Scalar(MarkedString::String("Hover docs".into())),
+                    range: None,
+                }))
+            })
+        }
+    }
+
+    struct Probe(Entity<EditorState>);
+    impl Render for Probe {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl gpui::IntoElement {
+            Editor::new(&self.0).size_full()
+        }
+    }
+
+    cx.update(|cx| {
+        gpui_component::init(cx);
+        cx.set_reduce_motion(true);
+    });
+    let requests = Rc::new(Cell::new(0));
+    let mut editor = None;
+    let (_, visual) = cx.add_window_view(|window, cx| {
+        let state = cx.new(|cx| {
+            let mut state = EditorState::new(window, cx).default_value("symbol next\n");
+            state.lsp_mut().hover_provider = Some(Rc::new(Documentation(requests.clone())));
+            state.focus(window, cx);
+            state
+        });
+        editor = Some(state.clone());
+        let view = cx.new(|_| Probe(state));
+        Root::new(view, window, cx)
+    });
+    let editor = editor.unwrap();
+    let draw = |visual: &mut gpui::VisualTestContext| {
+        visual.run_until_parked();
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+    };
+    let advance = |visual: &mut gpui::VisualTestContext, millis| {
+        visual
+            .executor()
+            .advance_clock(Duration::from_millis(millis));
+        draw(visual);
+    };
+    draw(visual);
+    let source = visual.update(|_, cx| editor.read(cx).range_to_bounds(&(0..6)).unwrap());
+    let pointer = source.center();
+    let hover_visible = |visual: &mut gpui::VisualTestContext| {
+        visual.update(|_, cx| editor.read(cx).hover_popover().is_some())
+    };
+    visual.simulate_mouse_move(pointer, None, Default::default());
+    draw(visual);
+    advance(visual, 150);
+    advance(visual, 200);
+    assert!(hover_visible(visual));
+    assert_eq!(requests.get(), 1);
+
+    visual.update(|_, cx| {
+        editor.update(cx, |editor, cx| {
+            editor.present_completion_items(
+                0,
+                "",
+                vec![CompletionItem::new_simple("symbol".into(), "Item".into())],
+                cx,
+            );
+        });
+    });
+    draw(visual);
+    visual.simulate_keystrokes("escape");
+    draw(visual);
+    assert!(
+        hover_visible(visual),
+        "completion receives the first Escape"
+    );
+    visual.update(|_, cx| {
+        assert!(!editor.read(cx).completion_menu_state().open);
+        editor.update(cx, |editor, cx| editor.add_selection(8..8, cx));
+    });
+    visual.simulate_keystrokes("escape");
+    draw(visual);
+    assert!(!hover_visible(visual));
+    assert_eq!(
+        visual.update(|_, cx| editor.read(cx).selection_endpoints().count()),
+        2
+    );
+    visual.simulate_keystrokes("escape");
+    assert_eq!(
+        visual.update(|_, cx| editor.read(cx).selection_endpoints().count()),
+        1
+    );
+
+    visual.simulate_mouse_move(pointer + point(px(1.), px(0.)), None, Default::default());
+    draw(visual);
+    advance(visual, 400);
+    assert_eq!(
+        requests.get(),
+        1,
+        "jitter on the dismissed symbol must not reopen it"
+    );
+
+    visual.simulate_mouse_move(point(px(2.), px(2.)), None, Default::default());
+    visual.simulate_mouse_move(pointer, None, Default::default());
+    draw(visual);
+    advance(visual, 150);
+    assert_eq!(requests.get(), 2);
+    assert!(!hover_visible(visual));
+    visual.simulate_keystrokes("escape");
+    advance(visual, 350);
+    assert!(
+        !hover_visible(visual),
+        "a pending hover must stay dismissed"
+    );
+}
+
 #[cfg(target_os = "linux")]
 #[gpui::test]
 fn long_lsp_hover_can_scroll_without_resizing_or_moving_the_editor(cx: &mut gpui::TestAppContext) {

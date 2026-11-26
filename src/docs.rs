@@ -1275,15 +1275,18 @@ impl DocReader {
                     }
                     self.find(window, cx);
                 }
-                Some('n' | 'N') => self
-                    .search
-                    .update(cx, |search, cx| search.step(key == Some('N'), cx)),
+                Some('n' | 'N') => self.step_find_match(key == Some('N'), cx),
                 Some(key) => return self.scroll_or_jump(key, cx),
                 None => return false,
             }
         }
         cx.notify();
         true
+    }
+
+    pub(crate) fn step_find_match(&mut self, previous: bool, cx: &mut Context<Self>) {
+        self.search
+            .update(cx, |search, cx| search.step(previous, cx));
     }
 
     pub(crate) fn session_position(&self, cx: &App) -> Option<DocumentPosition> {

@@ -346,6 +346,11 @@ dialogs in a Wayland window after changes to paint order or focus handling.
   show-document hook. Web links keep their default URL behavior. Run
   `cargo test --release --locked --lib hover_source_links_use_workspace_navigation`
   to verify link clicks, source positions, and navigation history.
+- A caret-triggered documentation request uses the shared hover provider and
+  popup without the pointer delay. Escape dismisses both hover triggers and
+  cancels pending documentation. A dismissed pointer target can reopen after
+  the pointer leaves it. Test with
+  `cargo test --release --locked --test popups escape_dismisses_editor_hover`.
 - The editor that owns a documentation popup defers hover retargeting during
   pointer handoff from the symbol. The documentation uses the shared clipboard
   button to copy the original LSP text, preserving Markdown and literal

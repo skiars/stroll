@@ -30,6 +30,7 @@ pub(super) struct WorkspaceState {
     hint: Option<KeyHint>,
     return_from_tree: Option<FocusHandle>,
     reader_prefix: bool,
+    preview_command: Option<PreviewCommand>,
     wide_status: bool,
     search: Option<source::Find>,
     pub(super) close_preference: Option<(PathBuf, PathBuf)>,
@@ -51,8 +52,14 @@ enum HintKind {
 enum GoScope {
     Source,
     Reader,
+    Image,
     Diff,
     ChangedFiles,
+}
+
+struct PreviewCommand {
+    pending: String,
+    _focus_out: Subscription,
 }
 
 struct KeyHint {
@@ -387,8 +394,15 @@ impl Workspace {
         if !self.config.current().keyboard.vim_mode
             || self.locator.open
             || self.repository_overlay_open()
+            || self.confirming_close
+            || self.image_preview.is_some()
             || window.has_active_dialog(cx)
+            || window.has_active_prompt()
         {
+            return;
+        }
+        if self.advance_preview_command(key, window, cx) {
+            consume(window, cx);
             return;
         }
         if !key.modifiers.modified() && matches!(key.key.as_str(), "enter" | "escape") {
@@ -501,6 +515,7 @@ impl Workspace {
     pub(super) fn cancel_vim_keys(&mut self, cx: &mut Context<Self>) {
         let mut changed = self.vim.hint.take().is_some();
         changed |= std::mem::take(&mut self.vim.reader_prefix);
+        changed |= self.vim.preview_command.take().is_some();
         if let Some(file) = self.tabs.active().and_then(|path| self.files.get_mut(path)) {
             changed |= file.vim.clear_pending();
         }
@@ -526,8 +541,13 @@ impl Workspace {
     fn vim_view_reader(&self) -> Option<&Entity<crate::docs::DocReader>> {
         match self.view {
             WorkspaceView::Docs => self.doc.as_ref(),
-            WorkspaceView::Editor => self.active_markdown_preview(),
-            WorkspaceView::Git => None,
+            WorkspaceView::Editor
+                if self.active_editor_preview_mode()
+                    != crate::session::EditorPreviewMode::Source =>
+            {
+                self.active_markdown_preview()
+            }
+            WorkspaceView::Editor | WorkspaceView::Git => None,
         }
     }
 
@@ -537,10 +557,15 @@ impl Workspace {
             .cloned()
     }
 
+    fn vim_image_focused(&self, window: &Window) -> bool {
+        self.view == WorkspaceView::Editor && self.image_viewer_focus.is_focused(window)
+    }
+
     fn vim_eligible(&self, window: &Window, cx: &App) -> bool {
         self.focus.is_focused(window)
             || (self.tree_focus.is_focused(window) && self.tree_edit.is_none())
             || self.vim_reader(window, cx).is_some()
+            || self.vim_image_focused(window)
             || self.vim_source(window, cx).is_some_and(|file| {
                 file.vim.accepts_leader() && !file.editor.read(cx).is_composing()
             })
@@ -578,7 +603,7 @@ impl Workspace {
             }
             return;
         }
-        if window.has_active_dialog(cx) {
+        if window.has_active_dialog(cx) || window.has_active_prompt() {
             self.cancel_vim_keys(cx);
             return;
         }
@@ -663,7 +688,15 @@ impl Workspace {
             }
             return;
         }
-        if let Some(reader) = self.vim_reader(window, cx) {
+        let reader = self.vim_reader(window, cx);
+        if self.view == WorkspaceView::Editor
+            && (reader.is_some() || self.vim_image_focused(window))
+            && self.vim_preview_key(plain, window, cx)
+        {
+            consume(window, cx);
+            return;
+        }
+        if let Some(reader) = reader {
             self.vim_reader_key(reader, key, plain, window, cx);
         } else if self.view == WorkspaceView::Git
             && let Some(panel) = self.git.clone()
@@ -671,6 +704,71 @@ impl Workspace {
         {
             consume(window, cx);
         }
+    }
+
+    fn vim_preview_key(
+        &mut self,
+        key: Option<char>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if self.tabs.active().is_none() {
+            return false;
+        }
+        match key {
+            Some('H' | 'L') => self.cycle_tabs(key == Some('L'), window, cx),
+            Some('X') => self.vim_source_action(source::Action::ClosePrevious, window, cx),
+            Some(':') => {
+                let Some(focus) = window.focused(cx) else {
+                    return false;
+                };
+                let focus_out = cx.on_focus_out(&focus, window, |this, _, _, _| {
+                    this.vim.preview_command = None;
+                });
+                self.vim.preview_command = Some(PreviewCommand {
+                    pending: ":".into(),
+                    _focus_out: focus_out,
+                });
+            }
+            _ => return false,
+        }
+        true
+    }
+
+    fn advance_preview_command(
+        &mut self,
+        key: &Keystroke,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(command) = self.vim.preview_command.as_mut() else {
+            return false;
+        };
+        if key.is_modifier_key() {
+            return false;
+        }
+        if key.key == "escape" && !key.modifiers.modified() {
+            self.vim.preview_command = None;
+            return true;
+        }
+        let plain = plain_key(key);
+        if plain.is_none()
+            && (key.modifiers.modified() || !matches!(key.key.as_str(), "enter" | "backspace"))
+        {
+            self.vim.preview_command = None;
+            return false;
+        }
+        if let Some(action) = source::advance_file_command(&mut command.pending, key, plain) {
+            self.vim.preview_command = None;
+            if !matches!(action, source::Action::Save | source::Action::SaveAndClose)
+                || self.active_file().is_some()
+            {
+                self.vim_source_action(action, window, cx);
+            }
+        } else if command.pending.is_empty() {
+            self.vim.preview_command = None;
+        }
+        true
     }
 
     fn vim_reader_key(
@@ -699,6 +797,7 @@ impl Workspace {
             editor.is_composing()
                 || editor.completion_menu_state().open
                 || editor.code_action_menu_state().open
+                || editor.has_language_hover()
         }) {
             return;
         }
@@ -1054,8 +1153,7 @@ impl Workspace {
                 super::editor_preview::PreviewKind::for_path(path)
                     == Some(super::editor_preview::PreviewKind::Svg)
             });
-        let in_image =
-            self.view == WorkspaceView::Editor && self.image_viewer_focus.is_focused(window);
+        let in_image = self.vim_image_focused(window);
         let in_content = in_source || reader.is_some() || in_image || self.focus.is_focused(window);
         match key {
             "h" if preview && (reader.is_some() || svg_preview && in_image) => {
@@ -1134,7 +1232,7 @@ impl Workspace {
             "j" if self.view == WorkspaceView::Editor
                 && (source.is_some()
                     || self.vim_reader(window, cx).is_some()
-                    || self.image_viewer_focus.is_focused(window)) =>
+                    || self.vim_image_focused(window)) =>
             {
                 self.focus_open_terminal(window, cx)
             }

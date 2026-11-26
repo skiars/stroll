@@ -66,6 +66,34 @@ pub(in crate::workspace) enum Action {
     Tab(bool),
 }
 
+pub(super) fn advance_file_command(
+    pending: &mut String,
+    stroke: &Keystroke,
+    key: Option<char>,
+) -> Option<Action> {
+    match stroke.key.as_str() {
+        "enter" => {
+            return Some(match std::mem::take(pending).as_str() {
+                ":w" => Action::Save,
+                ":q" => Action::Close,
+                ":wq" => Action::SaveAndClose,
+                _ => Action::Handled,
+            });
+        }
+        "backspace" => {
+            pending.pop();
+        }
+        _ => {
+            if let Some(key) = key
+                && pending.len() < 12
+            {
+                pending.push(key);
+            }
+        }
+    }
+    None
+}
+
 #[derive(Clone, Copy)]
 enum Target {
     Key(char),
@@ -285,27 +313,9 @@ impl Source {
         let locked = locked || !self.allows_edit(&[at..at], cx);
         let key = plain_key(stroke);
         if self.pending.starts_with(':') {
-            match stroke.key.as_str() {
-                "enter" => {
-                    return Some(match std::mem::take(&mut self.pending).as_str() {
-                        ":w" => Action::Save,
-                        ":q" => Action::Close,
-                        ":wq" => Action::SaveAndClose,
-                        _ => Action::Handled,
-                    });
-                }
-                "backspace" => {
-                    self.pending.pop();
-                }
-                _ => {
-                    if let Some(key) = key
-                        && self.pending.len() < 12
-                    {
-                        self.pending.push(key);
-                    }
-                }
-            }
-            return Some(Action::Handled);
+            return Some(
+                advance_file_command(&mut self.pending, stroke, key).unwrap_or(Action::Handled),
+            );
         }
         if self.mode == Mode::Insert {
             return None;
@@ -601,6 +611,10 @@ impl Source {
             }
             ("", ':') => {
                 self.pending.push(':');
+                return handled;
+            }
+            ("", 'K') if !explicit && self.mode == Mode::Normal => {
+                editor.show_hover_at_caret(window, cx);
                 return handled;
             }
             ("", '/' | '?') => return Some(Action::Find(key == '?')),

@@ -106,7 +106,61 @@ impl InputBaseState<EditorMode> {
         }
     }
 
-    /// Handle hover trigger LSP request.
+    /// Request documentation at the active editor caret.
+    #[doc(hidden)]
+    pub fn show_hover_at_caret(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.is_composing() || self.is_context_menu_open(cx) {
+            return;
+        }
+        let offset = self.cursor();
+        let Some((provider, target)) = self
+            .extras
+            .lsp
+            .hover_provider
+            .clone()
+            .zip(self.documentation_target_at(offset))
+        else {
+            return;
+        };
+
+        self.extras.dismissed_hover_target = None;
+        if let Some(popover) = self.extras.hover_popover.as_mut()
+            && popover.documentation_target.as_ref() == Some(&target)
+            && (popover.hover.is_some() || popover.keyboard_caret == Some(offset))
+        {
+            popover.keyboard_caret = Some(offset);
+            popover.pointer = None;
+            return;
+        }
+
+        let diagnostics = self
+            .hover_diagnostics_at(offset)
+            .into_iter()
+            .cloned()
+            .collect();
+        self.request_language_hover(
+            offset,
+            HoverPopoverState {
+                symbol_range: target.clone(),
+                target_range: target.clone(),
+                documentation_target: Some(target),
+                pointer: None,
+                keyboard_caret: Some(offset),
+                diagnostics,
+                hover: None,
+                documentation: None,
+                waiting_for_delay: true,
+                waiting_for_documentation: false,
+                presented: Default::default(),
+                pointer_handoff: Default::default(),
+            },
+            Some(provider),
+            window,
+            cx,
+        );
+    }
+
+    /// Handle a pointer-triggered hover request.
     pub(super) fn handle_hover_popover(
         &mut self,
         offset: usize,
@@ -117,6 +171,15 @@ impl InputBaseState<EditorMode> {
         if self.selecting {
             return;
         }
+        if self
+            .extras
+            .dismissed_hover_target
+            .as_ref()
+            .is_some_and(|range| range.contains(&offset) || range.start == offset)
+        {
+            return;
+        }
+        self.extras.dismissed_hover_target = None;
 
         let diagnostics = self.hover_diagnostics_at(offset);
 
@@ -137,7 +200,6 @@ impl InputBaseState<EditorMode> {
             return;
         }
 
-        let had_visible_popover = self.hover_popover().is_some();
         let word = documentation_target
             .clone()
             .or_else(|| self.text.word_range(offset))
@@ -168,33 +230,55 @@ impl InputBaseState<EditorMode> {
         }
 
         let diagnostics: Rc<[_]> = diagnostics.into_iter().cloned().collect();
-        // Dropping the previous task cancels the timer and any pending results.
-        self.extras.lsp._hover_task = Task::ready(Ok(()));
         let provider = provider.filter(|_| documentation_target.is_some());
-        let popover = HoverPopoverState {
-            symbol_range,
-            target_range,
-            documentation_target: documentation_target.clone(),
-            pointer: Some(position),
-            diagnostics,
-            hover: None,
-            documentation: None,
-            waiting_for_delay: true,
-            presented: Default::default(),
-            pointer_handoff: Default::default(),
-        };
-        if had_visible_popover {
+        self.request_language_hover(
+            offset,
+            HoverPopoverState {
+                symbol_range,
+                target_range,
+                documentation_target,
+                pointer: Some(position),
+                keyboard_caret: None,
+                diagnostics,
+                hover: None,
+                documentation: None,
+                waiting_for_delay: true,
+                waiting_for_documentation: false,
+                presented: Default::default(),
+                pointer_handoff: Default::default(),
+            },
+            provider,
+            window,
+            cx,
+        );
+    }
+
+    fn request_language_hover(
+        &mut self,
+        offset: usize,
+        mut popover: HoverPopoverState,
+        provider: Option<Rc<dyn HoverProvider>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let documentation_target = popover.documentation_target.clone();
+        let from_pointer = popover.pointer.is_some();
+        if self.hover_popover().is_some() {
             cx.notify();
         }
+        popover.waiting_for_documentation = provider.is_some();
         self.extras.hover_popover = Some(popover);
 
+        // Replacing the task cancels the previous delay, request and enrichment.
         let text = self.text.clone();
         let revision = self.document_revision;
         self.extras.lsp._hover_task = cx.spawn_in(window, async move |this, cx| {
-            let reveal = cx.background_executor().timer(HOVER_DELAY);
-            // Give the server a head start without querying briefly crossed symbols.
+            let reveal = from_pointer.then(|| cx.background_executor().timer(HOVER_DELAY));
             let mut request = if let Some(provider) = provider.as_ref() {
-                cx.background_executor().timer(HOVER_DELAY / 2).await;
+                if from_pointer {
+                    // Give the server a head start without querying briefly crossed symbols.
+                    cx.background_executor().timer(HOVER_DELAY / 2).await;
+                }
                 this.update_in(cx, |editor, window, cx| {
                     editor.validate_language_hover(cx);
                     (editor.document_revision == revision
@@ -206,37 +290,49 @@ impl InputBaseState<EditorMode> {
             } else {
                 None
             };
-            reveal.await;
-
             let mut early_hover = None;
-            if let Some(task) = request.as_mut()
-                && let Poll::Ready(result) = futures::poll!(task)
-            {
-                request = None;
-                early_hover = result.ok().flatten();
-            }
-            this.update_in(cx, |editor, _, cx| {
-                editor.validate_language_hover(cx);
-                if let Some(popover) = editor.extras.hover_popover.as_mut()
-                    && editor.document_revision == revision
+            if let Some(reveal) = reveal {
+                reveal.await;
+                if let Some(task) = request.as_mut()
+                    && let Poll::Ready(result) = futures::poll!(task)
                 {
-                    popover.waiting_for_delay = false;
-                    if popover.visible()
-                        && (early_hover.is_none()
-                            || popover.documentation_target != documentation_target)
-                    {
-                        cx.notify();
-                    }
+                    request = None;
+                    early_hover = result.ok().flatten();
                 }
-            })?;
+                this.update_in(cx, |editor, _, cx| {
+                    editor.validate_language_hover(cx);
+                    if let Some(popover) = editor.extras.hover_popover.as_mut()
+                        && editor.document_revision == revision
+                    {
+                        popover.waiting_for_delay = false;
+                        if popover.visible()
+                            && (early_hover.is_none()
+                                || popover.documentation_target != documentation_target)
+                        {
+                            cx.notify();
+                        }
+                    }
+                })?;
+            }
             let Some(provider) = provider else {
                 return Ok(());
             };
             let hover = match (early_hover, request) {
-                (None, Some(request)) => request.await?,
+                (None, Some(request)) => request.await.ok().flatten(),
                 (hover, _) => hover,
             };
             let Some(hover) = hover else {
+                this.update_in(cx, |editor, _, _| {
+                    if editor.document_revision == revision
+                        && let Some(popover) = editor.extras.hover_popover.as_mut()
+                        && popover.documentation_target == documentation_target
+                    {
+                        popover.waiting_for_documentation = false;
+                        if popover.is_keyboard_triggered() {
+                            editor.extras.hover_popover = None;
+                        }
+                    }
+                })?;
                 return Ok(());
             };
 
@@ -260,6 +356,8 @@ impl InputBaseState<EditorMode> {
                     }
                 }
                 let enrichment = provider.enrich_hover(&hover, offset, window, cx);
+                popover.waiting_for_delay = false;
+                popover.waiting_for_documentation = false;
                 popover.hover = Some(hover.clone());
                 editor.update_action_hover_documentation();
                 cx.notify();
@@ -269,6 +367,7 @@ impl InputBaseState<EditorMode> {
                 && let Some(documentation) = enrichment.await
             {
                 this.update_in(cx, |editor, _, cx| {
+                    editor.validate_language_hover(cx);
                     if editor.document_revision == revision
                         && let Some(popover) = editor.extras.hover_popover.as_mut()
                         && popover.hover.as_ref() == Some(&hover)
@@ -285,15 +384,18 @@ impl InputBaseState<EditorMode> {
 
     pub(crate) fn handle_mouse_move(
         &mut self,
-        offset: usize,
         event: &MouseMoveEvent,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self
-            .hover_popover()
-            .is_some_and(|hover| hover.pointer_handoff.take() == Some(event.position))
+        if self.hover_popover().is_some_and(|hover| {
+            hover.is_keyboard_triggered() || hover.pointer_handoff.take() == Some(event.position)
+        }) || self.has_pending_keyboard_hover()
         {
+            return;
+        }
+        if !self.visible_text_bounds.contains(&event.position) {
+            self.clear_hover_state(cx);
             return;
         }
         if event.modifiers.alt {
@@ -302,6 +404,7 @@ impl InputBaseState<EditorMode> {
         }
         if event.modifiers.secondary(cx) {
             self.clear_language_hover(cx);
+            let (offset, _) = self.index_for_mouse_position(event.position);
             self.handle_hover_definition(offset, window, cx);
         } else {
             // Repaint only when the definition underline goes away; the hover
@@ -316,6 +419,7 @@ impl InputBaseState<EditorMode> {
             if let Some(offset) = self.text_offset_at_point(event.position) {
                 self.handle_hover_popover(offset, event.position, window, cx);
             } else {
+                self.extras.dismissed_hover_target = None;
                 self.clear_language_hover(cx);
             }
         }
@@ -341,6 +445,7 @@ impl InputBaseState<EditorMode> {
         inserted_len: usize,
     ) {
         self.extras.lsp._hover_task = Task::ready(Ok(()));
+        self.extras.dismissed_hover_target = None;
         self.extras.hover_definition.clear();
         let Some(popover) = self.extras.hover_popover.as_mut() else {
             return;
@@ -370,6 +475,25 @@ impl InputBaseState<EditorMode> {
         }
     }
 
+    pub(crate) fn has_pending_keyboard_hover(&self) -> bool {
+        self.extras
+            .hover_popover
+            .as_ref()
+            .is_some_and(|popover| popover.is_keyboard_triggered() && !popover.presented.get())
+    }
+
+    /// Whether Escape will be handled by the shared editor hover.
+    #[doc(hidden)]
+    pub fn has_language_hover(&self) -> bool {
+        self.active_language_hover().is_some()
+    }
+
+    fn active_language_hover(&self) -> Option<&HoverPopoverState> {
+        self.extras.hover_popover.as_ref().filter(|popover| {
+            popover.visible() || popover.waiting_for_delay || popover.waiting_for_documentation
+        })
+    }
+
     pub(crate) fn has_pending_pointer_hover(&self) -> bool {
         self.extras.hover_popover.as_ref().is_some_and(|popover| {
             popover.pointer.is_some() && (!popover.visible() || !popover.presented.get())
@@ -391,6 +515,12 @@ impl InputBaseState<EditorMode> {
         let Some(popover) = self.extras.hover_popover.as_ref() else {
             return;
         };
+        if let Some(caret) = popover.keyboard_caret {
+            if self.cursor() != caret || self.visible_text_range_bounds(&(caret..caret)).is_none() {
+                self.clear_language_hover(cx);
+            }
+            return;
+        }
         let Some(pointer) = popover.pointer else {
             return;
         };
@@ -445,6 +575,7 @@ impl InputBaseState<EditorMode> {
         }
         if !same_documentation_target {
             popover.documentation_target = None;
+            popover.waiting_for_documentation = false;
             popover.hover = None;
             popover.documentation = None;
         }
@@ -454,7 +585,32 @@ impl InputBaseState<EditorMode> {
         cx.notify();
     }
 
+    pub(crate) fn dismiss_language_hover(
+        &mut self,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(popover) = self.active_language_hover() else {
+            return false;
+        };
+        let target = popover
+            .documentation_target
+            .as_ref()
+            .unwrap_or(&popover.target_range);
+        let pointer = window.mouse_position();
+        if self.visible_text_bounds.contains(&pointer)
+            && self
+                .text_offset_at_point(pointer)
+                .is_some_and(|offset| target.contains(&offset) || target.start == offset)
+        {
+            self.extras.dismissed_hover_target = Some(target.clone());
+        }
+        self.clear_language_hover(cx);
+        true
+    }
+
     pub fn clear_hover_state(&mut self, cx: &mut Context<Self>) {
+        self.extras.dismissed_hover_target = None;
         if !self.extras.hover_definition.is_empty() {
             self.extras.hover_definition.clear();
             cx.notify();

@@ -1137,10 +1137,9 @@ impl<M: InputModeKind> TextElement<M> {
                 if !phase.capture() {
                     return;
                 }
-                if !hitbox.is_hovered(window) {
-                    // The editor's bubble listener only sees events that hit the
-                    // input. An already visible popup owns its own pointer handoff.
-                    M::cancel_pending_pointer_hover(&state, cx);
+                if !hitbox.is_hovered(window) && window.is_pointer_motion() {
+                    // An already visible popup owns its own pointer handoff.
+                    M::leave_hover_hitbox(&state, cx);
                 }
                 if event.dragging() {
                     state.update(cx, |state, cx| {
@@ -1154,11 +1153,20 @@ impl<M: InputModeKind> TextElement<M> {
             }
         });
 
+        if M::CODE_EDITOR {
+            let state = self.state.clone();
+            window.on_mouse_event(move |_: &gpui::MouseDownEvent, phase, _, cx| {
+                if phase.capture() {
+                    M::cancel_pending_keyboard_hover(&state, cx);
+                }
+            });
+        }
+
         window.on_mouse_event({
             let state = self.state.clone();
             move |_: &gpui::MouseExitEvent, phase, _, cx| {
                 if phase.capture() {
-                    M::cancel_pending_pointer_hover(&state, cx);
+                    M::leave_hover_hitbox(&state, cx);
                 }
             }
         });

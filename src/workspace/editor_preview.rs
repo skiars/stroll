@@ -93,6 +93,7 @@ pub(super) struct EditorPreviews {
     pub(super) split_drag: Option<(PreviewKind, f32)>,
     scroll_follow: markdown_scroll::ScrollFollow,
     mode_menu: Option<PreviewModeMenu>,
+    pending_history: Option<(PathBuf, EditorPreviewLocation, Option<FocusHandle>)>,
 }
 
 struct PreviewModeMenu {
@@ -283,6 +284,59 @@ impl Workspace {
         })
     }
 
+    pub(super) fn cancel_editor_preview_history(&mut self) {
+        self.editor_previews.pending_history = None;
+    }
+
+    pub(super) fn restore_editor_preview_history(
+        &mut self,
+        path: PathBuf,
+        location: EditorPreviewLocation,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.cancel_editor_preview_history();
+        if let Some(reader) = self.active_markdown_preview() {
+            reader.update(cx, |reader, cx| {
+                reader.replay_history_location(location.document, false, cx);
+                reader.focus_content(window, cx);
+            });
+        } else {
+            self.editor_previews.pending_history = Some((path, location, window.focused(cx)));
+        }
+    }
+
+    fn finish_markdown_preview(
+        &mut self,
+        path: &Path,
+        reader: &Entity<docs::DocReader>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let history = self
+            .editor_previews
+            .pending_history
+            .take_if(|(key, _, _)| key == path);
+        let mode = self.editor_preview_mode(path);
+        if self.view != WorkspaceView::Editor
+            || self.tabs.active() != Some(path)
+            || mode == EditorPreviewMode::Source
+        {
+            return;
+        }
+        if let Some((_, location, focus)) = history.filter(|(_, location, _)| location.mode == mode)
+        {
+            reader.update(cx, |reader, cx| {
+                reader.replay_history_location(location.document, false, cx);
+                if window.focused(cx) == focus {
+                    reader.focus_content(window, cx);
+                }
+            });
+        } else if mode == EditorPreviewMode::Full && self.focus.is_focused(window) {
+            reader.update(cx, |reader, cx| reader.focus_content(window, cx));
+        }
+    }
+
     fn change_editor_preview_mode(
         &mut self,
         path: &Path,
@@ -305,6 +359,7 @@ impl Workspace {
                     .update(cx, |editor, cx| editor.dismiss_lsp_overlays(cx));
             }
         }
+        self.cancel_editor_preview_history();
         self.set_editor_preview_mode(path, mode);
         if let Err(error) = self
             .store
@@ -325,6 +380,15 @@ impl Workspace {
                 window,
                 cx,
             );
+        } else if mode == EditorPreviewMode::Full
+            || current == EditorPreviewMode::Full
+            || (mode == EditorPreviewMode::Source
+                && (self.image_viewer_focus.is_focused(window)
+                    || self
+                        .active_markdown_preview()
+                        .is_some_and(|reader| reader.read(cx).content_focused(window, cx))))
+        {
+            self.focus_workspace_content(None, window, cx);
         }
         cx.notify();
     }
@@ -667,8 +731,9 @@ impl Workspace {
                         reader.inherit_editor_preview(previous, window, cx);
                     }
                 });
-                preview.reader = Some(Ok(reader));
+                preview.reader = Some(Ok(reader.clone()));
                 preview.reader_revision = Some(revision);
+                this.finish_markdown_preview(&key, &reader, window, cx);
                 cx.notify();
             });
         });

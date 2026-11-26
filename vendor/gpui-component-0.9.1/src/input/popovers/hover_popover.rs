@@ -755,8 +755,10 @@ impl Element for Popover {
         let Some(placement) = placement else { return };
         let bounds = placement.bounds;
         placement.element.paint(window, cx);
-        if !self.closing
-            && let Some(hover) = self.editor.read(cx).hover_popover()
+        if self.closing {
+            return;
+        }
+        if let Some(hover) = self.editor.read(cx).hover_popover()
             && hover.symbol_range == self.range
         {
             hover.mark_presented();
@@ -811,6 +813,13 @@ impl Element for Popover {
             if !event.dragging() {
                 pointer_down.set(false);
             }
+            if editor
+                .read(cx)
+                .hover_popover()
+                .is_some_and(|hover| hover.is_keyboard_triggered())
+            {
+                return;
+            }
             if !pointer_down.get() && !keep_open_region.contains(&event.position) {
                 editor.update(cx, |editor, cx| editor.clear_hover_state(cx));
             } else if has_documentation {
@@ -835,6 +844,10 @@ impl Element for Popover {
                 && event.button == MouseButton::Left
                 && pointer_down.replace(false)
                 && !keep_open_region.contains(&event.position)
+                && !editor
+                    .read(cx)
+                    .hover_popover()
+                    .is_some_and(|hover| hover.is_keyboard_triggered())
             {
                 editor.update(cx, |editor, cx| editor.clear_hover_state(cx));
             }

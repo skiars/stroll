@@ -16,6 +16,9 @@ impl Workspace {
         if self.vim_reader(window, cx).is_some() {
             return Some(GoScope::Reader);
         }
+        if self.vim_image_focused(window) && self.tabs.paths().len() > 1 {
+            return Some(GoScope::Image);
+        }
         if self.view == WorkspaceView::Git
             && let Some(panel) = &self.git
         {
@@ -42,7 +45,9 @@ impl Workspace {
             | (GoScope::Reader, GoCommand::Top | GoCommand::File)
             | (GoScope::Diff, GoCommand::Top)
             | (GoScope::ChangedFiles, GoCommand::File) => true,
-            (GoScope::Source, GoCommand::Tab(_)) => self.tabs.paths().len() > 1,
+            (GoScope::Source | GoScope::Reader | GoScope::Image, GoCommand::Tab(_)) => {
+                self.view == WorkspaceView::Editor && self.tabs.paths().len() > 1
+            }
             (GoScope::Source, command) => self.vim_source(window, cx).is_some_and(|file| {
                 let editor = file.editor.read(cx);
                 match command {
@@ -90,7 +95,9 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         match (scope, command) {
-            (GoScope::Source, GoCommand::Tab(forward)) => self.cycle_tabs(forward, window, cx),
+            (GoScope::Source | GoScope::Reader | GoScope::Image, GoCommand::Tab(forward)) => {
+                self.cycle_tabs(forward, window, cx);
+            }
             (GoScope::Reader, GoCommand::Top) => {
                 if let Some(reader) = self.vim_reader(window, cx) {
                     reader.update(cx, |reader, cx| {
@@ -111,7 +118,9 @@ impl Workspace {
                         let bytes = source.as_bytes().get(..offset)?;
                         u32::try_from(bytes.iter().filter(|&&byte| byte == b'\n').count()).ok()
                     });
-                    let from = self.locator_history_origin(window, cx);
+                    let from = self
+                        .editor_preview_history_location(window, cx)
+                        .unwrap_or_else(|| self.locator_history_origin(window, cx));
                     let position =
                         line.map(|line| SourcePosition::Lsp(lsp_types::Position::new(line, 0)));
                     self.open_source_jump(path, position, from, window, cx);

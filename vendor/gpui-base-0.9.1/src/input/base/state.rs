@@ -2808,6 +2808,14 @@ impl<M: InputModeKind> InputBaseState<M> {
             return;
         }
 
+        if !self.is_composing() && M::dismiss_hover(self, window, cx) {
+            return;
+        }
+        if !self.is_editable() {
+            cx.propagate();
+            return;
+        }
+
         // Escape also dismisses a request whose popup has not arrived yet.
         M::hide_context_menu(self, cx);
 
@@ -3208,17 +3216,7 @@ impl<M: InputModeKind> InputBaseState<M> {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // `last_bounds` is moved by the scroll offset; `input_bounds` is the visible area.
-        let within_bounds = self.visible_text_bounds.contains(&event.position);
-
-        if !within_bounds {
-            // Clear hover when mouse leaves the input
-            M::clear_hover_state(self, cx);
-            return;
-        }
-
-        let (offset, _) = self.index_for_mouse_position(event.position);
-        M::on_mouse_move(self, offset, event, window, cx);
+        M::on_mouse_move(self, event, window, cx);
     }
 
     pub(super) fn on_scroll_wheel(
@@ -6489,7 +6487,6 @@ impl<M: InputModeKind> Render for InputBaseState<M> {
                     .on_action(window.listener_for(&entity, InputBaseState::delete_previous_word))
                     .on_action(window.listener_for(&entity, InputBaseState::delete_next_word))
                     .on_action(window.listener_for(&entity, InputBaseState::enter))
-                    .on_action(window.listener_for(&entity, InputBaseState::escape))
                     .on_action(window.listener_for(&entity, InputBaseState::paste))
                     .on_action(window.listener_for(&entity, InputBaseState::cut))
                     .on_action(window.listener_for(&entity, InputBaseState::undo))
@@ -6500,6 +6497,9 @@ impl<M: InputModeKind> Render for InputBaseState<M> {
                             .on_action(window.listener_for(&entity, InputBaseState::indent_block))
                             .on_action(window.listener_for(&entity, InputBaseState::outdent_block))
                     })
+            })
+            .when(self.is_editable() || M::CODE_EDITOR, |this| {
+                this.on_action(window.listener_for(&entity, InputBaseState::escape))
             })
             .on_action(window.listener_for(&entity, InputBaseState::left))
             .on_action(window.listener_for(&entity, InputBaseState::right))

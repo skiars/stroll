@@ -37,6 +37,7 @@ impl InputModeKind for EditorMode {
 
     fn reset_annotations(state: &mut InputBaseState<Self>) {
         state.extras.hover_popover = None;
+        state.extras.dismissed_hover_target = None;
         state.extras.lsp._hover_task = gpui::Task::ready(Ok(()));
         state.extras.lsp.reset_semantic_tokens();
         state.extras.decorations.clear();
@@ -116,13 +117,30 @@ impl InputModeKind for EditorMode {
         state.clear_hover_state(cx);
     }
 
-    fn cancel_pending_pointer_hover(
-        state: &gpui::Entity<InputBaseState<Self>>,
-        cx: &mut gpui::App,
-    ) {
-        if state.read(cx).has_pending_pointer_hover() {
-            state.update(cx, |state, cx| state.clear_hover_state(cx));
+    fn leave_hover_hitbox(state: &gpui::Entity<InputBaseState<Self>>, cx: &mut App) {
+        let editor = state.read(cx);
+        if editor.has_pending_pointer_hover() || editor.extras.dismissed_hover_target.is_some() {
+            state.update(cx, |editor, cx| {
+                editor.extras.dismissed_hover_target = None;
+                if editor.has_pending_pointer_hover() {
+                    editor.clear_hover_state(cx);
+                }
+            });
         }
+    }
+
+    fn cancel_pending_keyboard_hover(state: &gpui::Entity<InputBaseState<Self>>, cx: &mut App) {
+        if state.read(cx).has_pending_keyboard_hover() {
+            state.update(cx, |editor, cx| editor.clear_hover_state(cx));
+        }
+    }
+
+    fn dismiss_hover(
+        state: &mut InputBaseState<Self>,
+        window: &mut Window,
+        cx: &mut gpui::Context<InputBaseState<Self>>,
+    ) -> bool {
+        state.dismiss_language_hover(window, cx)
     }
 
     fn validate_hover_anchor(
@@ -196,12 +214,11 @@ impl InputModeKind for EditorMode {
 
     fn on_mouse_move(
         state: &mut InputBaseState<Self>,
-        offset: usize,
         event: &gpui::MouseMoveEvent,
         window: &mut Window,
         cx: &mut gpui::Context<InputBaseState<Self>>,
     ) {
-        state.handle_mouse_move(offset, event, window, cx);
+        state.handle_mouse_move(event, window, cx);
     }
 
     fn drive_highlighter(

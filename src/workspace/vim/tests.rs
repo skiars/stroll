@@ -85,6 +85,133 @@ fn with_vim_repository(
 }
 
 #[::core::prelude::v1::test]
+fn vim_k_requests_hover_at_the_caret_and_escape_preserves_visual_mode() -> anyhow::Result<()> {
+    use gpui::Task;
+    use gpui_component::input::{HoverDocumentation, HoverProvider, Rope};
+    use lsp_types::{Hover, HoverContents, MarkedString};
+    use std::{cell::RefCell, rc::Rc};
+
+    struct Documentation(Rc<RefCell<Vec<usize>>>);
+
+    impl HoverProvider for Documentation {
+        fn hover(
+            &self,
+            _: &Rope,
+            offset: usize,
+            _: &mut Window,
+            cx: &mut App,
+        ) -> Task<anyhow::Result<Option<Hover>>> {
+            self.0.borrow_mut().push(offset);
+            let timer =
+                (offset == 11).then(|| cx.background_executor().timer(Duration::from_millis(500)));
+            cx.background_spawn(async move {
+                if let Some(timer) = timer {
+                    timer.await;
+                }
+                Ok((offset != 6).then(|| Hover {
+                    contents: HoverContents::Scalar(MarkedString::String("Symbol docs".into())),
+                    range: None,
+                }))
+            })
+        }
+
+        fn enrich_hover(
+            &self,
+            _: &Hover,
+            _: usize,
+            _: &mut Window,
+            cx: &mut App,
+        ) -> Task<Option<HoverDocumentation>> {
+            let timer = cx.background_executor().timer(Duration::from_millis(500));
+            cx.background_spawn(async move {
+                timer.await;
+                Some(HoverDocumentation {
+                    plaintext: Some("Translated documentation".into()),
+                    ..Default::default()
+                })
+            })
+        }
+    }
+
+    with_vim_workspace("alpha beta slow\n", |visual, workspace| {
+        let calls = Rc::new(RefCell::new(Vec::new()));
+        let editor = visual.update(|_, cx| {
+            cx.set_reduce_motion(true);
+            let editor = workspace.read(cx).active_file().unwrap().editor.clone();
+            editor.update(cx, |editor, _| {
+                editor.lsp_mut().hover_provider = Some(Rc::new(Documentation(calls.clone())));
+            });
+            editor
+        });
+        let hover = |visual: &mut VisualTestContext| {
+            visual.update(|_, cx| {
+                editor
+                    .read(cx)
+                    .hover_popover()
+                    .map(|hover| hover.symbol_range.clone())
+            })
+        };
+
+        visual.simulate_keystrokes("shift-k");
+        draw(visual);
+        assert_eq!(hover(visual), Some(0..5));
+        assert!(visual.debug_bounds("hover-markdown").is_some());
+        visual.update(|window, cx| {
+            assert_eq!(editor.read(cx).cursor(), 0);
+            assert!(editor.read(cx).focus_handle(cx).is_focused(window));
+        });
+
+        visual.simulate_mouse_move(point(px(2.), px(2.)), None, Modifiers::default());
+        visual.simulate_keystrokes("shift-k");
+        draw(visual);
+        assert_eq!(hover(visual), Some(0..5));
+        assert_eq!(*calls.borrow(), [0]);
+
+        visual.simulate_keystrokes("l");
+        draw(visual);
+        assert!(hover(visual).is_none());
+        visual.simulate_keystrokes("4 l shift-k");
+        draw(visual);
+        assert!(hover(visual).is_none(), "whitespace should have no popup");
+        assert_eq!(*calls.borrow(), [0]);
+
+        visual.simulate_keystrokes("w shift-k");
+        draw(visual);
+        assert!(
+            hover(visual).is_none(),
+            "an empty response should have no popup"
+        );
+        visual.simulate_keystrokes("w shift-k");
+        draw(visual);
+        assert_eq!(*calls.borrow(), [0, 6, 11]);
+        visual.simulate_keystrokes("escape");
+        visual.executor().advance_clock(Duration::from_secs(1));
+        draw(visual);
+        assert!(hover(visual).is_none());
+
+        visual.simulate_keystrokes("0 shift-k");
+        draw(visual);
+        assert_eq!(hover(visual), Some(0..5));
+        visual.simulate_keystrokes("v");
+        draw(visual);
+        assert!(visual.debug_bounds("status-vim-mode: VISUAL").is_some());
+        let selection = visual.update(|_, cx| editor.read(cx).selected_range());
+        visual.simulate_keystrokes("escape");
+        visual.executor().advance_clock(Duration::from_secs(1));
+        draw(visual);
+        assert!(hover(visual).is_none());
+        assert!(visual.debug_bounds("status-vim-mode: VISUAL").is_some());
+        assert_eq!(
+            visual.update(|_, cx| editor.read(cx).selected_range()),
+            selection
+        );
+        visual.simulate_keystrokes("escape");
+        draw(visual);
+        assert!(visual.debug_bounds("status-vim-mode: NORMAL").is_some());
+    })
+}
+
+#[::core::prelude::v1::test]
 fn vim_status_toggle_renders_open_corners_and_a_short_disabled_slash() -> anyhow::Result<()> {
     let renderer = SvgRenderer::new(Arc::new(()));
     let side = (STATUS_ICON_SIZE.as_f32() * 2.) as usize;
@@ -419,6 +546,323 @@ fn vim_go_hint_uses_the_leader_layout_and_preserves_modal_commands() -> anyhow::
                     );
                 });
             }
+        },
+    )
+}
+
+fn wait_for_preview_key_state(
+    visual: &mut VisualTestContext,
+    mut ready: impl FnMut(&mut Window, &mut App) -> bool,
+) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        draw(visual);
+        if visual.update(|window, cx| ready(window, cx)) {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "Preview keyboard state did not settle"
+        );
+        visual.executor().advance_clock(Duration::from_millis(25));
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+fn click_preview_control(visual: &mut VisualTestContext, selector: &'static str) {
+    let button = visual.debug_bounds(selector).unwrap();
+    visual.simulate_click(button.center(), Modifiers::none());
+    draw(visual);
+}
+
+#[::core::prelude::v1::test]
+fn editor_preview_tab_commands_follow_focus_and_preserve_find_input() -> anyhow::Result<()> {
+    use crate::session::EditorPreviewMode;
+
+    let document = format!(
+        "# First hit\n\n{}## Last hit\n",
+        "Read this.\n\n".repeat(50)
+    );
+    with_vim_repository(
+        "guide.md",
+        &document,
+        &[("other.txt", "Other")],
+        |visual, workspace| {
+            visual.simulate_resize(size(px(1050.), px(550.)));
+            visual.update(|window, cx| {
+                cx.set_reduce_motion(true);
+                workspace.update(cx, |this, cx| {
+                    this.keep_tab(std::path::Path::new("guide.md"), cx);
+                    this.open_file("other.txt".into(), false, window, cx);
+                });
+            });
+            let on_tab = |visual: &mut VisualTestContext, name: &str| {
+                wait_for_preview_key_state(visual, |_, cx| {
+                    workspace.read(cx).tabs.active() == Some(std::path::Path::new(name))
+                });
+            };
+            on_tab(visual, "other.txt");
+            visual.simulate_keystrokes("shift-h");
+            on_tab(visual, "guide.md");
+
+            click_preview_control(visual, "editor-preview-icon-source");
+            wait_for_preview_key_state(visual, |window, cx| {
+                let this = workspace.read(cx);
+                this.active_editor_preview_mode() == EditorPreviewMode::Full
+                    && this.vim_reader(window, cx).is_some()
+            });
+            for (keys, name) in [
+                ("shift-l", "other.txt"),
+                ("shift-h", "guide.md"),
+                ("g t", "other.txt"),
+                ("g shift-t", "guide.md"),
+            ] {
+                visual.simulate_keystrokes(keys);
+                on_tab(visual, name);
+            }
+
+            visual.simulate_keystrokes("/");
+            draw(visual);
+            assert!(visual.debug_bounds("find-query-field").is_some());
+            visual.simulate_keystrokes("shift-h shift-l");
+            draw(visual);
+            assert!(visual.debug_bounds("find-query-field").is_some());
+            on_tab(visual, "guide.md");
+            visual.simulate_keystrokes("escape /");
+            visual.simulate_input("hit");
+            visual.simulate_keystrokes("enter");
+            wait_for_preview_key_state(visual, |window, cx| {
+                workspace
+                    .read(cx)
+                    .vim_reader(window, cx)
+                    .is_some_and(|reader| reader.read(cx).session_position(cx).is_some())
+            });
+            let top = visual.update(|_, cx| {
+                workspace
+                    .read(cx)
+                    .active_markdown_preview()
+                    .unwrap()
+                    .read(cx)
+                    .session_position(cx)
+                    .unwrap()
+                    .block
+            });
+            visual.simulate_keystrokes("f3");
+            wait_for_preview_key_state(visual, |_, cx| {
+                workspace
+                    .read(cx)
+                    .active_markdown_preview()
+                    .unwrap()
+                    .read(cx)
+                    .session_position(cx)
+                    .is_some_and(|position| position.block > top)
+            });
+            visual.simulate_keystrokes("shift-f3");
+            wait_for_preview_key_state(visual, |_, cx| {
+                workspace
+                    .read(cx)
+                    .active_markdown_preview()
+                    .unwrap()
+                    .read(cx)
+                    .session_position(cx)
+                    .is_some_and(|position| position.block == top)
+            });
+            visual.simulate_keystrokes("escape");
+
+            click_preview_control(visual, "editor-preview-icon-full");
+            visual.update(|window, cx| {
+                let this = workspace.read(cx);
+                assert!(this.vim_source(window, cx).is_some());
+            });
+            click_preview_control(visual, "editor-preview-pane");
+            visual.simulate_keystrokes("shift-l");
+            on_tab(visual, "other.txt");
+            visual.simulate_keystrokes("g shift-t");
+            on_tab(visual, "guide.md");
+            click_preview_control(visual, "editor-preview-pane");
+            visual.simulate_keystrokes(": escape shift-x");
+            on_tab(visual, "other.txt");
+            visual.update(|_, cx| {
+                assert!(
+                    workspace
+                        .read(cx)
+                        .tabs
+                        .index(std::path::Path::new("guide.md"))
+                        .is_none()
+                );
+            });
+        },
+    )
+}
+
+#[::core::prelude::v1::test]
+fn editor_preview_history_restores_full_reading_and_replays_source() -> anyhow::Result<()> {
+    use crate::session::EditorPreviewMode;
+
+    let document = (0..45)
+        .map(|section| format!("## Section {section}\n\nParagraph {section}.\n\n"))
+        .collect::<String>();
+    with_vim_repository("guide.md", &document, &[], |visual, workspace| {
+        visual.simulate_resize(size(px(1050.), px(500.)));
+        visual.update(|_, cx| cx.set_reduce_motion(true));
+        click_preview_control(visual, "editor-preview-icon-source");
+        wait_for_preview_key_state(visual, |window, cx| {
+            workspace.read(cx).vim_reader(window, cx).is_some()
+        });
+        visual.simulate_keystrokes("shift-g");
+        wait_for_preview_key_state(visual, |window, cx| {
+            workspace
+                .read(cx)
+                .editor_preview_history_location(window, cx)
+                .and_then(|location| location.editor_preview)
+                .and_then(|preview| preview.document.position)
+                .is_some_and(|position| position.block > 5)
+        });
+        let position = visual.update(|window, cx| {
+            workspace
+                .read(cx)
+                .editor_preview_history_location(window, cx)
+                .unwrap()
+                .editor_preview
+                .unwrap()
+                .document
+                .position
+                .unwrap()
+        });
+
+        visual.simulate_keystrokes("g f");
+        draw(visual);
+        let caret = visual.update(|window, cx| {
+            let this = workspace.read(cx);
+            assert_eq!(this.active_editor_preview_mode(), EditorPreviewMode::Split);
+            let caret = this
+                .vim_source(window, cx)
+                .unwrap()
+                .editor
+                .read(cx)
+                .cursor();
+            assert!(caret > 0);
+            caret
+        });
+        visual.simulate_keystrokes("ctrl-o");
+        wait_for_preview_key_state(visual, |window, cx| {
+            let this = workspace.read(cx);
+            this.active_editor_preview_mode() == EditorPreviewMode::Full
+                && this
+                    .editor_preview_history_location(window, cx)
+                    .and_then(|location| location.editor_preview)
+                    .and_then(|preview| preview.document.position)
+                    .is_some_and(|restored| restored.line == position.line)
+        });
+        visual.simulate_keystrokes("ctrl-i");
+        draw(visual);
+        visual.update(|window, cx| {
+            let this = workspace.read(cx);
+            assert_eq!(this.active_editor_preview_mode(), EditorPreviewMode::Split);
+            assert_eq!(
+                this.vim_source(window, cx)
+                    .unwrap()
+                    .editor
+                    .read(cx)
+                    .cursor(),
+                caret
+            );
+        });
+    })
+}
+
+#[::core::prelude::v1::test]
+fn editor_preview_file_commands_reuse_save_and_close_paths() -> anyhow::Result<()> {
+    with_vim_repository(
+        "guide.md",
+        "# Guide\n",
+        &[("other.txt", "Other")],
+        |visual, workspace| {
+            let path = visual.update(|_, cx| {
+                workspace
+                    .read(cx)
+                    .repository
+                    .as_ref()
+                    .unwrap()
+                    .root
+                    .join("guide.md")
+            });
+            visual.simulate_keystrokes("0 i");
+            visual.simulate_input("Draft ");
+            visual.simulate_keystrokes("escape");
+            click_preview_control(visual, "editor-preview-icon-source");
+            wait_for_preview_key_state(visual, |window, cx| {
+                workspace.read(cx).vim_reader(window, cx).is_some()
+            });
+            visual.simulate_keystrokes(": q enter");
+            draw(visual);
+            visual.update(|_, cx| assert!(workspace.read(cx).confirming_close));
+            assert_eq!(fs::read_to_string(&path).unwrap(), "# Guide\n");
+            visual.simulate_keystrokes("escape");
+            wait_for_preview_key_state(visual, |window, cx| {
+                !workspace.read(cx).confirming_close
+                    && workspace.read(cx).vim_reader(window, cx).is_some()
+            });
+            visual.simulate_keystrokes(": w enter");
+            wait_for_preview_key_state(visual, |_, cx| {
+                !workspace
+                    .read(cx)
+                    .saving
+                    .contains(std::path::Path::new("guide.md"))
+                    && fs::read_to_string(&path).is_ok_and(|text| text == "Draft # Guide\n")
+            });
+
+            visual.simulate_keystrokes(": w q enter");
+            wait_for_preview_key_state(visual, |_, cx| workspace.read(cx).tabs.active().is_none());
+            assert_eq!(fs::read_to_string(path).unwrap(), "Draft # Guide\n");
+        },
+    )
+}
+
+#[::core::prelude::v1::test]
+fn image_preview_has_tab_navigation_and_the_close_leader() -> anyhow::Result<()> {
+    let svg = r#"<svg xmlns="http://www.w3.org/2000/svg" width="48" height="48"><rect width="48" height="48" fill="teal"/></svg>"#;
+    with_vim_repository(
+        "picture.svg",
+        svg,
+        &[("other.txt", "Other")],
+        |visual, workspace| {
+            visual.update(|window, cx| {
+                workspace.update(cx, |this, cx| {
+                    this.keep_tab(std::path::Path::new("picture.svg"), cx);
+                    this.open_file("other.txt".into(), false, window, cx);
+                });
+            });
+            wait_for_preview_key_state(visual, |_, cx| {
+                workspace.read(cx).tabs.active() == Some(std::path::Path::new("other.txt"))
+            });
+            visual.simulate_keystrokes("shift-h");
+            draw(visual);
+            click_preview_control(visual, "editor-preview-icon-source");
+            wait_for_preview_key_state(visual, |window, cx| {
+                workspace.read(cx).vim_image_focused(window)
+            });
+            visual.simulate_keystrokes("g t");
+            draw(visual);
+            visual.update(|_, cx| {
+                assert_eq!(
+                    workspace.read(cx).tabs.active(),
+                    Some(std::path::Path::new("other.txt"))
+                );
+            });
+            visual.simulate_keystrokes("shift-h");
+            draw(visual);
+            visual.simulate_keystrokes("space b d");
+            draw(visual);
+            visual.update(|_, cx| {
+                assert!(
+                    workspace
+                        .read(cx)
+                        .tabs
+                        .index(std::path::Path::new("picture.svg"))
+                        .is_none()
+                );
+            });
         },
     )
 }

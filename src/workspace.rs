@@ -91,7 +91,9 @@ use crate::{
     lsp::{self, EditorLsp},
     paths,
     repository::{Document, Entry, Location, Repository, Store, WindowGeometry, WindowSlot},
-    session::{EditorPreviewMode, FilePosition, SourceLocation, WorktreeSession},
+    session::{
+        EditorPreviewLocation, EditorPreviewMode, FilePosition, SourceLocation, WorktreeSession,
+    },
     tabs::TabSession,
 };
 
@@ -583,6 +585,7 @@ enum FileOpen {
     History {
         index: usize,
         position: Option<FilePosition>,
+        editor_preview: Option<EditorPreviewLocation>,
     },
     Startup,
     Restore {
@@ -994,7 +997,9 @@ impl Workspace {
         let repository_mode = standalone.is_none();
         Self::bind_git_history_keys(cx);
         Self::bind_source_navigation_keys(cx);
-        let find_context = Some("WorkspaceEditor > (Input && mode == editor && !Locator)");
+        let find_context = Some(
+            "WorkspaceEditor > ((Input && mode == editor && !Locator) || (Reader && !Locator))",
+        );
         cx.bind_keys([
             #[cfg(target_os = "macos")]
             KeyBinding::new("cmd-g", FindNextMatch, find_context),
@@ -2126,6 +2131,7 @@ impl Workspace {
             return;
         }
         self.cancel_vim_keys(cx);
+        self.cancel_editor_preview_history();
         self.vim.forget_tree_origin();
         self.close_locator(false, window, cx);
         self.repository_ui.menu_open = false;
@@ -2923,18 +2929,24 @@ impl Workspace {
                 None,
             ),
             FileOpen::Locate { position, .. } => (false, None, position, None),
-            FileOpen::History { index, position } => (true, None, None, Some((index, position))),
+            FileOpen::History {
+                index,
+                position,
+                editor_preview,
+            } => (true, None, None, Some((index, position, editor_preview))),
             FileOpen::Startup | FileOpen::Restore { .. } => (true, None, None, None),
         };
         self.remember_editor_preview(&path);
-        if open_as_image {
+        if let Some((_, _, Some(preview))) = &replay {
+            self.set_editor_preview_mode(&path, preview.mode);
+        } else if open_as_image {
             self.set_editor_preview_mode(&path, EditorPreviewMode::Full);
         } else if ((source_jump && self.files.contains_key(&path))
             || position.is_some()
             || location.is_some()
             || replay
                 .as_ref()
-                .is_some_and(|(_, position)| position.is_some()))
+                .is_some_and(|(_, position, _)| position.is_some()))
             && self.editor_preview_mode(&path) == EditorPreviewMode::Full
         {
             self.set_editor_preview_mode(&path, EditorPreviewMode::Split);
@@ -3017,8 +3029,11 @@ impl Workspace {
                 toast::info(window, cx, t!("locator.stale"));
             }
         }
-        if let Some((index, position)) = replay {
+        if let Some((index, position, preview)) = replay {
             self.complete_source_replay(&path, index, position, source, animate, cx);
+            if let Some(preview) = preview {
+                self.restore_editor_preview_history(path.clone(), preview, window, cx);
+            }
         } else if explicit_jump && navigate {
             self.record_source_jump(source, cx);
         } else if navigate {
@@ -3723,6 +3738,7 @@ impl Workspace {
             cx.notify();
             return;
         }
+        let close_from_dialog = close && self.confirming_close;
         let buffer = self.files.get(&path).map(|file| {
             (
                 file.document.clone(),
@@ -3848,7 +3864,7 @@ impl Workspace {
                     if this.tabs.active() == Some(&path) {
                         this.language_format = Task::ready(());
                     }
-                    if close && this.confirming_close {
+                    if close_from_dialog && this.confirming_close {
                         // The close was already being confirmed. A conflict is a
                         // new decision, so drop the pending close rather than
                         // stacking a second dialog on top of it.
@@ -3888,8 +3904,14 @@ impl Workspace {
                                 this.capture_document_position(cx);
                                 this.doc = None;
                             }
-                            if close && this.confirming_close && !this.tab_is_dirty(&path) {
-                                this.finish_tab_close(&path, window, cx);
+                            if close && !this.tab_is_dirty(&path) {
+                                if close_from_dialog {
+                                    if this.confirming_close {
+                                        this.finish_tab_close(&path, window, cx);
+                                    }
+                                } else {
+                                    this.close_tabs(vec![path], window, cx);
+                                }
                             }
                         }
                         Err(error) => this.show_error(error, window, cx),
@@ -4184,6 +4206,7 @@ impl Workspace {
         let changed = self.tabs.active() != previous;
         if changed {
             self.cancel_vim_keys(cx);
+            self.cancel_editor_preview_history();
             if let Some(file) = previous.and_then(|path| self.files.get_mut(path)) {
                 file.vim.reset(&file.editor, cx);
                 file.editor.update(cx, |editor, cx| {
@@ -4666,6 +4689,13 @@ impl Workspace {
     }
 
     fn navigate_find_match(&self, previous: bool, window: &Window, cx: &mut Context<Self>) {
+        if let Some(reader) = self
+            .active_markdown_preview()
+            .filter(|reader| reader.read(cx).content_focused(window, cx))
+        {
+            reader.update(cx, |reader, cx| reader.step_find_match(previous, cx));
+            return;
+        }
         let Some(file) = self.active_file().filter(|file| {
             let editor = file.editor.read(cx);
             editor.focus_handle(cx).is_focused(window)

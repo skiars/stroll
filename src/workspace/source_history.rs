@@ -4,7 +4,10 @@ use super::{
     FileOpen, Workspace, WorkspaceView,
     session::{restore_file_selection, source_file_position},
 };
-use crate::session::{FilePosition, GitHistoryPane, SourceHistory, SourceLocation};
+use crate::session::{
+    EditorPreviewLocation, EditorPreviewMode, FilePosition, GitHistoryPane, SourceHistory,
+    SourceLocation,
+};
 use gpui::*;
 use gpui_component::{WindowExt as _, input::Position};
 
@@ -20,6 +23,7 @@ impl SourceLocation {
             path: None,
             position: None,
             document: (view == WorkspaceView::Docs).then(Default::default),
+            editor_preview: None,
             git: (view == WorkspaceView::Git).then_some(GitHistoryPane::Review),
         }
     }
@@ -38,12 +42,24 @@ impl SourceLocation {
         self.path == other.path && self.document.is_some() && other.document.is_some()
     }
 
+    fn same_editor_preview(&self, other: &Self) -> bool {
+        self.path == other.path
+            && self
+                .editor_preview
+                .as_ref()
+                .zip(other.editor_preview.as_ref())
+                .is_some_and(|(first, second)| first.mode == second.mode)
+    }
+
     fn same_destination(&self, other: &Self) -> bool {
         if self.path != other.path || self.git != other.git {
             return false;
         }
         if self.document.is_some() || other.document.is_some() {
             return self.document == other.document;
+        }
+        if self.editor_preview.is_some() || other.editor_preview.is_some() {
+            return self.editor_preview == other.editor_preview;
         }
         match (self.position, other.position) {
             (Some(first), Some(second)) => {
@@ -69,11 +85,11 @@ impl SourceHistory {
     fn record(&mut self, source: Option<SourceLocation>, target: SourceLocation) {
         self.entries.truncate(self.index + 1);
         if let Some(source) = source {
-            if let Some(current) = self
-                .entries
-                .back_mut()
-                .filter(|entry| entry.same_destination(&source) || entry.same_document(&source))
-            {
+            if let Some(current) = self.entries.back_mut().filter(|entry| {
+                entry.same_destination(&source)
+                    || entry.same_document(&source)
+                    || entry.same_editor_preview(&source)
+            }) {
                 *current = source;
             } else {
                 self.entries.push_back(source);
@@ -272,6 +288,15 @@ impl Workspace {
         }
         if self.view == WorkspaceView::Docs {
             self.capture_document_history_position(cx);
+        } else if let Some(location) = self.editor_preview_history_location(window, cx) {
+            let history = &mut self.session.source_history;
+            if let Some(current) = history.entries.get_mut(history.index)
+                && current.same_editor_preview(&location)
+                && *current != location
+            {
+                *current = location;
+                self.session_revision += 1;
+            }
         } else {
             self.capture_source_viewport(cx);
         }
@@ -320,6 +345,7 @@ impl Workspace {
                     FileOpen::History {
                         index,
                         position: location.position,
+                        editor_preview: location.editor_preview,
                     },
                     window,
                     cx,
@@ -381,12 +407,35 @@ impl Workspace {
         self.topbar_location(cx)
     }
 
+    pub(super) fn editor_preview_history_location(
+        &self,
+        window: &Window,
+        cx: &App,
+    ) -> Option<SourceLocation> {
+        let mode = self.active_editor_preview_mode();
+        if self.view != WorkspaceView::Editor || mode == EditorPreviewMode::Source {
+            return None;
+        }
+        let reader = self.active_markdown_preview()?.read(cx);
+        reader.content_focused(window, cx).then(|| SourceLocation {
+            path: Some(reader.path.clone()),
+            position: None,
+            document: None,
+            editor_preview: Some(EditorPreviewLocation {
+                mode,
+                document: reader.history_location(cx),
+            }),
+            git: None,
+        })
+    }
+
     pub(super) fn document_history_location(&self, cx: &App) -> Option<SourceLocation> {
         let reader = self.doc.as_ref()?.read(cx);
         Some(SourceLocation {
             path: Some(reader.path.clone()),
             position: None,
             document: Some(reader.history_location(cx)),
+            editor_preview: None,
             git: None,
         })
     }
@@ -547,6 +596,7 @@ impl Workspace {
             path: Some(path),
             position,
             document: None,
+            editor_preview: None,
             git: None,
         })
     }
@@ -586,13 +636,15 @@ impl Workspace {
             return;
         }
         let history = &mut self.session.source_history;
-        if source
-            .as_ref()
-            .is_none_or(|source| source.document.is_none() && target.document.is_none())
-            && history
-                .entries
-                .get(history.index)
-                .is_some_and(|entry| entry.same_destination(&target))
+        if source.as_ref().is_none_or(|source| {
+            source.document.is_none()
+                && source.editor_preview.is_none()
+                && target.document.is_none()
+                && target.editor_preview.is_none()
+        }) && history
+            .entries
+            .get(history.index)
+            .is_some_and(|entry| entry.same_destination(&target))
         {
             return;
         }

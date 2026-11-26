@@ -389,6 +389,7 @@ fn source_history_replays_files_jumps_and_worktree_positions() -> Result<()> {
                     path: Some("missing.txt".into()),
                     position: None,
                     document: None,
+                    editor_preview: None,
                     git: None,
                 },
             );

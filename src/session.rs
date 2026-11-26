@@ -174,6 +174,8 @@ pub(crate) struct SourceLocation {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub document: Option<DocumentLocation>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub editor_preview: Option<EditorPreviewLocation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub git: Option<GitHistoryPane>,
 }
 
@@ -186,6 +188,12 @@ pub(crate) enum GitHistoryPane {
     Modified,
     Original,
     Snapshot,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub(crate) struct EditorPreviewLocation {
+    pub mode: EditorPreviewMode,
+    pub document: DocumentLocation,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]

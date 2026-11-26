@@ -81,7 +81,9 @@ pub struct HoverPopoverState {
     pub(super) target_range: Range<usize>,
     pub(super) documentation_target: Option<Range<usize>>,
     pub(super) pointer: Option<gpui::Point<gpui::Pixels>>,
+    pub(super) keyboard_caret: Option<usize>,
     pub(super) waiting_for_delay: bool,
+    pub(super) waiting_for_documentation: bool,
     pub(super) presented: Cell<bool>,
     pub(super) pointer_handoff: Cell<Option<gpui::Point<gpui::Pixels>>>,
 }
@@ -91,6 +93,11 @@ impl HoverPopoverState {
     #[doc(hidden)]
     pub fn mark_presented(&self) {
         self.presented.set(true);
+    }
+
+    #[doc(hidden)]
+    pub fn is_keyboard_triggered(&self) -> bool {
+        self.keyboard_caret.is_some()
     }
 
     pub(super) fn visible(&self) -> bool {
@@ -160,8 +167,10 @@ impl InputBaseState<EditorMode> {
         self.extras.hover_popover = Some(HoverPopoverState {
             target_range: symbol_range.clone(),
             pointer: None,
+            keyboard_caret: None,
             documentation_target: None,
             waiting_for_delay: false,
+            waiting_for_documentation: false,
             presented: Cell::default(),
             pointer_handoff: Cell::default(),
             symbol_range,
@@ -189,8 +198,10 @@ impl InputBaseState<EditorMode> {
             .get_or_insert_with(|| HoverPopoverState {
                 target_range: range.clone(),
                 pointer: None,
+                keyboard_caret: None,
                 documentation_target: None,
                 waiting_for_delay: false,
+                waiting_for_documentation: false,
                 presented: Cell::default(),
                 pointer_handoff: Cell::default(),
                 symbol_range: range,
@@ -304,8 +315,10 @@ impl InputBaseState<EditorMode> {
                 symbol_range: menu.range.start..menu.range.start,
                 target_range: menu.range.clone(),
                 pointer: None,
+                keyboard_caret: None,
                 documentation_target: None,
                 waiting_for_delay: false,
+                waiting_for_documentation: false,
                 presented: Cell::default(),
                 pointer_handoff: Cell::default(),
                 hover: None,
