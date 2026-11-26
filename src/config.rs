@@ -116,6 +116,7 @@ pub(crate) struct Appearance {
     pub ui_scale_percent: u16,
     pub fallback_font_family: String,
     pub smooth_scroll: bool,
+    pub throttle_inactive_windows: bool,
     pub file_tree_sticky_scroll: bool,
     pub file_tree_horizontal_scroll: bool,
     pub text_rendering: TextRenderingPreference,
@@ -134,6 +135,7 @@ impl Default for Appearance {
             ui_scale_percent: UI_SCALE_DEFAULT,
             fallback_font_family: String::new(),
             smooth_scroll: true,
+            throttle_inactive_windows: true,
             file_tree_sticky_scroll: true,
             file_tree_horizontal_scroll: false,
             text_rendering: TextRenderingPreference::Auto,
@@ -865,8 +867,14 @@ mod tests {
             config.appearance.text_rendering,
             TextRenderingPreference::Auto
         );
+        let default_options = gpui::WindowOptions::default();
+        assert_eq!(
+            crate::workspace::Workspace::window_options(&file).inactive_frame_interval,
+            default_options.inactive_frame_interval,
+        );
         config.appearance.theme = Theme::Dark;
         config.appearance.gradient_title_bar = true;
+        config.appearance.throttle_inactive_windows = false;
         config.appearance.code_theme = CodeTheme::Paper;
         config.appearance.code_contrast = CodeContrast::High;
         config.appearance.language = Language::Chinese;
@@ -897,6 +905,7 @@ mod tests {
             "# User config",
             "language = \"zh-CN\"",
             "gradient_title_bar = true",
+            "throttle_inactive_windows = false",
             "code_theme = \"paper\"",
             "code_contrast = \"high\"",
             "ui_font_family = \"Inter\"",
@@ -923,6 +932,16 @@ mod tests {
             loaded.load_error
         );
         assert_eq!(loaded.current(), &config);
+        let options = crate::workspace::Workspace::window_options(&loaded);
+        assert_eq!(options.inactive_frame_interval, None);
+        assert_eq!(
+            options.low_power_frame_interval,
+            default_options.low_power_frame_interval
+        );
+        assert_eq!(
+            options.thermal_frame_interval,
+            default_options.thermal_frame_interval
+        );
         Ok(())
     }
 

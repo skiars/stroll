@@ -583,6 +583,7 @@ impl Workspace {
         previous_appearance.ui_scale_percent = config.appearance.ui_scale_percent;
         previous_appearance.ui_font_size = config.appearance.ui_font_size;
         previous_appearance.gradient_title_bar = config.appearance.gradient_title_bar;
+        previous_appearance.throttle_inactive_windows = config.appearance.throttle_inactive_windows;
         previous_appearance.file_tree_sticky_scroll = config.appearance.file_tree_sticky_scroll;
         previous_appearance.file_tree_horizontal_scroll =
             config.appearance.file_tree_horizontal_scroll;
@@ -1149,6 +1150,13 @@ impl SettingsPage {
                 }),
             )
             .description(t!("settings.smooth_scroll_description").into_owned()),
+            setting_item(
+                t!("settings.throttle_inactive_windows"),
+                self.switch(default.appearance.throttle_inactive_windows, |c| {
+                    &mut c.appearance.throttle_inactive_windows
+                }),
+            )
+            .description(t!("settings.throttle_inactive_windows_description").into_owned()),
             setting_item(
                 t!("settings.file_tree_sticky_scroll"),
                 self.switch(default.appearance.file_tree_sticky_scroll, |c| {
@@ -2468,6 +2476,7 @@ mod tests {
 
         draft.update(visual, |draft, cx| {
             draft.appearance.file_tree_sticky_scroll = !draft.appearance.file_tree_sticky_scroll;
+            draft.appearance.throttle_inactive_windows = false;
             cx.notify();
         });
         draw(visual);
@@ -2477,7 +2486,11 @@ mod tests {
         visual.simulate_click(reset.center(), Modifiers::default());
         draw(visual);
         assert!(visual.debug_bounds("settings-page-reset").is_none());
-        assert!(visual.update(|_, cx| draft.read(cx).appearance.file_tree_sticky_scroll));
+        visual.update(|_, cx| {
+            let appearance = &draft.read(cx).appearance;
+            assert!(appearance.file_tree_sticky_scroll);
+            assert!(appearance.throttle_inactive_windows);
+        });
         assert_eq!(geometry(visual), clean);
 
         Ok(())

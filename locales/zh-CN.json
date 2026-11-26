@@ -687,6 +687,8 @@
   "settings.windows_shell_description": "输入 PATH 中的可执行文件名（如 pwsh.exe）或其完整路径。留空使用系统 Shell。新建终端时生效。",
   "settings.smooth_scroll": "平滑滚动",
   "settings.smooth_scroll_description": "为鼠标滚轮、触控板和内容区内的定位启用平滑滚动。",
+  "settings.throttle_inactive_windows": "窗口失焦时降低帧率",
+  "settings.throttle_inactive_windows_description": "窗口失焦时将帧率限制在约 30 FPS。对新打开的工作区和文档窗口生效。",
   "settings.file_tree_sticky_scroll": "文件树粘性滚动",
   "settings.file_tree_sticky_scroll_description": "滚动工作区和文档的文件树时，将父目录固定在顶部。",
   "settings.file_tree_horizontal_scroll": "文件树水平滚动",

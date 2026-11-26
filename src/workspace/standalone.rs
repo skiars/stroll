@@ -70,7 +70,7 @@ impl Workspace {
             let path = path.clone();
             cx.background_spawn(async move { docs::load_local(&path) })
         });
-        let mut options = TitleBar::window_options();
+        let mut options = Self::window_options(&config);
         if let Some(titlebar) = options.titlebar.as_mut() {
             titlebar.title = Some(file_name(&path).to_owned().into());
         }

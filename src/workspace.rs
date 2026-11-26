@@ -944,6 +944,15 @@ enum RepositoryOpen {
 }
 
 impl Workspace {
+    #[doc(hidden)]
+    pub fn window_options(config: &ConfigFile) -> WindowOptions {
+        let mut options = TitleBar::window_options();
+        if !config.current().appearance.throttle_inactive_windows {
+            options.inactive_frame_interval = None;
+        }
+        options
+    }
+
     pub fn new(
         store: Arc<Store>,
         view: WorkspaceView,

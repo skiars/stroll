@@ -4,7 +4,7 @@ use std::{env, path::PathBuf, process::ExitCode, sync::Arc};
 
 use anyhow::{Result, ensure};
 use gpui::*;
-use gpui_component::{Root, TitleBar};
+use gpui_component::Root;
 use stroll::config::ConfigFile;
 use stroll::locale::text;
 use stroll::repository::{Location, Store};
@@ -192,7 +192,7 @@ fn launch() -> Result<()> {
                     return;
                 }
             } else {
-                let mut options = TitleBar::window_options();
+                let mut options = Workspace::window_options(&config);
                 if let Some(titlebar) = options.titlebar.as_mut() {
                     titlebar.title = Some("Stroll".into());
                 }
