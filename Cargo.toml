@@ -6,10 +6,6 @@ rust-version = "1.98"
 publish = false
 default-run = "stroll"
 
-[features]
-default = ["desktop"]
-desktop = ["dep:glob", "dep:alacritty_terminal", "dep:gpui", "dep:gpui_platform", "dep:gpui-base", "dep:gpui-component", "dep:gpui-kit-assets", "dep:toml_edit", "dep:markdown", "dep:merman", "dep:ratex-layout", "dep:ratex-parser", "dep:ratex-svg", "dep:percent-encoding", "dep:ratex-types", "dep:roxmltree", "dep:sys-locale", "dep:blocking", "dep:image", "dep:ureq", "dep:shlex", "dep:similar", "dep:chrono", "dep:keyring", "dep:giallo", "dep:tree-sitter", "dep:tree-sitter-vue-next", "dep:tree-sitter-xml", "dep:tree-sitter-less", "dep:arborium-scss", "dep:objc2", "dep:objc2-app-kit", "dep:objc2-foundation"]
-
 [[bin]]
 name = "stroll"
 path = "src/main.rs"
@@ -20,19 +16,25 @@ name = "stroll-remote"
 path = "src/bin/stroll-remote.rs"
 
 [dependencies]
-fancy-regex = "0.14"
-globset = "0.4"
-glob = { version = "0.3", optional = true }
-base64 = "0.22"
-anyhow = "1"
 alacritty_terminal = { version = "0.26", default-features = false, optional = true }
+anyhow = "1"
+arborium-scss = { version = "2.18.2", optional = true }
 async-channel = "2.5"
+base64 = "0.22"
 blocking = { version = "1.6", optional = true }
+chrono = { version = "0.4", default-features = false, optional = true }
+dirs = "6"
+fancy-regex = "0.14"
+flate2 = "1.1.11"
 futures-channel = "0.3"
+giallo = { version = "0.6.0", default-features = false, optional = true }
+glob = { version = "0.3", optional = true }
+globset = "0.4"
 gpui = { package = "gpui-pre", version = "=0.3.12", optional = true }
-gpui_platform = { package = "gpui-pre-platform", version = "=0.3.12", features = ["font-kit", "x11", "wayland", "runtime_shaders"], optional = true }
-gpui-base = { version = "=0.9.1", path = "vendor/gpui-base-0.9.1", optional = true }
-gpui-component = { version = "=0.9.1", features = [
+gpui-base = { path = "vendor/gpui-base-0.9.1", version = "=0.9.1", optional = true }
+gpui-component = {
+  version = "=0.9.1",
+  features = [
     "tree-sitter-bash",
     "tree-sitter-c",
     "tree-sitter-cmake",
@@ -47,43 +49,43 @@ gpui-component = { version = "=0.9.1", features = [
     "tree-sitter-tsx",
     "tree-sitter-typescript",
     "tree-sitter-yaml",
-], optional = true }
+  ],
+  optional = true
+}
 gpui-kit-assets = { version = "=0.9.1", optional = true }
-serde = { version = "1", features = ["derive", "rc"] }
-serde_json = "1"
-rust-i18n = "4.2.4"
-sys-locale = { version = "0.3.2", optional = true }
-sha2 = "0.11"
-tempfile = "3"
-dirs = "6"
-toml_edit = { version = "0.22", features = ["serde"], optional = true }
-lsp-types = "0.97"
-regex = "1"
+gpui_platform = { package = "gpui-pre-platform", version = "=0.3.12", features = ["font-kit", "runtime_shaders", "wayland", "x11"], optional = true }
 hex = "0.4"
+image = { version = "0.25", default-features = false, features = ["gif", "jpeg", "png", "webp"], optional = true }
+jsonc-parser = { version = "0.32", features = ["serde"] }
+keyring = { version = "=3.6.3", default-features = false, features = ["apple-native", "crypto-rust", "sync-secret-service", "vendored", "windows-native"], optional = true }
+lsp-types = "0.97"
 markdown = { version = "1", optional = true }
-image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif"], optional = true }
-ureq = { version = "=3.5.2", optional = true }
-merman = { version = "0.9.3", default-features = false, features = ["svg", "layout-elk", "diagram-flowchart", "diagram-sequence", "diagram-state", "diagram-class", "diagram-er", "diagram-gantt", "diagram-pie"], optional = true }
+merman = { version = "0.9.3", default-features = false, features = ["diagram-class", "diagram-er", "diagram-flowchart", "diagram-gantt", "diagram-pie", "diagram-sequence", "diagram-state", "layout-elk", "svg"], optional = true }
+notify = "=8.2.2"
+percent-encoding = { version = "2", optional = true }
 ratex-layout = { version = "0.1.15", optional = true }
 ratex-parser = { version = "0.1.15", optional = true }
 ratex-svg = { version = "0.1.15", features = ["embed-fonts"], optional = true }
-percent-encoding = { version = "2", optional = true }
-url = "2"
 ratex-types = { version = "0.1.15", optional = true }
+regex = "1"
 roxmltree = { version = "0.20", optional = true }
-notify = "=8.2.2"
-shlex = { version = "2.0.1", optional = true }
-similar = { version = "2.7.0", features = ["text"], default-features = false, optional = true }
-chrono = { version = "0.4", default-features = false, optional = true }
 rusqlite = { version = "0.43.0", features = ["bundled"] }
-keyring = { version = "=3.6.3", default-features = false, features = ["apple-native", "windows-native", "sync-secret-service", "crypto-rust", "vendored"], optional = true }
-giallo = { version = "0.6.0", default-features = false, optional = true }
-jsonc-parser = { version = "0.32", features = ["serde"] }
+rust-i18n = "4.2.4"
+serde = { version = "1", features = ["derive", "rc"] }
+serde_json = "1"
+sha2 = "0.11"
+shlex = { version = "2.0.1", optional = true }
+similar = { version = "2.7.0", default-features = false, features = ["text"], optional = true }
+sys-locale = { version = "0.3.2", optional = true }
+tar = "0.4.46"
+tempfile = "3"
+toml_edit = { version = "0.22", features = ["serde"], optional = true }
 tree-sitter = { version = "0.26.13", optional = true }
-tree-sitter-vue-next = { version = "0.1.0", optional = true }
-arborium-scss = { version = "2.18.2", optional = true }
 tree-sitter-less = { version = "1.0.0", optional = true }
+tree-sitter-vue-next = { version = "0.1.0", optional = true }
 tree-sitter-xml = { version = "0.7", optional = true }
+ureq = "=3.5.2"
+url = "2"
 
 [dev-dependencies]
 futures-lite = "2.6"
@@ -92,14 +94,11 @@ futures-lite = "2.6"
 cc = "1"
 embed-resource = "3.0.12"
 
-[target.'cfg(unix)'.dependencies]
-libc = "0.2"
+[target.'cfg(any(windows, target_os = "macos"))'.dev-dependencies]
+gpui_platform = { package = "gpui-pre-platform", version = "=0.3.12", features = ["test-support"] }
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 gpui_wgpu = { package = "gpui-pre-wgpu", version = "=0.3.12", features = ["test-support"] }
-
-[target.'cfg(any(windows, target_os = "macos"))'.dev-dependencies]
-gpui_platform = { package = "gpui-pre-platform", version = "=0.3.12", features = ["test-support"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = { version = "0.6.5", default-features = false, optional = true }
@@ -107,18 +106,33 @@ objc2-app-kit = { version = "0.3.2", default-features = false, features = ["NSPa
 objc2-foundation = { version = "0.3.2", default-features = false, features = ["NSArray", "NSString"], optional = true }
 
 [target.'cfg(target_os = "macos")'.dev-dependencies]
-gpui_apple = { path = "vendor/gpui-pre-apple-0.3.12", package = "gpui-pre-apple", features = ["font-kit"] }
+gpui_apple = { package = "gpui-pre-apple", path = "vendor/gpui-pre-apple-0.3.12", features = ["font-kit"] }
 
-[profile.dev.package.harfrust]
-opt-level = 3
+[target."cfg(unix)".dependencies]
+libc = "0.2"
 
-[profile.dev.package.read-fonts]
+[target."cfg(windows)".dependencies]
+zip = { version = "9.8.2", default-features = false, features = ["deflate"] }
+
+[features]
+default = ["desktop"]
+desktop = ["dep:alacritty_terminal", "dep:arborium-scss", "dep:blocking", "dep:chrono", "dep:giallo", "dep:glob", "dep:gpui", "dep:gpui-base", "dep:gpui-component", "dep:gpui-kit-assets", "dep:gpui_platform", "dep:image", "dep:keyring", "dep:markdown", "dep:merman", "dep:objc2", "dep:objc2-app-kit", "dep:objc2-foundation", "dep:percent-encoding", "dep:ratex-layout", "dep:ratex-parser", "dep:ratex-svg", "dep:ratex-types", "dep:roxmltree", "dep:shlex", "dep:similar", "dep:sys-locale", "dep:toml_edit", "dep:tree-sitter", "dep:tree-sitter-less", "dep:tree-sitter-vue-next", "dep:tree-sitter-xml"]
+
+[patch.crates-io]
+gpui-base = { path = "vendor/gpui-base-0.9.1" }
+gpui-component = { path = "vendor/gpui-component-0.9.1" }
+gpui-pre = { path = "vendor/gpui-pre-0.3.12" }
+gpui-pre-apple = { path = "vendor/gpui-pre-apple-0.3.12" }
+gpui-pre-linux = { path = "vendor/gpui-pre-linux-0.3.12" }
+gpui-pre-macos = { path = "vendor/gpui-pre-macos-0.3.12" }
+gpui-pre-wgpu = { path = "vendor/gpui-pre-wgpu-0.3.12" }
+gpui-pre-windows = { path = "vendor/gpui-pre-windows-0.3.12" }
+merman-render = { path = "vendor/merman-render-0.9.3" }
+
+[profile.dev.package.cosmic-text]
 opt-level = 3
 
 [profile.dev.package.font-types]
-opt-level = 3
-
-[profile.dev.package.cosmic-text]
 opt-level = 3
 
 [profile.dev.package.gpui-base]
@@ -127,19 +141,14 @@ opt-level = 2
 [profile.dev.package.gpui-component]
 opt-level = 2
 
+[profile.dev.package.harfrust]
+opt-level = 3
+
+[profile.dev.package.read-fonts]
+opt-level = 3
+
 [profile.dev.package.tree-sitter]
 opt-level = 2
-
-[patch.crates-io]
-merman-render = { path = "vendor/merman-render-0.9.3" }
-gpui-pre = { path = "vendor/gpui-pre-0.3.12" }
-gpui-pre-macos = { path = "vendor/gpui-pre-macos-0.3.12" }
-gpui-pre-apple = { path = "vendor/gpui-pre-apple-0.3.12" }
-gpui-pre-wgpu = { path = "vendor/gpui-pre-wgpu-0.3.12" }
-gpui-pre-windows = { path = "vendor/gpui-pre-windows-0.3.12" }
-gpui-pre-linux = { path = "vendor/gpui-pre-linux-0.3.12" }
-gpui-component = { path = "vendor/gpui-component-0.9.1" }
-gpui-base = { path = "vendor/gpui-base-0.9.1" }
 
 [profile.release.package.stroll]
 incremental = true

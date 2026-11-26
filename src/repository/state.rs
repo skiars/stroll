@@ -5,9 +5,32 @@ use rusqlite::{Connection, TransactionBehavior};
 
 use super::Store;
 
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 4;
 
 impl Store {
+    #[cfg(feature = "desktop")]
+    pub(crate) fn lsp_prompt_dismissed(&self, host: &str, server: &str) -> Result<bool> {
+        self.with_state(|db| {
+            Ok(db.query_row(
+                "SELECT EXISTS(SELECT 1 FROM lsp_prompt_dismissals WHERE host = ?1 AND server = ?2 AND explicit = 1)",
+                (host, server),
+                |row| row.get(0),
+            )?)
+        })
+    }
+
+    #[cfg(feature = "desktop")]
+    pub(crate) fn dismiss_lsp_prompt(&self, host: &str, server: &str) -> Result<()> {
+        self.with_state(|db| {
+            db.execute(
+                "INSERT INTO lsp_prompt_dismissals (host, server, explicit) VALUES (?1, ?2, 1)
+                 ON CONFLICT (host, server) DO UPDATE SET explicit = 1",
+                (host, server),
+            )?;
+            Ok(())
+        })
+    }
+
     pub(super) fn with_state<T>(
         &self,
         operation: impl FnOnce(&mut Connection) -> Result<T>,
@@ -48,9 +71,56 @@ impl Store {
                     value BLOB NOT NULL
                 )",
             )?;
+        }
+        if version < 3 {
+            tx.execute_batch(
+                "CREATE TABLE lsp_prompt_dismissals (
+                    host TEXT NOT NULL,
+                    server TEXT NOT NULL,
+                    PRIMARY KEY (host, server)
+                )",
+            )?;
+        }
+        if version < 4 {
+            // Earlier versions recorded the notification close control as a dismissal.
+            tx.execute_batch(
+                "ALTER TABLE lsp_prompt_dismissals ADD COLUMN explicit INTEGER NOT NULL DEFAULT 0",
+            )?;
+        }
+        if version < SCHEMA_VERSION {
             tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         }
         tx.commit()?;
         Ok(db)
+    }
+}
+
+#[cfg(all(test, feature = "desktop"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_the_dismiss_action_suppresses_future_lsp_prompts() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let db = Connection::open(temporary.path().join("state.sqlite3"))?;
+        db.execute_batch(
+            "CREATE TABLE lsp_prompt_dismissals (
+                host TEXT NOT NULL,
+                server TEXT NOT NULL,
+                PRIMARY KEY (host, server)
+            );
+            INSERT INTO lsp_prompt_dismissals (host, server) VALUES ('local', 'tsc');
+            PRAGMA user_version = 3;",
+        )?;
+        drop(db);
+        let store = Store::new(temporary.path().to_owned())?;
+        assert!(!store.lsp_prompt_dismissed("local", "tsc")?);
+        store.dismiss_lsp_prompt("local", "tsc")?;
+        drop(store);
+        let reopened = Store::new(temporary.path().to_owned())?;
+        assert!(reopened.lsp_prompt_dismissed("local", "tsc")?);
+        assert!(!reopened.lsp_prompt_dismissed("another host", "tsc")?);
+        assert!(!reopened.lsp_prompt_dismissed("local", "json")?);
+        Ok(())
     }
 }

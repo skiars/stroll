@@ -23,7 +23,10 @@ try:
     while (request := receive()) is not None:
         method = request["method"]
         if method == "initialize":
-            respond(request, {"capabilities": {"hoverProvider": True, "textDocumentSync": 1}})
+            respond(request, {
+                "capabilities": {"hoverProvider": True, "textDocumentSync": 1},
+                "serverInfo": {"name": "fixture", "version": "2.3.4"},
+            })
         elif method == "textDocument/hover":
             if child is None:
                 child = subprocess.Popen(

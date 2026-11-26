@@ -3,12 +3,15 @@ use std::{
     process::Command,
 };
 
-pub(super) fn bridge_args(command: &mut Command) {
-    command.args([
-        "--input-type=commonjs",
-        "-e",
-        include_str!("vue_bridge.cjs"),
-    ]);
+pub(super) fn bridge_args(command: &mut Command, tools: &Path) {
+    command
+        .args([
+            "--input-type=commonjs",
+            "-e",
+            include_str!("vue_bridge.cjs"),
+            "--",
+        ])
+        .arg(tools);
 }
 
 /// Keep TypeScript and Vue documents in the same session within a Vue package.

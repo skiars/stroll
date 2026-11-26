@@ -33,7 +33,8 @@ pub(crate) struct WorktreeServer {
     pub builtin: Option<LanguageServer>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote_snapshot: Option<PathBuf>,
-    discover_typescript: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) managed: Option<LanguageServer>,
     paths: Vec<String>,
 }
 
@@ -124,6 +125,11 @@ impl WorktreeLsp {
         self.entries.is_empty()
     }
 
+    #[cfg(feature = "desktop")]
+    pub(crate) fn ids(&self) -> impl Iterator<Item = &str> {
+        self.entries.iter().map(|server| server.entry.id.as_str())
+    }
+
     pub(crate) fn entry(&self, id: &str) -> Option<&WorktreeServer> {
         self.entries.iter().find(|server| server.entry.id == id)
     }
@@ -131,8 +137,7 @@ impl WorktreeLsp {
     pub(crate) fn for_remote(mut self, snapshot: &Path) -> Self {
         for server in &mut self.entries {
             // The client needs routing and LSP options, but the helper owns the launch.
-            server.entry.server.env.clear();
-            server.entry.server.args.clear();
+            server.entry.server.omit_host_launch_fields();
             server.remote_snapshot = Some(snapshot.to_owned());
         }
         self
@@ -192,14 +197,21 @@ impl WorktreeServer {
     ) -> Result<Self> {
         let builtin = LanguageServer::ALL
             .into_iter()
-            .find(|server| server.name() == id);
-        let user = user.iter().find(|entry| entry.id == id);
-        let mut discover_typescript = false;
+            .find(|server| server.id() == id);
+        let user_entry = user.iter().find(|entry| entry.id == id);
+        let user = user_entry.filter(|entry| !entry.disabled);
+        let explicit = overrides
+            .get("server")
+            .and_then(Value::as_object)
+            .is_some_and(|fields| fields.contains_key("command"));
+        let mut managed = None;
         let mut merged = if let Some(user) = user {
             serde_json::to_value(user)?
         } else if let Some(builtin) = builtin {
             let (command, use_default) = default_command(builtin);
-            discover_typescript = use_default && builtin == LanguageServer::TypeScript;
+            managed = use_default
+                .then_some(builtin)
+                .filter(|server| server.bundle().is_some());
             let languages: Map<_, _> = builtin
                 .languages()
                 .iter()
@@ -208,10 +220,12 @@ impl WorktreeServer {
             json!({
                 "id": id,
                 "languages": languages,
+                "disabled": !explicit && user_entry.is_some_and(|entry| entry.disabled),
                 "server": {
                     "command": command.get_program().to_string_lossy(),
                     "args": command.get_args().map(OsStr::to_string_lossy).collect::<Vec<_>>(),
-                    "initializationOptions": builtin.initialization_options()
+                    "initializationOptions": builtin.initialization_options(),
+                    "workspaceSettings": builtin.workspace_settings()
                 }
             })
         } else {
@@ -222,7 +236,9 @@ impl WorktreeServer {
         for (key, value) in overrides {
             if key == "server" {
                 let fields = value.as_object().context("Expected a server object")?;
-                discover_typescript &= !fields.contains_key("command");
+                if explicit {
+                    managed = None;
+                }
                 merged
                     .get_mut(key)
                     .and_then(Value::as_object_mut)
@@ -263,7 +279,7 @@ impl WorktreeServer {
         };
         let fingerprint = hex::encode(Sha256::digest(serde_json::to_vec(&(
             &entry.server,
-            discover_typescript,
+            managed,
         ))?));
         Ok(Self {
             entry,
@@ -271,7 +287,7 @@ impl WorktreeServer {
             roots,
             builtin,
             remote_snapshot: None,
-            discover_typescript,
+            managed,
             paths,
         })
     }
@@ -284,14 +300,23 @@ impl WorktreeServer {
         &self,
         project: &Path,
         environment: Option<&HashMap<OsString, OsString>>,
+        installed: Option<(&super::tools::Tools, &super::tools::Installed)>,
     ) -> Result<Command> {
-        let mut command = if self.discover_typescript {
-            let resolved =
-                LanguageServer::TypeScript.resolve_default_command(project, environment)?;
-            let mut command = crate::process::background(resolved.get_program());
-            command.args(&self.entry.server.args);
-            command
+        let mut command = if let Some((tools, installed)) = installed {
+            let server = self
+                .managed
+                .context("The worktree server has an explicit command")?;
+            tools.command(
+                server,
+                installed,
+                Some(&self.entry.server.args),
+                environment,
+            )?
         } else {
+            ensure!(
+                self.managed.is_none(),
+                "Managed language tools have not been installed"
+            );
             self.entry.command()
         };
         command.current_dir(project);
@@ -314,4 +339,43 @@ fn path_glob(pattern: &str) -> Result<globset::Glob> {
     Ok(globset::GlobBuilder::new(pattern)
         .literal_separator(true)
         .build()?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn managed_setup_is_inherited_only_with_the_default_executable() -> Result<()> {
+        let user: ExternalLsp = serde_json::from_value(json!({"id": "tsc", "disabled": true}))?;
+        user.validate()?;
+        let default = |server: LanguageServer| (server.default_command(), true);
+        for (overrides, user_entries, expected) in [
+            (
+                json!({"id":"tsc","server":{"args":["--lsp","--stdio"]}}),
+                &[][..],
+                Some(LanguageServer::TypeScript),
+            ),
+            (
+                json!({"id":"tsc","server":{"command":"my-tsc"}}),
+                &[][..],
+                None,
+            ),
+            (
+                json!({"id":"tsc"}),
+                std::slice::from_ref(&user),
+                Some(LanguageServer::TypeScript),
+            ),
+        ] {
+            let server = WorktreeServer::merge(
+                "tsc",
+                overrides.as_object().unwrap(),
+                user_entries,
+                &default,
+            )?;
+            assert_eq!(server.managed, expected);
+            assert_eq!(server.enabled(), user_entries.is_empty());
+        }
+        Ok(())
+    }
 }

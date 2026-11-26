@@ -129,6 +129,7 @@ pub struct Notification {
     content_builder: Option<Rc<dyn Fn(&mut Self, &mut Window, &mut Context<Self>) -> AnyElement>>,
     on_click: Option<Rc<dyn Fn(&ClickEvent, &mut Window, &mut App)>>,
     on_close: Option<Rc<dyn Fn(&mut Window, &mut App)>>,
+    on_user_dismiss: Option<Rc<dyn Fn(&mut Window, &mut App)>>,
     transition_status: ToastTransitionStatus,
 }
 
@@ -189,6 +190,7 @@ impl Notification {
             content_builder: None,
             on_click: None,
             on_close: None,
+            on_user_dismiss: None,
             transition_status: ToastTransitionStatus::Starting,
         }
     }
@@ -341,6 +343,21 @@ impl Notification {
         self
     }
 
+    /// Called when the user closes the toast with its close button or a middle click.
+    pub fn on_user_dismiss(mut self, callback: impl Fn(&mut Window, &mut App) + 'static) -> Self {
+        self.on_user_dismiss = Some(Rc::new(callback));
+        self
+    }
+
+    fn dismiss_by_user(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.transition_status != ToastTransitionStatus::Ending
+            && let Some(callback) = &self.on_user_dismiss
+        {
+            callback(window, cx);
+        }
+        self.dismiss(window, cx);
+    }
+
     /// Set the action button of the notification.
     ///
     /// When an action is set, the notification will not autohide.
@@ -478,6 +495,7 @@ impl Render for Notification {
                     .absolute()
                     .top_1()
                     .right_1()
+                    .debug_selector(|| "notification-close".into())
                     .invisible()
                     .group_hover("", |this| this.visible())
                     .child(
@@ -488,7 +506,7 @@ impl Render for Notification {
                             .xsmall()
                             .on_click(cx.listener(|this, _, window, cx| {
                                 cx.stop_propagation();
-                                this.dismiss(window, cx);
+                                this.dismiss_by_user(window, cx);
                             })),
                     ),
             )
@@ -500,7 +518,7 @@ impl Render for Notification {
             })
             .on_aux_click(cx.listener(move |view, event: &ClickEvent, window, cx| {
                 if event.is_middle_click() {
-                    view.dismiss(window, cx);
+                    view.dismiss_by_user(window, cx);
                 }
             }))
             .with_animation(

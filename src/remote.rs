@@ -8,7 +8,7 @@ pub(crate) use client::PendingCall;
 pub(crate) use client::SshSession;
 #[cfg(feature = "desktop")]
 use client::helper_command;
-pub use server::{serve, serve_lsp};
+pub use server::{serve, serve_lsp, serve_lsp_setup};
 
 use std::{
     io::{Read, Write},
@@ -47,7 +47,6 @@ pub(crate) const WORKSPACE_TRANSFER_VERSION: u32 = 20;
 pub(crate) const WORKTREE_LSP_VERSION: u32 = 21;
 pub(crate) const IMAGE_DIFF_VERSION: u32 = 22;
 pub(crate) const IMAGE_DIFF_RESOURCE_VERSION: u32 = 23;
-pub(crate) const BUILTIN_LSP_PROJECT_VERSION: u32 = 24;
 pub(crate) const HISTORY_EDIT_VERSION: u32 = 25;
 pub(crate) const TERMINAL_DIRECTORY_VERSION: u32 = 26;
 pub(crate) const WORKSPACE_IMPORT_VERSION: u32 = 27;
@@ -313,8 +312,8 @@ pub(crate) enum Request {
     TerminalResize(u64, pty::PtySize),
     TerminalPoll(u64),
     TerminalClose(u64),
-    LspRoot(crate::language::LanguageServer, RepoPath),
-    BuiltinLspProject(RepoPath, Vec<crate::language::LanguageServer>),
+    LspSetupStatus(LspLaunch),
+    RemoteLspProject(RepoPath, Vec<crate::language::LanguageServer>, Vec<String>),
     ExternalLspRoot(String, RepoPath),
     WorktreeLspConfig,
     WorktreeLspRoot(crate::language::worktree::ProjectRoots, RepoPath),
@@ -367,7 +366,7 @@ fn write_frame(output: &mut impl Write, frame: &impl Serialize) -> Result<()> {
     Ok(())
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(untagged, deny_unknown_fields)]
 pub(crate) enum LspTarget {
     Builtin(crate::language::LanguageServer),
@@ -381,33 +380,99 @@ pub(crate) enum LspTarget {
     },
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct LspLaunch {
     pub repository: PathBuf,
     pub project: PathBuf,
     pub server: LspTarget,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub managed: Option<crate::language::tools::Installed>,
+}
+
+#[derive(Serialize, Deserialize)]
+pub(crate) enum RemoteLspProject {
+    Builtin(crate::language::BuiltinProject),
+    External {
+        server: Box<crate::language::external::ExternalLsp>,
+        root: PathBuf,
+        language_id: String,
+    },
+}
+
+#[derive(Serialize, Deserialize)]
+pub(crate) struct LspSetupStatus {
+    pub account: String,
+    pub installed: Option<crate::language::tools::Installed>,
+}
+
+#[derive(Serialize, Deserialize)]
+pub(crate) enum LspSetupEvent {
+    Progress(crate::language::tools::Progress),
+    Installed(crate::language::tools::Installed),
+    Failed(String),
 }
 
 #[cfg(feature = "desktop")]
 impl SshSession {
     pub(crate) fn language_command(
         &self,
-        repository: PathBuf,
-        project: PathBuf,
-        server: LspTarget,
-        memory: Option<PathBuf>,
+        options: &LspLaunch,
+        argument: &str,
     ) -> Result<std::process::Command> {
-        let options = LspLaunch {
-            repository,
-            project,
-            server,
-            memory,
-        };
         let encoded =
-            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(serde_json::to_vec(&options)?);
-        Ok(helper_command(self.target(), &format!("--lsp {encoded}")))
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(serde_json::to_vec(options)?);
+        Ok(helper_command(
+            self.target(),
+            &format!("{argument} {encoded}"),
+        ))
+    }
+
+    pub(crate) fn install_language_tools(
+        &self,
+        options: &LspLaunch,
+        mut progress: impl FnMut(crate::language::tools::Progress),
+    ) -> Result<crate::language::tools::Installed> {
+        use std::{io::BufReader, process::Stdio};
+
+        let stderr = tempfile::tempfile()?;
+        let mut child = self
+            .language_command(options, "--lsp-setup")?
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(stderr.try_clone()?)
+            .spawn()?;
+        let mut output = BufReader::new(child.stdout.take().unwrap());
+        let result = loop {
+            match read_frame::<LspSetupEvent>(&mut output) {
+                Ok(Some(LspSetupEvent::Progress(state))) => progress(state),
+                Ok(Some(LspSetupEvent::Installed(installed))) => break Ok(installed),
+                Ok(Some(LspSetupEvent::Failed(error))) => break Err(anyhow::anyhow!("{error}")),
+                Ok(None) => {
+                    let mut stderr = stderr;
+                    use std::io::{Read as _, Seek as _};
+                    stderr.rewind()?;
+                    let mut detail = String::new();
+                    stderr.take(8192).read_to_string(&mut detail)?;
+                    break Err(anyhow::anyhow!(
+                        "Remote language tool setup ended early. {}",
+                        detail.trim()
+                    ));
+                }
+                Err(error) => {
+                    _ = child.kill();
+                    break Err(error);
+                }
+            }
+        };
+        let status = child.wait()?;
+        let installed = result?;
+        ensure!(
+            status.success(),
+            "Remote language tool setup failed ({status})"
+        );
+        Ok(installed)
     }
 }
 

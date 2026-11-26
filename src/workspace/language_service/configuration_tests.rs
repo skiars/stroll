@@ -47,7 +47,7 @@ fn format(
 }
 
 #[test]
-#[ignore = "requires a VS Code JSON server entry in STROLL_LSP_CONFIG"]
+#[ignore = "requires the managed vscode bundle in STROLL_HOME"]
 fn workspace_configuration_with_json_server() -> Result<()> {
     for (file, comment) in [
         ("sample.json", ""),
@@ -95,7 +95,7 @@ fn workspace_configuration_with_json_server() -> Result<()> {
 }
 
 #[test]
-#[ignore = "requires a Red Hat YAML server entry in STROLL_LSP_CONFIG"]
+#[ignore = "requires the managed YAML bundle in STROLL_HOME"]
 fn workspace_configuration_with_yaml_server() -> Result<()> {
     let fixture = schema_fixture()?;
     let source = "# yaml-language-server: $schema=./data-schema.json\nmode: broken\ncount:   2\n";
@@ -113,7 +113,7 @@ fn workspace_configuration_with_yaml_server() -> Result<()> {
 }
 
 #[test]
-#[ignore = "requires a Tombi server entry in STROLL_LSP_CONFIG"]
+#[ignore = "requires the managed Tombi bundle in STROLL_HOME"]
 fn workspace_configuration_with_tombi() -> Result<()> {
     let fixture = schema_fixture()?;
     fs::write(

@@ -80,6 +80,7 @@ type ActiveProgress = Arc<Mutex<Vec<(ProgressToken, ServerProgress)>>>;
 struct ClientHandle {
     events: Sender<Event>,
     state: Arc<Mutex<SessionState>>,
+    server_version: Arc<Mutex<Option<String>>>,
     state_changes: async_channel::Receiver<()>,
     progress: ActiveProgress,
     local_process: Option<LocalProcess>,
@@ -101,6 +102,7 @@ impl Drop for ClientHandle {
 pub(crate) struct ServerOptions {
     pub initialization: Value,
     pub workspace: Option<Value>,
+    pub dynamic_formatting: bool,
 }
 
 impl From<Value> for ServerOptions {
@@ -108,6 +110,7 @@ impl From<Value> for ServerOptions {
         Self {
             initialization,
             workspace: None,
+            dynamic_formatting: true,
         }
     }
 }
@@ -150,6 +153,7 @@ impl Client {
         let local_process = (cwd.is_some() && ProcessMemory::SUPPORTED).then(LocalProcess::default);
         let (events, inbox) = mpsc::channel();
         let state = Arc::new(Mutex::new(SessionState::Starting));
+        let server_version = Arc::new(Mutex::new(None));
         let (changed, state_changes) = async_channel::bounded(1);
         let (running, stopped) = async_channel::bounded(1);
         let actions = Arc::new(Mutex::new(actions::Capabilities::default()));
@@ -160,6 +164,7 @@ impl Client {
         let handle = ClientHandle {
             events: events.clone(),
             state: state.clone(),
+            server_version: server_version.clone(),
             state_changes,
             progress: progress.clone(),
             local_process: local_process.clone(),
@@ -194,7 +199,8 @@ impl Client {
                     .with_context(|| format!("Could not start {program}"))?;
                     let mut session =
                         Session::new(wire, inbox, options, progress.clone(), changed.clone());
-                    session.run(&uri, process_id, |capabilities| {
+                    session.run(&uri, process_id, |capabilities, version| {
+                        *server_version.lock().unwrap() = version;
                         *actions.lock().unwrap() = actions::Capabilities::from(capabilities);
                         references.store(supports_references(capabilities), Ordering::Relaxed);
                         *completion.lock().unwrap() = capabilities.completion_provider.clone();
@@ -255,6 +261,10 @@ impl Client {
 
     pub(crate) fn state(&self) -> SessionState {
         self.0.state.lock().unwrap().clone()
+    }
+
+    pub(crate) fn server_version(&self) -> Option<String> {
+        self.0.server_version.lock().unwrap().clone()
     }
 
     pub(crate) fn state_changes(&self) -> async_channel::Receiver<()> {
@@ -699,6 +709,24 @@ enum PendingKind {
     },
 }
 
+fn reported_server_version(info: &Value) -> Option<String> {
+    let version = info["version"].as_str()?.lines().next()?.trim();
+    if version.is_empty() || version.eq_ignore_ascii_case("unknown") {
+        return None;
+    }
+    let version = info["name"]
+        .as_str()
+        .and_then(|name| {
+            version
+                .strip_prefix(name)?
+                .strip_prefix(" version ")?
+                .split_whitespace()
+                .next()
+        })
+        .unwrap_or(version);
+    Some(version.to_owned())
+}
+
 struct Session {
     wire: Transport,
     inbox: Receiver<Event>,
@@ -744,7 +772,7 @@ impl Session {
         &mut self,
         root_uri: &str,
         process_id: Option<u32>,
-        initialized: impl FnOnce(&ServerCapabilities),
+        initialized: impl FnOnce(&ServerCapabilities, Option<String>),
     ) -> Result<()> {
         let uri = root_uri.to_owned();
         self.wire.send(json!({
@@ -798,7 +826,7 @@ impl Session {
                             "resolveSupport": { "properties": ["edit"] }
                         },
                         "rename": { "prepareSupport": true },
-                        "formatting": { "dynamicRegistration": true },
+                        "formatting": { "dynamicRegistration": self.options.dynamic_formatting },
                         "onTypeFormatting": { "dynamicRegistration": false },
                         "semanticTokens": {
                             "requests": { "range": true, "full": true },
@@ -814,7 +842,7 @@ impl Session {
         }))?;
         let deadline = Instant::now() + INITIALIZE_TIMEOUT;
         let mut deferred = Vec::new();
-        loop {
+        let version = loop {
             match self
                 .inbox
                 .recv_timeout(deadline.saturating_duration_since(Instant::now()))
@@ -835,7 +863,7 @@ impl Session {
                             .is_none_or(|encoding| encoding.as_str() == "utf-16"),
                         "The language server used a position encoding that was not negotiated"
                     );
-                    break;
+                    break reported_server_version(&initialization["serverInfo"]);
                 }
                 Event::Incoming(message) => self.incoming(message)?,
                 Event::Disconnected(error) => {
@@ -844,7 +872,7 @@ impl Session {
                 Event::Stop => return Ok(()),
                 event => deferred.push(event),
             }
-        }
+        };
         self.notify("initialized", json!({}))?;
         if let Some(settings) = &self.options.workspace {
             self.notify(
@@ -852,7 +880,7 @@ impl Session {
                 json!({ "settings": settings }),
             )?;
         }
-        initialized(&self.capabilities);
+        initialized(&self.capabilities, version);
         for event in deferred {
             self.handle(event)?;
         }

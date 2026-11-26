@@ -310,6 +310,9 @@ pub(crate) struct Lsp {
     pub python: Server,
     pub vue: Server,
     pub html: Server,
+    pub json: Server,
+    pub tombi: Server,
+    pub yaml: Server,
 }
 
 impl Default for Lsp {
@@ -322,6 +325,9 @@ impl Default for Lsp {
             python: Server::default(),
             vue: Server::default(),
             html: Server::default(),
+            json: Server::default(),
+            tombi: Server::default(),
+            yaml: Server::default(),
         }
     }
 }
@@ -335,6 +341,9 @@ impl Lsp {
             LanguageServer::Python => &self.python,
             LanguageServer::Vue => &self.vue,
             LanguageServer::Html => &self.html,
+            LanguageServer::Json => &self.json,
+            LanguageServer::Tombi => &self.tombi,
+            LanguageServer::Yaml => &self.yaml,
         }
     }
 }
@@ -424,6 +433,9 @@ impl Config {
             ("lsp.python.command", &self.lsp.python.command),
             ("lsp.vue.command", &self.lsp.vue.command),
             ("lsp.html.command", &self.lsp.html.command),
+            ("lsp.json.command", &self.lsp.json.command),
+            ("lsp.tombi.command", &self.lsp.tombi.command),
+            ("lsp.yaml.command", &self.lsp.yaml.command),
         ] {
             ensure!(
                 command.is_empty() || parse_command_line(command).is_some(),

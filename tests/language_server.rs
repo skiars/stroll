@@ -98,15 +98,9 @@ fn selects_language_ids_and_nearest_typescript_project() -> Result<()> {
 
 #[cfg(unix)]
 #[test]
-fn remote_helper_checks_typescript_versions_on_the_login_path() -> Result<()> {
+fn remote_helper_uses_the_managed_typescript_executable() -> Result<()> {
     use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-    use std::{os::unix::fs::PermissionsExt as _, path::Path};
-
-    fn executable(path: &Path, script: &str) -> Result<()> {
-        fs::write(path, script)?;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o755))?;
-        Ok(())
-    }
+    use std::os::unix::fs::PermissionsExt as _;
 
     let fixture = tempfile::tempdir()?;
     let root = fixture.path().canonicalize()?;
@@ -118,45 +112,66 @@ fn remote_helper_checks_typescript_versions_on_the_login_path() -> Result<()> {
             .success()
     );
     let shell = root.join("login-shell");
-    executable(
-        &shell,
-        "#!/bin/sh\nprintf '\\0stroll-env\\0PATH=%s\\0' \"$TEST_LSP_PATH\"\n",
+    let path = root.join("path");
+    let home = root.join("home");
+    let version = "7.0.2";
+    let platform = format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH);
+    let bundle = home
+        .join("lsp-tools/typescript")
+        .join(format!("{version}-{platform}"));
+    fs::create_dir(&path)?;
+    fs::create_dir_all(bundle.join("lib"))?;
+    for (file, script) in [
+        (
+            &shell,
+            "#!/bin/sh\nprintf '\\0stroll-env\\0PATH=%s\\0STROLL_HOME=%s\\0' \"$TEST_LSP_PATH\" \"$TEST_STROLL_HOME\"\n",
+        ),
+        (
+            &path.join("tsc"),
+            "#!/bin/sh\nprintf 'TypeScript on PATH'\n",
+        ),
+        (
+            &bundle.join("lib/tsc"),
+            "#!/bin/sh\n[ \"$*\" = '--lsp --stdio' ] || exit 2\nprintf 'managed LSP stream'\n",
+        ),
+    ] {
+        fs::write(file, script)?;
+        fs::set_permissions(file, fs::Permissions::from_mode(0o755))?;
+    }
+    fs::write(
+        bundle.join("lib/lib.d.ts"),
+        "declare const fixture: boolean;",
     )?;
-    let old = root.join("old");
-    let new = root.join("new");
-    fs::create_dir(&old)?;
-    fs::create_dir(&new)?;
-    executable(
-        &old.join("tsc"),
-        "#!/bin/sh\n[ \"$1\" = --version ] || exit 2\nprintf 'Version 6.0.3\\n'\n",
-    )?;
-    executable(
-        &new.join("tsc"),
-        "#!/bin/sh\nif [ \"$1\" = --version ]; then printf 'Version 7.0.2\\n'; else [ \"$*\" = '--lsp --stdio' ] || exit 2; printf 'lsp stream'; fi\n",
+    let installed = serde_json::json!({"bundle":"typescript","version":version});
+    fs::write(
+        bundle.join("install.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "bundle": "typescript", "version": version, "platform": platform,
+        }))?,
     )?;
 
-    let options = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&serde_json::json!({
-        "repository": root,
-        "project": root,
-        "server": "TypeScript",
-    }))?);
-    let launch = |paths: &[&Path]| -> Result<_> {
+    let launch = |managed: Option<&Value>| -> Result<_> {
+        let options = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&serde_json::json!({
+            "repository": root, "project": root, "server": "TypeScript", "managed": managed,
+        }))?);
         Ok(Command::new(env!("CARGO_BIN_EXE_stroll-remote"))
             .args(["--lsp", &options])
             .env("SHELL", &shell)
-            .env("TEST_LSP_PATH", std::env::join_paths(paths)?)
+            .env("TEST_LSP_PATH", &path)
+            .env("TEST_STROLL_HOME", &home)
             .output()?)
     };
-    let failed = launch(&[&old])?;
+    let failed = launch(None)?;
     assert!(!failed.status.success());
     assert!(failed.stdout.is_empty());
-    let stderr = std::str::from_utf8(&failed.stderr)?;
-    assert!(stderr.contains("TypeScript 7 or newer is required for tsc --lsp --stdio."));
-    assert!(stderr.contains(&format!("{}: TypeScript 6.0.3", old.join("tsc").display())));
+    assert!(
+        std::str::from_utf8(&failed.stderr)?
+            .contains("Managed language tools have not been installed")
+    );
 
-    let started = launch(&[&old, &new])?;
+    let started = launch(Some(&installed))?;
     assert!(started.status.success(), "{:?}", started.stderr);
-    assert_eq!(started.stdout, b"lsp stream");
+    assert_eq!(started.stdout, b"managed LSP stream");
     assert!(started.stderr.is_empty());
     Ok(())
 }

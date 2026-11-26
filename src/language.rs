@@ -1,21 +1,16 @@
 pub(crate) mod external;
 #[cfg(feature = "desktop")]
 pub(crate) mod resources;
+pub(crate) mod tools;
 mod vue;
 pub(crate) mod worktree;
 
 use serde_json::{Value, json};
 use std::{
-    collections::HashMap,
-    ffi::{OsStr, OsString},
-    io::{Read, Seek},
+    ffi::OsString,
     path::{Path, PathBuf},
-    process::{Command, Stdio},
-    thread,
-    time::{Duration, Instant},
+    process::Command,
 };
-
-use anyhow::{Context, Result, bail, ensure};
 
 pub(crate) fn language_home() -> Option<PathBuf> {
     std::env::var_os("STROLL_HOME")
@@ -31,6 +26,9 @@ pub enum LanguageServer {
     Python,
     Vue,
     Html,
+    Json,
+    Tombi,
+    Yaml,
 }
 
 #[derive(Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -81,16 +79,30 @@ impl LanguageServer {
             Self::Python => "pylsp",
             Self::Vue => "vue-language-server",
             Self::Html => "vscode-html-language-server",
+            Self::Json => "vscode-json-language-server",
+            Self::Tombi => "tombi",
+            Self::Yaml => "yaml-language-server",
         }
     }
 
-    pub(crate) const ALL: [Self; 6] = [
+    pub(crate) fn id(self) -> &'static str {
+        match self {
+            Self::Json => "json",
+            Self::Yaml => "yaml",
+            _ => self.name(),
+        }
+    }
+
+    pub(crate) const ALL: [Self; 9] = [
         Self::Rust,
         Self::Clangd,
         Self::TypeScript,
         Self::Python,
         Self::Vue,
         Self::Html,
+        Self::Json,
+        Self::Tombi,
+        Self::Yaml,
     ];
 
     pub(crate) fn languages(self) -> &'static [(&'static str, &'static str)] {
@@ -122,6 +134,9 @@ impl LanguageServer {
             Self::Python => &[(".py", "python"), (".pyi", "python")],
             Self::Vue => &[(".vue", "vue")],
             Self::Html => &[(".html", "html"), (".htm", "html")],
+            Self::Json => &[(".json", "json"), (".jsonc", "jsonc")],
+            Self::Tombi => &[(".toml", "toml")],
+            Self::Yaml => &[(".yaml", "yaml"), (".yml", "yaml")],
         }
     }
 
@@ -141,10 +156,11 @@ impl LanguageServer {
 
     #[cfg(feature = "desktop")]
     pub(crate) fn local_command(self, configured: &str) -> Option<(Command, CommandSource)> {
-        let variable = self.executable_variable();
-        if let Some(value) = std::env::var_os(variable) {
+        if let Some(variable) = self.executable_variable()
+            && let Some(value) = std::env::var_os(variable)
+        {
             return Some((
-                self.command_for(value),
+                self.environment_command(value),
                 CommandSource::Environment(variable),
             ));
         }
@@ -160,78 +176,71 @@ impl LanguageServer {
 
     #[cfg(feature = "desktop")]
     pub(crate) fn local_display_name(self, configured: &str) -> String {
-        if self == Self::Vue {
-            return self.name().to_owned();
-        }
         let (command, _) = self
             .local_command(configured)
             .expect("startup LSP configuration was validated");
         command.get_program().to_string_lossy().into_owned()
     }
 
-    #[cfg(feature = "desktop")]
-    pub(crate) fn supports_legacy_remote(self) -> bool {
-        !matches!(self, Self::Vue | Self::Html)
-    }
-
-    pub(crate) fn executable_variable(self) -> &'static str {
-        match self {
+    pub(crate) fn executable_variable(self) -> Option<&'static str> {
+        Some(match self {
             Self::Rust => "STROLL_RUST_ANALYZER",
             Self::Clangd => "STROLL_CLANGD",
             Self::TypeScript => "STROLL_TYPESCRIPT_LSP",
             Self::Python => "STROLL_PYTHON_LSP",
-            Self::Vue => "STROLL_VUE_NODE",
+            Self::Vue => return None,
             Self::Html => "STROLL_HTML_LSP",
-        }
+            Self::Json => "STROLL_JSON_LSP",
+            Self::Tombi => "STROLL_TOMBI_LSP",
+            Self::Yaml => "STROLL_YAML_LSP",
+        })
     }
 
     pub(crate) fn command_for(self, executable: OsString) -> Command {
         let mut command = crate::process::background(executable);
-        match self {
-            Self::TypeScript | Self::Html => {
-                command.arg("--stdio");
-            }
-            Self::Vue => vue::bridge_args(&mut command),
-            _ => {}
-        }
+        command.args(self.default_arguments());
         command
+    }
+
+    pub(crate) fn environment_command(self, executable: OsString) -> Command {
+        if self == Self::TypeScript {
+            let mut command = crate::process::background(executable);
+            command.arg("--stdio");
+            command
+        } else {
+            self.command_for(executable)
+        }
     }
 
     pub(crate) fn default_command(self) -> Command {
         match self {
-            Self::TypeScript => typescript_command(if cfg!(windows) { "tsc.cmd" } else { "tsc" }),
-            Self::Vue => self.command_for("node".into()),
-            Self::Html if cfg!(windows) => {
-                self.command_for("vscode-html-language-server.cmd".into())
+            Self::Html | Self::Json | Self::Yaml if cfg!(windows) => {
+                self.command_for(format!("{}.cmd", self.name()).into())
             }
-            Self::Html => self.command_for(self.name().into()),
-            _ => crate::process::background(self.name()),
+            _ => self.command_for(self.name().into()),
         }
     }
 
-    pub(crate) fn resolve_default_command(
-        self,
-        project: &Path,
-        environment: Option<&HashMap<OsString, OsString>>,
-    ) -> Result<Command> {
-        let prepare = |mut command: Command| {
-            command.current_dir(project);
-            if let Some(environment) = environment {
-                command.env_clear().envs(environment);
-            }
-            command
-        };
-        if self != Self::TypeScript {
-            return Ok(prepare(self.default_command()));
+    pub(crate) fn default_arguments(self) -> &'static [&'static str] {
+        match self {
+            Self::TypeScript => &["--lsp", "--stdio"],
+            Self::Html | Self::Json | Self::Yaml | Self::Vue => &["--stdio"],
+            Self::Tombi => &["lsp"],
+            _ => &[],
         }
-        let path = match environment {
-            Some(environment) => environment.get(OsStr::new("PATH")).cloned(),
-            None => std::env::var_os("PATH"),
-        };
-        let executable = find_typescript(path.as_deref(), project, |program| {
-            typescript_version(prepare(crate::process::background(program)))
-        })?;
-        Ok(prepare(typescript_command(executable)))
+    }
+
+    pub(crate) fn workspace_settings(self) -> Option<Value> {
+        (self == Self::Yaml).then(|| json!({"yaml": {"format": {"enable": true}}}))
+    }
+
+    #[cfg(feature = "desktop")]
+    pub(crate) fn lsp_options(self) -> crate::lsp::ServerOptions {
+        crate::lsp::ServerOptions {
+            initialization: self.initialization_options(),
+            workspace: self.workspace_settings(),
+            dynamic_formatting: true,
+        }
     }
 
     pub fn project_root(self, repository: &Path, file: &Path) -> PathBuf {
@@ -239,7 +248,9 @@ impl LanguageServer {
             return vue::project_root(repository, file).unwrap_or_else(|| repository.to_owned());
         }
         let markers: &[_] = match self {
-            Self::Rust | Self::Html => return repository.to_owned(),
+            Self::Rust | Self::Html | Self::Json | Self::Tombi | Self::Yaml => {
+                return repository.to_owned();
+            }
             Self::Clangd => &["compile_commands.json", "compile_flags.txt", ".clangd"],
             Self::TypeScript => &["tsconfig.json", "jsconfig.json", "package.json"],
             Self::Python => &["pyproject.toml", "setup.py"],
@@ -271,89 +282,10 @@ impl LanguageServer {
                 "procMacro": { "enable": false }
             }),
             Self::TypeScript => json!({ "disableAutomaticTypingAcquisition": true }),
-            Self::Html => json!({ "provideFormatter": true }),
+            Self::Html | Self::Json => json!({ "provideFormatter": true }),
             _ => Value::Null,
         }
     }
-}
-
-fn typescript_command(executable: impl AsRef<OsStr>) -> Command {
-    let mut command = crate::process::background(executable);
-    command.args(["--lsp", "--stdio"]);
-    command
-}
-
-fn find_typescript(
-    path: Option<&OsStr>,
-    project: &Path,
-    version_of: impl Fn(&Path) -> Result<(u32, String)>,
-) -> Result<PathBuf> {
-    let names: &[&str] = if cfg!(windows) {
-        &["tsc.cmd", "tsc.exe"]
-    } else {
-        &["tsc"]
-    };
-    let mut rejected = Vec::new();
-    let mut seen = std::collections::HashSet::new();
-    for directory in path.into_iter().flat_map(std::env::split_paths) {
-        for name in names {
-            let candidate = project.join(&directory).join(name);
-            if !candidate.is_file() || !seen.insert(candidate.clone()) {
-                continue;
-            }
-            let reason = match version_of(&candidate) {
-                Ok((major, _)) if major >= 7 => return Ok(candidate),
-                Ok((_, version)) => format!("TypeScript {version}"),
-                Err(error) => format!("{error:#}"),
-            };
-            rejected.push(format!("{}: {reason}", candidate.display()));
-        }
-    }
-    let reason = if rejected.is_empty() {
-        "No tsc executable was found on PATH.".to_owned()
-    } else {
-        rejected.join("\n")
-    };
-    bail!("TypeScript 7 or newer is required for tsc --lsp --stdio.\n{reason}")
-}
-
-fn typescript_version(mut command: Command) -> Result<(u32, String)> {
-    let mut output = tempfile::tempfile()?;
-    let mut child = command
-        .arg("--version")
-        .stdin(Stdio::null())
-        .stdout(output.try_clone()?)
-        .stderr(Stdio::null())
-        .spawn()
-        .context("Could not run tsc --version")?;
-    let deadline = Instant::now() + Duration::from_secs(2);
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
-            result => {
-                let _ = child.kill();
-                let _ = child.wait();
-                result.context("Could not wait for tsc --version")?;
-                bail!("tsc --version timed out");
-            }
-        }
-    };
-    ensure!(status.success(), "tsc --version failed ({status})");
-    output.rewind()?;
-    let mut version = String::new();
-    output.take(4096).read_to_string(&mut version)?;
-    let version = version
-        .lines()
-        .find_map(|line| line.trim().strip_prefix("Version "))
-        .context("Unrecognized tsc --version output")?;
-    let (major, _) = version
-        .split_once('.')
-        .context("Unrecognized tsc version")?;
-    Ok((
-        major.parse().context("Unrecognized tsc version")?,
-        version.to_owned(),
-    ))
 }
 
 #[cfg(feature = "desktop")]
@@ -370,6 +302,7 @@ pub(crate) fn parse_command_line(line: &str) -> Option<Vec<String>> {
 #[cfg(all(test, feature = "desktop"))]
 mod tests {
     use super::*;
+    use anyhow::Result;
 
     #[test]
     fn builtin_project_routes_files_with_their_package_and_respects_overrides() -> Result<()> {

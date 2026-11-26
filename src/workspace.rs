@@ -794,6 +794,7 @@ pub struct Workspace {
     ai: crate::ai::Service,
     settings: Option<SettingsWindow>,
     startup_lsp: Lsp,
+    lsp_window: AnyWindowHandle,
     editor_font: Option<SharedString>,
     repository: Option<Arc<Repository>>,
     // Refresh the tree without replacing the active repository's identity for in-flight work.
@@ -1006,6 +1007,7 @@ impl Workspace {
             config,
             settings: None,
             startup_lsp,
+            lsp_window: window.window_handle(),
             editor_font,
             repository: None,
             repository_snapshot: None,

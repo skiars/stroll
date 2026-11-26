@@ -118,7 +118,7 @@ pub(super) fn with_workspace_editor(
     )
 }
 
-fn with_open_workspace(
+pub(super) fn with_open_workspace(
     fixture: &Path,
     config: ConfigFile,
     location: Location,
@@ -538,7 +538,7 @@ fn workspace_python_with_pylsp() -> Result<()> {
 }
 
 #[test]
-#[ignore = "requires vscode-html-language-server on PATH"]
+#[ignore = "requires the managed vscode bundle in STROLL_HOME"]
 fn workspace_builtin_html_supports_hover_and_formatting() -> Result<()> {
     let fixture = tempfile::tempdir()?;
     let source = "<main><div>hello</div></main>\n";
@@ -1434,7 +1434,7 @@ fn workspace_caret_hints_use_the_latest_symbol_and_signature() -> Result<()> {
 }
 
 #[test]
-#[ignore = "requires an installed Vue project and the npm tools described in docs/language-packs.md"]
+#[ignore = "requires an installed Vue project and the managed Vue bundle in STROLL_HOME"]
 fn workspace_routes_vue_and_typescript_to_the_same_session() -> Result<()> {
     use anyhow::Context as _;
     use futures_lite::future::block_on;

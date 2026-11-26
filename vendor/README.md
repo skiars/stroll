@@ -481,3 +481,8 @@ notices are included. Run the `mermaid` library tests and the `documents` and
 The text measurement counter uses `AtomicU64::try_update` to avoid the
 `fetch_update` deprecation in Rust 1.99. The `measurement_count_saturates`
 unit test covers the counter at its upper bound.
+
+
+- Notification dismissal callbacks can distinguish an explicit close from
+  expiration and programmatic removal. The workspace toast test exercises
+  both closure paths.

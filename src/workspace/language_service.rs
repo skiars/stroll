@@ -1,3 +1,4 @@
+mod setup;
 mod worktree_config;
 pub(super) use worktree_config::{WorktreeLanguageState, read_config as read_worktree_lsp};
 
@@ -27,7 +28,8 @@ use gpui_kit_assets::IconName;
 
 use crate::{
     language::{
-        BuiltinProject, CommandSource,
+        BuiltinProject, CommandSource, external,
+        tools::{Bundle, Installed, Tools},
         worktree::{WorktreeLsp, WorktreeServer},
     },
     lsp::{
@@ -102,7 +104,7 @@ impl ServerKey {
 
     fn server_id(&self) -> &str {
         match &self.server {
-            ServiceServer::Builtin(server) => server.name(),
+            ServiceServer::Builtin(server) => server.id(),
             ServiceServer::External(server) => &server.id,
             ServiceServer::Worktree(server) => &server.0.entry.id,
         }
@@ -169,52 +171,86 @@ impl ServerProject {
         path: &Path,
         config: Option<&WorktreeLsp>,
     ) -> Option<Self> {
-        match crate::language::external::load() {
-            Ok(entries) => {
-                let mut selected = None;
-                for entry in entries {
-                    if config.is_none_or(|config| config.entry(&entry.id).is_none())
-                        && let Some((id, length)) = entry.language_id(path)
-                        && selected.as_ref().is_none_or(|(_, _, best)| length > *best)
-                    {
-                        selected = Some((SharedString::from(id.to_owned()), entry, length));
-                    }
-                }
-                if let Some((language_id, server, _)) = selected {
-                    let root = match ssh {
-                        Some(ssh) => {
-                            let version = crate::remote::EXTERNAL_LSP_VERSION;
-                            if ssh.call::<u32>(crate::remote::Request::Hello(version)).ok()
-                                != Some(version)
-                            {
-                                return None;
-                            }
-                            ssh.call(crate::remote::Request::ExternalLspRoot(
-                                server.id.clone(),
-                                crate::remote::RepoPath::from_local(path).ok()?,
-                            ))
-                            .ok()?
-                        }
-                        None => server.project_root(root, path),
-                    };
-                    return Some(Self {
-                        key: ServerKey {
-                            server: ServiceServer::External(server.into()),
-                            root,
-                            remote: ssh.is_some(),
-                        },
-                        language_id,
-                    });
-                }
+        let entries = match external::load() {
+            Ok(entries) => entries,
+            Err(error) => {
+                eprintln!("Could not load external language servers: {error:#}");
+                Vec::new()
             }
-            Err(error) => eprintln!("Could not load external language servers: {error:#}"),
+        };
+        let disabled: HashSet<_> = entries
+            .iter()
+            .filter(|entry| entry.disabled)
+            .map(|entry| entry.id.clone())
+            .collect();
+        if let Some((server, language_id)) = external::select(entries, path, |id| {
+            config.is_some_and(|config| config.entry(id).is_some())
+        }) {
+            let root = match ssh {
+                Some(ssh) => {
+                    let version = crate::remote::EXTERNAL_LSP_VERSION;
+                    if ssh.call::<u32>(crate::remote::Request::Hello(version)).ok() != Some(version)
+                    {
+                        return None;
+                    }
+                    ssh.call(crate::remote::Request::ExternalLspRoot(
+                        server.id.clone(),
+                        crate::remote::RepoPath::from_local(path).ok()?,
+                    ))
+                    .ok()?
+                }
+                None => server.project_root(root, path),
+            };
+            return Some(Self {
+                key: ServerKey {
+                    server: ServiceServer::External(server.into()),
+                    root,
+                    remote: ssh.is_some(),
+                },
+                language_id: language_id.into(),
+            });
         }
         let excluded = LanguageServer::ALL
             .into_iter()
-            .filter(|server| config.is_some_and(|config| config.entry(server.name()).is_some()))
+            .filter(|server| {
+                disabled.contains(server.id())
+                    || config.is_some_and(|config| config.entry(server.id()).is_some())
+            })
             .collect::<Vec<_>>();
         let project = match ssh {
-            Some(ssh) => ssh.builtin_lsp_project(path, excluded).ok().flatten(),
+            Some(ssh) => {
+                use crate::remote::{RemoteLspProject, RepoPath, Request};
+                let worktree_ids = config
+                    .into_iter()
+                    .flat_map(WorktreeLsp::ids)
+                    .map(str::to_owned)
+                    .collect();
+                let project = ssh
+                    .call(Request::RemoteLspProject(
+                        RepoPath::from_local(path).ok()?,
+                        excluded,
+                        worktree_ids,
+                    ))
+                    .ok()
+                    .flatten()?;
+                match project {
+                    RemoteLspProject::Builtin(project) => Some(project),
+                    RemoteLspProject::External {
+                        server,
+                        root,
+                        language_id,
+                    } => {
+                        return Some(Self {
+                            key: ServerKey {
+                                server: ServiceServer::External(Arc::from(server)),
+                                root,
+                                remote: true,
+                            },
+                            language_id: language_id.into(),
+                        });
+                    }
+                }
+            }
             None => BuiltinProject::resolve(root, path, &excluded),
         }?;
         Some(Self {
@@ -229,9 +265,14 @@ impl ServerProject {
 }
 
 pub(super) enum LanguageService {
+    Checking {
+        _task: Task<()>,
+    },
+    Setup(setup::Setup),
     Session {
         client: Client,
         restart: bool,
+        managed: Option<Installed>,
         _watch: Task<()>,
     },
     Failed(String),
@@ -247,6 +288,9 @@ enum ServiceStatus {
     Unsupported,
     Disabled,
     Idle,
+    NotInstalled,
+    Installing,
+    InstallFailed,
     Starting,
     Ready,
     Stopping,
@@ -260,6 +304,9 @@ impl ServiceStatus {
             Self::Unsupported => t!("lsp.unsupported"),
             Self::Disabled => t!("lsp.disabled"),
             Self::Idle => t!("lsp.idle"),
+            Self::NotInstalled => t!("lsp.not_installed"),
+            Self::Installing => t!("lsp.installing"),
+            Self::InstallFailed => t!("lsp.install_failed"),
             Self::Starting => t!("common.starting"),
             Self::Ready => t!("lsp.ready"),
             Self::Stopping => t!("lsp.stopping"),
@@ -269,22 +316,79 @@ impl ServiceStatus {
     }
 
     fn controls(&self) -> bool {
-        !matches!(self, Self::Unsupported | Self::Disabled)
+        !matches!(
+            self,
+            Self::Unsupported
+                | Self::Disabled
+                | Self::NotInstalled
+                | Self::Installing
+                | Self::InstallFailed
+        )
     }
 
     fn pending(&self) -> bool {
-        matches!(self, Self::Starting | Self::Stopping)
+        matches!(self, Self::Starting | Self::Stopping | Self::Installing)
     }
 }
 
 impl Workspace {
+    fn can_start_language_service(&self, key: &ServerKey) -> bool {
+        self.startup_lsp.enabled
+            && (!matches!(key.server, ServiceServer::Worktree(_))
+                || self.session.worktree_lsp_trusted)
+    }
+
     pub(super) fn start_language_service(&mut self, key: &ServerKey, cx: &mut Context<Self>) {
-        if !self.startup_lsp.enabled
-            || (matches!(key.server, ServiceServer::Worktree(_))
-                && !self.session.worktree_lsp_trusted)
-        {
-            return;
+        if self.can_start_language_service(key) && !self.check_language_tools(key, cx) {
+            self.launch_language_service(key, None, cx);
         }
+    }
+
+    fn remote_lsp_launch(
+        &self,
+        key: &ServerKey,
+    ) -> anyhow::Result<(crate::remote::SshSession, crate::remote::LspLaunch)> {
+        use crate::remote::{LspLaunch, LspTarget};
+        let repo = self
+            .repository
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Missing SSH worktree"))?;
+        let ssh = repo
+            .ssh
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Missing SSH connection"))?;
+        let repository = crate::remote::SshTarget::parse(&repo.root)?.unwrap().path;
+        let server = match &key.server {
+            ServiceServer::Builtin(server) => LspTarget::Builtin(*server),
+            ServiceServer::External(server) => LspTarget::External {
+                id: server.id.clone(),
+            },
+            ServiceServer::Worktree(server) => LspTarget::Worktree {
+                id: server.0.entry.id.clone(),
+                fingerprint: server.0.fingerprint.clone(),
+                snapshot: server.0.remote_snapshot.clone().ok_or_else(|| {
+                    anyhow::anyhow!("Missing remote worktree LSP configuration snapshot")
+                })?,
+            },
+        };
+        Ok((
+            ssh.clone(),
+            LspLaunch {
+                repository,
+                project: key.root.clone(),
+                server,
+                memory: None,
+                managed: None,
+            },
+        ))
+    }
+
+    fn launch_language_service(
+        &mut self,
+        key: &ServerKey,
+        managed: Option<Installed>,
+        cx: &mut Context<Self>,
+    ) {
         let barriers = &mut self.worktree_language.retiring;
         barriers.retain(|(_, _, stopped)| !stopped.is_closed());
         let wait: Vec<_> = barriers
@@ -298,44 +402,22 @@ impl Workspace {
                 _ = stopped.recv_blocking();
             }
         };
+        let mut options = match &key.server {
+            ServiceServer::Builtin(server) => server.lsp_options(),
+            ServiceServer::External(server) => server.server.lsp_options(),
+            ServiceServer::Worktree(server) => server.0.entry.server.lsp_options(),
+        };
+        if managed
+            .as_ref()
+            .is_some_and(|tools| tools.bundle == Bundle::Yaml)
+        {
+            // YAML registers its formatter dynamically only after refreshing SchemaStore.
+            options.dynamic_formatting = false;
+        }
         let start = (|| {
             if key.remote {
-                use crate::remote::LspTarget;
-                let repo = self
-                    .repository
-                    .as_ref()
-                    .expect("remote language service has a repository");
-                let ssh = repo
-                    .ssh
-                    .as_ref()
-                    .expect("remote language service has an SSH connection");
-                let repository = crate::remote::SshTarget::parse(&repo.root)?.unwrap().path;
-                let (target, options) = match &key.server {
-                    ServiceServer::Builtin(server) => (
-                        LspTarget::Builtin(*server),
-                        server.initialization_options().into(),
-                    ),
-                    ServiceServer::External(server) => (
-                        LspTarget::External {
-                            id: server.id.clone(),
-                        },
-                        server.server.lsp_options(),
-                    ),
-                    ServiceServer::Worktree(server) => (
-                        LspTarget::Worktree {
-                            id: server.0.entry.id.clone(),
-                            fingerprint: server.0.fingerprint.clone(),
-                            snapshot: server
-                                .0
-                                .remote_snapshot
-                                .clone()
-                                .expect("remote worktree LSP snapshot"),
-                        },
-                        server.0.entry.server.lsp_options(),
-                    ),
-                };
-                let ssh = ssh.clone();
-                let project = key.root.clone();
+                let (ssh, mut launch) = self.remote_lsp_launch(key)?;
+                launch.managed = managed.clone();
                 let process = RemoteProcess::new(ssh.clone());
                 let monitor = process.clone();
                 let uri = crate::remote::file_uri(
@@ -346,7 +428,8 @@ impl Workspace {
                 Client::start_with_uri(
                     move || {
                         wait_for_exit();
-                        ssh.language_command(repository, project, target, monitor.prepare())
+                        launch.memory = monitor.prepare();
+                        ssh.language_command(&launch, "--lsp")
                     },
                     process,
                     uri,
@@ -354,6 +437,15 @@ impl Workspace {
                 )
             } else {
                 let project = key.root.clone();
+                let installed = managed
+                    .clone()
+                    .map(|installed| -> anyhow::Result<_> {
+                        let home = crate::language::language_home().ok_or_else(|| {
+                            anyhow::anyhow!("Could not determine the Stroll directory")
+                        })?;
+                        Ok((Tools::new(home)?, installed))
+                    })
+                    .transpose()?;
                 match &key.server {
                     ServiceServer::Builtin(server) => {
                         let server = *server;
@@ -365,13 +457,21 @@ impl Workspace {
                                 wait_for_exit();
                                 match source {
                                     CommandSource::Path => {
-                                        server.resolve_default_command(&project, None)
+                                        if let Some((tools, installed)) = installed {
+                                            tools.command(server, &installed, None, None)
+                                        } else {
+                                            anyhow::ensure!(
+                                                server.bundle().is_none(),
+                                                "Managed language tools have not been installed"
+                                            );
+                                            Ok(command)
+                                        }
                                     }
                                     _ => Ok(command),
                                 }
                             },
                             key.root.clone(),
-                            server.initialization_options().into(),
+                            options,
                         )
                     }
                     ServiceServer::External(server) => {
@@ -382,17 +482,22 @@ impl Workspace {
                                 Ok(command)
                             },
                             project,
-                            server.server.lsp_options(),
+                            options,
                         )
                     }
                     ServiceServer::Worktree(server) => {
                         let server = server.0.clone();
-                        let options = server.entry.server.lsp_options();
                         let directory = project.clone();
                         Client::start_with_command(
                             move || {
                                 wait_for_exit();
-                                server.command(&directory, None)
+                                server.command(
+                                    &directory,
+                                    None,
+                                    installed
+                                        .as_ref()
+                                        .map(|(tools, installed)| (tools, installed)),
+                                )
                             },
                             project,
                             options,
@@ -436,6 +541,7 @@ impl Workspace {
             LanguageService::Session {
                 client,
                 restart: false,
+                managed,
                 _watch: watch,
             },
         );
@@ -672,6 +778,12 @@ impl Workspace {
         else {
             return;
         };
+        if matches!(
+            self.language_servers.get(&key),
+            Some(LanguageService::Checking { .. } | LanguageService::Setup(_))
+        ) {
+            return;
+        }
         if let Some(LanguageService::Session {
             client, restart, ..
         }) = self.language_servers.get_mut(&key)
@@ -696,7 +808,7 @@ impl Workspace {
         }
     }
 
-    fn language_service_state(&self, project: Option<&ServerProject>) -> ServiceStatus {
+    fn language_service_state(&self, project: Option<&ServerProject>, cx: &App) -> ServiceStatus {
         let Some(project) = project else {
             return ServiceStatus::Unsupported;
         };
@@ -705,6 +817,8 @@ impl Workspace {
         }
         match self.language_servers.get(&project.key) {
             None => ServiceStatus::Idle,
+            Some(LanguageService::Checking { .. }) => ServiceStatus::Starting,
+            Some(LanguageService::Setup(setup)) => setup.status(cx),
             Some(LanguageService::Failed(error)) => ServiceStatus::Failed(error.clone()),
             Some(LanguageService::Session { client, .. }) => match client.state() {
                 SessionState::Starting => ServiceStatus::Starting,
@@ -837,7 +951,7 @@ impl Workspace {
         colors: Palette,
         cx: &Context<Self>,
     ) -> impl IntoElement {
-        let status = self.language_service_state(file.server_project.as_ref());
+        let status = self.language_service_state(file.server_project.as_ref(), cx);
         let tooltip = t!("lsp.tooltip", status = status.label()).into_owned();
         let workspace = cx.weak_entity();
         Popover::new("language-service")
@@ -870,7 +984,9 @@ impl Workspace {
                     .when(!status.pending(), |button| {
                         let (glyph, color) = match status {
                             ServiceStatus::Ready => (IconName::Check, cx.theme().success),
-                            ServiceStatus::Failed(_) => (IconName::TriangleAlert, colors.warning),
+                            ServiceStatus::Failed(_) | ServiceStatus::InstallFailed => {
+                                (IconName::TriangleAlert, colors.warning)
+                            }
                             _ => (IconName::Minus, colors.muted),
                         };
                         button.icon(icon(glyph, color, 12.))
@@ -879,11 +995,12 @@ impl Workspace {
             )
             .content(move |_, window, cx| {
                 workspace
-                    .read_with(cx, |this, _| {
+                    .read_with(cx, |this, cx| {
                         this.language_service_panel(
                             workspace.clone(),
                             window.viewport_size(),
                             colors,
+                            cx,
                         )
                         .into_any_element()
                     })
@@ -896,16 +1013,34 @@ impl Workspace {
         workspace: WeakEntity<Self>,
         viewport: Size<Pixels>,
         colors: Palette,
+        cx: &App,
     ) -> impl IntoElement {
         let project = self
             .active_file()
             .and_then(|file| file.server_project.as_ref());
-        let status = self.language_service_state(project);
+        let status = self.language_service_state(project, cx);
+        let service = project.and_then(|project| self.language_servers.get(&project.key));
+        let setup = match service {
+            Some(LanguageService::Setup(setup)) => Some(setup),
+            _ => None,
+        };
+        let managed = match service {
+            Some(LanguageService::Session { managed, .. }) => managed.as_ref(),
+            _ => None,
+        };
+        let version = match service {
+            Some(LanguageService::Session { client, .. }) => client
+                .server_version()
+                .or_else(|| managed.map(|tool| tool.version.clone())),
+            _ => setup.map(|setup| setup.version().to_owned()),
+        };
         let running = status == ServiceStatus::Ready;
-        let stop_disabled = !matches!(status, ServiceStatus::Starting | ServiceStatus::Ready);
+        let stop_disabled = !matches!(service, Some(LanguageService::Session { .. }))
+            || !matches!(status, ServiceStatus::Starting | ServiceStatus::Ready);
         let start_disabled = status.pending();
         let memory = self.language_service_memory();
         let mut panel = v_flex()
+            .debug_selector(|| "language-service-panel".into())
             .w(px(312.).min((viewport.width - px(42.)).max(px(0.))))
             .gap_2()
             .text_size(px(12.))
@@ -922,15 +1057,26 @@ impl Workspace {
                     .filter(|_| project.key.remote)
                     .and_then(|repo| repo.ssh.as_ref());
                 let program = match &project.key.server {
-                    ServiceServer::Builtin(server) if ssh.is_some() => server.name().to_owned(),
+                    ServiceServer::Builtin(server)
+                        if ssh.is_some() || setup.is_some() || managed.is_some() =>
+                    {
+                        server.name().to_owned()
+                    }
                     ServiceServer::Builtin(server) => {
                         server.local_display_name(&self.startup_lsp.server(*server).command)
                     }
                     ServiceServer::External(server) => server.server.command.clone(),
                     ServiceServer::Worktree(server) => server.0.entry.server.command.clone(),
                 };
+                let service = version.as_deref().map_or_else(
+                    || program.clone(),
+                    |version| format!("{program} · {version}"),
+                );
                 panel
-                    .child(service_detail(t!("lsp.server"), program, colors))
+                    .child(
+                        service_detail(t!("lsp.server"), service.clone(), colors)
+                            .debug_selector(move || format!("language-service-server: {service}")),
+                    )
                     .when_some(ssh, |panel, ssh| {
                         panel.child(service_detail(
                             t!("common.ssh_host"),
@@ -945,7 +1091,7 @@ impl Workspace {
                     ))
             })
             .child(service_detail(t!("lsp.status"), status.label(), colors))
-            .when(project.is_some(), |panel| {
+            .when(project.is_some() && setup.is_none(), |panel| {
                 let rss = memory
                     .map(|sample| format!("{:.1} MiB", sample.bytes as f64 / 1_048_576.))
                     .unwrap_or_else(|| t!("lsp.memory_unavailable").into_owned());
@@ -960,7 +1106,37 @@ impl Workspace {
             });
 
         let worktree_workspace = workspace.clone();
-        if status.controls() {
+        if let Some(setup) = setup {
+            panel = panel
+                .children(setup.progress_panel(cx, colors))
+                .when_some(setup.error(cx), |panel, error| {
+                    panel.child(last_error(error, colors))
+                })
+                .when(
+                    matches!(
+                        status,
+                        ServiceStatus::NotInstalled | ServiceStatus::InstallFailed
+                    ),
+                    |panel| {
+                        panel.child(
+                            action_button("install-language-service")
+                                .debug_selector(|| "install-language-service".into())
+                                .small()
+                                .secondary()
+                                .label(if status == ServiceStatus::InstallFailed {
+                                    t!("lsp.retry_install")
+                                } else {
+                                    t!("lsp.install")
+                                })
+                                .on_click(move |_, _, cx| {
+                                    _ = workspace.update(cx, |this, cx| {
+                                        this.install_active_language_tools(cx)
+                                    });
+                                }),
+                        )
+                    },
+                );
+        } else if status.controls() {
             let stop_workspace = workspace.clone();
             panel = panel
                 .when_some(
@@ -1039,23 +1215,19 @@ fn service_detail(
     value: impl Into<SharedString>,
     colors: Palette,
 ) -> Div {
+    service_detail_columns(
+        div().child(label.into()),
+        div().whitespace_normal().child(value.into()),
+        colors,
+    )
+}
+
+fn service_detail_columns(label: Div, value: Div, colors: Palette) -> Div {
     h_flex()
         .items_start()
         .gap_3()
-        .child(
-            div()
-                .w(px(84.))
-                .flex_shrink_0()
-                .text_color(colors.muted)
-                .child(label.into()),
-        )
-        .child(
-            div()
-                .min_w_0()
-                .flex_1()
-                .whitespace_normal()
-                .child(value.into()),
-        )
+        .child(label.w(px(84.)).flex_shrink_0().text_color(colors.muted))
+        .child(value.min_w_0().flex_1())
 }
 
 #[cfg(all(test, unix))]

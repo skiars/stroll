@@ -3,6 +3,7 @@ fn main() -> anyhow::Result<()> {
     match (args.next().as_deref(), args.next(), args.next()) {
         (None, None, None) => stroll::remote::serve(),
         (Some("--lsp"), Some(options), None) => stroll::remote::serve_lsp(&options),
+        (Some("--lsp-setup"), Some(options), None) => stroll::remote::serve_lsp_setup(&options),
         _ => anyhow::bail!("Invalid remote helper arguments"),
     }
 }

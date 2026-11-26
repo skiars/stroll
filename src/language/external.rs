@@ -13,12 +13,14 @@ use serde_json::Value;
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ExternalLsp {
     pub id: String,
+    #[serde(default)]
     pub languages: BTreeMap<String, String>,
     #[serde(default)]
     pub(super) root_markers: Vec<String>,
+    #[serde(default)]
     pub server: ExternalCommand,
     #[serde(default)]
-    pub(super) disabled: bool,
+    pub(crate) disabled: bool,
 }
 
 impl Hash for ExternalLsp {
@@ -27,7 +29,7 @@ impl Hash for ExternalLsp {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ExternalCommand {
     pub command: String,
@@ -41,12 +43,20 @@ pub(crate) struct ExternalCommand {
     pub workspace_settings: Option<Value>,
 }
 
+impl ExternalCommand {
+    pub(crate) fn omit_host_launch_fields(&mut self) {
+        self.args.clear();
+        self.env.clear();
+    }
+}
+
 #[cfg(feature = "desktop")]
 impl ExternalCommand {
     pub(crate) fn lsp_options(&self) -> crate::lsp::ServerOptions {
         crate::lsp::ServerOptions {
             initialization: self.initialization_options.clone(),
             workspace: self.workspace_settings.clone(),
+            dynamic_formatting: true,
         }
     }
 }
@@ -76,15 +86,33 @@ pub(crate) fn load() -> Result<Vec<ExternalLsp>> {
             .validate()
             .with_context(|| format!("Invalid language server {:?}", entry.id))?;
     }
-    Ok(entries
-        .into_iter()
-        .filter(|entry| !entry.disabled)
-        .collect())
+    Ok(entries)
+}
+
+pub(crate) fn select(
+    entries: Vec<ExternalLsp>,
+    file: &Path,
+    excluded: impl Fn(&str) -> bool,
+) -> Option<(ExternalLsp, String)> {
+    let mut selected = None;
+    for entry in entries {
+        if !entry.disabled
+            && !excluded(&entry.id)
+            && let Some((language, length)) = entry.language_id(file)
+            && selected.as_ref().is_none_or(|(_, _, best)| length > *best)
+        {
+            selected = Some((language.to_owned(), entry, length));
+        }
+    }
+    selected.map(|(language, entry, _)| (entry, language))
 }
 
 impl ExternalLsp {
     pub(super) fn validate(&self) -> Result<()> {
         ensure!(!self.id.trim().is_empty(), "Expected a language server ID");
+        if self.disabled {
+            return Ok(());
+        }
         ensure!(
             self.server
                 .workspace_settings
@@ -111,7 +139,6 @@ impl ExternalLsp {
         validate_root_markers(&self.root_markers)
     }
 
-    #[cfg(feature = "desktop")]
     pub(crate) fn language_id(&self, file: &Path) -> Option<(&str, usize)> {
         let name = file.file_name()?.to_str()?;
         self.languages

@@ -18,7 +18,11 @@ use serde_json::{Value, to_value};
 use super::{Bytes, Call, Reply, Request, TerminalEvent, VERSION, read_frame, write_frame};
 use crate::{
     git,
-    language::worktree::WorktreeLsp,
+    language::{
+        LanguageServer,
+        tools::Tools,
+        worktree::{WorktreeLsp, WorktreeServer},
+    },
     pty,
     repository::{Repository, RepositoryInfo, files::WorkspaceImport, write_checked},
 };
@@ -203,7 +207,6 @@ impl Server {
                             | super::WORKTREE_LSP_VERSION
                             | super::IMAGE_DIFF_VERSION
                             | super::IMAGE_DIFF_RESOURCE_VERSION
-                            | super::BUILTIN_LSP_PROJECT_VERSION
                             | super::HISTORY_EDIT_VERSION
                             | super::TERMINAL_DIRECTORY_VERSION
                             | super::WORKSPACE_IMPORT_VERSION
@@ -758,17 +761,57 @@ impl Server {
                 crate::repository::resolve_file(root, file.as_path())?;
                 value(external_server(&id)?.project_root(root, file.as_path()))
             }
-            Request::BuiltinLspProject(file, excluded) => {
+            Request::RemoteLspProject(file, mut excluded, worktree_ids) => {
+                use super::RemoteLspProject;
+                use crate::language::{BuiltinProject, external};
                 crate::repository::resolve_file(root, file.as_path())?;
-                value(crate::language::BuiltinProject::resolve(
-                    root,
-                    file.as_path(),
-                    &excluded,
-                ))
+                let entries = match external::load() {
+                    Ok(entries) => entries,
+                    Err(error) => {
+                        eprintln!("Could not load external language servers: {error:#}");
+                        Vec::new()
+                    }
+                };
+                excluded.extend(LanguageServer::ALL.into_iter().filter(|server| {
+                    entries
+                        .iter()
+                        .any(|entry| entry.disabled && entry.id == server.id())
+                }));
+                if let Some((mut server, language_id)) =
+                    external::select(entries, file.as_path(), |id| {
+                        worktree_ids.iter().any(|entry| entry == id)
+                    })
+                {
+                    let root = server.project_root(root, file.as_path());
+                    server.server.omit_host_launch_fields();
+                    return value(Some(RemoteLspProject::External {
+                        server: Box::new(server),
+                        root,
+                        language_id,
+                    }));
+                }
+                value(
+                    BuiltinProject::resolve(root, file.as_path(), &excluded)
+                        .map(RemoteLspProject::Builtin),
+                )
             }
-            Request::LspRoot(server, file) => {
-                crate::repository::resolve_file(root, file.as_path())?;
-                value(server.project_root(root, file.as_path()))
+            Request::LspSetupStatus(options) => {
+                let root = lsp_root(&options)?;
+                ensure!(
+                    root == repo.root,
+                    "The language server is for another worktree"
+                );
+                let environment = lsp_environment(&options.project)?;
+                let Some(server) = managed_server(&options, &root, environment.as_ref())? else {
+                    return value(None::<super::LspSetupStatus>);
+                };
+                let home = lsp_home(environment.as_ref())?;
+                let account = lsp_account(&home, environment.as_ref());
+                value(Some(super::LspSetupStatus {
+                    account,
+                    installed: Tools::new(home)?
+                        .lookup(server.bundle().unwrap(), environment.as_ref())?,
+                }))
             }
         }
     }
@@ -903,7 +946,7 @@ fn serve_queue(
 fn external_server(id: &str) -> Result<crate::language::external::ExternalLsp> {
     crate::language::external::load()?
         .into_iter()
-        .find(|server| server.id == id)
+        .find(|server| !server.disabled && server.id == id)
         .with_context(|| format!("Unknown external language server {id:?}"))
 }
 
@@ -918,21 +961,54 @@ fn worktree_lsp(root: &std::path::Path) -> Result<crate::language::worktree::Wor
         let variables = environment
             .get_or_init(|| None::<HashMap<std::ffi::OsString, std::ffi::OsString>>)
             .as_ref();
-        let variable = std::ffi::OsStr::new(server.executable_variable());
-        let executable = match variables {
-            Some(variables) => variables.get(variable).cloned(),
-            None => std::env::var_os(variable),
-        };
+        let executable = server
+            .executable_variable()
+            .and_then(|name| lsp_variable(name, variables));
         match executable {
-            Some(executable) => (server.command_for(executable), false),
+            Some(executable) => (server.environment_command(executable), false),
             None => (server.default_command(), true),
         }
     })
 }
 
-pub fn serve_lsp(options: &str) -> Result<()> {
-    use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
-    let options: super::LspLaunch = serde_json::from_slice(&URL_SAFE_NO_PAD.decode(options)?)?;
+type LspEnvironment = HashMap<std::ffi::OsString, std::ffi::OsString>;
+
+fn lsp_environment(project: &Path) -> Result<Option<LspEnvironment>> {
+    #[cfg(unix)]
+    return login_environment(project).map(Some);
+    #[cfg(not(unix))]
+    {
+        let _ = project;
+        Ok(None)
+    }
+}
+
+fn lsp_variable(name: &str, environment: Option<&LspEnvironment>) -> Option<std::ffi::OsString> {
+    match environment {
+        Some(environment) => environment.get(std::ffi::OsStr::new(name)).cloned(),
+        None => std::env::var_os(name),
+    }
+}
+
+fn lsp_home(environment: Option<&LspEnvironment>) -> Result<PathBuf> {
+    lsp_variable("STROLL_HOME", environment)
+        .map(PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|home| home.join(".stroll")))
+        .context("Could not determine the remote Stroll directory")
+}
+
+fn lsp_account(home: &Path, environment: Option<&LspEnvironment>) -> String {
+    let account = lsp_variable(if cfg!(windows) { "USERNAME" } else { "USER" }, environment)
+        .unwrap_or_default();
+    format!("{}:{}", account.to_string_lossy(), home.display())
+}
+
+fn decode_launch(options: &str) -> Result<super::LspLaunch> {
+    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+    Ok(serde_json::from_slice(&URL_SAFE_NO_PAD.decode(options)?)?)
+}
+
+fn lsp_root(options: &super::LspLaunch) -> Result<PathBuf> {
     let root = crate::repository::repository_root(&options.repository)?;
     let relative = options.project.strip_prefix(&root)?;
     ensure!(
@@ -945,32 +1021,96 @@ pub fn serve_lsp(options: &str) -> Result<()> {
         options.project.canonicalize()? == options.project && options.project.is_dir(),
         "Invalid language server directory"
     );
-    #[cfg(unix)]
-    let environment = Some(login_environment(&options.project)?);
-    #[cfg(not(unix))]
-    let environment: Option<HashMap<std::ffi::OsString, std::ffi::OsString>> = None;
+    Ok(root)
+}
+
+fn snapshot_server(
+    root: &Path,
+    id: &str,
+    fingerprint: &str,
+    snapshot: &Path,
+) -> Result<WorktreeServer> {
+    let snapshot = LspSnapshot::read(snapshot)?;
+    ensure!(
+        snapshot.root == root,
+        "The language server snapshot is for another worktree"
+    );
+    let server = snapshot
+        .config
+        .entry(id)
+        .filter(|server| server.enabled())
+        .with_context(|| format!("Unknown worktree language server {id:?}"))?;
+    ensure!(
+        server.fingerprint == fingerprint,
+        "The worktree language server configuration changed before launch"
+    );
+    Ok(server.clone())
+}
+
+fn managed_server(
+    options: &super::LspLaunch,
+    root: &Path,
+    environment: Option<&LspEnvironment>,
+) -> Result<Option<LanguageServer>> {
+    Ok(match &options.server {
+        super::LspTarget::Builtin(server) => server
+            .bundle()
+            .filter(|_| {
+                server
+                    .executable_variable()
+                    .and_then(|name| lsp_variable(name, environment))
+                    .is_none()
+            })
+            .map(|_| *server),
+        super::LspTarget::Worktree {
+            id,
+            fingerprint,
+            snapshot,
+        } => snapshot_server(root, id, fingerprint, snapshot)?.managed,
+        super::LspTarget::External { .. } => None,
+    })
+}
+
+pub fn serve_lsp_setup(options: &str) -> Result<()> {
+    let mut output = BufWriter::new(io::stdout().lock());
+    let installed = (|| {
+        let options = decode_launch(options)?;
+        let root = lsp_root(&options)?;
+        let environment = lsp_environment(&options.project)?;
+        let server = managed_server(&options, &root, environment.as_ref())?
+            .context("The selected language server does not use managed tools")?;
+        let tools = Tools::new(lsp_home(environment.as_ref())?)?;
+        tools.install(server.bundle().unwrap(), environment.as_ref(), |progress| {
+            let _ = write_frame(&mut output, &super::LspSetupEvent::Progress(progress));
+        })
+    })();
+    let event = match installed {
+        Ok(installed) => super::LspSetupEvent::Installed(installed),
+        Err(error) => super::LspSetupEvent::Failed(format!("{error:#}")),
+    };
+    write_frame(&mut output, &event)
+}
+
+pub fn serve_lsp(options: &str) -> Result<()> {
+    let options = decode_launch(options)?;
+    let root = lsp_root(&options)?;
+    let environment = lsp_environment(&options.project)?;
+    let tools = options
+        .managed
+        .as_ref()
+        .map(|_| Tools::new(lsp_home(environment.as_ref())?))
+        .transpose()?;
+    let installed = tools.as_ref().zip(options.managed.as_ref());
     let mut command = match options.server {
         super::LspTarget::Worktree {
             id,
             fingerprint,
             snapshot,
-        } => {
-            let snapshot = LspSnapshot::read(&snapshot)?;
-            ensure!(
-                snapshot.root == root,
-                "The language server snapshot is for another worktree"
-            );
-            let server = snapshot
-                .config
-                .entry(&id)
-                .filter(|server| server.enabled())
-                .with_context(|| format!("Unknown worktree language server {id:?}"))?;
-            ensure!(
-                server.fingerprint == fingerprint,
-                "The worktree language server configuration changed before launch"
-            );
-            server.command(&options.project, environment.as_ref())?
-        }
+        } => snapshot_server(&root, &id, &fingerprint, &snapshot)?.command(
+            &options.project,
+            environment.as_ref(),
+            installed,
+        )?,
         super::LspTarget::External { id } => {
             let server = external_server(&id)?;
             let mut command = server.command();
@@ -984,21 +1124,25 @@ pub fn serve_lsp(options: &str) -> Result<()> {
             command
         }
         super::LspTarget::Builtin(server) => {
-            let variable = server.executable_variable();
-            let executable = match &environment {
-                Some(environment) => environment.get(std::ffi::OsStr::new(variable)).cloned(),
-                None => std::env::var_os(variable),
-            };
-            if let Some(executable) = executable {
-                let mut command = server.command_for(executable);
-                command.current_dir(&options.project);
-                if let Some(environment) = &environment {
-                    command.env_clear().envs(environment);
-                }
-                command
+            let mut command = if let Some(executable) = server
+                .executable_variable()
+                .and_then(|name| lsp_variable(name, environment.as_ref()))
+            {
+                server.environment_command(executable)
+            } else if let Some((tools, installed)) = installed {
+                tools.command(server, installed, None, environment.as_ref())?
             } else {
-                server.resolve_default_command(&options.project, environment.as_ref())?
+                ensure!(
+                    server.bundle().is_none(),
+                    "Managed language tools have not been installed"
+                );
+                server.default_command()
+            };
+            command.current_dir(&options.project);
+            if let Some(environment) = &environment {
+                command.env_clear().envs(environment);
             }
+            command
         }
     };
     #[cfg(unix)]

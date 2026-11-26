@@ -1,27 +1,14 @@
 // This program is embedded in both Stroll binaries and launched on the project host.
 const { spawn } = require('node:child_process');
-const { homedir } = require('node:os');
 const { join } = require('node:path');
 const { createRequire } = require('node:module');
 
-const tools = join(process.env.STROLL_HOME || join(homedir(), '.stroll'), 'vue-tools');
+const [, tools, ...vueArgs] = process.argv;
 const requireTool = createRequire(join(tools, 'package.json'));
-let rpc, vueScript, tsScript, sdk;
-try {
-    rpc = requireTool('vscode-jsonrpc/node');
-    vueScript = requireTool.resolve('@vue/language-server/bin/vue-language-server.js');
-    tsScript = requireTool.resolve('typescript-language-server/lib/cli.mjs');
-    sdk = requireTool.resolve('typescript/lib/tsserver.js');
-    requireTool.resolve('@vue/typescript-plugin');
-    if (!requireTool('typescript').server?.protocol) {
-        throw new Error('Vue requires a JavaScript TypeScript SDK');
-    }
-} catch (error) {
-    console.error(error.message);
-    console.error('Install Vue language tools on this host:');
-    console.error('npm install --prefix "' + tools + '" @vue/language-server@3.3.14 @vue/typescript-plugin@3.3.14 typescript-language-server@5.3.0 typescript@6.0.3 vscode-jsonrpc@8.2.1');
-    process.exit(1);
-}
+const rpc = requireTool('vscode-jsonrpc/node');
+const vueScript = requireTool.resolve('@vue/language-server/bin/vue-language-server.js');
+const tsScript = requireTool.resolve('typescript-language-server/lib/cli.mjs');
+const sdk = requireTool.resolve('typescript/lib/tsserver.js');
 
 const connection = (input, output) => rpc.createMessageConnection(
     new rpc.StreamMessageReader(input), new rpc.StreamMessageWriter(output),
@@ -39,8 +26,8 @@ process.on('SIGTERM', () => process.exit(0));
 process.on('SIGINT', () => process.exit(0));
 client.onClose(() => process.exit(0));
 
-function server(script) {
-    const child = spawn(process.execPath, [script, '--stdio'], {
+function server(script, args) {
+    const child = spawn(process.execPath, [script, ...args], {
         stdio: ['pipe', 'pipe', 'inherit'],
         windowsHide: true,
     });
@@ -63,8 +50,8 @@ function server(script) {
     return peer;
 }
 
-const vue = server(vueScript);
-const ts = server(tsScript);
+const vue = server(vueScript, vueArgs);
+const ts = server(tsScript, ['--stdio']);
 const peers = { vue, ts };
 const typescriptDiagnostics = new Map();
 const versions = new Map();
@@ -146,7 +133,7 @@ client.onRequest('initialize', async params => {
         tokenModifiers: [...new Set(legends.flatMap(legend => legend.tokenModifiers))],
     } : undefined;
     return {
-        serverInfo: { name: 'Stroll Vue' },
+        serverInfo: { name: 'Stroll Vue', version: vueInit.serverInfo?.version },
         capabilities: {
             ...tsCapabilities,
             ...vueCapabilities,

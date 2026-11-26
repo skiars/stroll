@@ -49,6 +49,11 @@ fn language_service_panel_samples_the_current_process_tree() -> Result<()> {
             });
             assert!(memory(visual).is_none());
             click_trigger(visual);
+            assert!(
+                visual
+                    .debug_bounds("language-service-server: python3 · 2.3.4")
+                    .is_some()
+            );
             wait(visual, "first LSP memory sample", |visual| {
                 memory(visual).is_some_and(|sample| sample.bytes > 0)
             })?;

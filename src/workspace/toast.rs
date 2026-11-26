@@ -25,7 +25,7 @@ pub(super) fn error(window: &mut Window, cx: &mut App, message: impl Into<Shared
     push(Notification::error(message).autohide(false), window, cx);
 }
 
-fn push(notification: Notification, window: &mut Window, cx: &mut App) {
+pub(super) fn push(notification: Notification, window: &mut Window, cx: &mut App) {
     window.push_notification(notification.placement(PLACEMENT), cx);
 }
 
@@ -97,5 +97,46 @@ mod tests {
                 assert_eq!(icon.top(), message.top(), "the icon follows the message");
             },
         );
+    }
+    #[::core::prelude::v1::test]
+    fn only_explicit_toast_closure_calls_user_dismiss() {
+        use gpui::Modifiers;
+        use std::{cell::Cell, rc::Rc, time::Duration};
+
+        struct TestToast;
+        let dismissals = Rc::new(Cell::new(0));
+        let notification = || {
+            let dismissals = dismissals.clone();
+            Notification::info("Install the language server")
+                .id::<TestToast>()
+                .on_user_dismiss(move |_, _| dismissals.set(dismissals.get() + 1))
+        };
+        with_toast(notification(), |visual| {
+            visual.update(|window, cx| {
+                window.activate_window();
+                window.remove_notification::<TestToast>(cx);
+            });
+            visual.executor().advance_clock(Duration::from_secs(6));
+            visual.run_until_parked();
+            assert_eq!(dismissals.get(), 0);
+            visual.update(|window, cx| push(notification(), window, cx));
+            visual.executor().advance_clock(Duration::from_secs(6));
+            visual.run_until_parked();
+            visual.executor().advance_clock(Duration::from_secs(1));
+            visual.run_until_parked();
+            assert_eq!(dismissals.get(), 0);
+            visual.update(|window, cx| push(notification().autohide(false), window, cx));
+            for _ in 0..8 {
+                visual.executor().advance_clock(Duration::from_millis(40));
+                visual.run_until_parked();
+                visual.update(|window, cx| window.draw(cx).clear(cx));
+            }
+            let position = visual.debug_bounds("notification-close").unwrap().center();
+            visual.simulate_mouse_move(position, None, Modifiers::default());
+            visual.update(|window, cx| window.draw(cx).clear(cx));
+            visual.simulate_click(position, Modifiers::default());
+            visual.run_until_parked();
+            assert_eq!(dismissals.get(), 1);
+        });
     }
 }

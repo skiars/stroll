@@ -1273,6 +1273,9 @@ impl SettingsPage {
                 &mut c.lsp.python.command
             }),
             (LanguageServer::Html, "HTML", |c| &mut c.lsp.html.command),
+            (LanguageServer::Json, "JSON", |c| &mut c.lsp.json.command),
+            (LanguageServer::Tombi, "TOML", |c| &mut c.lsp.tombi.command),
+            (LanguageServer::Yaml, "YAML", |c| &mut c.lsp.yaml.command),
         ] {
             let (command, source) = server
                 .local_command(startup_lsp.map_or("", |lsp| &lsp.server(server).command))
