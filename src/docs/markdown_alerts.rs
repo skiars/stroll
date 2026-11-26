@@ -1,0 +1,96 @@
+use gpui::{App, Div, FontWeight, ParentElement as _, Styled as _, Window, div, px, rgb};
+use gpui_component::{
+    ActiveTheme as _, Icon, h_flex,
+    text::{MarkdownExtensions, markdown_ast::Node},
+};
+use gpui_kit_assets::IconName;
+
+pub(super) const RAIL_WIDTH: gpui::Pixels = px(3.);
+
+struct Alert {
+    marker: &'static str,
+    title: &'static str,
+    icon: IconName,
+    light: u32,
+    dark: u32,
+}
+
+const ALERTS: [Alert; 5] = [
+    Alert {
+        marker: "note",
+        title: "Note",
+        icon: IconName::Info,
+        light: 0x365ac3,
+        dark: 0x8ea2ff,
+    },
+    Alert {
+        marker: "tip",
+        title: "Tip",
+        icon: IconName::Lightbulb,
+        light: 0x18794e,
+        dark: 0x65c994,
+    },
+    Alert {
+        marker: "important",
+        title: "Important",
+        icon: IconName::CircleAlert,
+        light: 0x7547bd,
+        dark: 0xbd9cf6,
+    },
+    Alert {
+        marker: "warning",
+        title: "Warning",
+        icon: IconName::TriangleAlert,
+        light: 0x8c5c11,
+        dark: 0xd3a95f,
+    },
+    Alert {
+        marker: "caution",
+        title: "Caution",
+        icon: IconName::OctagonAlert,
+        light: 0xb03c34,
+        dark: 0xe3837a,
+    },
+];
+
+pub(super) fn register(extensions: MarkdownExtensions) -> MarkdownExtensions {
+    ALERTS.iter().fold(extensions, |extensions, alert| {
+        extensions.block_surface(alert.marker, |window, cx| alert.render(window, cx))
+    })
+}
+
+pub(crate) fn strip_markers(root: &mut Node, source: &str) {
+    let Node::Root(root) = root else {
+        return;
+    };
+    let extensions = register(MarkdownExtensions::default());
+    for child in &mut root.children {
+        if let Node::Blockquote(quote) = child {
+            extensions.take_block_surface_marker(source, quote);
+        }
+    }
+}
+
+impl Alert {
+    fn render(&self, window: &mut Window, cx: &App) -> Div {
+        let color = rgb(if cx.theme().mode.is_dark() {
+            self.dark
+        } else {
+            self.light
+        })
+        .into();
+        let font_size = window.text_style().font_size.to_pixels(window.rem_size());
+        div()
+            .pl(px(2.) + font_size * 0.9)
+            .content_left_rule(RAIL_WIDTH, color)
+            .child(
+                h_flex()
+                    .gap(font_size * 0.5)
+                    .pb(px(4.))
+                    .text_color(color)
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child(Icon::new(self.icon).size(font_size))
+                    .child(self.title),
+            )
+    }
+}

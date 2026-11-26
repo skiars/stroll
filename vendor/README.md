@@ -419,6 +419,13 @@ dialogs in a Wayland window after changes to paint order or focus handling.
 
 ### Markdown headings and reader scrolling
 
+- Markdown readers can opt into a left rule fitted to the painted contents of
+  blockquotes. Stroll uses the same GPUI rule for GitHub alert surfaces, with
+  paragraph spacing outside the rule. The surface marker parser also supplies
+  the body offsets for document translation. Run
+  `cargo test --release --locked --lib markdown_alerts` for source mapping,
+  theme colors, and offscreen rule alignment.
+
 - The Markdown highlight query exposes separate captures for heading text and
   heading markers so code themes can style them independently.
 - Scrollable Markdown text views can align a rendered range below the top edge.

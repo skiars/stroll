@@ -4740,40 +4740,51 @@ impl BlockNode {
                     heading.pt(top).pb(bottom).into_any_element()
                 }
             }
-            BlockNode::Blockquote { children, .. } => gapped(
-                div()
+            BlockNode::Blockquote { children, .. } => {
+                let indent = body_font_size(node_cx, window) * 0.9;
+                let mut quote = div()
                     .w_full()
                     .text_color(node_cx.style.muted_foreground())
                     .border_l_2()
                     .border_color(node_cx.style.border())
-                    .pl(body_font_size(node_cx, window) * 0.9)
-                    .refine_style(node_cx.style.blockquote_style())
-                    // Nested tables measure while rendering, before this div applies its text style.
-                    .children({
-                        let children_len = children.len();
-                        children.into_iter().enumerate().map(move |(index, c)| {
-                            let is_last = index == children_len - 1;
-                            let (is_first, prev) = flow_position(children, index);
-                            window.with_text_style(
-                                Some(node_cx.style.blockquote_style().text.clone()),
-                                |window| {
-                                    c.render_block(
-                                        NodeRenderOptions {
-                                            is_first,
-                                            prev,
-                                            ..options.is_last(is_last)
-                                        },
-                                        node_cx,
-                                        window,
-                                        cx,
-                                    )
-                                },
-                            )
+                    .pl(indent)
+                    .refine_style(node_cx.style.blockquote_style());
+                if let Some(width) = node_cx.markdown_extensions.blockquote_left_rule_width() {
+                    let color = quote.style().border_color.unwrap_or(node_cx.style.border());
+                    quote = quote
+                        .border_l_0()
+                        .pl(indent + px(2.))
+                        .content_left_rule(width, color);
+                }
+                gapped(
+                    quote
+                        // Nested tables measure while rendering, before this div applies its text style.
+                        .children({
+                            let children_len = children.len();
+                            children.into_iter().enumerate().map(move |(index, c)| {
+                                let is_last = index == children_len - 1;
+                                let (is_first, prev) = flow_position(children, index);
+                                window.with_text_style(
+                                    Some(node_cx.style.blockquote_style().text.clone()),
+                                    |window| {
+                                        c.render_block(
+                                            NodeRenderOptions {
+                                                is_first,
+                                                prev,
+                                                ..options.is_last(is_last)
+                                            },
+                                            node_cx,
+                                            window,
+                                            cx,
+                                        )
+                                    },
+                                )
+                            })
                         })
-                    })
-                    .into_any_element(),
-                mb,
-            ),
+                        .into_any_element(),
+                    mb,
+                )
+            }
             BlockNode::Surface { name, children, .. } => {
                 if children.iter().all(Self::draws_nothing) {
                     // Nothing to hold, as when a stream has only sent the marker.

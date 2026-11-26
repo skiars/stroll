@@ -257,12 +257,36 @@ pub struct MarkdownExtensions {
     inline_parsers: Vec<Arc<MarkdownInlineParserFn>>,
     inline_renderers: HashMap<SharedString, Arc<MarkdownInlineRenderFn>>,
     block_surfaces: HashMap<SharedString, Arc<BlockSurfaceRenderFn>>,
+    blockquote_left_rule: Option<gpui::Pixels>,
     prose_suffix: Option<Arc<ProseSuffixFn>>,
     revision: u64,
     parser_revision: u64,
 }
 
 impl MarkdownExtensions {
+    /// Sets a paint-aligned blockquote border and keeps the default text inset.
+    #[doc(hidden)]
+    pub fn blockquote_left_rule(mut self, width: gpui::Pixels) -> Self {
+        self.blockquote_left_rule = Some(width);
+        self.bump_revision();
+        self
+    }
+
+    pub(crate) fn blockquote_left_rule_width(&self) -> Option<gpui::Pixels> {
+        self.blockquote_left_rule
+    }
+
+    /// Removes a registered surface marker from a top-level quote for callers
+    /// that extract prose from the same Markdown AST.
+    #[doc(hidden)]
+    pub fn take_block_surface_marker(
+        &self,
+        source: &str,
+        quote: &mut mdast::Blockquote,
+    ) -> Option<SharedString> {
+        super::format::markdown::take_surface_marker(source, quote, self)
+    }
+
     /// Change this revision when parser captures or plugin configuration change.
     /// Reusing it allows equivalent registrations rebuilt during rendering to
     /// retain the parsed document. Renderer-only changes do not need a new value.

@@ -3,14 +3,14 @@ use crate::ai::context::allowed_local_document;
 
 pub(crate) type DocumentTranslations = HashMap<String, SharedString>;
 
-pub(crate) fn document_prose_keys(root: &Node, source: &str) -> HashMap<usize, String> {
+pub(crate) fn document_prose_keys(root: Node, source: &str) -> HashMap<usize, String> {
     document_prose(root, source)
         .into_iter()
         .map(|paragraph| (paragraph.offset, paragraph.original()))
         .collect()
 }
 
-fn document_prose(root: &Node, source: &str) -> Vec<ProseParagraph> {
+fn document_prose(mut root: Node, source: &str) -> Vec<ProseParagraph> {
     fn collect(
         node: &Node,
         source: &str,
@@ -38,10 +38,11 @@ fn document_prose(root: &Node, source: &str) -> Vec<ProseParagraph> {
         }
     }
 
+    crate::docs::strip_alert_markers(&mut root, source);
     let mut definitions = HashMap::new();
-    collect_definitions(root, &mut definitions);
+    collect_definitions(&root, &mut definitions);
     let mut paragraphs = Vec::new();
-    collect(root, source, &definitions, &mut paragraphs);
+    collect(&root, source, &definitions, &mut paragraphs);
     paragraphs
 }
 
@@ -69,7 +70,7 @@ impl Snapshot {
             }
             let source = source();
             let root = crate::docs::parse_markdown(&source).map_err(|_| ())?;
-            let mut paragraphs = document_prose(&root, &source);
+            let mut paragraphs = document_prose(root, &source);
             let keys: Vec<_> = paragraphs.iter().map(ProseParagraph::original).collect();
 
             // Long runs are split only for the request. Their complete source
@@ -184,7 +185,7 @@ mod tests {
     fn document_translation_extracts_prose_without_repeating_images_or_math() {
         let source = "# Document heading\n\n> Quoted sentence.\n\n- List item.\n\n| Header text |\n| --- |\n| Cell text |\n\nA [reference][ref] with `code()`, $a^2$, and ![image](./p.png).\n\n[ref]: ./guide.md\n\n[^note]: Footnote text.\n\n```rust\nfn sample() {}\n```\n";
         let ast = crate::docs::parse_markdown(source).unwrap();
-        let paragraphs = document_prose(&ast, source);
+        let paragraphs = document_prose(ast, source);
         let fragments: Vec<_> = paragraphs
             .iter()
             .flat_map(ProseParagraph::candidates)

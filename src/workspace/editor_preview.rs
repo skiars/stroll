@@ -1050,9 +1050,17 @@ mod tests {
         cx: &'a mut TestAppContext,
         fixture: &Path,
     ) -> Result<(Entity<Workspace>, &'a mut VisualTestContext)> {
+        open_markdown_preview_fixture(cx, fixture, MARKDOWN_SCROLL_FIXTURE)
+    }
+
+    fn open_markdown_preview_fixture<'a>(
+        cx: &'a mut TestAppContext,
+        fixture: &Path,
+        source: &str,
+    ) -> Result<(Entity<Workspace>, &'a mut VisualTestContext)> {
         let image = include_bytes!("../../tests/fixtures/markdown-scroll/tall-image.svg");
         let path = fixture.join("complex-layout.md");
-        fs::write(&path, MARKDOWN_SCROLL_FIXTURE)?;
+        fs::write(&path, source)?;
         fs::write(fixture.join("tall-image.svg"), image)?;
         let config_path = fixture.join("config.toml");
         fs::write(&config_path, "[editor]\nsoft_wrap = false\n")?;
@@ -1107,8 +1115,28 @@ mod tests {
                 Some("Reader && !Locator"),
             )]);
         });
-        let (workspace, visual) = open_markdown_scroll_fixture(&mut cx, fixture.path())?;
+        let markdown = format!("> [!NOTE]\n> An alert in split view.\n\n{MARKDOWN_SCROLL_FIXTURE}");
+        let (workspace, visual) =
+            open_markdown_preview_fixture(&mut cx, fixture.path(), &markdown)?;
         visual.update(|window, _| window.activate_window());
+
+        let preview = visual.debug_bounds("editor-preview-pane").unwrap();
+        visual.update(|window, cx| {
+            let note = rgb(if cx.theme().mode.is_dark() {
+                0x8ea2ff
+            } else {
+                0x365ac3
+            })
+            .into();
+            let scale = window.scale_factor();
+            assert!(window.painted_quads().iter().any(|quad| {
+                let width = quad.bounds.size.width.as_f32() / scale;
+                let center = quad.bounds.center().map(|value| px(value.as_f32() / scale));
+                quad.background.as_solid() == Some(note)
+                    && (width - 3.).abs() <= 0.5
+                    && preview.contains(&center)
+            }));
+        });
 
         let source = visual.debug_bounds("workspace-editor").unwrap();
         visual.simulate_click(source.center(), Modifiers::none());
@@ -1133,14 +1161,13 @@ mod tests {
                 .open
         });
 
-        let preview = visual.debug_bounds("editor-preview-pane").unwrap();
         visual.simulate_click(preview.center(), Modifiers::none());
         visual.simulate_keystrokes(find);
         settle(visual, &workspace, |_, _| true);
         assert!(preview.contains(&visual.debug_bounds("find-bar").unwrap().center()));
 
         visual.simulate_input("Final section");
-        let final_section = MARKDOWN_SCROLL_FIXTURE.find("## Final section").unwrap();
+        let final_section = markdown.find("## Final section").unwrap();
         settle(visual, &workspace, |this, cx| {
             let reader = this.active_markdown_preview().unwrap().read(cx);
             reader

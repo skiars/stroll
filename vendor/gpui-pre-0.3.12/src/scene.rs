@@ -40,6 +40,7 @@ impl From<bool> for PaddedBool32 {
 #[expect(missing_docs)]
 pub struct Scene {
     pub(crate) paint_operations: Vec<PaintOperation>,
+    pub(crate) text_highlights: Vec<usize>,
     primitive_bounds: BoundsTree<ScaledPixels>,
     layer_stack: Vec<(Bounds<ScaledPixels>, DrawOrder)>,
     pub shadows: Vec<Shadow>,
@@ -60,6 +61,7 @@ pub struct Scene {
 impl Scene {
     pub fn clear(&mut self) {
         self.paint_operations.clear();
+        self.text_highlights.clear();
         self.primitive_bounds.clear();
         self.layer_stack.clear();
         self.paths.clear();
@@ -170,9 +172,23 @@ impl Scene {
     }
 
     pub fn replay(&mut self, range: Range<usize>, prev_scene: &Scene) {
-        for operation in &prev_scene.paint_operations[range] {
+        let range_start = range.start;
+        let first_highlight = prev_scene
+            .text_highlights
+            .partition_point(|&index| index < range_start);
+        let mut highlights = prev_scene.text_highlights[first_highlight..]
+            .iter()
+            .copied()
+            .peekable();
+        for (offset, operation) in prev_scene.paint_operations[range].iter().enumerate() {
             match operation {
-                PaintOperation::Primitive(primitive) => self.insert_primitive(primitive.clone()),
+                PaintOperation::Primitive(primitive) => {
+                    let start = self.len();
+                    self.insert_primitive(primitive.clone());
+                    if highlights.next_if_eq(&(offset + range_start)).is_some() {
+                        self.mark_text_highlights(start);
+                    }
+                }
                 PaintOperation::BackdropBlur(blur) => self.insert_backdrop_blur(*blur),
                 PaintOperation::StartLayer(bounds) => self.push_layer(*bounds),
                 PaintOperation::EndLayer => self.pop_layer(),
@@ -182,6 +198,11 @@ impl Scene {
                 PaintOperation::EndPartial => self.end_partial_region(),
             }
         }
+    }
+
+    pub(crate) fn mark_text_highlights(&mut self, start: usize) {
+        self.text_highlights
+            .extend(start..self.paint_operations.len());
     }
 
     #[doc(hidden)]

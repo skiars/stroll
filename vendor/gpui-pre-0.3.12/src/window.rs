@@ -4964,6 +4964,51 @@ impl Window {
         self.next_frame.scene.end_partial_region();
     }
 
+    pub(crate) fn paint_and_measure_vertical_bounds(
+        &mut self,
+        paint: impl FnOnce(&mut Self),
+    ) -> Option<std::ops::Range<Pixels>> {
+        use crate::scene::PaintOperation;
+
+        let start = self.next_frame.scene.len();
+        paint(self);
+        let scale = self.scale_factor();
+        let scene = &self.next_frame.scene;
+        let first_highlight = scene
+            .text_highlights
+            .partition_point(|&index| index < start);
+        let mut highlights = scene.text_highlights[first_highlight..]
+            .iter()
+            .copied()
+            .peekable();
+        scene.paint_operations[start..]
+            .iter()
+            .enumerate()
+            .filter_map(|(offset, operation)| {
+                if highlights.next_if_eq(&(start + offset)).is_some() {
+                    return None;
+                }
+                let PaintOperation::Primitive(primitive) = operation else {
+                    return None;
+                };
+                let visible = primitive
+                    .bounds()
+                    .intersect(&primitive.content_mask().bounds);
+                (!visible.is_empty()).then(|| {
+                    px(visible.top().as_f32() / scale)..px(visible.bottom().as_f32() / scale)
+                })
+            })
+            .reduce(|a, b| a.start.min(b.start)..a.end.max(b.end))
+    }
+
+    /// Paints a transient text highlight without changing measured content bounds.
+    #[doc(hidden)]
+    pub fn paint_text_highlight(&mut self, quad: PaintQuad) {
+        let start = self.next_frame.scene.len();
+        self.paint_quad(quad);
+        self.next_frame.scene.mark_text_highlights(start);
+    }
+
     /// Creates a new painting layer for the specified bounds. A "layer" is a batch
     /// of geometry that are non-overlapping and have the same draw order. This is typically used
     /// for performance reasons.

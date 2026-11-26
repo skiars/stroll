@@ -19,8 +19,8 @@ use crate::{
     Action, AnyDrag, AnyElement, AnyTooltip, AnyView, App, BackGestureEvent, Bounds, ClickEvent,
     DispatchPhase, Display, Element, ElementId, Entity, EntityId, ExternalDragPayload,
     ExternalDragPayloadSource, FileDropEvent, FocusHandle, Global, GlobalElementId, Hitbox,
-    HitboxBehavior, HitboxId, InspectorElementId, IntoElement, IsZero, KeyContext, KeyDownEvent,
-    KeyUpEvent, KeyboardButton, KeyboardClickEvent, LayoutId, LongPressEvent,
+    HitboxBehavior, HitboxId, Hsla, InspectorElementId, IntoElement, IsZero, KeyContext,
+    KeyDownEvent, KeyUpEvent, KeyboardButton, KeyboardClickEvent, LayoutId, LongPressEvent,
     ModifiersChangedEvent, MouseButton, MouseClickEvent, MouseDownEvent, MouseExitEvent,
     MouseMoveEvent, MousePressureEvent, MouseUpEvent, OngoingScroll, Overflow, ParentElement,
     PinchEvent, Pixels, Point, Render, ScrollEvent, SharedString, Size, SmoothScroll,
@@ -1849,6 +1849,7 @@ pub fn div() -> Div {
         prepaint_order_fn: None,
         viewport_overlays: Vec::new(),
         partial_repaint: None,
+        content_left_rule: None,
     }
 }
 
@@ -1858,12 +1859,21 @@ pub struct Div {
     children: SmallVec<[StackSafe<AnyElement>; 2]>,
     viewport_overlays: Vec<Box<AnyElement>>,
     partial_repaint: Option<Box<dyn Fn(&App) -> Option<Pixels>>>,
+    content_left_rule: Option<(Pixels, Hsla)>,
     prepaint_listener: Option<Box<dyn Fn(Vec<Bounds<Pixels>>, &mut Window, &mut App) + 'static>>,
     image_cache: Option<Box<dyn ImageCacheProvider>>,
     prepaint_order_fn: Option<Box<dyn Fn(&mut Window, &mut App) -> SmallVec<[usize; 8]>>>,
 }
 
 impl Div {
+    /// Draws a left rule spanning the children's painted content. The caller
+    /// reserves the horizontal space through normal layout.
+    #[doc(hidden)]
+    pub fn content_left_rule(mut self, width: Pixels, color: Hsla) -> Self {
+        self.content_left_rule = Some((width, color));
+        self
+    }
+
     /// Clip children to this viewport and allow the renderer to update it independently.
     pub fn partial_repaint(mut self) -> Self {
         self.partial_repaint = Some(Box::new(|_| None));
@@ -2192,12 +2202,41 @@ impl Element for Div {
                     }
 
                     let scroll = self.partial_repaint.as_ref().map(|offset| offset(cx));
-                    let mut paint = |window: &mut Window| {
+                    let mut paint_children = |window: &mut Window| {
                         for child in &mut self.children {
                             child.paint(window, cx);
                         }
                         for overlay in &mut self.viewport_overlays {
                             overlay.paint(window, cx);
+                        }
+                    };
+                    let paint = |window: &mut Window| {
+                        if let Some((width, color)) = self.content_left_rule {
+                            let ink = window.paint_and_measure_vertical_bounds(paint_children);
+                            let clip = window.content_mask().bounds;
+                            // Continue through a clipped edge even when the
+                            // viewport cuts through the space between lines.
+                            let top = if bounds.top() < clip.top() {
+                                clip.top()
+                            } else {
+                                ink.as_ref().map_or(bounds.bottom(), |ink| ink.start)
+                            };
+                            let bottom = if bounds.bottom() > clip.bottom() {
+                                clip.bottom()
+                            } else {
+                                ink.map_or(bounds.top(), |ink| ink.end)
+                            };
+                            if bottom > top {
+                                window.paint_quad(crate::fill(
+                                    Bounds::new(
+                                        point(bounds.left(), top),
+                                        size(width, bottom - top),
+                                    ),
+                                    color,
+                                ));
+                            }
+                        } else {
+                            paint_children(window);
                         }
                     };
                     if let Some(scroll) = scroll {

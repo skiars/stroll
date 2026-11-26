@@ -47,7 +47,10 @@ use crate::{
 };
 
 mod context_menu;
+mod markdown_alerts;
 mod online_images;
+
+pub(crate) use markdown_alerts::strip_markers as strip_alert_markers;
 
 pub fn is_markdown(path: &Path) -> bool {
     crate::repository::is_markdown(path)
@@ -254,14 +257,17 @@ impl PreparedDocument {
         });
         let graphics = Arc::new(graphics);
         let html_anchors = html_anchors(&ast, &source);
-        let prose_keys = Arc::new(document_prose_keys(&ast, &source));
+        let prose_keys = Arc::new(document_prose_keys(ast, &source));
+        let extensions = markdown_alerts::register(doc_graphics::extensions(graphics.clone()))
+            .blockquote_left_rule(markdown_alerts::RAIL_WIDTH)
+            .plugin(TaskTable(task_cells));
         Ok(Self {
             source: source.into(),
             headings,
             prose_keys,
             editor_scroll_spans,
             html_anchors,
-            extensions: doc_graphics::extensions(graphics.clone()).plugin(TaskTable(task_cells)),
+            extensions,
             graphics,
             remote: None,
         })
@@ -1752,6 +1758,11 @@ impl Render for DocReader {
         let colors = Palette::for_mode(theme.mode);
         let dark = theme.mode == gpui_component::ThemeMode::Dark;
         let body_foreground = Hsla::from(rgb(if dark { 0xc5c8d0 } else { 0x24262b }));
+        let quote_border = if dark {
+            rgb(0x404550).into()
+        } else {
+            colors.surface
+        };
         let translation_foreground = body_foreground.mix_oklab(colors.muted, 0.8);
         let reader = cx.weak_entity();
         let code_font = crate::workspace::ui_code_font(cx);
@@ -1876,6 +1887,7 @@ impl Render for DocReader {
             .wheel_line_height(px(30.))
             .style(style)
             .inline_code_style(inline_code)
+            .blockquote_style(StyleRefinement::default().border_color(quote_border))
             .text_size(px(self.typography.body_font_size as f32))
             .line_height(relative(1.72))
             .text_color(body_foreground)
@@ -2095,6 +2107,188 @@ impl DocReader {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[gpui::test]
+    fn markdown_alerts_keep_body_offsets_and_fall_back_to_quotes(cx: &mut TestAppContext) {
+        let source = concat!(
+            "> [!nOtE]\n> **First paragraph**\n>\n> - Another item\n",
+            "\n> [!OTHER]\n> Unknown type\n",
+            "\n> > [!TIP]\n> > Nested quote\n",
+            "\n> [!WARNING] Custom title\n> Ordinary quote\n",
+            "\n> \\[!CAUTION]\n> Escaped marker\n",
+        );
+        let paragraph = source.find("First paragraph").unwrap();
+        let paragraph_range = paragraph..paragraph + "First paragraph".len();
+        let marker = source.find("[!nOtE]").unwrap();
+
+        for document in [
+            PreparedDocument::new(source.into()).unwrap(),
+            PreparedDocument::from_editor(source.into(), None).unwrap(),
+        ] {
+            assert_eq!(document.prose_keys[&(paragraph - 2)], "**First paragraph**");
+            let state = cx.update(|cx| {
+                cx.new(|cx| {
+                    TextViewState::markdown_with_extensions(
+                        &document.source,
+                        document.extensions,
+                        cx,
+                    )
+                })
+            });
+            state.read_with(cx, |state, _| {
+                let rendered = state.rendered_text();
+                assert_eq!(rendered.source(), source);
+                assert!(
+                    rendered
+                        .range_for_source(marker..marker + "[!nOtE]".len())
+                        .is_none()
+                );
+                let range = rendered.range_for_source(paragraph_range.clone()).unwrap();
+                assert_eq!(&rendered.as_str()[range], "First paragraph");
+                for text in [
+                    "Another item",
+                    "[!OTHER]",
+                    "[!TIP]",
+                    "[!WARNING] Custom title",
+                    "[!CAUTION]",
+                ] {
+                    assert!(rendered.as_str().contains(text), "{text}: {rendered:?}");
+                }
+            });
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn markdown_alerts_and_quotes_fit_their_painted_content() -> Result<()> {
+        use gpui_component::ThemeMode;
+        use gpui_wgpu::WgpuHeadlessRenderer;
+
+        const SOURCE: &str = concat!(
+            "Opening paragraph.\n",
+            "\n> A quote with enough words to wrap in a narrow preview.\n>\n> A second paragraph.\n",
+            "\n> [!NOTE]\n> Read the full chapter before moving on to the next steps.\n>\n> Keep reading.\n",
+            "\n> [!TIP]\n> Preview the changes.\n",
+            "\n> [!IMPORTANT]\n> Add the images.\n",
+            "\n> [!WARNING]\n> Check the links.\n",
+            "\n> [!CAUTION]\n> Review the screenshots.\n",
+            "\nEnd of document.\n",
+        );
+
+        let mut app = HeadlessAppContext::with_platform(
+            gpui_platform::current_platform(true).text_system(),
+            Arc::new(gpui_kit_assets::AllAssets),
+            || Ok(Some(Box::new(WgpuHeadlessRenderer::new()?))),
+        );
+        for (mode, width, scale, colors) in [
+            (
+                ThemeMode::Light,
+                580.,
+                1.,
+                [0xd7dce8, 0x365ac3, 0x18794e, 0x7547bd, 0x8c5c11, 0xb03c34],
+            ),
+            (
+                ThemeMode::Dark,
+                330.,
+                2.,
+                [0x404550, 0x8ea2ff, 0x65c994, 0xbd9cf6, 0xd3a95f, 0xe3837a],
+            ),
+        ] {
+            app.update(|cx| {
+                gpui_component::init(cx);
+                crate::workspace::apply_theme(mode, cx);
+            });
+            let window = app.open_window(size(px(width), px(790.)), |window, cx| {
+                cx.new(|cx| {
+                    DocReader::new(
+                        PathBuf::new(),
+                        "alerts.md".into(),
+                        PreparedDocument::new(SOURCE.into()).unwrap(),
+                        None,
+                        WeakEntity::new_invalid(),
+                        window,
+                        cx,
+                    )
+                })
+            })?;
+            app.simulate_scale_factor_change(window.into(), scale)?;
+            app.run_until_parked();
+            let read_rails = |window: &mut Window, cx: &mut App| {
+                window.draw(cx).clear(cx);
+                let painted = window.painted_quads();
+                let width = 3. * window.scale_factor();
+                colors.map(|color| {
+                    let mut matching = painted.iter().filter(|quad| {
+                        quad.bounds.size.width.as_f32() == width
+                            && quad.background.as_solid() == Some(rgb(color).into())
+                    });
+                    let rail = matching
+                        .next()
+                        .unwrap_or_else(|| {
+                            let narrow: Vec<_> = painted
+                                .iter()
+                                .filter(|quad| quad.bounds.size.width.as_f32() <= width)
+                                .map(|quad| (quad.bounds, quad.background.as_solid()))
+                                .collect();
+                            panic!("{mode:?}: missing three-pixel rail for {color:#x}: {narrow:?}");
+                        })
+                        .bounds;
+                    assert!(matching.next().is_none(), "duplicate rail for {color:#x}");
+                    rail
+                })
+            };
+            let rails = app.update_window(window.into(), |_, window, cx| read_rails(window, cx))?;
+            let screenshot = app.capture_screenshot(window.into())?;
+            assert!(
+                rails
+                    .windows(2)
+                    .all(|pair| pair[0].bottom() < pair[1].top())
+            );
+
+            for (index, rail) in rails.into_iter().enumerate() {
+                let x = rail.left().as_f32() as u32;
+                let top = rail.top().as_f32() as u32;
+                let bottom = rail.bottom().as_f32() as u32;
+                let background = *screenshot.get_pixel(x - 1, top);
+                let probe = (4. * scale) as u32;
+                let left = x + (10. * scale) as u32;
+                let right = screenshot.width() - (40. * scale) as u32;
+                let ink: Vec<_> = (top - probe..bottom + probe)
+                    .filter(|&y| (left..right).any(|x| screenshot.get_pixel(x, y) != &background))
+                    .collect();
+                let first = *ink.first().expect("painted quote or alert");
+                let last = *ink.last().unwrap() + 1;
+                assert!(
+                    first.abs_diff(top) <= probe / 2 && last.abs_diff(bottom) <= probe / 2,
+                    "{mode:?} block {index}: rail {top}..{bottom}, content {first}..{last}",
+                );
+            }
+
+            app.update_window(window.into(), |reader, window, cx| {
+                let reader = reader.downcast::<DocReader>().unwrap();
+                let text = reader.read(cx).text.clone();
+                let sentence = "Review the screenshots.";
+                let source = SOURCE.find(sentence).unwrap();
+                text.update(cx, |state, cx| {
+                    let range = state
+                        .rendered_text()
+                        .range_for_source(source..source + sentence.len())
+                        .unwrap();
+                    state
+                        .set_range_highlights([RangeHighlight::new(range, gpui::red())], cx)
+                        .unwrap();
+                });
+                assert_eq!(read_rails(window, cx), rails);
+                assert!(
+                    window
+                        .painted_quads()
+                        .iter()
+                        .any(|quad| quad.background.as_solid() == Some(gpui::red()))
+                );
+            })?;
+        }
+        Ok(())
+    }
 
     #[cfg(target_os = "linux")]
     #[test]

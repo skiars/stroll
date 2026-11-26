@@ -1127,7 +1127,7 @@ impl Inline {
         let line_height = text_layout.line_height();
         for (range, color) in &self.range_backgrounds {
             for (row, left, right) in range_boxes(&glyphs, range.clone()) {
-                window.paint_quad(gpui::fill(
+                window.paint_text_highlight(gpui::fill(
                     Bounds::from_corners(
                         point(origin.x + left, origin.y + line_height * row as f32),
                         point(origin.x + right, origin.y + line_height * (row + 1) as f32),
@@ -1327,7 +1327,7 @@ impl Element for Inline {
                 selection.start.min(selection.end)..selection.start.max(selection.end),
                 window.content_mask().bounds,
                 &mut state.selection_rows,
-                |rect| window.paint_quad(gpui::fill(rect, color)),
+                |rect| window.paint_text_highlight(gpui::fill(rect, color)),
             );
             if let Some((start, end)) = Self::selection_edges(&selection, &text_layout)
                 && let Some(text_view_state) = GlobalState::global(cx).text_view_state()

@@ -1030,7 +1030,10 @@ fn blockquote_to_node(
     mut quote: mdast::Blockquote,
     cx: &mut NodeContext,
 ) -> BlockNode {
-    let Some(name) = take_surface_marker(source, &mut quote, cx) else {
+    let Some(name) = cx
+        .markdown_extensions
+        .take_block_surface_marker(source, &mut quote)
+    else {
         return ast_to_node(source, Node::Blockquote(quote), cx);
     };
     let children = quote
@@ -1051,10 +1054,10 @@ fn blockquote_to_node(
 /// As in a GitHub alert, the marker `[!name]` is alone on the first line of
 /// the first paragraph, and the lines after it are that paragraph's text. The
 /// name matches ASCII-case-insensitively.
-fn take_surface_marker(
+pub(in crate::text) fn take_surface_marker(
     source: &str,
     quote: &mut mdast::Blockquote,
-    cx: &NodeContext,
+    extensions: &super::super::MarkdownExtensions,
 ) -> Option<SharedString> {
     let Some(Node::Paragraph(paragraph)) = quote.children.first_mut() else {
         return None;
@@ -1074,7 +1077,7 @@ fn take_surface_marker(
         return None;
     }
     let name = line.strip_prefix("[!")?.strip_suffix(']')?;
-    let name = cx.markdown_extensions.block_surface_name(name)?;
+    let name = extensions.block_surface_name(name)?;
     match rest {
         // The next line goes on in this text, which starts after the line's
         // blockquote marker in the source.
