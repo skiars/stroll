@@ -2,7 +2,6 @@ use std::{
     cell::RefCell,
     collections::{HashMap, HashSet},
     io::Cursor,
-    net::IpAddr,
     path::PathBuf,
     rc::Rc,
     sync::{
@@ -24,18 +23,14 @@ use image::{
     DynamicImage, Frame, ImageDecoder, ImageFormat, ImageReader, Limits, imageops::FilterType,
 };
 use ureq::{
-    Agent, Body, Error,
-    config::Config,
-    http::{Response, StatusCode, Uri, header},
-    unversioned::{
-        resolver::{DefaultResolver, ResolvedSocketAddrs, Resolver},
-        transport::{DefaultConnector, NextTimeout},
-    },
+    Body,
+    http::{Response, StatusCode, header},
 };
 use url::Url;
 
 use crate::{
     image_viewer,
+    network::{self, Client},
     repository::{
         canonical_local_file,
         resources::{RemoteResources, read_local_resource},
@@ -251,19 +246,17 @@ fn ssh_budget_error() -> ImageCacheError {
 struct OnlineImages {
     pending: Rc<RefCell<PendingImages>>,
     cache: Option<ResourceCache>,
-    agent: Agent,
+    client: Arc<Client>,
 }
 
 impl Global for OnlineImages {}
 
 impl Default for OnlineImages {
     fn default() -> Self {
-        // A proxy resolving the host itself would bypass the address filter.
-        let config = Agent::config_builder().proxy(None).max_redirects(0).build();
         Self {
             pending: Rc::default(),
             cache: ResourceCache::for_desktop(),
-            agent: Agent::with_parts(config, DefaultConnector::new(), PublicResolver::default()),
+            client: Arc::new(Client::public()),
         }
     }
 }
@@ -400,7 +393,7 @@ fn use_image(
     drop(state);
 
     let cache = online.cache.clone();
-    let agent = online.agent.clone();
+    let client = online.client.clone();
     let svg = cx.svg_renderer();
     let remote = remote.cloned();
     let ssh_check =
@@ -431,7 +424,7 @@ fn use_image(
                 let mut ssh_bytes = None;
                 let image = match load {
                     ImageRequest::Online { url, original } => {
-                        load_image(&url, cache.as_ref(), &agent, &svg, original)?
+                        load_image(&url, cache.as_ref(), &client, &svg, original)?
                     }
                     ImageRequest::Local(path) => {
                         let path = canonical_local_file(&path)?;
@@ -544,11 +537,11 @@ fn has_capacity<'a>(
 fn load_image(
     url: &Url,
     cache: Option<&ResourceCache>,
-    agent: &Agent,
+    client: &Client,
     svg: &SvgRenderer,
     original: bool,
 ) -> Result<ImageContent> {
-    let downloaded = download(url.clone(), agent, MAX_DOWNLOAD_BYTES, cache)?;
+    let downloaded = download(url.clone(), client, MAX_DOWNLOAD_BYTES, cache)?;
     let image = decode(&downloaded.bytes, svg, original)?;
     if let (Some(cache), Some((key, version))) = (cache, downloaded.index) {
         let _ = cache.store(key, &version, &downloaded.bytes);
@@ -574,7 +567,7 @@ fn image_key(url: &Url) -> SourceKey {
 
 fn download(
     mut url: Url,
-    agent: &Agent,
+    client: &Client,
     max_bytes: u64,
     mut cache: Option<&ResourceCache>,
 ) -> Result<DownloadedImage> {
@@ -602,8 +595,7 @@ fn download(
             let remaining = REQUEST_TIMEOUT
                 .checked_sub(started.elapsed())
                 .context("online image request timed out")?;
-            let mut request = agent
-                .get(url.as_str())
+            let mut request = ureq::http::Request::get(url.as_str())
                 .header(header::ACCEPT, IMAGE_ACCEPT)
                 .header(header::ACCEPT_ENCODING, http::ACCEPT_ENCODING);
             if let Some(entry) = &cached {
@@ -615,11 +607,7 @@ fn download(
                 }
             }
             let request_started = Instant::now();
-            let response = request
-                .config()
-                .timeout_global(Some(remaining))
-                .build()
-                .call()?;
+            let response = client.send(request.body(())?, remaining)?;
             if response.status() != StatusCode::NOT_MODIFIED {
                 break (response, request_started.elapsed());
             }
@@ -649,7 +637,7 @@ fn download(
         };
         let (response, request_time) = response;
 
-        if matches!(response.status().as_u16(), 301 | 302 | 303 | 307 | 308) {
+        if let Some(location) = network::redirect(&response) {
             ensure!(hop < MAX_REDIRECTS, "too many online image redirects");
             if let Some(previous_cache) = cache {
                 previous_cache.forget(key);
@@ -657,12 +645,7 @@ fn download(
                     cache = None;
                 }
             }
-            let location = response
-                .headers()
-                .get(header::LOCATION)
-                .context("missing redirect location")?
-                .to_str()?;
-            let next = url.join(location)?;
+            let next = url.join(location.to_str()?)?;
             ensure!(
                 url.scheme() != "https" || next.scheme() == "https",
                 "insecure image redirect"
@@ -707,57 +690,6 @@ fn read_body(mut response: Response<Body>, max_bytes: u64) -> Result<Vec<u8>> {
         .with_config()
         .limit(max_bytes)
         .read_to_vec()?)
-}
-
-#[derive(Debug, Default)]
-struct PublicResolver(DefaultResolver);
-
-impl Resolver for PublicResolver {
-    fn resolve(
-        &self,
-        uri: &Uri,
-        config: &Config,
-        timeout: NextTimeout,
-    ) -> Result<ResolvedSocketAddrs, Error> {
-        let mut addresses = self.empty();
-        for address in &self.0.resolve(uri, config, timeout)? {
-            if is_public(address.ip()) {
-                addresses.push(*address);
-            }
-        }
-        if addresses.is_empty() {
-            return Err(Error::HostNotFound);
-        }
-        Ok(addresses)
-    }
-}
-
-fn is_public(ip: IpAddr) -> bool {
-    match ip.to_canonical() {
-        IpAddr::V4(ip) => {
-            let [a, b, c, _] = ip.octets();
-            !ip.is_private()
-                && !ip.is_loopback()
-                && !ip.is_link_local()
-                && !ip.is_documentation()
-                && !matches!(
-                    (a, b, c),
-                    (0 | 224..=255, _, _)
-                        | (100, 64..=127, _)
-                        | (192, 0 | 88, _)
-                        | (198, 18 | 19, _)
-                )
-        }
-        IpAddr::V6(ip) => {
-            let [a, b, ..] = ip.segments();
-            // Global unicast, excluding protocol assignments, tunnels and documentation.
-            matches!(a, 0x2000..=0x3fff)
-                && !matches!(
-                    (a, b),
-                    (0x2001, 0..=0x01ff | 0x0db8) | (0x2002, _) | (0x3fff, _)
-                )
-        }
-    }
 }
 
 fn decode_known_format(image: &Image, svg: &SvgRenderer) -> Result<ImageContent> {
@@ -826,13 +758,14 @@ fn decode(bytes: &[u8], svg: &SvgRenderer, original: bool) -> Result<ImageConten
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::network::is_public;
     use gpui::{Context, Render, TestApp, img};
     use image::{Rgba, RgbaImage};
     use std::{
         fs,
         sync::atomic::{AtomicUsize, Ordering},
     };
-    use ureq::{SendBody, http::Request, middleware::MiddlewareNext};
+    use ureq::{Agent, SendBody, http::Request, middleware::MiddlewareNext};
 
     #[test]
     fn decodes_online_formats_from_bytes() -> Result<()> {
@@ -907,39 +840,41 @@ mod tests {
     fn download_resolves_redirects_and_bounds_response() -> Result<()> {
         let requests = Arc::new(AtomicUsize::new(0));
         let request_count = requests.clone();
-        let agent: Agent = Agent::config_builder()
-            .middleware(move |req: Request<SendBody>, _: MiddlewareNext| {
-                request_count.fetch_add(1, Ordering::Relaxed);
-                assert_eq!(req.headers()[header::ACCEPT], "image/*");
-                let response = match req.uri().path() {
-                    "/redirect" => Response::builder()
-                        .status(302)
-                        .header(header::LOCATION, "https://example.com/image?variant=1")
-                        .body(Body::builder().data(Vec::new())),
-                    "/downgrade" => Response::builder()
-                        .status(302)
-                        .header(header::LOCATION, "http://example.com/image")
-                        .body(Body::builder().data(Vec::new())),
-                    "/image" => {
-                        assert_eq!(req.uri().query(), Some("variant=1"));
-                        Response::builder().body(Body::builder().data(vec![1, 2, 3, 4]))
-                    }
-                    _ => panic!("unexpected request"),
-                };
-                Ok(response.unwrap())
-            })
-            .build()
-            .into();
+        let client = Client::mock(
+            Agent::config_builder()
+                .middleware(move |req: Request<SendBody>, _: MiddlewareNext| {
+                    request_count.fetch_add(1, Ordering::Relaxed);
+                    assert_eq!(req.headers()[header::ACCEPT], "image/*");
+                    let response = match req.uri().path() {
+                        "/redirect" => Response::builder()
+                            .status(302)
+                            .header(header::LOCATION, "https://example.com/image?variant=1")
+                            .body(Body::builder().data(Vec::new())),
+                        "/downgrade" => Response::builder()
+                            .status(302)
+                            .header(header::LOCATION, "http://example.com/image")
+                            .body(Body::builder().data(Vec::new())),
+                        "/image" => {
+                            assert_eq!(req.uri().query(), Some("variant=1"));
+                            Response::builder().body(Body::builder().data(vec![1, 2, 3, 4]))
+                        }
+                        _ => panic!("unexpected request"),
+                    };
+                    Ok(response.unwrap())
+                })
+                .build()
+                .new_agent(),
+        );
         let redirect = Url::parse("http://example.com/redirect")?;
         assert_eq!(
-            download(redirect.clone(), &agent, 4, None)?.bytes,
+            download(redirect.clone(), &client, 4, None)?.bytes,
             vec![1, 2, 3, 4]
         );
-        assert!(download(redirect, &agent, 3, None).is_err());
+        assert!(download(redirect, &client, 3, None).is_err());
         assert!(
             download(
                 Url::parse("https://example.com/downgrade")?,
-                &agent,
+                &client,
                 4,
                 None
             )
@@ -948,7 +883,7 @@ mod tests {
         assert!(
             download(
                 Url::parse("https://user:pass@example.com/image")?,
-                &agent,
+                &client,
                 4,
                 None,
             )
@@ -985,64 +920,66 @@ mod tests {
         let cache = ResourceCache::new(directory.path().to_owned());
         let calls = Arc::new(AtomicUsize::new(0));
         let request_count = calls.clone();
-        let agent: Agent = Agent::config_builder()
-            .middleware(move |req: Request<SendBody>, _: MiddlewareNext| {
-                request_count.fetch_add(1, Ordering::Relaxed);
-                let mut response =
-                    Response::builder().header(header::VARY, "Accept, Accept-Encoding");
-                let bytes = match req.uri().path() {
-                    "/private" => {
-                        response = response.header(header::CACHE_CONTROL, "private, no-store");
-                        test_svg()
-                    }
-                    "/vary" => {
-                        response = response
-                            .header(header::VARY, "*")
-                            .header(header::CACHE_CONTROL, "max-age=600");
-                        test_svg()
-                    }
-                    "/image" if req.headers().contains_key(header::IF_NONE_MATCH) => {
-                        assert_eq!(req.headers()[header::IF_NONE_MATCH], "\"svg\"");
-                        response = response
-                            .status(304)
-                            .header(header::CACHE_CONTROL, "max-age=600");
-                        Vec::new()
-                    }
-                    "/image" => {
-                        response = response
-                            .header(header::ETAG, "\"svg\"")
-                            .header(header::CACHE_CONTROL, "max-age=600")
-                            .header(header::AGE, "600");
-                        test_svg()
-                    }
-                    _ => panic!("unexpected request"),
-                };
-                Ok(response.body(Body::builder().data(bytes)).unwrap())
-            })
-            .build()
-            .into();
+        let client = Client::mock(
+            Agent::config_builder()
+                .middleware(move |req: Request<SendBody>, _: MiddlewareNext| {
+                    request_count.fetch_add(1, Ordering::Relaxed);
+                    let mut response =
+                        Response::builder().header(header::VARY, "Accept, Accept-Encoding");
+                    let bytes = match req.uri().path() {
+                        "/private" => {
+                            response = response.header(header::CACHE_CONTROL, "private, no-store");
+                            test_svg()
+                        }
+                        "/vary" => {
+                            response = response
+                                .header(header::VARY, "*")
+                                .header(header::CACHE_CONTROL, "max-age=600");
+                            test_svg()
+                        }
+                        "/image" if req.headers().contains_key(header::IF_NONE_MATCH) => {
+                            assert_eq!(req.headers()[header::IF_NONE_MATCH], "\"svg\"");
+                            response = response
+                                .status(304)
+                                .header(header::CACHE_CONTROL, "max-age=600");
+                            Vec::new()
+                        }
+                        "/image" => {
+                            response = response
+                                .header(header::ETAG, "\"svg\"")
+                                .header(header::CACHE_CONTROL, "max-age=600")
+                                .header(header::AGE, "600");
+                            test_svg()
+                        }
+                        _ => panic!("unexpected request"),
+                    };
+                    Ok(response.body(Body::builder().data(bytes)).unwrap())
+                })
+                .build()
+                .new_agent(),
+        );
         let url = Url::parse("https://example.com/image")?;
         let svg = SvgRenderer::new(Arc::new(()));
         let local = directory.path().join("diagram.svg");
         fs::write(&local, test_svg())?;
         assert_eq!(read_local_resource(&local, true, Some(&cache))?, test_svg());
 
-        let first = load_image(&url, Some(&cache), &agent, &svg, false)?;
+        let first = load_image(&url, Some(&cache), &client, &svg, false)?;
         let reopened = ResourceCache::new(directory.path().to_owned());
-        let second = load_image(&url, Some(&reopened), &agent, &svg, false)?;
+        let second = load_image(&url, Some(&reopened), &client, &svg, false)?;
         let (ImageContent::Svg(first, _), ImageContent::Svg(second, layout)) = (first, second)
         else {
             anyhow::bail!("expected two parsed SVG trees");
         };
         assert!(!Arc::ptr_eq(&first, &second));
         assert_eq!(layout, gpui::size(gpui::px(8.), gpui::px(4.)));
-        load_image(&url, Some(&reopened), &agent, &svg, false)?;
+        load_image(&url, Some(&reopened), &client, &svg, false)?;
         assert_eq!(calls.load(Ordering::Relaxed), 2);
         assert_eq!(cache.count_contents(), 1);
 
         let cached = reopened.source::<HttpVersion>(image_key(&url)).unwrap();
         reopened.corrupt_content(&cached.hash)?;
-        load_image(&url, Some(&reopened), &agent, &svg, false)?;
+        load_image(&url, Some(&reopened), &client, &svg, false)?;
         assert_eq!(calls.load(Ordering::Relaxed), 3);
         assert_eq!(
             reopened
@@ -1054,7 +991,7 @@ mod tests {
         for path in ["private", "vary"] {
             let alternate = url.join(path)?;
             for _ in 0..2 {
-                load_image(&alternate, Some(&reopened), &agent, &svg, false)?;
+                load_image(&alternate, Some(&reopened), &client, &svg, false)?;
             }
             assert!(
                 reopened
@@ -1087,21 +1024,23 @@ mod tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let request_count = calls.clone();
         let (release_response, response_gate) = async_channel::bounded(1);
-        let agent: Agent = Agent::config_builder()
-            .middleware(move |_: Request<SendBody>, _: MiddlewareNext| {
-                if request_count.fetch_add(1, Ordering::Relaxed) == 0 {
-                    response_gate.recv_blocking().unwrap();
-                }
-                Ok(Response::new(Body::builder().data(test_svg())))
-            })
-            .build()
-            .into();
+        let client = Client::mock(
+            Agent::config_builder()
+                .middleware(move |_: Request<SendBody>, _: MiddlewareNext| {
+                    if request_count.fetch_add(1, Ordering::Relaxed) == 0 {
+                        response_gate.recv_blocking().unwrap();
+                    }
+                    Ok(Response::new(Body::builder().data(test_svg())))
+                })
+                .build()
+                .new_agent(),
+        );
         let directory = tempfile::tempdir()?;
         let (first_display, second_display) = app.update(|cx| {
             cx.set_global(OnlineImages {
                 pending: Rc::default(),
                 cache: Some(ResourceCache::new(directory.path().to_owned())),
-                agent,
+                client: Arc::new(client),
             });
             (DisplayedImages::new(cx), DisplayedImages::new(cx))
         });

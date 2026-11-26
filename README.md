@@ -8,7 +8,7 @@ Install stable Rust 1.98 or later, Git, and a C toolchain. On macOS, the
 GPUI backend uses `Option::map_or_default`, which stabilized in Rust 1.98.
 If you use rustup, run `rustup update stable` to update your stable toolchain.
 
-- Linux needs `pkg-config`, Wayland, libxkbcommon with X11 support, libxcb, and Fontconfig. The desktop app also needs a Vulkan loader and driver.
+- Linux needs `pkg-config`, Wayland, libxkbcommon with X11 support, libxcb, and Fontconfig. The desktop app also needs GLib, libproxy, a Vulkan loader, and a Vulkan driver.
 - For WSL2 with WSLg, see [WSL development](docs/wsl-development.md).
 - On macOS, install the Xcode Command Line Tools with `xcode-select --install`.
 - On Windows, install Visual Studio C++ Build Tools, the Windows SDK, and the Rust MSVC toolchain.
@@ -17,7 +17,7 @@ If you use rustup, run `rustup update stable` to update your stable toolchain.
 The following command installs the common prerequisites on Arch Linux.
 
 ```sh
-sudo pacman -S --needed base-devel pkgconf git wayland libxkbcommon libxkbcommon-x11 libxcb fontconfig vulkan-icd-loader
+sudo pacman -S --needed base-devel pkgconf git wayland libxkbcommon libxkbcommon-x11 libxcb fontconfig glib2 libproxy vulkan-icd-loader
 ```
 
 ## Build, run, and test

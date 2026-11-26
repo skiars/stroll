@@ -299,6 +299,8 @@ fn project_gradient_joins_the_file_tree_at_the_editor_corner() -> anyhow::Result
                         && quad.corner_radii.top_left == ScaledPixels(16.)
                 })
                 .expect("view switcher track");
+            let titlebar_center = (bar.bounds.left() + bar_end.bounds.right()) * 0.5;
+            assert!((navigation.bounds.center().x - titlebar_center).0.abs() <= 1.);
             let white = gpui::Hsla::white();
             let ink = gpui::Hsla::from(rgb(0x303540));
             let (track, selected_color) = if mode.is_dark() {

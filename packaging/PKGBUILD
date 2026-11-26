@@ -4,7 +4,7 @@ pkgrel=2
 pkgdesc='Read and edit local Git repositories and Markdown documents'
 arch=(x86_64)
 license=(custom)
-depends=(git openssh libxcb libxkbcommon libxkbcommon-x11 wayland fontconfig vulkan-icd-loader)
+depends=(git openssh libxcb libxkbcommon libxkbcommon-x11 wayland fontconfig glib2 libproxy vulkan-icd-loader)
 makedepends=(cargo rust pkgconf)
 # C LTO flags break ring's pregenerated assembly at link time.
 options=(!lto !debug)

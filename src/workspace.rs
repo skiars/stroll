@@ -4353,7 +4353,7 @@ impl Workspace {
         project_gradient: bool,
     ) -> impl IntoElement {
         let actions = self.topbar_actions(cx);
-        let row = if cfg!(target_os = "macos") && self.repository.is_some() {
+        let row = if self.repository.is_some() {
             centered_topbar(cx.entity(), actions, colors).into_any_element()
         } else {
             h_flex()
@@ -4362,10 +4362,6 @@ impl Workspace {
                 .gap_2()
                 .pr_2()
                 .child(self.repository_trigger(window, cx, colors, None))
-                .child(div().flex_1())
-                .when(self.repository.is_some(), |bar| {
-                    bar.child(self.topbar_navigation(window, cx, colors, true))
-                })
                 .child(div().flex_1())
                 .child(actions)
                 .into_any_element()
@@ -5847,9 +5843,10 @@ fn centered_topbar(
 ) -> impl IntoElement {
     canvas(
         move |bounds, window, cx| {
-            // The title bar has already reserved space for the native buttons.
-            // Center against the whole viewport while laying out inside the remaining bounds.
-            let center = window.viewport_size().width / 2.;
+            // The title bar has already reserved space for the window controls.
+            // Center on the visible frame, accounting for asymmetric shadow padding.
+            let padding = window_paddings(window);
+            let center = (padding.left + window.viewport_size().width - padding.right) / 2.;
             let gap = window.rem_size() * 0.5;
             let available = size(AvailableSpace::MaxContent, AvailableSpace::MaxContent);
             let mut actions = actions.into_any_element();

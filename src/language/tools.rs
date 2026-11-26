@@ -636,15 +636,28 @@ fn write_entry(root: &Path, path: &Path, entry: &mut impl Read, _mode: u32) -> R
 
 fn download(url: &str, out: &mut File, progress: &mut dyn FnMut(u64, Option<u64>)) -> Result<()> {
     ensure!(url.starts_with("https://"), "Expected an HTTPS archive URL");
-    static HTTP: LazyLock<ureq::Agent> = LazyLock::new(|| {
-        ureq::Agent::config_builder()
-            .timeout_global(Some(Duration::from_secs(180)))
-            .build()
-            .into()
-    });
-    let mut response = HTTP.get(url).call()?;
-    let size = response.body().content_length();
-    copy_download(&mut response.body_mut().as_reader(), out, size, progress)
+    static HTTP: LazyLock<crate::network::Client> = LazyLock::new(crate::network::Client::new);
+    let started = Instant::now();
+    let mut url = url::Url::parse(url)?;
+    for hop in 0..=10 {
+        let remaining = Duration::from_secs(180)
+            .checked_sub(started.elapsed())
+            .context("language tool download timed out")?;
+        let request = ureq::http::Request::get(url.as_str()).body(())?;
+        let mut response = HTTP.send(request, remaining)?;
+        let status = response.status();
+        if let Some(location) = crate::network::redirect(&response) {
+            ensure!(hop < 10, "too many language tool redirects");
+            url = url.join(location.to_str()?)?;
+            continue;
+        }
+        if status.is_client_error() || status.is_server_error() {
+            return Err(ureq::Error::StatusCode(status.as_u16()).into());
+        }
+        let size = response.body().content_length();
+        return copy_download(&mut response.body_mut().as_reader(), out, size, progress);
+    }
+    unreachable!("the last redirect returns an error")
 }
 
 fn copy_download(

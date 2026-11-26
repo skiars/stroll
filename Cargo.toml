@@ -84,7 +84,7 @@ tree-sitter = { version = "0.26.13", optional = true }
 tree-sitter-less = { version = "1.0.0", optional = true }
 tree-sitter-vue-next = { version = "0.1.0", optional = true }
 tree-sitter-xml = { version = "0.7", optional = true }
-ureq = "=3.5.2"
+ureq = { version = "=3.5.2", features = ["socks-proxy"] }
 url = "2"
 
 [dev-dependencies]
@@ -96,6 +96,9 @@ embed-resource = "3.0.12"
 
 [target.'cfg(any(windows, target_os = "macos"))'.dev-dependencies]
 gpui_platform = { package = "gpui-pre-platform", version = "=0.3.12", features = ["test-support"] }
+
+[target.'cfg(any(windows, target_os = "macos"))'.dependencies]
+proxyres = { version = "=1.5.7", default-features = false, optional = true }
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 gpui_wgpu = { package = "gpui-pre-wgpu", version = "=0.3.12", features = ["test-support"] }
@@ -116,7 +119,7 @@ zip = { version = "9.8.2", default-features = false, features = ["deflate"] }
 
 [features]
 default = ["desktop"]
-desktop = ["dep:alacritty_terminal", "dep:arborium-scss", "dep:blocking", "dep:chrono", "dep:giallo", "dep:glob", "dep:gpui", "dep:gpui-base", "dep:gpui-component", "dep:gpui-kit-assets", "dep:gpui_platform", "dep:image", "dep:keyring", "dep:markdown", "dep:merman", "dep:objc2", "dep:objc2-app-kit", "dep:objc2-foundation", "dep:percent-encoding", "dep:ratex-layout", "dep:ratex-parser", "dep:ratex-svg", "dep:ratex-types", "dep:roxmltree", "dep:shlex", "dep:similar", "dep:sys-locale", "dep:toml_edit", "dep:tree-sitter", "dep:tree-sitter-less", "dep:tree-sitter-vue-next", "dep:tree-sitter-xml"]
+desktop = ["dep:alacritty_terminal", "dep:arborium-scss", "dep:blocking", "dep:chrono", "dep:giallo", "dep:glob", "dep:gpui", "dep:gpui-base", "dep:gpui-component", "dep:gpui-kit-assets", "dep:gpui_platform", "dep:image", "dep:keyring", "dep:markdown", "dep:merman", "dep:objc2", "dep:objc2-app-kit", "dep:objc2-foundation", "dep:percent-encoding", "dep:proxyres", "dep:ratex-layout", "dep:ratex-parser", "dep:ratex-svg", "dep:ratex-types", "dep:roxmltree", "dep:shlex", "dep:similar", "dep:sys-locale", "dep:toml_edit", "dep:tree-sitter", "dep:tree-sitter-less", "dep:tree-sitter-vue-next", "dep:tree-sitter-xml"]
 
 [patch.crates-io]
 gpui-base = { path = "vendor/gpui-base-0.9.1" }

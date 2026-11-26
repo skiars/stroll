@@ -180,10 +180,12 @@ impl Provider {
             id: String,
         }
 
-        let response = agent(Duration::from_secs(12))
-            .get(format!("{}/models", self.base))
+        let request = ureq::http::Request::get(format!("{}/models", self.base))
             .header("authorization", self.authorization()?)
-            .call()
+            .body(())
+            .map_err(|_| Failure::Network)?;
+        let response = HTTP
+            .send(request, Duration::from_secs(12))
             .map_err(network_failure)?;
         let body = response_bytes(response, 2 * 1024 * 1024)?;
         let list: ModelList = serde_json::from_slice(&body).map_err(|_| Failure::ResponseJson)?;
@@ -247,12 +249,12 @@ impl Provider {
         thinking: Thinking,
     ) -> Result<String, Failure> {
         let body = self.completion_body(prompt, input, tokens, thinking);
-        let response = agent(timeout)
-            .post(format!("{}/chat/completions", self.base))
+        let request = ureq::http::Request::post(format!("{}/chat/completions", self.base))
             .header("authorization", self.authorization()?)
             .header("content-type", "application/json")
-            .send(body.to_string())
-            .map_err(network_failure)?;
+            .body(body.to_string())
+            .map_err(|_| Failure::Network)?;
+        let response = HTTP.send(request, timeout).map_err(network_failure)?;
         let bytes = response_bytes(response, max_response)?;
         let response: serde_json::Value =
             serde_json::from_slice(&bytes).map_err(|_| Failure::ResponseJson)?;
@@ -267,14 +269,8 @@ impl Provider {
     }
 }
 
-fn agent(timeout: Duration) -> ureq::Agent {
-    ureq::Agent::config_builder()
-        .max_redirects(0)
-        .http_status_as_error(false)
-        .timeout_global(Some(timeout))
-        .build()
-        .new_agent()
-}
+static HTTP: std::sync::LazyLock<crate::network::Client> =
+    std::sync::LazyLock::new(crate::network::Client::new);
 
 fn response_bytes(
     response: ureq::http::Response<ureq::Body>,

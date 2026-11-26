@@ -16,6 +16,7 @@ pub mod locale;
 mod locator;
 #[cfg(feature = "desktop")]
 pub mod lsp;
+mod network;
 mod paths;
 mod process;
 #[cfg(any(feature = "desktop", target_os = "linux"))]
