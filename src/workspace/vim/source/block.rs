@@ -1,6 +1,6 @@
 use std::ops::Range;
 
-use gpui_component::input::{Rope, RopeExt as _};
+use gpui_component::input::{Rope, RopeExt as _, TabSize};
 use unicode_segmentation::UnicodeSegmentation as _;
 use unicode_width::UnicodeWidthStr as _;
 
@@ -217,6 +217,38 @@ impl Row {
         result
     }
 
+    pub(super) fn shift_indent(
+        &self,
+        column: usize,
+        right: bool,
+        columns: usize,
+        tab: TabSize,
+    ) -> Option<(Range<usize>, String)> {
+        let mut cells = self
+            .cells
+            .iter()
+            .skip_while(|cell| cell.columns.end <= column);
+        let first = cells.next()?;
+        let from = if first.tab {
+            column
+        } else {
+            first.columns.start
+        };
+        if right {
+            return self.insert(Some(from), false, &indent_text(tab, from, from + columns));
+        }
+        let blank = |cell: &Cell| cell.tab || &self.text[cell.bytes.clone()] == " ";
+        if !blank(first) {
+            return None;
+        }
+        let last = cells.take_while(|cell| blank(cell)).last().unwrap_or(first);
+        let to = last.columns.end.saturating_sub(columns).max(from);
+        Some((
+            self.start + first.bytes.start..self.start + last.bytes.end,
+            indent_text(tab, first.columns.start, to),
+        ))
+    }
+
     pub(super) fn insertion_offset(&self, column: usize) -> usize {
         let offset = self.offset(column);
         if self.text.as_bytes().get(offset - self.start) == Some(&b'\t') || offset == self.end() {
@@ -254,6 +286,20 @@ impl Row {
             format!("{}{value}", " ".repeat(column.saturating_sub(self.width))),
         ))
     }
+}
+
+pub(super) fn indent_text(tab: TabSize, from: usize, to: usize) -> String {
+    let tabs = if tab.hard_tabs {
+        to / tab.tab_size - from / tab.tab_size
+    } else {
+        0
+    };
+    let spaces = if tabs == 0 {
+        to - from
+    } else {
+        to % tab.tab_size
+    };
+    "\t".repeat(tabs) + &" ".repeat(spaces)
 }
 
 pub(super) fn put(

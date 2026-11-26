@@ -448,6 +448,39 @@ impl<M: InputModeKind> InputBaseState<M> {
         true
     }
 
+    /// Navigate from a modal caret without turning the match into a selection.
+    #[doc(hidden)]
+    pub fn modal_search_match(
+        &mut self,
+        origin: usize,
+        previous: bool,
+        count: usize,
+        cx: &mut Context<Self>,
+    ) -> Option<usize> {
+        if self.search_session.query.is_empty() {
+            return None;
+        }
+        self.search_session.activate();
+        self.sync_search_matcher();
+        let matcher = &mut self.search_session.matcher;
+        let ranges = matcher.matched_ranges();
+        let len = ranges.len();
+        if len == 0 {
+            return None;
+        }
+
+        let steps = count.saturating_sub(1) % len;
+        let index = if previous {
+            (ranges.partition_point(|range| range.start < origin) + len - 1 - steps) % len
+        } else {
+            (ranges.partition_point(|range| range.start <= origin) + steps) % len
+        };
+        let start = ranges[index].start;
+        matcher.current_match_ix = index;
+        cx.notify();
+        Some(start)
+    }
+
     fn select_search_match(
         &mut self,
         range: &Range<usize>,

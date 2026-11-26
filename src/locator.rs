@@ -13,6 +13,8 @@ use sha2::{Digest, Sha256};
 
 use crate::repository::{Document, Repository};
 
+pub(crate) const WORD_CHARACTERS: &str = r"[\p{L}\p{N}\p{M}_$]";
+
 #[derive(Clone, Default, Serialize, Deserialize)]
 pub(crate) struct TextQuery {
     pub query: String,
@@ -31,9 +33,7 @@ impl TextQuery {
             regex::escape(&self.query)
         };
         if self.whole_word {
-            pattern = format!(
-                r"(?<![\p{{L}}\p{{N}}\p{{M}}_$])(?:{pattern})(?![\p{{L}}\p{{N}}\p{{M}}_$])"
-            );
+            pattern = format!("(?<!{WORD_CHARACTERS})(?:{pattern})(?!{WORD_CHARACTERS})");
         }
         let flags = if self.case_sensitive { "(?m)" } else { "(?im)" };
         RegexBuilder::new(&format!("{flags}{pattern}"))

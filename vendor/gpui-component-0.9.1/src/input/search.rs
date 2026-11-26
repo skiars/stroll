@@ -578,6 +578,35 @@ impl DocumentFind {
         }
     }
 
+    #[doc(hidden)]
+    pub fn retained_query(&self) -> &str {
+        &self.session.query
+    }
+
+    /// Return to the document from its Find input. An old query cancels the
+    /// in-progress search and is retained the next time the field opens.
+    #[doc(hidden)]
+    pub fn finish_modal_find(
+        &mut self,
+        restore_query: Option<&str>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if !self.session.open || !self.has_focus(window, cx) || self.is_composing(cx) {
+            return false;
+        }
+        if let Some(query) = restore_query {
+            if let SearchField::Single(field) = &self.search_input {
+                field.update(cx, |field, cx| field.set_value(query, window, cx));
+            }
+            self.update_search_query(None, cx);
+            self.hide(window, cx);
+        } else {
+            _ = self.target.update(cx, |target, cx| target.focus_search_target(window, cx));
+        }
+        true
+    }
+
     /// Show Find, seeding the field when a nonempty query is supplied.
     pub fn open_with_query(&mut self, query: &str, window: &mut Window, cx: &mut Context<Self>) {
         self.show_with_focus(&Rope::from(query), false, None, true, window, cx);

@@ -4,7 +4,7 @@ use super::{
     FileOpen, Workspace, WorkspaceView,
     session::{restore_file_selection, source_file_position},
 };
-use crate::session::{FilePosition, SourceHistory, SourceLocation};
+use crate::session::{FilePosition, GitHistoryPane, SourceHistory, SourceLocation};
 use gpui::*;
 use gpui_component::{WindowExt as _, input::Position};
 
@@ -20,6 +20,17 @@ impl SourceLocation {
             path: None,
             position: None,
             document: (view == WorkspaceView::Docs).then(Default::default),
+            git: (view == WorkspaceView::Git).then_some(GitHistoryPane::Review),
+        }
+    }
+
+    fn view(&self) -> WorkspaceView {
+        if self.git.is_some() {
+            WorkspaceView::Git
+        } else if self.document.is_some() {
+            WorkspaceView::Docs
+        } else {
+            WorkspaceView::Editor
         }
     }
 
@@ -28,7 +39,7 @@ impl SourceLocation {
     }
 
     fn same_destination(&self, other: &Self) -> bool {
-        if self.path != other.path {
+        if self.path != other.path || self.git != other.git {
             return false;
         }
         if self.document.is_some() || other.document.is_some() {
@@ -165,7 +176,12 @@ impl Workspace {
         self.navigate_source(direction == NavigationDirection::Forward, window, cx);
     }
 
-    fn navigate_source(&mut self, forward: bool, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn navigate_source(
+        &mut self,
+        forward: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let (source_focused, composing) = self.active_file().map_or((false, false), |file| {
             let editor = file.editor.read(cx);
             (
@@ -173,7 +189,12 @@ impl Workspace {
                 editor.is_composing(),
             )
         });
-        if !matches!(self.view, WorkspaceView::Editor | WorkspaceView::Docs)
+        let git_focused = self.view == WorkspaceView::Git
+            && self
+                .git
+                .as_ref()
+                .is_some_and(|panel| panel.read(cx).vim_focused(window, cx));
+        if (self.view == WorkspaceView::Git && !git_focused)
             || self.confirming_close
             || self.repository_overlay_open()
             || self.repository_ui.opening.is_some()
@@ -183,6 +204,7 @@ impl Workspace {
             || self.terminal_focused(window, cx)
             || composing
             || (!source_focused
+                && !git_focused
                 && window
                     .context_stack()
                     .iter()
@@ -195,7 +217,9 @@ impl Workspace {
         if !forward {
             let pending_origin = match self.view {
                 WorkspaceView::Editor => match &self.loading_file {
-                    Some((_, FileOpen::Restore { from })) => from.as_ref(),
+                    Some((_, FileOpen::Restore { from } | FileOpen::Locate { from, .. })) => {
+                        from.as_ref()
+                    }
                     _ => None,
                 },
                 WorkspaceView::Docs => {
@@ -239,10 +263,7 @@ impl Workspace {
         else {
             return;
         };
-        if index == history.index
-            && ((self.view == WorkspaceView::Editor && location.document.is_none())
-                || (self.view == WorkspaceView::Docs && location.document.is_some()))
-        {
+        if index == history.index && self.view == location.view() {
             self.cancel_file_open();
             self.cancel_document_navigation(cx);
             cx.notify();
@@ -263,12 +284,18 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if let Some(pane) = location.git {
+            self.switch_view(WorkspaceView::Git, window, cx);
+            if let Some(panel) = &self.git {
+                panel.update(cx, |panel, cx| {
+                    panel.restore_history_location(pane, location.position, window, cx);
+                });
+            }
+            self.complete_navigation_replay(index);
+            return;
+        }
+        let view = location.view();
         let Some(path) = location.path else {
-            let view = if location.document.is_some() {
-                WorkspaceView::Docs
-            } else {
-                WorkspaceView::Editor
-            };
             self.restore_empty_view(view, window, cx);
             self.complete_navigation_replay(index);
             return;
@@ -276,7 +303,7 @@ impl Workspace {
         if let Some(document) = location.document {
             self.open_history_document(path, index, document, window, cx);
         } else {
-            if self.view == WorkspaceView::Docs {
+            if self.view != WorkspaceView::Editor {
                 self.cancel_document_navigation(cx);
                 self.switch_view(WorkspaceView::Editor, window, cx);
             }
@@ -338,12 +365,22 @@ impl Workspace {
         .unwrap_or_else(|| SourceLocation::empty(self.view))
     }
 
+    pub(super) fn locator_history_origin(&self, window: &Window, cx: &App) -> SourceLocation {
+        if self.view == WorkspaceView::Git
+            && let Some(panel) = &self.git
+        {
+            return panel.read(cx).navigation_history_location(window, cx);
+        }
+        self.topbar_location(cx)
+    }
+
     pub(super) fn document_history_location(&self, cx: &App) -> Option<SourceLocation> {
         let reader = self.doc.as_ref()?.read(cx);
         Some(SourceLocation {
             path: Some(reader.path.clone()),
             position: None,
             document: Some(reader.history_location(cx)),
+            git: None,
         })
     }
 
@@ -503,7 +540,24 @@ impl Workspace {
             path: Some(path),
             position,
             document: None,
+            git: None,
         })
+    }
+
+    pub(super) fn record_source_jump(&mut self, source: Option<SourceLocation>, cx: &App) {
+        let Some(target) = self.source_location(cx) else {
+            return;
+        };
+        if source
+            .as_ref()
+            .is_some_and(|source| source.same_destination(&target))
+        {
+            return;
+        }
+        // An explicit search jump also records a new origin when the target
+        // already happens to be the current entry in the history.
+        self.session.source_history.record(source, target);
+        self.session_revision += 1;
     }
 
     pub(super) fn record_source_navigation(&mut self, source: Option<SourceLocation>, cx: &App) {

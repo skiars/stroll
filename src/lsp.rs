@@ -77,6 +77,27 @@ pub(crate) struct ServerProgress {
 
 type ActiveProgress = Arc<Mutex<Vec<(ProgressToken, ServerProgress)>>>;
 
+#[derive(Clone, Copy, Default)]
+struct SymbolSupport {
+    document: bool,
+    workspace: bool,
+}
+
+impl From<&ServerCapabilities> for SymbolSupport {
+    fn from(capabilities: &ServerCapabilities) -> Self {
+        Self {
+            document: capabilities
+                .document_symbol_provider
+                .as_ref()
+                .is_some_and(|provider| *provider != OneOf::Left(false)),
+            workspace: capabilities
+                .workspace_symbol_provider
+                .as_ref()
+                .is_some_and(|provider| *provider != OneOf::Left(false)),
+        }
+    }
+}
+
 struct ClientHandle {
     events: Sender<Event>,
     state: Arc<Mutex<SessionState>>,
@@ -89,6 +110,7 @@ struct ClientHandle {
     stopped: async_channel::Receiver<()>,
     actions: Arc<Mutex<actions::Capabilities>>,
     references: Arc<AtomicBool>,
+    symbols: Arc<Mutex<SymbolSupport>>,
     completion: Arc<Mutex<Option<CompletionOptions>>>,
     signature: Arc<Mutex<Option<lsp_types::SignatureHelpOptions>>>,
 }
@@ -158,6 +180,7 @@ impl Client {
         let (running, stopped) = async_channel::bounded(1);
         let actions = Arc::new(Mutex::new(actions::Capabilities::default()));
         let references = Arc::new(AtomicBool::new(false));
+        let symbols = Arc::new(Mutex::new(SymbolSupport::default()));
         let completion = Arc::new(Mutex::new(None));
         let signature = Arc::new(Mutex::new(None));
         let progress = ActiveProgress::default();
@@ -173,6 +196,7 @@ impl Client {
             stopped,
             actions: actions.clone(),
             references: references.clone(),
+            symbols: symbols.clone(),
             completion: completion.clone(),
             signature: signature.clone(),
         };
@@ -203,6 +227,7 @@ impl Client {
                         *server_version.lock().unwrap() = version;
                         *actions.lock().unwrap() = actions::Capabilities::from(capabilities);
                         references.store(supports_references(capabilities), Ordering::Relaxed);
+                        *symbols.lock().unwrap() = SymbolSupport::from(capabilities);
                         *completion.lock().unwrap() = capabilities.completion_provider.clone();
                         *signature.lock().unwrap() = capabilities.signature_help_provider.clone();
                         let mut state = state.lock().unwrap();
@@ -521,6 +546,18 @@ impl Document {
                     target_selection_range: location.range,
                 })
                 .collect())
+        }
+    }
+
+    pub(crate) fn supports_locator_symbols(&self, workspace: bool) -> bool {
+        if self.client.state() != SessionState::Ready {
+            return false;
+        }
+        let support = self.client.0.symbols.lock().unwrap();
+        if workspace {
+            support.workspace
+        } else {
+            support.document
         }
     }
 
@@ -1337,22 +1374,10 @@ impl Session {
                 params["context"] = json!({ "includeDeclaration": include_declaration });
                 (Some("textDocument/references"), None)
             }
-            Query::DocumentSymbols
-                if self
-                    .capabilities
-                    .document_symbol_provider
-                    .as_ref()
-                    .is_some_and(|cap| *cap != OneOf::Left(false)) =>
-            {
+            Query::DocumentSymbols if SymbolSupport::from(&self.capabilities).document => {
                 (Some("textDocument/documentSymbol"), None)
             }
-            Query::WorkspaceSymbols(query)
-                if self
-                    .capabilities
-                    .workspace_symbol_provider
-                    .as_ref()
-                    .is_some_and(|cap| *cap != OneOf::Left(false)) =>
-            {
+            Query::WorkspaceSymbols(query) if SymbolSupport::from(&self.capabilities).workspace => {
                 params = json!({ "query": query });
                 (Some("workspace/symbol"), None)
             }

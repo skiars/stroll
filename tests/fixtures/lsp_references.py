@@ -40,13 +40,30 @@ while message := receive():
     params = message.get("params", {}) or {}
     if method == "initialize":
         assert "references" in params["capabilities"]["textDocument"]
-        reply(message, {"capabilities": {"referencesProvider": {}, "textDocumentSync": 1}})
+        reply(message, {"capabilities": {
+            "referencesProvider": {},
+            "documentSymbolProvider": True,
+            "workspaceSymbolProvider": True,
+            "textDocumentSync": 1,
+        }})
     elif method == "textDocument/didOpen":
         documents[params["textDocument"]["uri"]] = params["textDocument"]["text"]
     elif method == "textDocument/didChange":
         documents[params["textDocument"]["uri"]] = params["contentChanges"][0]["text"]
+    elif method == "textDocument/documentSymbol":
+        uri = params["textDocument"]["uri"]
+        assert uri == main
+        span = location(uri, 0, 0, 4)["range"]
+        reply(message, [{"name": "word", "kind": 12, "range": span, "selectionRange": span}])
+    elif method == "workspace/symbol":
+        assert params["query"] == "word"
+        reply(message, [{"name": "word", "kind": 12, "location": location(declaration, 0, 4, 8)}])
     elif method == "textDocument/references":
         assert params["textDocument"]["uri"] == main
+        if documents[main] == "word();\n":
+            assert 0 <= params["position"]["character"] < 4
+            reply(message, [location(target, 0, 3, 7)])
+            continue
         assert documents[main] == "😀 word();\n"
         assert documents[target] == "// draft\n😀 word();\n"
         if params["position"] == {"line": 0, "character": 0}:

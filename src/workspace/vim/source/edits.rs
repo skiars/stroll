@@ -2,10 +2,10 @@ use gpui_component::input::RopeExt as _;
 use unicode_segmentation::UnicodeSegmentation as _;
 
 use super::{
-    App, BLOCKWISE, Block, Change, ClipboardItem, Context, EditorState, InsertSession, LINEWISE,
-    Mode, Motion, Range, Register, Rope, Row, SelectionShape, Source, SurroundEdit, Target, Window,
-    block, first_non_blank, last_row, line, line_end, move_cursor, next, previous, row_boundary,
-    selection_motion, selection_range,
+    App, BLOCKWISE, Block, Change, ClipboardItem, Context, EditorState, Indent, IndentTarget,
+    InsertSession, LINEWISE, Mode, Motion, Range, Register, Rope, Row, SelectionShape, Source,
+    SurroundEdit, Target, Window, block, first_non_blank, last_row, line, line_end, move_cursor,
+    next, previous, row_boundary, selection_motion, selection_range,
 };
 
 impl Source {
@@ -192,6 +192,136 @@ impl Source {
             let head = if self.mode.visual() { range.start } else { at };
             self.leave_visual(editor, head, cx);
         }
+    }
+
+    pub(super) fn indent_selection(
+        &mut self,
+        editor: &mut EditorState,
+        right: bool,
+        levels: usize,
+        window: &mut Window,
+        cx: &mut Context<EditorState>,
+    ) {
+        let text = editor.text();
+        let (target, at) = if let Some(block) = self.block(editor) {
+            let at = Row::new(text, block.first, editor.tab_width()).offset(block.left);
+            (IndentTarget::Block(block.shape()), at)
+        } else if let Some((anchor, head)) = self.selection {
+            let first = text.offset_to_point(anchor.min(head)).row;
+            let last = text.offset_to_point(anchor.max(head)).row;
+            let target = IndentTarget::Motion(Motion {
+                target: Target::Lines,
+                count: last - first + 1,
+                explicit: true,
+            });
+            (target, text.line_start_offset(first))
+        } else {
+            return;
+        };
+        self.indent(
+            editor,
+            Indent {
+                target,
+                right,
+                levels,
+            },
+            at,
+            window,
+            cx,
+        );
+    }
+
+    pub(super) fn indent(
+        &mut self,
+        editor: &mut EditorState,
+        indent: Indent,
+        at: usize,
+        window: &mut Window,
+        cx: &mut Context<EditorState>,
+    ) {
+        let text = editor.text();
+        let tab = editor.tab_settings();
+        let columns = indent.levels.saturating_mul(tab.tab_size);
+        let (row, column, edits) = match indent.target {
+            IndentTarget::Motion(motion) => {
+                let Some((range, _)) = motion.range(text, at) else {
+                    return;
+                };
+                let first = text.offset_to_point(range.start).row;
+                let last = text
+                    .offset_to_point(previous(text, range.end).max(range.start))
+                    .row;
+                let edits = (first..=last)
+                    .filter_map(|row| {
+                        let start = text.line_start_offset(row);
+                        let end = line_end(text, start);
+                        if start == end {
+                            return None;
+                        }
+                        let line = text.slice(start..end);
+                        let whitespace = line
+                            .bytes()
+                            .take_while(|byte| matches!(byte, b' ' | b'\t'))
+                            .count();
+                        let current = tab.indent_count(&line);
+                        let shifted = if indent.right {
+                            current.saturating_add(columns)
+                        } else {
+                            current.saturating_sub(columns)
+                        };
+                        (shifted != current).then(|| {
+                            (
+                                start..start + whitespace,
+                                block::indent_text(tab, 0, shifted),
+                            )
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                (first, None, edits)
+            }
+            IndentTarget::Block(shape) => {
+                let row = text.offset_to_point(at).row;
+                let column = if self.mode == Mode::VisualBlock {
+                    self.block(editor).map_or(0, |block| block.left)
+                } else {
+                    Row::new(text, row, tab.tab_size).column(at)
+                };
+                let span = shape.at(row, column, text);
+                let edits = (span.first..=span.last)
+                    .filter_map(|row| {
+                        Row::new(text, row, tab.tab_size).shift_indent(
+                            column,
+                            indent.right,
+                            columns,
+                            tab,
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                (row, Some(column), edits)
+            }
+        };
+        if !self.allows_edit(
+            &edits
+                .iter()
+                .map(|(range, _)| range.clone())
+                .collect::<Vec<_>>(),
+            cx,
+        ) {
+            return;
+        }
+        if !edits.is_empty() {
+            let revision = editor.document_revision();
+            editor.edit_ranges(&edits, window, cx);
+            if editor.document_revision() != revision {
+                self.last_change = Some(Change::Indent(indent));
+            }
+        }
+        let text = editor.text();
+        let head = column.map_or_else(
+            || first_non_blank(text, text.line_start_offset(row)),
+            |column| Row::new(text, row, tab.tab_size).offset(column),
+        );
+        self.leave_visual(editor, head, cx);
     }
 
     pub(super) fn block_edit(
@@ -455,6 +585,7 @@ impl Source {
         self.goal_column = None;
         match change {
             Change::Delete(motion) => self.run_operator(editor, 'd', motion, window, cx),
+            Change::Indent(indent) => self.indent(editor, indent, editor.cursor(), window, cx),
             Change::Insert {
                 key,
                 motion,

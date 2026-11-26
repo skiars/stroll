@@ -567,7 +567,10 @@ enum FileOpen {
         preview: bool,
     },
     ImageBrowse,
-    Locate(Option<(std::ops::Range<usize>, [u8; 32])>),
+    Locate {
+        position: Option<(std::ops::Range<usize>, [u8; 32])>,
+        from: Option<crate::session::SourceLocation>,
+    },
     DocumentLink {
         from: crate::session::SourceLocation,
         line: Option<u32>,
@@ -638,6 +641,30 @@ fn reveal_editor_range(
     if animate {
         editor.animate_pending_scroll();
     }
+}
+
+fn flash_locator_result(
+    editor: &mut EditorState,
+    range: std::ops::Range<usize>,
+    cx: &mut Context<EditorState>,
+) {
+    use gpui_component::input::{RangeDecoration, RangeDecorationStyle};
+    let accent = cx.theme().accent.opacity(0.4);
+    let decoration = editor.create_range_decorations_collection(
+        vec![
+            RangeDecoration::new(range)
+                .with_style(RangeDecorationStyle::Fill)
+                .with_color(accent),
+        ],
+        cx,
+    );
+    cx.spawn(async move |_, cx| {
+        cx.background_executor()
+            .timer(Duration::from_millis(700))
+            .await;
+        cx.update(|cx| decoration.dispose(cx));
+    })
+    .detach();
 }
 
 enum DocumentNavigation {
@@ -2660,7 +2687,7 @@ impl Workspace {
             && loading == &path
         {
             match request {
-                FileOpen::Select { .. } | FileOpen::Locate(_)
+                FileOpen::Select { .. } | FileOpen::Locate { .. }
                     if matches!(pending, FileOpen::History { .. }) =>
                 {
                     *pending = request;
@@ -2678,7 +2705,7 @@ impl Workspace {
                     position: None,
                 } => match pending {
                     FileOpen::Select { preview, .. } => *preview = false,
-                    FileOpen::Locate(_) => {}
+                    FileOpen::Locate { .. } => {}
                     FileOpen::Tree { .. }
                     | FileOpen::ImageBrowse
                     | FileOpen::DocumentLink { .. }
@@ -2795,7 +2822,7 @@ impl Workspace {
                             FileOpen::Select { .. }
                             | FileOpen::Tree { .. }
                             | FileOpen::ImageBrowse
-                            | FileOpen::Locate(_)
+                            | FileOpen::Locate { .. }
                             | FileOpen::History { .. } => {}
                             FileOpen::DocumentLink { .. } => {
                                 this.switch_view(WorkspaceView::Docs, window, cx);
@@ -2823,9 +2850,10 @@ impl Workspace {
                 request,
                 FileOpen::Startup | FileOpen::Restore { from: None }
             );
+        let locator_jump = matches!(&request, FileOpen::Locate { .. });
         let source = match &request {
             FileOpen::DocumentLink { from, .. } => Some(from.clone()),
-            FileOpen::Restore { from } => from.clone(),
+            FileOpen::Restore { from } | FileOpen::Locate { from, .. } => from.clone(),
             _ => navigate.then(|| self.source_location(cx)).flatten(),
         };
         let same_file = self.tabs.active() == Some(path.as_path());
@@ -2851,7 +2879,7 @@ impl Workspace {
                 None,
                 None,
             ),
-            FileOpen::Locate(location) => (false, None, location, None),
+            FileOpen::Locate { position, .. } => (false, None, position, None),
             FileOpen::History { index, position } => (true, None, None, Some((index, position))),
             FileOpen::Startup | FileOpen::Restore { .. } => (true, None, None, None),
         };
@@ -2922,6 +2950,7 @@ impl Workspace {
             && let Some(file) = self.files.get_mut(&path)
         {
             file.restore_position = None;
+            let modal = self.config.current().keyboard.vim_mode;
             let applied = file.editor.update(cx, |editor, cx| {
                 let text = editor.text();
                 if crate::locator::fingerprint(&text.to_string()) != fingerprint
@@ -2929,7 +2958,16 @@ impl Workspace {
                 {
                     return false;
                 }
-                reveal_editor_range(editor, range, None, animate, window, cx);
+                if modal {
+                    file.vim.locate(editor, range.start, window, cx);
+                    let caret = editor.cursor();
+                    reveal_editor_range(editor, caret..caret, None, animate, window, cx);
+                    if !range.is_empty() {
+                        flash_locator_result(editor, range, cx);
+                    }
+                } else {
+                    reveal_editor_range(editor, range, None, animate, window, cx);
+                }
                 true
             });
             if !applied {
@@ -2938,6 +2976,8 @@ impl Workspace {
         }
         if let Some((index, position)) = replay {
             self.complete_source_replay(&path, index, position, source, animate, cx);
+        } else if locator_jump && navigate {
+            self.record_source_jump(source, cx);
         } else if navigate {
             self.record_source_navigation(source, cx);
         }

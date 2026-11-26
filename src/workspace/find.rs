@@ -65,7 +65,7 @@ pub(super) fn compile(
     ))
 }
 
-fn scan(
+pub(super) fn scan(
     pattern: &Regex,
     text: &str,
     scope: Option<&Range<usize>>,

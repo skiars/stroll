@@ -1351,14 +1351,29 @@ impl GitPanel {
     ) -> bool {
         let history = self.history_focus.is_focused(window);
         let tree = self.vim_tree_focus.is_focused(window);
-        let editor = self.search_editor(window, cx);
-        let diff =
-            self.focus.is_focused(window) || editor.read(cx).focus_handle(cx).is_focused(window);
+        let right = self
+            .snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.editor.as_ref())
+            .unwrap_or_else(|| self.editor.modified_state())
+            .read(cx)
+            .focus_handle(cx);
+        let diff = self.diff.read(cx);
+        let left =
+            (self.snapshot.is_none() && diff.mode() == DiffMode::Split && !diff.files().is_empty())
+                .then(|| self.editor.original_state().read(cx).focus_handle(cx));
+        let in_left = left.as_ref().is_some_and(|focus| focus.is_focused(window));
+        let in_right = right.is_focused(window);
+        let in_panel = self.focus.is_focused(window);
         match key {
-            "h" if tree => editor.read(cx).focus_handle(cx).focus(window, cx),
-            "h" if diff => self.vim_history(window, cx),
-            "l" if history => editor.read(cx).focus_handle(cx).focus(window, cx),
-            "l" if diff && self.vim_has_tree() => self.focus_vim_file_tree(window, cx),
+            "h" if tree => right.focus(window, cx),
+            "h" if in_right && let Some(left) = &left => left.focus(window, cx),
+            "h" if in_left || in_right || in_panel => self.vim_history(window, cx),
+            "l" if history => left.as_ref().unwrap_or(&right).focus(window, cx),
+            "l" if in_left => right.focus(window, cx),
+            "l" if (in_right || in_panel) && self.vim_has_tree() => {
+                self.focus_vim_file_tree(window, cx)
+            }
             _ => return false,
         }
         true
@@ -3205,6 +3220,54 @@ mod tests {
                     .is_focused(window)
             );
         });
+        let (history_focus, original_focus, modified_focus, tree_focus) = visual.update(|_, cx| {
+            let panel = panel.read(cx);
+            (
+                panel.history_focus.clone(),
+                panel.editor.original_state().read(cx).focus_handle(cx),
+                panel.editor.modified_state().read(cx).focus_handle(cx),
+                panel.vim_tree_focus.clone(),
+            )
+        });
+        let move_focus = |visual: &mut VisualTestContext, key, target: &FocusHandle| {
+            visual.simulate_keystrokes(key);
+            draw(visual);
+            visual.update(|window, _| assert!(target.is_focused(window), "{key}"));
+        };
+        for (key, target) in [
+            ("ctrl-h", &original_focus),
+            ("ctrl-h", &history_focus),
+            ("ctrl-l", &original_focus),
+            ("ctrl-l", &modified_focus),
+            ("ctrl-l", &tree_focus),
+            ("ctrl-h", &modified_focus),
+        ] {
+            move_focus(visual, key, target);
+        }
+        visual.simulate_resize(size(px(820.), px(560.)));
+        draw(visual);
+        visual.update(|_, cx| {
+            let panel = panel.read(cx);
+            assert!(panel.split);
+            assert_eq!(panel.diff.read(cx).mode(), DiffMode::Unified);
+        });
+        for (key, target) in [
+            ("ctrl-h", &history_focus),
+            ("ctrl-l", &modified_focus),
+            ("ctrl-l", &tree_focus),
+            ("ctrl-h", &modified_focus),
+        ] {
+            move_focus(visual, key, target);
+        }
+        visual.simulate_resize(size(px(1280.), px(560.)));
+        visual.update(|_, cx| {
+            panel.update(cx, |panel, cx| {
+                panel.show_history = false;
+                panel.show_tree = false;
+                cx.notify();
+            });
+        });
+        draw(visual);
         let place = |visual: &mut VisualTestContext, side, word: &str| {
             visual.update(|window, cx| {
                 let panel = panel.read(cx);
@@ -3262,17 +3325,34 @@ mod tests {
         visual.simulate_keystrokes("] c");
         draw(visual);
         assert_eq!(visual.update(|_, cx| left.read(cx).cursor()), start);
+        let matches = str::matches(&before.to_string(), "alpha").count();
         visual.simulate_keystrokes("/");
         draw(visual);
         visual.simulate_input("alpha");
         visual.simulate_keystrokes("enter");
         draw(visual);
-        assert_eq!(visual.update(|_, cx| left.read(cx).cursor()), start + 4);
+        visual.update(|window, cx| {
+            let editor = left.read(cx);
+            assert!(editor.focus_handle(cx).is_focused(window));
+            assert!(editor.search_session().open);
+            assert_eq!(
+                editor.search_session().matcher.label(),
+                format!("1/{matches}")
+            );
+            assert_eq!(editor.cursor(), start + 4);
+        });
         visual.simulate_keystrokes("n");
-        assert_eq!(
-            visual.update(|_, cx| left.read(cx).cursor()),
-            start + 4 + "old alpha beta\n".len()
-        );
+        visual.update(|_, cx| {
+            let editor = left.read(cx);
+            assert_eq!(
+                editor.search_session().matcher.label(),
+                format!("2/{matches}")
+            );
+            assert_eq!(editor.cursor(), start + 4 + "old alpha beta\n".len());
+        });
+        visual.simulate_keystrokes("escape");
+        draw(visual);
+        visual.update(|_, cx| assert!(!left.read(cx).search_session().open));
 
         let (right, start) = place(visual, DiffSide::Modified, "new alpha beta");
         draw(visual);

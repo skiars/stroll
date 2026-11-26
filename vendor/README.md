@@ -95,7 +95,13 @@ dialogs in a Wayland window after changes to paint order or focus handling.
   selection and refocus policy. The reader and editor editing tests cover these
   actions.
 - Source Find shortcuts navigate relative to the editor selection and reuse a
-  retained query without moving focus into the Find panel.
+  retained query without moving focus into the Find panel. Vim Find can update
+  the active match and count independently of the caret's selection. In the
+  Markdown reader, Vim Find returns focus to the body while the panel stays
+  visible. The workspace Vim tests cover both paths.
+- Vim indentation uses the editor's tab width and hard-tab setting for logical
+  lines and display columns in Visual Block. The workspace Vim tests exercise
+  counts, motions, undo, and repeat.
 - The source editor opts into advanced Find through a pattern compiler shared
   with Locator. The shared Find panel retains match options and a tracked
   selection scope, and uses multiline query and replacement fields for opted-in

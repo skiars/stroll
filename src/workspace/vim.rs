@@ -19,6 +19,7 @@ const HINT_DELAY: Duration = Duration::from_millis(300);
 pub(super) const STATUS_HEIGHT: f32 = 26.;
 const SPACE: &str = "␣";
 const STATUS_BUTTON_SIZE: Pixels = px(22.);
+const STATUS_ICON_SIZE: Pixels = px(17.5);
 const STATUS_ITEM_GAP: Pixels = px(4.);
 const MODE_HEIGHT: Pixels = px(18.);
 const PENDING_SAMPLE: &str = "…0000000␣";
@@ -51,6 +52,9 @@ struct Leader {
 enum Command {
     Files,
     Text,
+    DocumentSymbols,
+    WorkspaceSymbols,
+    View(WorkspaceView),
     Tree,
     Git,
     Status,
@@ -90,6 +94,31 @@ const BINDINGS: &[Binding] = &[
         keys: "sg",
         command: Command::Text,
         label: "vim.text",
+    },
+    Binding {
+        keys: "ss",
+        command: Command::DocumentSymbols,
+        label: "locator.document_symbols",
+    },
+    Binding {
+        keys: "sS",
+        command: Command::WorkspaceSymbols,
+        label: "locator.workspace_symbols",
+    },
+    Binding {
+        keys: "1",
+        command: Command::View(WorkspaceView::Docs),
+        label: "common.docs",
+    },
+    Binding {
+        keys: "2",
+        command: Command::View(WorkspaceView::Editor),
+        label: "common.workspace",
+    },
+    Binding {
+        keys: "3",
+        command: Command::View(WorkspaceView::Git),
+        label: "vim.git",
     },
     Binding {
         keys: "e",
@@ -254,12 +283,16 @@ impl Workspace {
         {
             return;
         }
-        if !key.modifiers.modified()
-            && matches!(key.key.as_str(), "enter" | "escape")
-            && self.finish_vim_find(key.key == "enter", window, cx)
-        {
-            consume(window, cx);
-            return;
+        if !key.modifiers.modified() && matches!(key.key.as_str(), "enter" | "escape") {
+            let commit = key.key == "enter";
+            if self.finish_vim_find(commit, window, cx)
+                || self.vim_view_reader().is_some_and(|reader| {
+                    reader.update(cx, |reader, cx| reader.finish_vim_find(commit, window, cx))
+                })
+            {
+                consume(window, cx);
+                return;
+            }
         }
         if self.vim_focus_pane(key, window, cx) {
             self.cancel_vim_keys(cx);
@@ -276,6 +309,24 @@ impl Workspace {
             && !key.is_modifier_key()
         {
             self.cancel_vim_keys(cx);
+            consume(window, cx);
+            return;
+        }
+        if key.modifiers
+            == (Modifiers {
+                control: true,
+                ..Modifiers::none()
+            })
+            && matches!(key.key.as_str(), "o" | "i")
+            && self.vim_eligible(window, cx)
+            && self.vim_source(window, cx).is_none_or(|file| {
+                let editor = file.editor.read(cx);
+                file.vim.mode() == source::Mode::Normal
+                    && !editor.completion_menu_state().open
+                    && !editor.code_action_menu_state().open
+            })
+        {
+            self.navigate_source(key.key == "i", window, cx);
             consume(window, cx);
             return;
         }
@@ -364,16 +415,18 @@ impl Workspace {
         })
     }
 
-    fn vim_reader(&self, window: &Window, cx: &App) -> Option<Entity<crate::docs::DocReader>> {
-        let reader = match self.view {
+    fn vim_view_reader(&self) -> Option<&Entity<crate::docs::DocReader>> {
+        match self.view {
             WorkspaceView::Docs => self.doc.as_ref(),
             WorkspaceView::Editor => self.active_markdown_preview(),
             WorkspaceView::Git => None,
-        }?;
-        reader
-            .read(cx)
-            .content_focused(window, cx)
-            .then(|| reader.clone())
+        }
+    }
+
+    fn vim_reader(&self, window: &Window, cx: &App) -> Option<Entity<crate::docs::DocReader>> {
+        self.vim_view_reader()
+            .filter(|reader| reader.read(cx).content_focused(window, cx))
+            .cloned()
     }
 
     fn vim_eligible(&self, window: &Window, cx: &App) -> bool {
@@ -469,6 +522,14 @@ impl Workspace {
             return;
         }
         if let Some(file) = self.vim_source(window, cx) {
+            let origin = if file.vim.mode() == source::Mode::Normal
+                && matches!(plain, Some('*' | '#'))
+                && file.vim.pending().chars().all(|key| key.is_ascii_digit())
+            {
+                self.source_location(cx)
+            } else {
+                None
+            };
             let path = file.path.clone();
             let locked = self.file_editor_locked(file);
             let file = self.files.get_mut(&path).unwrap();
@@ -477,6 +538,9 @@ impl Workspace {
                 .key_down(&file.editor, locked, key, file.wrap, window, cx);
             if let Some(action) = action {
                 self.vim_source_action(action, window, cx);
+                if origin.is_some() {
+                    self.record_source_jump(origin, cx);
+                }
                 consume(window, cx);
                 cx.notify();
             }
@@ -502,8 +566,11 @@ impl Workspace {
     ) {
         let top = plain == Some('g') && self.vim.reader_prefix;
         self.vim.reader_prefix = plain == Some('g') && !top;
+        let modal = self.config.current().keyboard.vim_mode;
         if self.vim.reader_prefix
-            || reader.update(cx, |reader, cx| reader.vim_key(key, plain, top, window, cx))
+            || reader.update(cx, |reader, cx| {
+                reader.vim_key(key, plain, top, modal, window, cx)
+            })
         {
             consume(window, cx);
         }
@@ -638,6 +705,9 @@ impl Workspace {
     fn vim_command_available(&self, command: Command, window: &Window, cx: &App) -> bool {
         let source = self.vim_source(window, cx);
         match command {
+            Command::DocumentSymbols | Command::WorkspaceSymbols => {
+                self.locator_symbols_available(command == Command::WorkspaceSymbols, cx)
+            }
             Command::Close => self.view == WorkspaceView::Editor && self.tabs.active().is_some(),
             Command::Comment => source.is_some_and(|file| !self.file_editor_locked(file)),
             Command::CodeActions => {
@@ -671,6 +741,12 @@ impl Workspace {
         match command {
             Command::Files => self.open_locator(window, cx),
             Command::Text => self.open_text_locator(window, cx),
+            Command::DocumentSymbols | Command::WorkspaceSymbols => {
+                self.open_symbol_locator(command == Command::WorkspaceSymbols, window, cx);
+            }
+            Command::View(view) => {
+                self.switch_view_shortcut(&super::SwitchWorkspaceView(view), window, cx);
+            }
             Command::Tree if self.view != WorkspaceView::Git => {
                 if self.tree_focus.is_focused(window) {
                     if let Some(focus) = self.vim.return_from_tree.take() {
@@ -780,10 +856,8 @@ impl Workspace {
             deferred(
                 div()
                     .absolute()
-                    .w_full()
+                    .right(px(12.))
                     .bottom(px(bottom))
-                    .flex()
-                    .justify_center()
                     .child(panel),
             )
             .with_priority(gpui_base::POPUP_PRIORITY - 1),
@@ -959,7 +1033,7 @@ impl Workspace {
                     .with_size(STATUS_BUTTON_SIZE)
                     .size(STATUS_BUTTON_SIZE)
                     .p_0()
-                    .icon_size(px(16.))
+                    .icon_size(STATUS_ICON_SIZE)
                     .icon(Icon::default().data(art).text_color(color))
                     .toggled(enabled)
                     .accessibility_label(label.clone())

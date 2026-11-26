@@ -173,6 +173,19 @@ pub(crate) struct SourceLocation {
     pub position: Option<FilePosition>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub document: Option<DocumentLocation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git: Option<GitHistoryPane>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum GitHistoryPane {
+    Review,
+    History,
+    ChangedFiles,
+    Modified,
+    Original,
+    Snapshot,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]

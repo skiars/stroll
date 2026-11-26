@@ -4656,9 +4656,17 @@ impl<M: InputModeKind> InputBaseState<M> {
         self.modal_head.is_some()
     }
 
+    /// The configured width and style of indentation.
+    #[doc(hidden)]
+    pub fn tab_settings(&self) -> crate::input::TabSize {
+        let mut tab = self.mode.tab_size();
+        tab.tab_size = tab.tab_size.max(1);
+        tab
+    }
+
     /// Configured number of columns per tab stop.
     pub fn tab_width(&self) -> usize {
-        self.mode.tab_size().tab_size.max(1)
+        self.tab_settings().tab_size
     }
 
     /// Set the selected range using UTF-8 byte offsets, removing additional cursors.

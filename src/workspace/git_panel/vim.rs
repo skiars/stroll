@@ -2,8 +2,10 @@ use gpui::*;
 use gpui_component::input::{self, EditorState};
 
 use super::{GitPanel, review::has_live_target};
+use crate::session::{FilePosition, GitHistoryPane, SourceLocation};
 use crate::workspace::{
     SaveFile,
+    session::{restore_file_selection, source_file_position},
     vim::{
         plain_key,
         source::{Action, EditGuard, Find, Mode, Source},
@@ -65,6 +67,76 @@ impl GitPanel {
         } else {
             Column::Modified
         })
+    }
+
+    pub(in crate::workspace) fn navigation_history_location(
+        &self,
+        window: &Window,
+        cx: &App,
+    ) -> SourceLocation {
+        let pane = if let Some(column) = self.focused_diff_column(window, cx) {
+            match column {
+                Column::Original => GitHistoryPane::Original,
+                Column::Modified => GitHistoryPane::Modified,
+                Column::Snapshot => GitHistoryPane::Snapshot,
+            }
+        } else if self.history_focus.is_focused(window) {
+            GitHistoryPane::History
+        } else if self.vim_tree_focus.is_focused(window) {
+            GitHistoryPane::ChangedFiles
+        } else {
+            GitHistoryPane::Review
+        };
+        let position = self
+            .history_diff_editor(pane)
+            .map(|editor| source_file_position(editor.read(cx), None));
+        SourceLocation {
+            path: None,
+            position,
+            document: None,
+            git: Some(pane),
+        }
+    }
+
+    pub(in crate::workspace) fn restore_history_location(
+        &mut self,
+        pane: GitHistoryPane,
+        position: Option<FilePosition>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(editor) = self.history_diff_editor(pane) {
+            editor.update(cx, |editor, cx| {
+                if let Some(position) = position {
+                    use gpui_component::input::Position;
+                    restore_file_selection(editor, position, cx);
+                    editor.scroll_to_viewport_anchor(
+                        Position::new(position.top.0, position.top.1),
+                        px(position.inset),
+                        px(position.horizontal),
+                        false,
+                        cx,
+                    );
+                }
+                editor.focus(window, cx);
+            });
+            return;
+        }
+        match pane {
+            GitHistoryPane::History => self.history_focus.focus(window, cx),
+            GitHistoryPane::ChangedFiles => self.focus_vim_file_tree(window, cx),
+            _ => self.focus(window, cx),
+        }
+    }
+
+    fn history_diff_editor(&self, pane: GitHistoryPane) -> Option<&Entity<EditorState>> {
+        let column = match pane {
+            GitHistoryPane::Original => Column::Original,
+            GitHistoryPane::Modified => Column::Modified,
+            GitHistoryPane::Snapshot => Column::Snapshot,
+            _ => return None,
+        };
+        self.diff_editor(column)
     }
 
     pub(super) fn observe_vim_diff(

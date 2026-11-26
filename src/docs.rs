@@ -582,6 +582,7 @@ pub struct DocReader {
     text: Entity<TextViewState>,
     translation: Option<Arc<DocumentTranslations>>,
     search: Entity<DocumentFind>,
+    vim_find_origin: Option<(String, ListOffset)>,
     workspace: WeakEntity<Workspace>,
     _subscriptions: [Subscription; 2],
     show_outline: Option<bool>,
@@ -595,6 +596,7 @@ pub struct DocReader {
     fragment_jump_block: Option<usize>,
     pending_fragment: Option<(DocumentFragment, bool)>,
     pending_source_location: Option<(Range<usize>, bool)>,
+    history_source_offset: Option<usize>,
     history_fragment: Option<String>,
     pending_position: Option<DocumentPosition>,
     restoring_line: bool,
@@ -1026,7 +1028,11 @@ impl DocReader {
         let search = DocumentFind::for_document(text.clone(), window, cx);
         let text_subscription = cx.observe(&text, |this: &mut Self, _, cx| this.reveal_pending(cx));
         let search_subscription = cx.observe(&search, |this: &mut Self, search, cx| {
-            if search.read(cx).has_matches() {
+            let search = search.read(cx);
+            if !search.is_open() {
+                this.vim_find_origin = None;
+            }
+            if search.has_matches() {
                 this.fragment_jump_block = None;
             }
             cx.notify();
@@ -1045,6 +1051,7 @@ impl DocReader {
             text,
             translation: None,
             search,
+            vim_find_origin: None,
             workspace,
             _subscriptions: [text_subscription, search_subscription],
             show_outline: None,
@@ -1058,6 +1065,7 @@ impl DocReader {
             fragment_jump_block: None,
             pending_fragment: None,
             pending_source_location: None,
+            history_source_offset: None,
             history_fragment: None,
             pending_position: None,
             restoring_line: false,
@@ -1127,10 +1135,23 @@ impl DocReader {
         DocumentLocation {
             position: self.pending_position.or_else(|| {
                 if self.fragment_jump_block.is_some() {
-                    None
-                } else {
-                    self.session_position(cx)
+                    return None;
                 }
+                let text = self.text.read(cx);
+                if !text.has_pending_reveal()
+                    && let Some(position) = self.session_position(cx)
+                {
+                    return Some(position);
+                }
+                self.history_source_offset.map(|offset| DocumentPosition {
+                    source_offset: Some(offset),
+                    block: text.block_for_source_offset(offset).unwrap_or_default(),
+                    inset: 0.,
+                    line: Some(DocumentLinePosition {
+                        source_offset: offset,
+                        viewport_inset: 0.,
+                    }),
+                })
             }),
             fragment: self.history_fragment.clone(),
         }
@@ -1143,6 +1164,7 @@ impl DocReader {
         cx: &mut Context<Self>,
     ) {
         self.pending_source_location = None;
+        self.history_source_offset = None;
         if let Some(position) = location.position {
             self.pending_fragment = None;
             self.history_fragment = location.fragment;
@@ -1217,6 +1239,7 @@ impl DocReader {
         stroke: &Keystroke,
         key: Option<char>,
         top: bool,
+        modal: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
@@ -1238,7 +1261,14 @@ impl DocReader {
         } else {
             match key {
                 Some('G') => self.text.read(cx).list_state().scroll_to_end(),
-                Some('/') => self.find(window, cx),
+                Some('/') => {
+                    if modal {
+                        let query = self.search.read(cx).retained_query().to_owned();
+                        let top = self.text.read(cx).list_state().logical_scroll_top();
+                        self.vim_find_origin = Some((query, top));
+                    }
+                    self.find(window, cx);
+                }
                 Some('n' | 'N') => self
                     .search
                     .update(cx, |search, cx| search.step(key == Some('N'), cx)),
@@ -1359,6 +1389,32 @@ impl DocReader {
         cx.notify();
     }
 
+    pub(crate) fn finish_vim_find(
+        &mut self,
+        commit: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some((query, top)) = &self.vim_find_origin else {
+            return false;
+        };
+        let restore = (!commit).then_some(query.as_str());
+        if !self.search.update(cx, |search, cx| {
+            search.finish_modal_find(restore, window, cx)
+        }) {
+            return false;
+        }
+        if !commit {
+            self.text.update(cx, |text, _| {
+                text.cancel_scroll_navigation();
+                text.list_state().scroll_to(*top);
+            });
+        }
+        self.vim_find_origin = None;
+        cx.notify();
+        true
+    }
+
     pub fn toggle_find(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.search
             .update(cx, |search, cx| search.toggle(window, cx));
@@ -1408,6 +1464,8 @@ impl DocReader {
         };
         let source = to_source_offset(range.start)..to_source_offset(range.end);
         self.restore_position(None);
+        self.history_fragment = None;
+        self.history_source_offset = Some(source.start);
         self.fragment_jump_block = None;
         self.pending_fragment = None;
         self.pending_source_location = Some((source, animate));

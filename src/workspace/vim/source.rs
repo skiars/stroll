@@ -1,4 +1,4 @@
-use std::{ops::Range, rc::Rc};
+use std::{ops::Range, rc::Rc, sync::LazyLock};
 
 use gpui::{App, ClipboardItem, Context, Entity, Keystroke, Window};
 use gpui_component::input::{self, EditorState, Rope, RopeExt as _};
@@ -102,6 +102,7 @@ enum Register {
 #[derive(Clone)]
 enum Change {
     Delete(Motion),
+    Indent(Indent),
     Insert {
         key: char,
         motion: Option<Motion>,
@@ -119,6 +120,19 @@ enum Change {
     Join(usize, bool),
     Replace(char, Motion),
     Surround(SurroundEdit),
+}
+
+#[derive(Clone, Copy)]
+enum IndentTarget {
+    Motion(Motion),
+    Block(block::Shape),
+}
+
+#[derive(Clone, Copy)]
+struct Indent {
+    target: IndentTarget,
+    right: bool,
+    levels: usize,
 }
 
 #[derive(Clone)]
@@ -447,6 +461,23 @@ impl Source {
         }
     }
 
+    pub(in crate::workspace) fn locate(
+        &mut self,
+        editor: &mut EditorState,
+        head: usize,
+        window: &mut Window,
+        cx: &mut Context<EditorState>,
+    ) {
+        if self.mode == Mode::Insert {
+            self.finish_insert(editor, window, cx);
+        }
+        self.clear_pending();
+        self.page_inset = None;
+        self.page_count = None;
+        editor.set_modal_editing(true, cx);
+        self.leave_visual(editor, head, cx);
+    }
+
     fn leave_visual(
         &mut self,
         editor: &mut EditorState,
@@ -572,8 +603,13 @@ impl Source {
                 return handled;
             }
             ("", '/' | '?') => return Some(Action::Find(key == '?')),
+            ("", '*' | '#') if self.mode == Mode::Normal => {
+                self.search_word(editor, key == '#', count, cx);
+                return handled;
+            }
             ("", 'n' | 'N') => {
-                if let Some(at) = match_offset(editor, editor.cursor(), key == 'N', count, cx) {
+                if let Some(at) = editor.modal_search_match(editor.cursor(), key == 'N', count, cx)
+                {
                     self.jump_head(editor, at, cx);
                 }
                 return handled;
@@ -650,6 +686,12 @@ impl Source {
                 }
                 return handled;
             }
+            ("", '>' | '<') if self.mode.visual() => {
+                if editable {
+                    self.indent_selection(editor, key == '>', count.max(1), window, cx);
+                }
+                return handled;
+            }
             ("" | "g", 'J') => {
                 if editable {
                     let count = if self.mode.visual() {
@@ -683,7 +725,7 @@ impl Source {
         }
 
         let (operator, tail) = match rest.as_bytes().first().copied() {
-            Some(key @ (b'd' | b'c' | b'y')) => (Some(key as char), &rest[1..]),
+            Some(key @ (b'd' | b'c' | b'y' | b'>' | b'<')) => (Some(key as char), &rest[1..]),
             _ => (None, rest),
         };
         let (surround_add, tail) = if let Some(tail) = rest.strip_prefix("ys") {
@@ -716,8 +758,10 @@ impl Source {
         } else if tail.is_empty() && surround_add && key == 's' {
             Target::Lines
         } else if tail.is_empty()
-            && (matches!(key, 'g' | 'f' | 'F' | 't' | 'T' | 'd' | 'c' | 'y')
-                || (operator.is_some() || self.mode.visual()) && matches!(key, 'i' | 'a'))
+            && (matches!(
+                key,
+                'g' | 'f' | 'F' | 't' | 'T' | 'd' | 'c' | 'y' | '>' | '<'
+            ) || (operator.is_some() || self.mode.visual()) && matches!(key, 'i' | 'a'))
         {
             self.pending = prefix;
             self.pending.push(key);
@@ -772,6 +816,24 @@ impl Source {
                     count,
                     explicit,
                 });
+            }
+        } else if let Some(operator @ ('>' | '<')) = operator {
+            if editable {
+                self.indent(
+                    editor,
+                    Indent {
+                        target: IndentTarget::Motion(Motion {
+                            target,
+                            count,
+                            explicit,
+                        }),
+                        right: operator == '>',
+                        levels: 1,
+                    },
+                    editor.cursor(),
+                    window,
+                    cx,
+                );
             }
         } else if let Some(operator) = operator {
             if editable || operator == 'y' {
@@ -907,6 +969,60 @@ impl Source {
         })
     }
 
+    fn search_word(
+        &mut self,
+        editor: &mut EditorState,
+        previous: bool,
+        count: usize,
+        cx: &mut Context<EditorState>,
+    ) {
+        static WORD: LazyLock<regex::Regex> = LazyLock::new(|| {
+            regex::Regex::new(&format!("{}+", crate::locator::WORD_CHARACTERS)).unwrap()
+        });
+        let caret = editor.cursor();
+        let bounds = line(editor.text(), caret);
+        let row = editor.text().slice(bounds.clone()).to_string();
+        let Some(word) = WORD
+            .find_iter(&row)
+            .find(|word| word.range().contains(&(caret - bounds.start)))
+        else {
+            return;
+        };
+        let origin = bounds.start + word.start();
+        let word = word.as_str().to_owned();
+        let case_insensitive = editor.search_session().case_insensitive;
+        if editor.search_session().in_selection {
+            editor.set_find_in_selection(false, cx);
+        }
+        if editor.has_advanced_find() {
+            let options = gpui_base::input::SearchOptions {
+                whole_word: true,
+                regex: false,
+            };
+            editor.set_find_query(word, case_insensitive, options, cx);
+        } else {
+            // Git diff Find uses the plain panel and can still match a whole word.
+            let query = crate::locator::TextQuery {
+                query: word,
+                case_sensitive: !case_insensitive,
+                whole_word: true,
+                ..Default::default()
+            };
+            let Ok(pattern) = query.pattern() else {
+                return;
+            };
+            editor.set_search_pattern(
+                query.query,
+                case_insensitive,
+                move |text| crate::workspace::find::scan(&pattern, text, None).unwrap_or_default(),
+                cx,
+            );
+        }
+        if let Some(at) = editor.modal_search_match(origin, previous, count, cx) {
+            self.jump_head(editor, at, cx);
+        }
+    }
+
     pub(in crate::workspace) fn jump_head(
         &mut self,
         editor: &mut EditorState,
@@ -1035,9 +1151,8 @@ impl Find {
         cx: &mut App,
     ) {
         self.editor.update(cx, |editor, cx| {
-            editor.close_search(cx);
             if commit {
-                if let Some(at) = match_offset(editor, self.origin, self.backward, 1, cx) {
+                if let Some(at) = editor.modal_search_match(self.origin, self.backward, 1, cx) {
                     source.jump_head(editor, at, cx);
                 }
             } else {
@@ -1118,31 +1233,4 @@ impl Workspace {
             Action::Tab(next) => self.cycle_tabs(next, window, cx),
         }
     }
-}
-
-fn match_offset(
-    editor: &mut EditorState,
-    origin: usize,
-    backward: bool,
-    count: usize,
-    cx: &mut Context<EditorState>,
-) -> Option<usize> {
-    let session = editor.search_session();
-    let query = session.query.clone();
-    if query.is_empty() {
-        return None;
-    }
-    editor.set_search_query(query, session.case_insensitive, cx);
-    let ranges = editor.search_session().matcher.matched_ranges();
-    let len = ranges.len();
-    if len == 0 {
-        return None;
-    }
-    let steps = count.saturating_sub(1) % len;
-    let index = if backward {
-        (ranges.partition_point(|range| range.start < origin) + len - 1 - steps) % len
-    } else {
-        (ranges.partition_point(|range| range.start <= origin) + steps) % len
-    };
-    Some(ranges[index].start)
 }

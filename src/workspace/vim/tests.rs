@@ -85,9 +85,10 @@ fn with_vim_repository(
 }
 
 #[::core::prelude::v1::test]
-fn vim_status_toggle_renders_the_diamond_and_disabled_slash() -> anyhow::Result<()> {
+fn vim_status_toggle_renders_open_corners_and_a_short_disabled_slash() -> anyhow::Result<()> {
     let renderer = SvgRenderer::new(Arc::new(()));
-    let extent = DevicePixels(32);
+    let side = (STATUS_ICON_SIZE.as_f32() * 2.) as usize;
+    let extent = DevicePixels(side as i32);
     let render = |art: &[u8]| -> anyhow::Result<_> {
         let svg = renderer.parse_svg(art)?;
         let image = renderer.render_parsed(&svg, SvgSize::ExactSize(size(extent, extent)))?;
@@ -95,14 +96,24 @@ fn vim_status_toggle_renders_the_diamond_and_disabled_slash() -> anyhow::Result<
     };
     let enabled = render(include_bytes!("../icons/vim-on.svg"))?;
     let disabled = render(include_bytes!("../icons/vim-off.svg"))?;
-    let alpha = |image: &[u8], x: usize, y: usize| image[(y * 32 + x) * 4 + 3];
-    for (x, y) in [(16, 4), (16, 27)] {
+    let alpha = |image: &[u8], x, y| image[(y * side + x) * 4 + 3];
+    for (x, y) in [(17, 3), (31, 17), (17, 31), (3, 17)] {
         assert!(alpha(&enabled, x, y) > 128);
         assert!(alpha(&disabled, x, y) > 128);
     }
-    for index in [4, 27] {
+    for (x, y) in [(6, 9), (28, 8), (26, 26), (9, 25), (17, 10)] {
+        assert!(alpha(&enabled, x, y) < 16, "expected clearance at {x}, {y}");
+    }
+    for (x, y) in [(10, 11), (26, 11), (17, 26)] {
+        assert!(alpha(&enabled, x, y) > 200, "expected V ink at {x}, {y}");
+    }
+    assert!(alpha(&enabled, 19, 28) < 128);
+    for index in [4, 30] {
         assert_eq!(alpha(&enabled, index, index), 0);
         assert!(alpha(&disabled, index, index) > 128);
+    }
+    for index in [1, 33] {
+        assert_eq!(alpha(&disabled, index, index), 0);
     }
     Ok(())
 }
@@ -170,7 +181,9 @@ fn vim_status_keeps_geometry_and_leader_does_not_take_focus() -> anyhow::Result<
                 assert!(visual.debug_bounds("vim-leader").is_none());
                 visual.executor().advance_clock(HINT_DELAY);
                 draw(visual);
-                assert!(visual.debug_bounds("vim-leader").is_some());
+                let leader = visual.debug_bounds("vim-leader").unwrap();
+                assert_eq!(status.right() - leader.right(), px(12.));
+                assert_eq!(status.top() - leader.bottom(), px(8.));
                 visual.simulate_keystrokes("g");
                 draw(visual);
                 assert!(visual.debug_bounds("status-vim-pending: ␣ g").is_some());
@@ -275,6 +288,220 @@ fn assert_source(
         assert_eq!((position.line, position.character), cursor, "{keys} caret");
         assert_eq!(editor.value().as_str(), contents, "{keys} edit");
     });
+}
+
+#[::core::prelude::v1::test]
+fn vim_find_keeps_match_count_visible_and_returns_focus() -> anyhow::Result<()> {
+    with_vim_workspace("first hit\nsecond hit\nthird hit\n", |visual, workspace| {
+        let editor =
+            visual.update(|_, cx| workspace.read(cx).active_file().unwrap().editor.clone());
+        let assert_match = |visual: &mut VisualTestContext, label, row| {
+            draw(visual);
+            assert!(visual.debug_bounds("find-query-field").is_some());
+            visual.update(|window, cx| {
+                let state = editor.read(cx);
+                assert!(state.focus_handle(cx).is_focused(window));
+                assert!(state.selected_range().is_empty());
+                assert!(state.search_session().open);
+                assert_eq!(state.search_session().matcher.label(), label);
+                assert_eq!(state.cursor_position().line, row);
+                assert!(
+                    workspace.read(cx).active_file().unwrap().vim.mode() == source::Mode::Normal
+                );
+            });
+        };
+        visual.simulate_keystrokes("/");
+        draw(visual);
+        visual.simulate_input("hit");
+        visual.simulate_keystrokes("enter");
+        assert_match(visual, "1/3", 0);
+        visual.simulate_keystrokes("2 n");
+        assert_match(visual, "3/3", 2);
+        visual.simulate_keystrokes("n");
+        assert_match(visual, "1/3", 0);
+        visual.simulate_keystrokes("shift-n");
+        assert_match(visual, "3/3", 2);
+        visual.simulate_keystrokes("?");
+        draw(visual);
+        visual.simulate_keystrokes("enter");
+        assert_match(visual, "2/3", 1);
+        visual.simulate_keystrokes("/");
+        draw(visual);
+        visual.simulate_input("missing");
+        visual.simulate_keystrokes("escape");
+        draw(visual);
+        assert!(visual.debug_bounds("find-query-field").is_none());
+        visual.update(|window, cx| {
+            let state = editor.read(cx);
+            assert!(state.focus_handle(cx).is_focused(window));
+            assert_eq!(state.search_session().query, "hit");
+            assert_eq!(state.cursor_position().line, 1);
+        });
+        visual.simulate_keystrokes("/");
+        draw(visual);
+        visual.simulate_keystrokes("enter escape");
+        draw(visual);
+        assert!(visual.debug_bounds("find-query-field").is_none());
+        visual.update(|_, cx| assert_eq!(editor.read(cx).cursor_position().line, 2));
+    })
+}
+
+#[::core::prelude::v1::test]
+fn vim_word_search_uses_whole_words_and_the_source_history() -> anyhow::Result<()> {
+    with_vim_workspace(
+        "alpha_beta xalpha_beta
+ALPHA_BETA alpha_beta2
+alpha_beta
+name $item
+name $item
+",
+        |visual, workspace| {
+            let check = |visual: &mut VisualTestContext, keys, row, col, query, label| {
+                visual.simulate_keystrokes(keys);
+                draw(visual);
+                visual.update(|window, cx| {
+                    let workspace = workspace.read(cx);
+                    assert!(!workspace.repository_overlay_open());
+                    let file = workspace.active_file().unwrap();
+                    let editor = file.editor.read(cx);
+                    assert!(editor.focus_handle(cx).is_focused(window));
+                    assert!(file.vim.mode() == source::Mode::Normal);
+                    assert!(editor.selected_range().is_empty());
+                    let position = editor.cursor_position();
+                    assert_eq!((position.line, position.character), (row, col));
+                    assert_eq!(editor.search_session().query, query);
+                    assert_eq!(editor.search_session().matcher.label(), label);
+                });
+            };
+            check(visual, "l l #", 2, 0, "alpha_beta", "3/3");
+            check(visual, "ctrl-o", 0, 2, "alpha_beta", "3/3");
+            check(visual, "ctrl-i", 2, 0, "alpha_beta", "3/3");
+            check(visual, "* n", 1, 0, "alpha_beta", "2/3");
+            check(visual, "2 #", 2, 0, "ALPHA_BETA", "3/3");
+            check(visual, "4 g g 6 l *", 4, 5, "$item", "2/2");
+        },
+    )
+}
+
+#[::core::prelude::v1::test]
+fn vim_document_find_returns_focus_without_dismissing() -> anyhow::Result<()> {
+    let document = (0..40)
+        .map(|index| {
+            if index == 12 || index == 28 {
+                "target\n\n".to_owned()
+            } else {
+                format!("Paragraph {index}.\n\n")
+            }
+        })
+        .collect::<String>();
+    with_vim_repository("README.md", &document, &[], |visual, workspace| {
+        visual.simulate_keystrokes("space 1");
+        draw(visual);
+        for _ in 0..40 {
+            if visual.update(|_, cx| workspace.read(cx).doc.is_some()) {
+                break;
+            }
+            visual.executor().advance_clock(Duration::from_millis(25));
+            draw(visual);
+        }
+        let reader = visual.update(|_, cx| workspace.read(cx).doc.as_ref().unwrap().clone());
+        visual.simulate_keystrokes("/");
+        draw(visual);
+        visual.simulate_input("target");
+        visual.simulate_keystrokes("enter");
+        draw(visual);
+        assert!(visual.debug_bounds("find-query-field").is_some());
+        visual.update(|window, cx| assert!(reader.read(cx).content_focused(window, cx)));
+        crate::workspace::finish_scroll_navigation(visual);
+        let first = visual.update(|_, cx| reader.read(cx).session_position(cx).unwrap());
+        visual.simulate_keystrokes("n");
+        crate::workspace::finish_scroll_navigation(visual);
+        let next = visual.update(|_, cx| reader.read(cx).session_position(cx).unwrap());
+        assert!(next.block > first.block);
+        visual.simulate_keystrokes("/");
+        draw(visual);
+        visual.simulate_input("Paragraph 2.");
+        visual.simulate_keystrokes("escape");
+        draw(visual);
+        assert!(visual.debug_bounds("find-query-field").is_none());
+        visual.update(|window, cx| {
+            assert!(reader.read(cx).content_focused(window, cx));
+            assert_eq!(
+                reader.read(cx).session_position(cx).unwrap().block,
+                next.block
+            );
+        });
+    })
+}
+
+#[::core::prelude::v1::test]
+fn vim_indent_supports_operators_visual_blocks_and_undo() -> anyhow::Result<()> {
+    let text = "a\n b\nc\n\nd\n";
+    with_vim_workspace(text, |visual, workspace| {
+        let width = visual.update(|_, cx| {
+            workspace
+                .read(cx)
+                .active_file()
+                .unwrap()
+                .editor
+                .read(cx)
+                .tab_width()
+        });
+        let indent = " ".repeat(width);
+        let shifted = format!("{indent}a\n{indent} b\nc\n\nd\n");
+        assert_source(visual, workspace, "2 > >", &[], (0, width as u32), &shifted);
+        assert_source(visual, workspace, "u", &[], (0, 0), text);
+        assert_source(visual, workspace, "> j", &[], (0, width as u32), &shifted);
+        assert_source(
+            visual,
+            workspace,
+            "< <",
+            &[],
+            (0, 0),
+            &format!("a\n{indent} b\nc\n\nd\n"),
+        );
+        assert_source(visual, workspace, "j .", &[], (1, 1), text);
+        assert_source(
+            visual,
+            workspace,
+            "g g shift-v 2 j 2 >",
+            &[],
+            (0, (2 * width) as u32),
+            &format!("{indent}{indent}a\n{indent}{indent} b\n{indent}{indent}c\n\nd\n"),
+        );
+        visual.simulate_keystrokes("u");
+        draw(visual);
+        visual.update(|_, cx| {
+            assert_eq!(
+                workspace
+                    .read(cx)
+                    .active_file()
+                    .unwrap()
+                    .editor
+                    .read(cx)
+                    .value(),
+                text
+            );
+        });
+        reset_editor(visual, workspace, "abcd\nab cd\na\n  ab\n");
+        let shifted = format!("ab{indent}cd\nab{indent} cd\na\n  {indent}ab\n");
+        assert_source(
+            visual,
+            workspace,
+            "g g 0 2 l ctrl-v 3 j >",
+            &[],
+            (0, 2),
+            &shifted,
+        );
+        assert_source(
+            visual,
+            workspace,
+            "ctrl-v 3 j <",
+            &[],
+            (0, 2),
+            "abcd\nab cd\na\n  ab\n",
+        );
+    })
 }
 
 #[::core::prelude::v1::test]
@@ -1063,7 +1290,18 @@ fn vim_panes_keep_document_focus_and_reveal_the_active_buffer() -> anyhow::Resul
             switch(visual, WorkspaceView::Editor);
             assert_editor(visual, "switching to Editor");
             toggle(visual, true);
-            switch(visual, WorkspaceView::Docs);
+            visual.simulate_keystrokes("space 1");
+            assert_doc(visual);
+            visual.simulate_keystrokes("space 3");
+            draw(visual);
+            visual.update(|window, cx| {
+                let this = workspace.read(cx);
+                assert_eq!(this.view, WorkspaceView::Git);
+                assert!(this.git.as_ref().unwrap().read(cx).vim_focused(window, cx));
+            });
+            visual.simulate_keystrokes("space 2");
+            assert_editor(visual, "Space 2");
+            visual.simulate_keystrokes("space 1");
             assert_doc(visual);
             hide_tree(visual);
             visual.simulate_keystrokes("ctrl-h");

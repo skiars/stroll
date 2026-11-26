@@ -242,6 +242,7 @@ pub(super) struct Locator {
     position: Option<Point<Pixels>>,
     drag_anchor: Option<Point<Pixels>>,
     return_focus: Option<FocusHandle>,
+    history_origin: Option<crate::session::SourceLocation>,
     mode: Mode,
     sessions: HashMap<Vec<u8>, Session>,
     source: Option<PathBuf>,
@@ -321,6 +322,7 @@ impl Locator {
             position: None,
             drag_anchor: None,
             return_focus: None,
+            history_origin: None,
             mode: Mode::Files,
             sessions: HashMap::new(),
             source: None,
@@ -409,6 +411,42 @@ impl Workspace {
         }
     }
 
+    pub(super) fn locator_symbols_available(&self, workspace: bool, cx: &App) -> bool {
+        self.repository.is_some()
+            && self.locator_source(cx).is_some_and(|path| {
+                self.files.get(path).is_some_and(|file| {
+                    !file.missing
+                        && file.language_server.as_ref().is_some_and(|server| {
+                            server.document.supports_locator_symbols(workspace)
+                        })
+                })
+            })
+    }
+
+    pub(super) fn open_symbol_locator(
+        &mut self,
+        workspace: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let mode = if workspace {
+            Mode::WorkspaceSymbols
+        } else {
+            Mode::DocumentSymbols
+        };
+        if self.show_locator(mode, window, cx) {
+            self.locator_mode(mode, window, cx);
+        }
+    }
+
+    fn locator_source<'a>(&'a self, cx: &'a App) -> Option<&'a Path> {
+        match self.view {
+            WorkspaceView::Editor => self.tabs.active(),
+            WorkspaceView::Docs => self.doc.as_ref().map(|doc| doc.read(cx).path.as_path()),
+            WorkspaceView::Git => None,
+        }
+    }
+
     pub(super) fn find_references(
         &mut self,
         _: &super::FindReferences,
@@ -470,6 +508,7 @@ impl Workspace {
         self.locator.references = None;
         self.locator.position = None;
         self.locator.return_focus = window.focused(cx);
+        self.locator.history_origin = Some(self.locator_history_origin(window, cx));
         self.locator
             .inputs
             .get_or_insert_with(|| LocatorInputs::new(window, cx));
@@ -482,11 +521,7 @@ impl Workspace {
         self.repository_ui.menu_open = false;
         self.open_files_list = false;
         self.lsp_panel = None;
-        self.locator.source = match self.view {
-            WorkspaceView::Editor => self.tabs.active().map(Path::to_owned),
-            WorkspaceView::Docs => self.doc.as_ref().map(|doc| doc.read(cx).path.clone()),
-            WorkspaceView::Git => None,
-        };
+        self.locator.source = self.locator_source(cx).map(Path::to_owned);
         if let Some(file) = self.active_file() {
             file.editor
                 .update(cx, |editor, cx| editor.dismiss_lsp_overlays(cx));
@@ -504,6 +539,7 @@ impl Workspace {
             return;
         }
         self.locator.open = false;
+        self.locator.history_origin = None;
         self.locator.drag_anchor = None;
         self.locator.search_cancel = None;
         self.locator.search_task = Task::ready(());
@@ -1123,13 +1159,23 @@ impl Workspace {
             self.notify_locator(cx);
             return;
         }
+        let from = self.locator.history_origin.take();
         self.close_locator(false, window, cx);
         self.focus.focus(window, cx);
         if self.view == WorkspaceView::Docs && docs::is_markdown(&path) {
-            self.open_doc_at(path, None, position, None, window, cx);
+            self.open_doc_request(
+                path,
+                None,
+                position,
+                None,
+                Some(super::DocumentNavigation::Record(from)),
+                window,
+                cx,
+            );
+            self.focus_document_content(window, cx);
         } else {
             self.switch_view(WorkspaceView::Editor, window, cx);
-            self.request_file(path, FileOpen::Locate(position), window, cx);
+            self.request_file(path, FileOpen::Locate { position, from }, window, cx);
         }
     }
 }

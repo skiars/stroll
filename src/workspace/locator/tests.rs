@@ -27,7 +27,7 @@ fn wait_for(
     }
 }
 
-fn workflow(authority: Option<String>) -> Result<()> {
+fn workflow(authority: Option<String>, vim: bool) -> Result<()> {
     let fixture = tempfile::tempdir()?;
     let root = fixture.path().canonicalize()?.join("repository");
     let main = PathBuf::from("main.cpp");
@@ -44,6 +44,18 @@ fn workflow(authority: Option<String>) -> Result<()> {
     fs::write(root.join(&main), "word();\n")?;
     fs::write(root.join(&usage), "😀 word();\n")?;
     fs::write(root.join(&declaration), "int word();\n")?;
+    if vim {
+        let readme = (0..40)
+            .map(|row| {
+                if row == 28 {
+                    "unique_reader_term\n\n".to_owned()
+                } else {
+                    format!("Paragraph {row} in the reader.\n\n")
+                }
+            })
+            .collect::<String>();
+        fs::write(root.join("README.md"), readme)?;
+    }
     let script = fixture.path().join("server.py");
     fs::write(
         &script,
@@ -53,7 +65,7 @@ fn workflow(authority: Option<String>) -> Result<()> {
     fs::write(
         &config_path,
         format!(
-            "[lsp.clangd]\ncommand = 'python3 -u {}'\n",
+            "[keyboard]\nvim_mode = {vim}\n[lsp.clangd]\ncommand = 'python3 -u {}'\n",
             script.display()
         ),
     )?;
@@ -107,6 +119,176 @@ fn workflow(authority: Option<String>) -> Result<()> {
                 .is_some_and(|server| server.document.supports_references())
         })
     })?;
+    if vim {
+        let accept = |visual: &mut VisualTestContext, keys, mode, query| -> Result<()> {
+            visual.simulate_keystrokes(keys);
+            wait_for(visual, "Locator mode", |visual| {
+                visual.update(|_, cx| {
+                    let locator = &workspace.read(cx).locator;
+                    locator.open && locator.mode == mode
+                })
+            })?;
+            if let Some(query) = query {
+                visual.simulate_input(query);
+            }
+            wait_for(visual, "Locator match preview", |visual| {
+                visual.update(|_, cx| {
+                    let locator = &workspace.read(cx).locator;
+                    !locator.busy && !locator.preview_busy && locator.preview.is_some()
+                })
+            })?;
+            visual.simulate_keystrokes("enter");
+            Ok(())
+        };
+        let check_editor = |visual: &mut VisualTestContext, step, path: &Path, offset| {
+            wait_for(visual, step, |visual| {
+                visual.update(|window, cx| {
+                    let workspace = workspace.read(cx);
+                    if workspace.view != WorkspaceView::Editor
+                        || workspace.locator.open
+                        || workspace.tabs.active() != Some(path)
+                    {
+                        return false;
+                    }
+                    let file = workspace.active_file().unwrap();
+                    let editor = file.editor.read(cx);
+                    file.vim.mode() == crate::workspace::vim::source::Mode::Normal
+                        && editor.focus_handle(cx).is_focused(window)
+                        && editor.selected_range() == (offset..offset)
+                        && editor.cursor() == offset
+                })
+            })
+        };
+        let round_trip =
+            |visual: &mut VisualTestContext, keys, mode, query, path: &Path, offset, origin| {
+                accept(visual, keys, mode, query)?;
+                check_editor(visual, "Normal-mode jump", path, offset)?;
+                visual.simulate_keystrokes("ctrl-o");
+                check_editor(visual, "jump back to the originating caret", &main, origin)?;
+                visual.simulate_keystrokes("ctrl-i");
+                check_editor(visual, "jump forward to the accepted result", path, offset)?;
+                visual.simulate_keystrokes("ctrl-o");
+                check_editor(visual, "jump back before the next query", &main, origin)
+            };
+        visual.simulate_keystrokes("l l");
+        round_trip(
+            visual,
+            "space s s",
+            Mode::DocumentSymbols,
+            None,
+            &main,
+            0,
+            2,
+        )?;
+        round_trip(
+            visual,
+            "space s shift-s",
+            Mode::WorkspaceSymbols,
+            Some("word"),
+            &declaration,
+            4,
+            2,
+        )?;
+        round_trip(
+            visual,
+            "space s g",
+            Mode::Text,
+            Some("int word"),
+            &declaration,
+            0,
+            2,
+        )?;
+        round_trip(
+            visual,
+            "g r",
+            Mode::References,
+            None,
+            &usage,
+            "😀 ".len(),
+            2,
+        )?;
+
+        visual.simulate_keystrokes("space 1");
+        let check_reader = |visual: &mut VisualTestContext, step, at_top| {
+            wait_for(visual, step, |visual| {
+                visual.update(|window, cx| {
+                    let this = workspace.read(cx);
+                    this.view == WorkspaceView::Docs
+                        && this.doc.as_ref().is_some_and(|reader| {
+                            let reader = reader.read(cx);
+                            reader.content_focused(window, cx)
+                                && reader.session_position(cx).is_some_and(|position| {
+                                    if at_top {
+                                        position.block == 0
+                                    } else {
+                                        position.block > 0
+                                    }
+                                })
+                        })
+                })
+            })
+            .with_context(|| {
+                visual.update(|window, cx| {
+                    let this = workspace.read(cx);
+                    let reader = this.doc.as_ref().map(|reader| reader.read(cx));
+                    format!(
+                        "View: {:?}, reader focus: {}, position: {:?}",
+                        this.view,
+                        reader.is_some_and(|reader| reader.content_focused(window, cx)),
+                        reader.and_then(|reader| reader.session_position(cx)),
+                    )
+                })
+            })
+        };
+        check_reader(visual, "reading position before Locator", true)?;
+        accept(visual, "space s g", Mode::Text, Some("unique_reader_term"))?;
+        check_reader(visual, "text result in the reader", false)?;
+        let reader_position = |visual: &mut VisualTestContext| {
+            visual.update(|_, cx| {
+                workspace
+                    .read(cx)
+                    .doc
+                    .as_ref()
+                    .unwrap()
+                    .read(cx)
+                    .session_position(cx)
+            })
+        };
+        let destination = reader_position(visual);
+        visual.simulate_keystrokes("ctrl-o");
+        check_reader(visual, "return to the original reading position", true)?;
+        visual.simulate_keystrokes("ctrl-i");
+        check_reader(visual, "return to the text result in the reader", false)?;
+        assert_eq!(reader_position(visual), destination);
+        visual.simulate_keystrokes("ctrl-o");
+        check_reader(visual, "restore reader before cross-view jump", true)?;
+        accept(visual, "space s g", Mode::Text, Some("int word"))?;
+        check_editor(visual, "source result from the reader", &declaration, 0)?;
+        visual.simulate_keystrokes("ctrl-o");
+        check_reader(visual, "restore reader from the source result", true)?;
+
+        visual.simulate_keystrokes("space 3");
+        let check_git = |visual: &mut VisualTestContext| {
+            wait_for(visual, "focused Git view", |visual| {
+                visual.update(|window, cx| {
+                    let this = workspace.read(cx);
+                    this.view == WorkspaceView::Git
+                        && this
+                            .git
+                            .as_ref()
+                            .is_some_and(|panel| panel.read(cx).vim_focused(window, cx))
+                })
+            })
+        };
+        check_git(visual)?;
+        accept(visual, "space s g", Mode::Text, None)?;
+        check_editor(visual, "source result from Git", &declaration, 0)?;
+        visual.simulate_keystrokes("ctrl-o");
+        check_git(visual)?;
+        visual.simulate_keystrokes("ctrl-i");
+        check_editor(visual, "redo the jump from Git", &declaration, 0)?;
+        return Ok(());
+    }
     visual.update(|window, cx| {
         workspace.update(cx, |workspace, cx| {
             workspace.request_file(
@@ -248,11 +430,16 @@ fn workflow(authority: Option<String>) -> Result<()> {
 
 #[::core::prelude::v1::test]
 fn find_references_previews_drafts_and_jumps() -> Result<()> {
-    workflow(None)
+    workflow(None, false)
+}
+
+#[::core::prelude::v1::test]
+fn vim_locator_symbols_and_text_jump_in_normal_mode() -> Result<()> {
+    workflow(None, true)
 }
 
 #[::core::prelude::v1::test]
 #[ignore = "requires a disposable SSH host with a fixture clangd command"]
 fn find_references_over_ssh() -> Result<()> {
-    workflow(Some(std::env::var("STROLL_TEST_LSP_SSH_AUTHORITY")?))
+    workflow(Some(std::env::var("STROLL_TEST_LSP_SSH_AUTHORITY")?), false)
 }
