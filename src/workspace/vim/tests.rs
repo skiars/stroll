@@ -969,6 +969,88 @@ fn vim_ctrl_v_selects_and_edits_rectangles() -> anyhow::Result<()> {
 }
 
 #[::core::prelude::v1::test]
+fn vim_substitute_uses_change_ranges_and_history() -> anyhow::Result<()> {
+    let text = "one two\n  three\nfour\n";
+    with_vim_workspace(text, |visual, workspace| {
+        visual.simulate_keystrokes("3 s");
+        visual.simulate_input("X");
+        assert_source(
+            visual,
+            workspace,
+            "escape",
+            &[],
+            (0, 0),
+            "X two\n  three\nfour\n",
+        );
+        assert_source(
+            visual,
+            workspace,
+            "w .",
+            &[],
+            (0, 2),
+            "X X\n  three\nfour\n",
+        );
+        assert_source(visual, workspace, "u u 0", &[], (0, 0), text);
+
+        visual.simulate_keystrokes("v e s");
+        visual.simulate_input("Y");
+        assert_source(
+            visual,
+            workspace,
+            "escape",
+            &[],
+            (0, 0),
+            "Y two\n  three\nfour\n",
+        );
+
+        reset_editor(visual, workspace, "  one\n  two\n  three\n  four\n");
+        visual.simulate_keystrokes("2 shift-s");
+        visual.simulate_input("Z");
+        assert_source(
+            visual,
+            workspace,
+            "escape",
+            &[],
+            (0, 2),
+            "  Z\n  three\n  four\n",
+        );
+        assert_source(visual, workspace, "j .", &[], (1, 2), "  Z\n  Z\n");
+        assert_source(
+            visual,
+            workspace,
+            "u u 0",
+            &[],
+            (0, 0),
+            "  one\n  two\n  three\n  four\n",
+        );
+    })
+}
+
+#[::core::prelude::v1::test]
+fn vim_toggle_case_uses_grapheme_counts_and_repeats_at_the_caret() -> anyhow::Result<()> {
+    let text = "aB--cd\né\u{301}ßz\n";
+    let toggled = "Ab--cd\né\u{301}ßz\n";
+    with_vim_workspace(text, |visual, workspace| {
+        assert_source(visual, workspace, "2 ~", &[], (0, 2), toggled);
+        assert_source(visual, workspace, ".", &[], (0, 4), toggled);
+        assert_source(visual, workspace, ".", &[], (0, 5), "Ab--CD\né\u{301}ßz\n");
+        assert_source(visual, workspace, "u 0", &[], (0, 0), toggled);
+        assert_source(
+            visual,
+            workspace,
+            "j 0 9 ~",
+            &[],
+            (1, 4),
+            "Ab--cd\nÉ\u{301}SSZ\n",
+        );
+        assert_source(visual, workspace, "u 0", &[], (1, 0), toggled);
+
+        reset_editor(visual, workspace, "a-bcd\n");
+        assert_source(visual, workspace, "x ~ .", &[], (0, 2), "-Bcd\n");
+    })
+}
+
+#[::core::prelude::v1::test]
 fn vim_surround_join_replace_and_match_integrate_with_undo_and_repeat() -> anyhow::Result<()> {
     let text = "one two\n  three\nfour\n";
     with_vim_workspace(text, |visual, workspace| {

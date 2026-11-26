@@ -119,6 +119,7 @@ enum Change {
     },
     Join(usize, bool),
     Replace(char, Motion),
+    ToggleCase(usize),
     Surround(SurroundEdit),
 }
 
@@ -652,10 +653,16 @@ impl Source {
                 }
                 return handled;
             }
-            ("", 'd' | 'c' | 'y' | 'x' | 'D' | 'C' | 'Y') if self.mode.visual() => {
+            ("", '~') if self.mode == Mode::Normal => {
+                if editable {
+                    self.toggle_case(editor, count, window, cx);
+                }
+                return handled;
+            }
+            ("", 'd' | 'c' | 's' | 'y' | 'x' | 'D' | 'C' | 'Y') if self.mode.visual() => {
                 let operator = match key {
                     'd' | 'x' | 'D' => 'd',
-                    'c' | 'C' => 'c',
+                    'c' | 's' | 'C' => 'c',
                     _ => 'y',
                 };
                 if editable || operator == 'y' {
@@ -766,22 +773,23 @@ impl Source {
             self.pending = prefix;
             self.pending.push(key);
             return handled;
-        } else if tail.is_empty() && operator.is_none() && matches!(key, 'x' | 'D' | 'C' | 'Y') {
-            if editable || key == 'Y' {
-                let target = if key == 'Y' {
-                    Target::Lines
-                } else {
-                    Target::Key(if key == 'x' { 'l' } else { '$' })
-                };
+        } else if tail.is_empty()
+            && operator.is_none()
+            && matches!(key, 'x' | 's' | 'D' | 'C' | 'S' | 'Y')
+        {
+            let (operator, target) = match key {
+                'x' => ('d', Target::Key('l')),
+                's' => ('c', Target::Key('l')),
+                'D' => ('d', Target::Key('$')),
+                'C' => ('c', Target::Key('$')),
+                'S' => ('c', Target::Lines),
+                'Y' => ('y', Target::Lines),
+                _ => unreachable!(),
+            };
+            if editable || operator == 'y' {
                 self.run_operator(
                     editor,
-                    if key == 'C' {
-                        'c'
-                    } else if key == 'Y' {
-                        'y'
-                    } else {
-                        'd'
-                    },
+                    operator,
                     Motion {
                         target,
                         count,

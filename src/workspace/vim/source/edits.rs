@@ -506,6 +506,45 @@ impl Source {
         }
     }
 
+    pub(super) fn toggle_case(
+        &mut self,
+        editor: &mut EditorState,
+        count: usize,
+        window: &mut Window,
+        cx: &mut Context<EditorState>,
+    ) {
+        let motion = Motion {
+            target: Target::Key('l'),
+            count,
+            explicit: true,
+        };
+        let Some((range, _)) = motion.range(editor.text(), editor.cursor()) else {
+            return;
+        };
+        if range.is_empty() || !self.allows_edit(std::slice::from_ref(&range), cx) {
+            return;
+        }
+
+        let value = editor.text().slice(range.clone()).to_string();
+        let mut replacement = String::with_capacity(value.len());
+        for glyph in value.graphemes(true) {
+            let mut chars = glyph.chars();
+            let ch = chars.next().unwrap();
+            if ch.is_uppercase() {
+                replacement.extend(ch.to_lowercase());
+            } else {
+                replacement.extend(ch.to_uppercase());
+            }
+            replacement.push_str(chars.as_str());
+        }
+        let head = range.start + replacement.len();
+        if value != replacement {
+            editor.edit_ranges(&[(range, replacement)], window, cx);
+        }
+        self.last_change = Some(Change::ToggleCase(count));
+        self.leave_visual(editor, head, cx);
+    }
+
     pub(super) fn surround(
         &mut self,
         editor: &mut EditorState,
@@ -675,6 +714,7 @@ impl Source {
                     move_cursor(editor, at, cx);
                 }
             }
+            Change::ToggleCase(count) => self.toggle_case(editor, count, window, cx),
             Change::Surround(edit) => self.surround(editor, edit, window, cx),
         }
     }
