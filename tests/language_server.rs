@@ -178,7 +178,7 @@ fn remote_helper_uses_the_managed_typescript_executable() -> Result<()> {
 
 #[cfg(unix)]
 #[test]
-fn remote_helper_resolves_external_language_server_from_its_own_config() -> Result<()> {
+fn remote_helper_resolves_configured_language_server_on_the_interactive_login_path() -> Result<()> {
     use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
     use std::os::unix::fs::PermissionsExt as _;
 
@@ -192,11 +192,22 @@ fn remote_helper_resolves_external_language_server_from_its_own_config() -> Resu
             .success()
     );
     let shell = root.join("login-shell");
-    let server = root.join("example-lsp");
+    let home = root.join("home");
+    let bin = home.join(".local/bin");
+    fs::create_dir_all(&bin)?;
+    let server = bin.join("lace-lsp");
     for (path, script) in [
         (
             &shell,
-            "#!/bin/sh\nprintf '\\0stroll-env\\0PATH=/usr/bin:/bin\\0'\n",
+            r#"#!/bin/sh
+printf 'shell startup output\n'
+PATH=/usr/bin:/bin
+if [ "$1" = -ilc ]; then
+    PATH="$HOME/.local/bin:$PATH"
+fi
+export PATH
+exec /bin/sh -c "$2"
+"#,
         ),
         (
             &server,
@@ -212,7 +223,7 @@ fn remote_helper_resolves_external_language_server_from_its_own_config() -> Resu
         serde_json::to_vec(&serde_json::json!([{
             "id": "example",
             "languages": {".example": "example"},
-            "server": {"command": server, "args": ["--stdio"], "env": {"LSP_TEST": "yes"}}
+            "server": {"command": "lace-lsp", "args": ["--stdio"], "env": {"LSP_TEST": "yes"}}
         }]))?,
     )?;
     for (id, expected) in [("example", true), ("unregistered", false)] {
@@ -222,6 +233,7 @@ fn remote_helper_resolves_external_language_server_from_its_own_config() -> Resu
         let result = Command::new(env!("CARGO_BIN_EXE_stroll-remote"))
             .args(["--lsp", &request])
             .env("SHELL", &shell)
+            .env("HOME", &home)
             .env("STROLL_LSP_CONFIG", &config)
             .output()?;
         assert_eq!(result.status.success(), expected, "{:?}", result.stderr);

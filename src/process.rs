@@ -15,10 +15,10 @@ pub(crate) fn background(program: impl AsRef<OsStr>) -> Command {
 }
 
 #[cfg(unix)]
-pub(crate) fn login_shell(shell: &OsStr, directory: &std::path::Path) -> Command {
+pub(crate) fn login_shell(shell: &OsStr, directory: &std::path::Path, flags: &str) -> Command {
     let mut command = Command::new(shell);
     command
-        .args(["-lc", r"printf '\0stroll-env\0'; exec env -0"])
+        .args([flags, r"printf '\0stroll-env\0'; exec env -0"])
         .current_dir(directory)
         .stdin(std::process::Stdio::null());
     command

@@ -60,7 +60,7 @@ fn login_environment(
     use std::io::{Read as _, Seek as _};
 
     let mut output = tempfile::tempfile().ok()?;
-    let mut child = crate::process::login_shell(shell, directory)
+    let mut child = crate::process::login_shell(shell, directory, "-lc")
         .stdout(output.try_clone().ok()?)
         .stderr(Stdio::null())
         .process_group(0)

@@ -1266,8 +1266,8 @@ fn login_environment(
 ) -> Result<HashMap<std::ffi::OsString, std::ffi::OsString>> {
     let shell = std::env::var_os("SHELL")
         .context("The SSH session did not provide the remote account's default shell")?;
-    // Capture startup output separately from the language server's protocol stream.
-    let output = crate::process::login_shell(&shell, directory)
+    // Load interactive startup files and keep their output off the protocol stream.
+    let output = crate::process::login_shell(&shell, directory, "-ilc")
         .output()
         .context("Could not start the remote account's default login shell")?;
     ensure!(

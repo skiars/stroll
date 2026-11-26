@@ -92,6 +92,8 @@ optional `server.workspaceSettings` object for the server's workspace settings.
 For SSH, install the updated remote helper and register the same server ID
 in the helper user's `lsp.json` with the command for that host. The client
 routes by ID and the helper resolves the executable from its own configuration.
+On Unix, the helper reads the remote account's interactive login shell
+environment, including its `PATH`.
 
 ### Worktree LSP configuration
 
