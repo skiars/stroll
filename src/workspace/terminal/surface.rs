@@ -15,6 +15,8 @@ use std::{
 use gpui::*;
 use gpui_component::{ActiveTheme, ThemeMode, animation::ease_in_cubic, menu::ContextMenuExt as _};
 
+use super::super::{toast, tree_transfer::TreeDrag};
+use crate::remote::{RepoPath, SshSession};
 use crate::session::TerminalTab;
 use crate::terminal::{
     Command, Emulator, Event, Frame, Link, LinkTarget, MouseAction, Process, PtySize,
@@ -25,6 +27,7 @@ use crate::terminal::{
 mod directory;
 mod links;
 mod paint;
+mod path_drop;
 
 use links::link_modifier;
 use paint::Appearance;
@@ -324,9 +327,17 @@ impl Session {
             .map_or_else(|| root.to_owned(), |target| target.path)
     }
 
+    fn reported_directory(&self) -> Option<PathBuf> {
+        #[cfg(windows)]
+        if self.ssh.is_none() {
+            return self.directory_report.path().cloned();
+        }
+        self.process.as_ref().and_then(Process::working_directory)
+    }
+
     pub(super) fn snapshot_directory(&self) -> Option<PathBuf> {
         if self.ssh.is_some() {
-            if let Some(path) = self.process.as_ref().and_then(Process::working_directory) {
+            if let Some(path) = self.reported_directory() {
                 let path = path
                     .strip_prefix(&self.root)
                     .map_or(path.clone(), Path::to_owned);
@@ -334,11 +345,10 @@ impl Session {
             }
             return self.last_directory.borrow().clone();
         }
-        #[cfg(unix)]
-        let reported = self.process.as_ref().and_then(Process::working_directory);
-        #[cfg(windows)]
-        let reported = self.directory_report.path().cloned();
-        if let Some(path) = reported.filter(|path| path.is_absolute() && path.to_str().is_some()) {
+        if let Some(path) = self
+            .reported_directory()
+            .filter(|path| path.is_absolute() && path.to_str().is_some())
+        {
             self.last_directory.replace(Some(path));
         }
         self.last_directory.borrow().as_ref().map(|path| {
@@ -635,6 +645,37 @@ impl Session {
         self.begin_input(cx);
         if let Some(emulator) = &mut self.emulator {
             emulator.paste(text);
+        }
+    }
+
+    fn accepts_tree_path(&self, drag: &TreeDrag) -> bool {
+        self.can_paste()
+            && self.root == Self::directory_root(&drag.repo.root)
+            && self.ssh.as_ref().map(SshSession::target)
+                == drag.repo.ssh.as_ref().map(SshSession::target)
+    }
+
+    fn drop_tree_path(&mut self, drag: &TreeDrag, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.accepts_tree_path(drag) {
+            return;
+        }
+        let directory = self.reported_directory();
+        let formatted = if self.ssh.is_some() {
+            RepoPath::from_local(&drag.path).ok().and_then(|path| {
+                path_drop::remote_path(&self.root, path.as_str(), directory.as_deref())
+            })
+        } else {
+            path_drop::local_path(
+                &self.root.join(&drag.path),
+                directory.as_deref(),
+                &self.shell,
+            )
+        };
+        if let Some(path) = formatted {
+            self.focus.focus(window, cx);
+            self.paste_text(&path, cx);
+        } else {
+            toast::error(window, cx, t!("terminal.path_drop_unavailable"));
         }
     }
 
@@ -940,6 +981,20 @@ impl Render for Session {
                     .role(Role::Terminal)
                     .aria_label(self.label.clone())
                     .cursor_text()
+                    .can_drop({
+                        let session = weak.clone();
+                        move |value, _, cx| {
+                            value.downcast_ref::<TreeDrag>().is_some_and(|drag| {
+                                session
+                                    .read_with(cx, |this, _| this.accepts_tree_path(drag))
+                                    .unwrap_or(false)
+                            })
+                        }
+                    })
+                    .drag_over::<TreeDrag>(|style, _, _, cx| {
+                        style.bg(cx.theme().accent.opacity(0.15))
+                    })
+                    .on_drop(cx.listener(Self::drop_tree_path))
                     .on_key_down(cx.listener(Self::focused_key))
                     .on_any_mouse_down(cx.listener(Self::mouse_down))
                     .on_mouse_up(MouseButton::Left, cx.listener(Self::mouse_up))
@@ -2027,6 +2082,124 @@ mod tests {
             window.draw(cx).clear(cx);
         });
         (terminal, input, cx)
+    }
+
+    #[gpui::test]
+    fn worktree_drag_pastes_one_path_into_the_terminal(cx: &mut TestAppContext) {
+        use crate::{repository::Entry, workspace::tree_transfer::tree_drag_source};
+        use gpui::{div, prelude::*};
+
+        struct TerminalDropView {
+            repo: Arc<Repository>,
+            entry: Entry,
+            session: Entity<Session>,
+        }
+
+        impl Render for TerminalDropView {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div()
+                    .size_full()
+                    .flex()
+                    .child(tree_drag_source(
+                        div().id("drag-source").w(px(150.)).h_full().child("File"),
+                        &self.entry,
+                        Some(&self.repo),
+                    ))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .h_full()
+                            .child(self.session.clone()),
+                    )
+            }
+        }
+
+        let fixture = tempfile::tempdir().unwrap();
+        assert!(
+            std::process::Command::new("git")
+                .arg("init")
+                .arg(fixture.path())
+                .output()
+                .unwrap()
+                .status
+                .success()
+        );
+        let entry = Entry {
+            path: "a b-项目.txt".into(),
+            directory: false,
+            symlink: false,
+            ignored: false,
+        };
+        let path = fixture.path().join(&entry.path);
+        fs::write(&path, "file contents").unwrap();
+        let repo = Arc::new(Repository::open(fixture.path()).unwrap());
+        let expected =
+            super::path_drop::local_path(&repo.root.join(&entry.path), None, "bash".as_ref())
+                .unwrap();
+        let (commands, input) = mpsc::channel();
+        let mut terminal = None;
+        let (_, visual) = cx.add_window_view(|window, cx| {
+            gpui_component::init(cx);
+            let session = cx.new(|cx| {
+                let mut session = Session::new(
+                    Default::default(),
+                    &repo.root,
+                    "bash".into(),
+                    None,
+                    window,
+                    cx,
+                );
+                session.pending = None;
+                session.commands = commands;
+                session.emulator = Some(Emulator::new(
+                    PtySize {
+                        cols: 80,
+                        rows: 24,
+                        cell_width: 8,
+                        cell_height: 16,
+                    },
+                    session.commands.clone(),
+                ));
+                session.output(vec![Event::Output(b"\x1b[?2004h".to_vec())], cx);
+                session
+            });
+            terminal = Some(session.clone());
+            let view = cx.new(|_| TerminalDropView {
+                repo,
+                entry,
+                session,
+            });
+            Root::new(view, window, cx)
+        });
+        let terminal = terminal.unwrap();
+        visual.simulate_resize(size(px(720.), px(480.)));
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+        let source = point(px(60.), px(100.));
+        let destination = point(px(400.), px(150.));
+        let modifiers = Modifiers::none();
+        visual.simulate_mouse_move(source, None, modifiers);
+        visual.simulate_mouse_down(source, MouseButton::Left, modifiers);
+        visual.simulate_mouse_move(
+            source + point(px(20.), px(0.)),
+            MouseButton::Left,
+            modifiers,
+        );
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+        visual.simulate_mouse_move(destination, MouseButton::Left, modifiers);
+        visual.simulate_mouse_up(destination, MouseButton::Left, modifiers);
+        visual.update(|window, cx| {
+            assert!(terminal.read(cx).focus.is_focused(window));
+        });
+        let writes = input
+            .try_iter()
+            .filter_map(|command| match command {
+                Command::Input(bytes) => Some(String::from_utf8(bytes).unwrap()),
+                Command::Resize(_) => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(writes, [format!("\x1b[200~{expected}\x1b[201~")]);
+        assert_eq!(fs::read_to_string(path).unwrap(), "file contents");
     }
 
     #[gpui::test]

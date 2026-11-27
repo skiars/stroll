@@ -4715,8 +4715,10 @@ impl Workspace {
         let rows = self.rows.clone();
         let in_workspace = self.view == WorkspaceView::Editor;
         let drag_repo = self
-            .tree_transfer_available()
-            .then(|| self.repository.as_ref().unwrap().clone());
+            .repository
+            .as_ref()
+            .filter(|_| self.tree_drag_available())
+            .cloned();
         let repository = self.repository.clone();
         let associations = self.config.file_associations.clone();
         let status = self.tree_status.clone();

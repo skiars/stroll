@@ -895,6 +895,7 @@
   "terminal.maximize": "Maximize terminal",
   "terminal.new": "New terminal",
   "terminal.open_link": "Open Link",
+  "terminal.path_drop_unavailable": "This path cannot be inserted safely in the terminal.",
   "terminal.paste": "Paste",
   "terminal.resize": "Resize terminal",
   "terminal.restore": "Restore terminal size",

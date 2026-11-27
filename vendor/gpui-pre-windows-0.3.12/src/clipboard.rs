@@ -6,6 +6,7 @@ use itertools::Itertools;
 use windows::Win32::{
     Foundation::{HANDLE, HGLOBAL, HWND},
     System::{
+        Com::{DVASPECT_CONTENT, FORMATETC, IDataObject, STGMEDIUM, STGMEDIUM_0, TYMED_HGLOBAL},
         DataExchange::{
             CloseClipboard, CountClipboardFormats, EmptyClipboard, EnumClipboardFormats,
             GetClipboardData, GetClipboardFormatNameW, OpenClipboard, RegisterClipboardFormatW,
@@ -14,7 +15,7 @@ use windows::Win32::{
         Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock},
         Ole::{CF_DIB, CF_HDROP, CF_UNICODETEXT},
     },
-    UI::Shell::{DragQueryFileW, HDROP},
+    UI::Shell::{DragQueryFileW, HDROP, SHCreateDataObject},
 };
 use windows::core::{Owned, PCWSTR};
 
@@ -166,13 +167,20 @@ where
     }
 }
 
-fn set_clipboard_bytes<T>(data: &[T], format: u32) -> Result<()> {
+fn copy_to_global<T>(data: &[T]) -> Result<Owned<HGLOBAL>> {
     unsafe {
         let global = Owned::new(GlobalAlloc(GMEM_MOVEABLE, std::mem::size_of_val(data))?);
         let ptr = GlobalLock(*global);
         anyhow::ensure!(!ptr.is_null(), "GlobalLock returned null");
         std::ptr::copy_nonoverlapping(data.as_ptr(), ptr as _, data.len());
         GlobalUnlock(*global).ok();
+        Ok(global)
+    }
+}
+
+fn set_clipboard_bytes<T>(data: &[T], format: u32) -> Result<()> {
+    let global = copy_to_global(data)?;
+    unsafe {
         SetClipboardData(format, Some(HANDLE(global.0)))?;
         // SetClipboardData succeeded — the system now owns the memory.
         std::mem::forget(global);
@@ -297,6 +305,29 @@ fn file_drop_bytes(paths: &ExternalPaths) -> Vec<u8> {
     }
     data.extend_from_slice(&[0, 0]);
     data
+}
+
+pub(crate) fn file_drag_data_object(paths: &ExternalPaths) -> Result<IDataObject> {
+    let format = FORMATETC {
+        cfFormat: CF_HDROP.0,
+        ptd: std::ptr::null_mut(),
+        dwAspect: DVASPECT_CONTENT.0,
+        lindex: -1,
+        tymed: TYMED_HGLOBAL.0 as u32,
+    };
+    let bytes = copy_to_global(&file_drop_bytes(paths))?;
+    let medium = STGMEDIUM {
+        tymed: TYMED_HGLOBAL.0 as u32,
+        u: STGMEDIUM_0 { hGlobal: *bytes },
+        pUnkForRelease: std::mem::ManuallyDrop::new(None),
+    };
+    unsafe {
+        let object: IDataObject = SHCreateDataObject(None, None, None::<&IDataObject>)?;
+        object.SetData(&format, &medium, true)?;
+        // The COM data object now owns the memory, independently of the clipboard.
+        std::mem::forget(bytes);
+        Ok(object)
+    }
 }
 
 fn write_files(paths: &ExternalPaths, cut: bool) -> Result<()> {
@@ -440,6 +471,37 @@ impl Drop for LockedGlobal {
 #[cfg(test)]
 mod file_list_tests {
     use super::*;
+
+    #[test]
+    fn file_drag_data_object_serves_file_paths() {
+        use windows::Win32::System::Ole::{OleInitialize, OleUninitialize, ReleaseStgMedium};
+
+        unsafe {
+            OleInitialize(None).unwrap();
+            let paths = ExternalPaths(
+                [std::path::PathBuf::from(r"C:\My Folder\音.txt")]
+                    .into_iter()
+                    .collect(),
+            );
+            let object = file_drag_data_object(&paths).unwrap();
+            let format = FORMATETC {
+                cfFormat: CF_HDROP.0,
+                ptd: std::ptr::null_mut(),
+                dwAspect: DVASPECT_CONTENT.0,
+                lindex: -1,
+                tymed: TYMED_HGLOBAL.0 as u32,
+            };
+            let mut medium = object.GetData(&format).unwrap();
+            let mut names = Vec::new();
+            with_file_names(HDROP(medium.u.hGlobal.0), |name| {
+                names.push(name.to_owned())
+            });
+            ReleaseStgMedium(&mut medium);
+            drop(object);
+            OleUninitialize();
+            assert_eq!(names, [r"C:\My Folder\音.txt"]);
+        }
+    }
 
     #[test]
     fn wide_file_drop_list_has_a_header_and_two_terminators() {

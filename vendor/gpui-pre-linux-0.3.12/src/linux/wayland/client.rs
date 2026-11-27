@@ -88,6 +88,7 @@ use super::{
     window::{ImeInput, WaylandWindowStatePtr},
 };
 
+use crate::linux::file_uri_list;
 use crate::linux::{
     DOUBLE_CLICK_INTERVAL, LinuxCommon, LinuxKeyboardLayout, PIPE_READ_TIMEOUT, SCROLL_LINES,
     capslock_from_xkb, cursor_style_to_icon_names, get_xkb_compose_state, is_within_click_distance,
@@ -106,12 +107,11 @@ use crate::linux::{
 };
 use gpui::{
     AnyWindowHandle, Bounds, Capslock, CursorStyle, DevicePixels, ExternalDragPayload,
-    FileDragPaths, FileDropEvent, ForegroundExecutor, GraphicalEnvironment, KeyDownEvent,
-    KeyUpEvent, Keystroke, Modifiers, ModifiersChangedEvent, MouseButton, MouseDownEvent,
-    MouseExitEvent, MouseMoveEvent, MouseUpEvent, NavigationDirection, Pixels, PlatformDisplay,
-    PlatformFrameSignal, PlatformInput, PlatformKeyboardLayout, PlatformWindow, Point, ScrollDelta,
-    ScrollEvent, ScrollSource, SharedString, Size, TouchPhase, WindowButtonLayout, WindowKind,
-    WindowParams, point, px, size,
+    FileDropEvent, ForegroundExecutor, GraphicalEnvironment, KeyDownEvent, KeyUpEvent, Keystroke,
+    Modifiers, ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseExitEvent, MouseMoveEvent,
+    MouseUpEvent, NavigationDirection, Pixels, PlatformDisplay, PlatformFrameSignal, PlatformInput,
+    PlatformKeyboardLayout, PlatformWindow, Point, ScrollDelta, ScrollEvent, ScrollSource,
+    SharedString, Size, TouchPhase, WindowButtonLayout, WindowKind, WindowParams, point, px, size,
 };
 use gpui_wgpu::{CompositorGpuHint, GpuContext};
 use wayland_protocols::wp::linux_dmabuf::zv1::client::{
@@ -520,18 +520,8 @@ pub(crate) struct ExternalDrag {
     source: wl_data_source::WlDataSource,
     bytes: Vec<u8>,
     window: WaylandWindowStatePtr,
-}
-
-fn file_uri_list(paths: &FileDragPaths) -> String {
-    paths
-        .entries()
-        .iter()
-        .filter_map(|(path, _)| Url::from_file_path(path).ok())
-        .fold(String::new(), |mut list, url| {
-            list.push_str(url.as_str());
-            list.push_str("\r\n");
-            list
-        })
+    paths: gpui::ExternalPaths,
+    returned_drop: Option<Point<Pixels>>,
 }
 
 pub struct ClickState {
@@ -676,6 +666,9 @@ impl WaylandClientStatePtr {
         let client = self.get_client();
         let mut state = client.borrow_mut();
 
+        if state.external_drag.is_some() {
+            return false;
+        }
         let Some(window) = get_window(&mut state, &surface.id()) else {
             return false;
         };
@@ -697,13 +690,21 @@ impl WaylandClientStatePtr {
         let source =
             data_device_manager.create_data_source(&state.globals.qh, DataSourceKind::Drag);
         source.offer(FILE_LIST_MIME_TYPE.to_string());
-        source.set_actions(DndAction::Copy | DndAction::Move);
+        source.set_actions(DndAction::Copy);
         data_device.start_drag(Some(&source), surface, None, serial.as_raw());
 
         state.external_drag = Some(ExternalDrag {
             source,
             bytes: uri_list.into_bytes(),
             window,
+            paths: gpui::ExternalPaths(
+                paths
+                    .entries()
+                    .iter()
+                    .map(|(path, _)| path.clone())
+                    .collect(),
+            ),
+            returned_drop: None,
         });
         true
     }
@@ -3023,6 +3024,25 @@ impl Dispatch<wl_data_device::WlDataDevice, ()> for WaylandClientStatePtr {
                     const ACTIONS: DndAction = DndAction::Copy;
                     data_offer.set_actions(ACTIONS, ACTIONS);
 
+                    // A drop back in this client can follow Enter before a pipe read
+                    // completes. The source already has the paths for this seat.
+                    if let Some(paths) = state.external_drag.as_ref().map(|drag| drag.paths.clone())
+                    {
+                        data_offer.accept(serial, Some(FILE_LIST_MIME_TYPE.to_string()));
+                        let input = state.drag.complete_uri_read(
+                            uri_read_generation,
+                            data_offer,
+                            drag_window,
+                            point(x.into(), y.into()),
+                            paths,
+                        );
+                        drop(state);
+                        if let Some((window, input)) = input {
+                            window.handle_input(input);
+                        }
+                        return;
+                    }
+
                     let pipe = Pipe::new().unwrap();
                     data_offer.receive(FILE_LIST_MIME_TYPE.to_string(), unsafe {
                         BorrowedFd::borrow_raw(pipe.write.as_raw_fd())
@@ -3109,6 +3129,9 @@ impl Dispatch<wl_data_device::WlDataDevice, ()> for WaylandClientStatePtr {
                 }
             }
             wl_data_device::Event::Drop => {
+                if let Some(drag) = state.external_drag.as_mut() {
+                    drag.returned_drop = None;
+                }
                 let input = state.drag.handle_drop();
                 drop(state);
                 if let Some((drag_window, input)) = input {
@@ -3182,18 +3205,48 @@ impl Dispatch<wl_data_source::WlDataSource, DataSourceKind> for WaylandClientSta
                 let bytes = external_drag.bytes.clone();
                 state.clipboard.send_bytes(fd, bytes);
             }
+            (DataSourceKind::Drag, wl_data_source::Event::DndDropPerformed) => {
+                let at = state
+                    .drag
+                    .window
+                    .as_ref()
+                    .map(|window| (window.handle(), state.drag.position));
+                if let Some(drag) = state.external_drag.as_mut()
+                    && let Some((window, position)) = at
+                    && window == drag.window.handle()
+                {
+                    // On a quick return, the button may be released before the compositor
+                    // processes our offer acceptance. Remember the drop in the source window.
+                    drag.returned_drop = Some(position);
+                }
+            }
             (
                 DataSourceKind::Drag,
-                wl_data_source::Event::DndFinished | wl_data_source::Event::Cancelled,
+                event @ (wl_data_source::Event::DndFinished | wl_data_source::Event::Cancelled),
             ) => {
                 let Some(external_drag) = state.external_drag.take() else {
                     return;
                 };
                 external_drag.source.destroy();
 
-                let input = PlatformInput::FileDrop(FileDropEvent::Ended);
+                let returned_drop = match event {
+                    wl_data_source::Event::Cancelled => external_drag.returned_drop,
+                    _ => None,
+                };
+                if returned_drop.is_some() {
+                    state.drag.handle_leave();
+                }
                 drop(state);
-                external_drag.window.handle_input(input);
+                let window = external_drag.window;
+                if let Some(position) = returned_drop {
+                    window.handle_input(PlatformInput::FileDrop(FileDropEvent::Entered {
+                        position,
+                        paths: external_drag.paths,
+                    }));
+                    window
+                        .handle_input(PlatformInput::FileDrop(FileDropEvent::Submit { position }));
+                }
+                window.handle_input(PlatformInput::FileDrop(FileDropEvent::Ended));
             }
             _ => {}
         }
@@ -3508,7 +3561,7 @@ mod tests {
 
     #[test]
     fn builds_terminated_uri_list_for_each_dragged_path() {
-        let paths = FileDragPaths::new([
+        let paths = gpui::FileDragPaths::new([
             (PathBuf::from("/tmp/first"), false),
             (PathBuf::from("/tmp/nested directory"), true),
         ]);
@@ -3521,7 +3574,7 @@ mod tests {
 
     #[test]
     fn skips_paths_that_have_no_file_url() {
-        let paths = FileDragPaths::new([
+        let paths = gpui::FileDragPaths::new([
             (PathBuf::from("relative/path"), false),
             (PathBuf::from("/tmp/absolute"), false),
         ]);
@@ -3531,9 +3584,13 @@ mod tests {
 
     #[test]
     fn builds_empty_uri_list_without_convertible_paths() {
-        assert!(file_uri_list(&FileDragPaths::default()).is_empty());
+        assert!(file_uri_list(&gpui::FileDragPaths::default()).is_empty());
         assert!(
-            file_uri_list(&FileDragPaths::new([(PathBuf::from("relative"), false)])).is_empty()
+            file_uri_list(&gpui::FileDragPaths::new([(
+                PathBuf::from("relative"),
+                false
+            )]))
+            .is_empty()
         );
     }
 

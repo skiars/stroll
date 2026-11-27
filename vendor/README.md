@@ -436,6 +436,18 @@ dialogs in a Wayland window after changes to paint order or focus handling.
   [file tree desktop integration](../docs/workspace-file-operations.md) for
   the native round-trip checks.
 
+- Wayland file drags offer copy and reuse in-process paths when the source
+  reenters the client, so an immediate drop can restore the original GPUI
+  payload without waiting on the transfer pipe. The X11 XDND source serves
+  URI lists, negotiates copy with the target, and releases its selection on
+  completion or cancellation. The X11 backend advertises XDND awareness with
+  the protocol's predefined ATOM type, including for a drop back on the source
+  window. Windows uses a Shell data object with CF_HDROP
+  and posts the drag start so the OLE loop runs after the GPUI input callback.
+  The GPUI promotion test covers restoring the source payload. Linux URI tests
+  cover encoding and the Windows file-drag test checks the COM data format.
+  See [native drag validation](../docs/workspace-file-operations.md#verification).
+
 ### Markdown headings and reader scrolling
 
 - Markdown readers can opt into a left rule fitted to the painted contents of

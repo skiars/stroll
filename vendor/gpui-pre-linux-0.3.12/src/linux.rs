@@ -32,6 +32,19 @@ use std::rc::Rc;
 
 use gpui::WindowingModes;
 
+#[cfg(any(feature = "wayland", feature = "x11"))]
+fn file_uri_list(paths: &gpui::FileDragPaths) -> String {
+    paths
+        .entries()
+        .iter()
+        .filter_map(|(path, _)| http_client::Url::from_file_path(path).ok())
+        .fold(String::new(), |mut list, url| {
+            list.push_str(url.as_str());
+            list.push_str("\r\n");
+            list
+        })
+}
+
 /// Returns the default platform implementation for the current OS.
 ///
 /// A windowed platform connects to the display server the process environment names, or starts

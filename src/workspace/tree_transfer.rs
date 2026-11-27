@@ -18,8 +18,8 @@ impl Global for TreeKeys {}
 
 #[derive(Clone)]
 pub(super) struct TreeDrag {
-    repo: Arc<Repository>,
-    path: PathBuf,
+    pub(super) repo: Arc<Repository>,
+    pub(super) path: PathBuf,
 }
 
 impl Render for TreeDrag {
@@ -118,11 +118,15 @@ impl Workspace {
         cx.bind_keys([KeyBinding::new("alt-cmd-v", MoveTreeClipboard, context)]);
     }
 
-    pub(super) fn tree_transfer_available(&self) -> bool {
+    pub(super) fn tree_drag_available(&self) -> bool {
         !self.tree_busy
             && self.tree_edit.is_none()
             && self.view == WorkspaceView::Editor
             && self.accepts_file_drop()
+    }
+
+    pub(super) fn tree_transfer_available(&self) -> bool {
+        self.tree_drag_available()
             && self.repository.as_ref().is_some_and(|repo| {
                 repo.ssh
                     .as_ref()
@@ -472,17 +476,27 @@ pub(super) fn tree_drag_source(
     entry: &Entry,
     repo: Option<&Arc<Repository>>,
 ) -> Stateful<Div> {
-    if let Some(repo) = repo {
-        row.on_drag(
-            TreeDrag {
-                repo: repo.clone(),
-                path: entry.path.clone(),
-            },
-            |drag, _, _, cx| cx.new(|_| drag.clone()),
-        )
-    } else {
-        row
-    }
+    let Some(repo) = repo else {
+        return row;
+    };
+    let directory = entry.directory;
+    row.on_drag(
+        TreeDrag {
+            repo: repo.clone(),
+            path: entry.path.clone(),
+        },
+        |drag, _, _, cx| cx.new(|_| drag.clone()),
+    )
+    .when(repo.ssh.is_none(), |row| {
+        row.external_drag_payload(move |drag: &TreeDrag, _, _| {
+            let path = drag.repo.root.join(&drag.path);
+            path.symlink_metadata().ok()?;
+            let path = paths::simplified(&path);
+            Some(ExternalDragPayload::Files(FileDragPaths::new([(
+                path, directory,
+            )])))
+        })
+    })
 }
 
 pub(super) fn tree_drop_target(

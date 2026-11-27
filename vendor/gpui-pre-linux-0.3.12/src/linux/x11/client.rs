@@ -67,6 +67,9 @@ use gpui::{
 };
 use gpui_wgpu::{CompositorGpuHint, GpuContext};
 
+mod drag;
+use drag::{DragPointer, XdndSource};
+
 /// Value for DeviceId parameters which selects all devices.
 pub(crate) const XINPUT_ALL_DEVICES: xinput::DeviceId = 0;
 
@@ -239,6 +242,8 @@ pub struct X11ClientState {
     pub(crate) clipboard: Clipboard,
     pub(crate) clipboard_item: Option<ClipboardItem>,
     pub(crate) xdnd_state: Xdnd,
+    xdnd_source: Option<XdndSource>,
+    drag_pointer: Option<DragPointer>,
 }
 
 #[derive(Clone)]
@@ -254,6 +259,7 @@ impl X11ClientStatePtr {
             return;
         };
         let mut state = client.0.borrow_mut();
+        state.close_drag_source(x_window);
 
         if let Some(window_ref) = state.windows.remove(&x_window)
             && let Some(RefreshState::PeriodicRefresh {
@@ -554,6 +560,8 @@ impl X11Connection {
                 clipboard,
                 clipboard_item: None,
                 xdnd_state: Xdnd::default(),
+                xdnd_source: None,
+                drag_pointer: None,
             })
         })));
         // From here on, `Drop` removes whatever was registered if a later step fails.
@@ -880,6 +888,9 @@ impl X11Client {
     }
 
     fn handle_event(&self, event: Event) -> Option<()> {
+        if self.handle_xdnd_source(&event) {
+            return Some(());
+        }
         match event {
             Event::UnmapNotify(event) => {
                 let mut state = self.0.borrow_mut();
@@ -1363,7 +1374,13 @@ impl X11Client {
                         state.xcb_connection.flush().log_err();
                     };
                 }
-                let pressed_button = pressed_button_from_mask(event.button_mask[0]);
+                let pressed_button = event
+                    .button_mask
+                    .first()
+                    .copied()
+                    .and_then(pressed_button_from_mask);
+                state.drag_pointer =
+                    (pressed_button == Some(MouseButton::Left)).then(|| DragPointer::from(&event));
                 let position = point(
                     px(event.event_x as f32 / u16::MAX as f32 / state.scale_factor),
                     px(event.event_y as f32 / u16::MAX as f32 / state.scale_factor),
@@ -1735,7 +1752,7 @@ impl X11Client {
                 xproto::PropMode::REPLACE,
                 x_window,
                 state.atoms.XdndAware,
-                state.atoms.XA_ATOM,
+                AtomEnum::ATOM,
                 &[5],
             ),
         )

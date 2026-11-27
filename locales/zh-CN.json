@@ -895,6 +895,7 @@
   "terminal.maximize": "最大化终端",
   "terminal.new": "新建终端",
   "terminal.open_link": "打开链接",
+  "terminal.path_drop_unavailable": "无法在终端中安全输入此路径。",
   "terminal.paste": "粘贴",
   "terminal.resize": "调整终端高度",
   "terminal.restore": "还原终端",

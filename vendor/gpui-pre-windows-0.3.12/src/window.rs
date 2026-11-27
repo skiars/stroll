@@ -91,6 +91,7 @@ pub struct WindowsWindowState {
     hwnd: HWND,
     pub(crate) a11y: RefCell<Option<A11yState>>,
     pub mouse_position: Cell<Point<Pixels>>,
+    file_drag: Cell<Option<ExternalPaths>>,
 }
 
 pub(crate) struct WindowsWindowInner {
@@ -193,6 +194,7 @@ impl WindowsWindowState {
             direct_manipulation,
             a11y: RefCell::new(None),
             mouse_position: Cell::new(Point::default()),
+            file_drag: Cell::new(None),
         })
     }
 
@@ -634,6 +636,41 @@ impl Drop for WindowsWindow {
 }
 
 impl PlatformWindow for WindowsWindow {
+    fn can_start_external_drag(&self) -> bool {
+        true
+    }
+
+    fn start_external_drag(&self, payload: &ExternalDragPayload) -> bool {
+        let ExternalDragPayload::Files(paths) = payload;
+        if paths.entries().is_empty() {
+            return false;
+        }
+        self.state.file_drag.set(Some(ExternalPaths(
+            paths
+                .entries()
+                .iter()
+                .map(|(path, _)| path.clone())
+                .collect(),
+        )));
+        // SHDoDragDrop pumps messages and may immediately call our own drop target.
+        // Let the current input callback return and GPUI hand off the drag first.
+        if unsafe {
+            PostMessageW(
+                Some(self.hwnd),
+                WM_GPUI_START_FILE_DRAG,
+                WPARAM(0),
+                LPARAM(0),
+            )
+        }
+        .log_err()
+        .is_none()
+        {
+            self.state.file_drag.take();
+            return false;
+        }
+        true
+    }
+
     fn bounds(&self) -> Bounds<Pixels> {
         self.state.bounds()
     }
@@ -1143,17 +1180,40 @@ impl accesskit::ActionHandler for A11yActionHandler {
     }
 }
 
-#[implement(IDropTarget)]
-struct WindowsDragDropHandler(pub Rc<WindowsWindowInner>);
+impl WindowsWindowInner {
+    pub(crate) fn run_external_file_drag(&self) {
+        let Some(paths) = self.state.file_drag.take() else {
+            return;
+        };
+        if unsafe { GetAsyncKeyState(VK_LBUTTON.0 as i32) } < 0
+            && let Some(object) = crate::clipboard::file_drag_data_object(&paths).log_err()
+        {
+            if unsafe { GetCapture() } == self.hwnd {
+                unsafe { ReleaseCapture() }.log_err();
+            }
+            unsafe {
+                SHDoDragDrop(
+                    Some(self.hwnd),
+                    &object,
+                    None::<&IDropSource>,
+                    DROPEFFECT_COPY,
+                )
+            }
+            .log_err();
+        }
+        self.handle_drag_drop(PlatformInput::FileDrop(FileDropEvent::Ended));
+    }
 
-impl WindowsDragDropHandler {
     fn handle_drag_drop(&self, input: PlatformInput) {
-        if let Some(mut func) = self.0.state.callbacks.input.take() {
+        if let Some(mut func) = self.state.callbacks.input.take() {
             func(input);
-            self.0.state.callbacks.input.set(Some(func));
+            self.state.callbacks.input.set(Some(func));
         }
     }
 }
+
+#[implement(IDropTarget)]
+struct WindowsDragDropHandler(pub Rc<WindowsWindowInner>);
 
 #[allow(non_snake_case)]
 impl IDropTarget_Impl for WindowsDragDropHandler_Impl {
@@ -1203,7 +1263,7 @@ impl IDropTarget_Impl for WindowsDragDropHandler_Impl {
                     ),
                     paths: ExternalPaths(paths),
                 });
-                self.handle_drag_drop(input);
+                self.0.handle_drag_drop(input);
             } else {
                 *pdweffect = DROPEFFECT_NONE;
             }
@@ -1240,7 +1300,7 @@ impl IDropTarget_Impl for WindowsDragDropHandler_Impl {
                 scale_factor,
             ),
         });
-        self.handle_drag_drop(input);
+        self.0.handle_drag_drop(input);
 
         Ok(())
     }
@@ -1250,7 +1310,7 @@ impl IDropTarget_Impl for WindowsDragDropHandler_Impl {
             self.0.drop_target_helper.DragLeave().log_err();
         }
         let input = PlatformInput::FileDrop(FileDropEvent::Exited);
-        self.handle_drag_drop(input);
+        self.0.handle_drag_drop(input);
 
         Ok(())
     }
@@ -1282,7 +1342,7 @@ impl IDropTarget_Impl for WindowsDragDropHandler_Impl {
                 scale_factor,
             ),
         });
-        self.handle_drag_drop(input);
+        self.0.handle_drag_drop(input);
 
         Ok(())
     }
