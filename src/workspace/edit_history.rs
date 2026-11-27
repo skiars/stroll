@@ -71,21 +71,36 @@ impl Workspace {
         Ok(())
     }
 
-    fn history_drafts(&self, cx: &App) -> Result<Option<Vec<DraftUpdate>>> {
+    fn history_drafts(
+        &self,
+        include_queued: bool,
+        cx: &App,
+    ) -> Result<(Vec<DraftUpdate>, Vec<PathBuf>)> {
         let mut files = self
             .files
             .values()
-            .filter(|file| file.pending_draft && !file.missing)
+            .filter(|file| {
+                file.pending_draft
+                    && !file.missing
+                    && (include_queued || file.queued_revision != Some(file.revision))
+            })
             .collect::<Vec<_>>();
         files.sort_unstable_by(|a, b| a.path.cmp(&b.path));
         let mut updates = Vec::new();
+        let mut deferred = Vec::new();
         for file in files {
             let editor = file.editor.read(cx);
-            let Some(history) = editor.edit_history_snapshot()? else {
-                // A composition still owns its pending transaction. Publish the text and its history together.
-                return Ok(None);
+            let history = if editor.text() == &file.committed {
+                editor.edit_history_snapshot()?
+            } else {
+                None
             };
-            let text = editor.text().to_string();
+            let Some(history) = history else {
+                // Publish matching text and history once the editor can supply both.
+                deferred.push(file.path.clone());
+                continue;
+            };
+            let text = file.committed.to_string();
             updates.push(DraftUpdate {
                 path: file.path.clone(),
                 revision: file.revision,
@@ -96,36 +111,41 @@ impl Workspace {
                         .edit_history_key(self.repository.as_deref(), &file.path),
                     baseline: file.document.edit_baseline(),
                     buffer: Sha256::digest(text.as_bytes()).into(),
-                    draft: (editor.text() != &file.saved).then_some(text),
+                    draft: (file.committed != file.saved).then_some(text),
                     history,
                     undo_group: editor.history_group(true),
                     redo_group: editor.history_group(false),
                 },
             });
         }
-        Ok(Some(updates))
+        Ok((updates, deferred))
     }
 
     pub(super) fn queue_drafts(&mut self, window: &Window, cx: &mut Context<Self>) {
-        if !self.files.values().any(|file| {
-            file.pending_draft && !file.missing && file.queued_revision != Some(file.revision)
-        }) {
-            return;
-        }
-        let updates = match self.history_drafts(cx) {
-            Ok(Some(updates)) => updates,
-            Ok(None) => return,
+        let (updates, deferred) = match self.history_drafts(false, cx) {
+            Ok(batch) => batch,
             Err(error) => {
                 eprintln!("Could not capture editor history: {error:#}");
                 return;
             }
         };
+        if !deferred.is_empty() {
+            // Wait for a coherent batch so a multi-file undo group recovers together.
+            for path in deferred {
+                self.files.get_mut(&path).unwrap().draft_deferred = true;
+            }
+            return;
+        }
+        if updates.is_empty() {
+            return;
+        }
         let revisions = updates
             .iter()
             .map(|entry| (entry.path.clone(), entry.revision))
             .collect::<Vec<_>>();
         for (path, revision) in &revisions {
             let file = self.files.get_mut(path).unwrap();
+            file.draft_deferred = false;
             file.queued_revision = Some(*revision);
             if let Some(server) = &file.language_server {
                 server.document.changed(file.committed.clone());
@@ -162,6 +182,7 @@ impl Workspace {
                     Some(Ok(dirty)) => {
                         file.dirty = dirty;
                         file.pending_draft = false;
+                        file.draft_deferred = false;
                     }
                     Some(Err(failure)) => {
                         write.revision = 0;
@@ -183,9 +204,11 @@ impl Workspace {
         cx: &App,
         restore: Option<(&Repository, u64, &Path)>,
     ) -> Result<()> {
-        let Some(updates) = self.history_drafts(cx)? else {
-            anyhow::bail!("Finish composing text before saving edit history.");
-        };
+        let (updates, deferred) = self.history_drafts(true, cx)?;
+        anyhow::ensure!(
+            deferred.is_empty(),
+            "Finish the current edit before saving edit history."
+        );
         if updates.is_empty() && restore.is_none() {
             return Ok(());
         }
@@ -202,7 +225,9 @@ impl Workspace {
 mod tests {
     use super::*;
     use crate::git::{FileAction, FileDiffOptions, FileEdit, Mode};
-    use gpui::{TestAppContext, TestDispatcher, VisualTestContext};
+    use gpui::{
+        EntityInputHandler as _, Keystroke, TestAppContext, TestDispatcher, VisualTestContext,
+    };
     use std::process::Command;
 
     fn git(root: &Path, args: &[&str]) {
@@ -298,6 +323,234 @@ mod tests {
     fn flush(workspace: &Entity<Workspace>, visual: &mut VisualTestContext) {
         visual.update(|_, cx| {
             workspace.update(cx, |workspace, cx| workspace.flush_drafts(cx).unwrap())
+        });
+    }
+
+    fn vim_keys(
+        workspace: &mut Workspace,
+        keys: &[&'static str],
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let path = workspace.tabs.active().unwrap();
+        let file = workspace.files.get_mut(path).unwrap();
+        for key in keys {
+            if *key == "escape" {
+                assert!(file.vim.escape(&file.editor, window, cx));
+            } else {
+                assert!(
+                    file.vim
+                        .key_down(
+                            &file.editor,
+                            false,
+                            &Keystroke::parse(key).unwrap(),
+                            file.wrap,
+                            window,
+                            cx,
+                        )
+                        .is_some()
+                );
+            }
+        }
+    }
+
+    fn stored_history(workspace: &Workspace, path: &Path) -> Option<SavedEditHistory> {
+        workspace
+            .store
+            .read_editor_history(workspace.repository.as_deref(), path)
+            .unwrap()
+    }
+
+    #[::core::prelude::v1::test]
+    fn vim_insert_saves_the_requested_text_and_keeps_one_undo_entry() {
+        for standalone in [false, true] {
+            let (_fixture, root, state) = fixture();
+            let disk = root.join("a.txt").canonicalize().unwrap();
+            let mut app = test_app();
+            let (workspace, visual) = if standalone {
+                let store = Arc::new(Store::new(state.clone()).unwrap());
+                let config = crate::config::ConfigFile::load(Some(state.join("config.toml")));
+                let (workspace, visual) = app.add_window_view(|window, cx| {
+                    Workspace::with_config(store, config, WorkspaceView::Editor, window, cx)
+                });
+                visual.update(|window, cx| {
+                    workspace.update(cx, |this, cx| {
+                        this.standalone = Some(disk.clone());
+                        this.request_file(disk.clone(), FileOpen::Startup, window, cx);
+                    });
+                });
+                visual.run_until_parked();
+                (workspace, visual)
+            } else {
+                open(&mut app, &root, &state)
+            };
+            let editor = visual.update(|window, cx| {
+                workspace.update(cx, |this, cx| {
+                    vim_keys(this, &["2", "i"], window, cx);
+                    this.active_file().unwrap().editor.clone()
+                })
+            });
+            visual.update(|window, cx| {
+                editor.update(cx, |editor, cx| {
+                    editor.replace_text_in_range(None, "a", window, cx);
+                });
+            });
+            visual.update(|window, cx| {
+                workspace.update(cx, |this, cx| this.save(&SaveFile, window, cx));
+                editor.update(cx, |editor, cx| {
+                    editor.replace_text_in_range(None, "b", window, cx);
+                });
+            });
+            visual.run_until_parked();
+            assert_eq!(fs::read_to_string(&disk).unwrap(), "aoriginal\n");
+            visual.update(|_, cx| {
+                let this = workspace.read(cx);
+                let file = this.active_file().unwrap();
+                assert!(file.vim.mode() == vim::source::Mode::Insert);
+                assert!(file.is_dirty());
+                assert_eq!(file.committed, "aboriginal\n");
+                let saved = stored_history(this, &file.path).unwrap();
+                assert_eq!(saved.baseline, file.document.edit_baseline());
+                assert_eq!(saved.draft.as_deref(), Some("aboriginal\n"));
+            });
+            visual.update(|window, cx| {
+                workspace.update(cx, |this, cx| vim_keys(this, &["escape"], window, cx));
+            });
+            visual.executor().advance_clock(Duration::from_millis(250));
+            visual.run_until_parked();
+            visual.update(|window, cx| {
+                let this = workspace.read(cx);
+                let file = this.active_file().unwrap();
+                assert_eq!(
+                    stored_history(this, &file.path).unwrap().draft.as_deref(),
+                    Some("ababoriginal\n")
+                );
+                editor.update(cx, |editor, cx| {
+                    editor.replay_text_history(true, window, cx);
+                    assert_eq!(editor.text(), "original\n");
+                    editor.replay_text_history(false, window, cx);
+                    assert_eq!(editor.text(), "ababoriginal\n");
+                });
+            });
+        }
+    }
+
+    #[::core::prelude::v1::test]
+    fn vim_insert_draft_checkpoint_restores_undo_without_saving_the_file() {
+        let (_fixture, root, state) = fixture();
+        {
+            let mut app = test_app();
+            let (workspace, visual) = open(&mut app, &root, &state);
+            visual.update(|window, cx| {
+                workspace.update(cx, |this, cx| {
+                    vim_keys(this, &["c", "i", "w"], window, cx);
+                    this.active_file().unwrap().editor.update(cx, |editor, cx| {
+                        editor.replace_text_in_range(None, "draft", window, cx);
+                    });
+                });
+            });
+            visual.run_until_parked();
+            visual.executor().advance_clock(Duration::from_millis(250));
+            visual.run_until_parked();
+            visual.update(|_, cx| {
+                let this = workspace.read(cx);
+                let file = this.active_file().unwrap();
+                assert!(file.vim.mode() == vim::source::Mode::Insert);
+                let saved = stored_history(this, &file.path).unwrap();
+                assert_eq!(saved.draft.as_deref(), Some("draft\n"));
+            });
+        }
+        let mut app = test_app();
+        let (workspace, visual) = open(&mut app, &root, &state);
+        assert_eq!(read(&workspace, visual, "a.txt"), "draft\n");
+        replay(&workspace, visual, true);
+        assert_eq!(read(&workspace, visual, "a.txt"), "original\n");
+        replay(&workspace, visual, false);
+        assert_eq!(read(&workspace, visual, "a.txt"), "draft\n");
+        assert_eq!(
+            fs::read_to_string(root.join("a.txt")).unwrap(),
+            "original\n"
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn vim_escape_retries_a_deferred_draft_without_another_text_change() {
+        let (_fixture, root, state) = fixture();
+        let mut app = test_app();
+        let (workspace, visual) = open(&mut app, &root, &state);
+        let path = Path::new("a.txt");
+        let group = visual.update(|window, cx| {
+            workspace.update(cx, |this, cx| {
+                let group = this.store.register_edit_group(&[path.to_owned()]).unwrap();
+                this.files[path].editor.update(cx, |editor, cx| {
+                    editor.edit_ranges_in_group(&[(0..8, "draft".into())], group, window, cx);
+                });
+                vim_keys(this, &["i"], window, cx);
+                group
+            })
+        });
+        visual.run_until_parked();
+        visual.executor().advance_clock(Duration::from_millis(250));
+        visual.run_until_parked();
+        let revision = visual.update(|_, cx| {
+            let this = workspace.read(cx);
+            assert!(this.files[path].draft_deferred);
+            assert!(stored_history(this, path).is_none());
+            this.files[path].revision
+        });
+        visual.update(|window, cx| {
+            workspace.update(cx, |this, cx| vim_keys(this, &["escape"], window, cx));
+        });
+        visual.run_until_parked();
+        visual.update(|_, cx| {
+            let this = workspace.read(cx);
+            assert_eq!(this.files[path].revision, revision);
+            let saved = stored_history(this, path).unwrap();
+            assert_eq!(saved.undo_group, Some(group));
+            assert_eq!(saved.draft.as_deref(), Some("draft\n"));
+        });
+    }
+
+    #[::core::prelude::v1::test]
+    fn vim_insert_save_excludes_ime_preedit_and_drafts_resume_after_cancellation() {
+        let (_fixture, root, state) = fixture();
+        let mut app = test_app();
+        let (workspace, visual) = open(&mut app, &root, &state);
+        let path = Path::new("a.txt");
+        let editor = visual.update(|window, cx| {
+            workspace.update(cx, |this, cx| vim_keys(this, &["i"], window, cx));
+            let editor = workspace.read(cx).files[path].editor.clone();
+            editor.update(cx, |editor, cx| {
+                editor.replace_text_in_range(None, "saved", window, cx);
+            });
+            editor
+        });
+        visual.update(|window, cx| {
+            editor.update(cx, |editor, cx| {
+                editor.replace_and_mark_text_in_range(None, "仮", None, window, cx);
+                assert!(editor.is_composing());
+                assert!(editor.edit_history_snapshot().unwrap().is_none());
+            });
+            workspace.update(cx, |this, cx| this.save(&SaveFile, window, cx));
+        });
+        visual.run_until_parked();
+        assert_eq!(
+            fs::read_to_string(root.join(path)).unwrap(),
+            "savedoriginal\n"
+        );
+        visual.update(|window, cx| {
+            assert!(workspace.read(cx).files[path].draft_deferred);
+            editor.update(cx, |editor, cx| {
+                editor.replace_and_mark_text_in_range(None, "", None, window, cx);
+            });
+            workspace.update(cx, |this, cx| vim_keys(this, &["escape"], window, cx));
+        });
+        visual.run_until_parked();
+        visual.update(|_, cx| {
+            let this = workspace.read(cx);
+            let saved = stored_history(this, path).unwrap();
+            assert!(saved.draft.is_none());
+            assert!(!this.files[path].draft_deferred);
         });
     }
 

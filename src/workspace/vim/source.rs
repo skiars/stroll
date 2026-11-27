@@ -247,6 +247,7 @@ impl Source {
         state.update(cx, |editor, cx| {
             if self.insert.take().is_some() {
                 editor.end_edit_transaction();
+                cx.notify();
             }
             self.mode = Mode::Normal;
             self.clear_selection();

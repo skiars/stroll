@@ -740,6 +740,7 @@ struct OpenFile {
     draft_write: Arc<Mutex<DraftWrite>>,
     revision: u64,
     queued_revision: Option<u64>,
+    draft_deferred: bool,
     _changes: Subscription,
     _editor_observer: Subscription,
     _input_edits: Subscription,
@@ -798,6 +799,7 @@ impl OpenFile {
         };
         write.revision = self.revision;
         self.queued_revision = None;
+        self.draft_deferred = false;
         self.dirty = dirty;
         self.pending_draft = false;
         Ok(())
@@ -3414,6 +3416,7 @@ impl Workspace {
                 draft_write: Arc::default(),
                 revision: 1,
                 queued_revision: None,
+                draft_deferred: false,
                 _changes: changes,
                 _editor_observer: editor_observer,
                 _input_edits: input_edits,
@@ -3748,12 +3751,8 @@ impl Workspace {
         }
         let origin = repo.clone();
         let editor_id = self.files.get(&path).map(|file| file.editor.entity_id());
-        if let Err(error) = self.flush_drafts(cx) {
-            self.show_error(error, window, cx);
-            cx.notify();
-            return;
-        }
         let close_from_dialog = close && self.confirming_close;
+        // Save the committed text independently of draft and undo-history persistence.
         let buffer = self.files.get(&path).map(|file| {
             (
                 file.document.clone(),
@@ -3859,22 +3858,24 @@ impl Workspace {
                         file.unconfirmed_save = None;
                         file.saved = text.clone();
                         file.dirty = file.committed != file.saved;
-                        file.pending_draft = true;
                         if wrote {
+                            file.pending_draft = true;
                             file.revision += 1;
                         }
                         if let Some(server) = &file.language_server {
                             server.document.saved(text);
                         }
-                        this.flush_drafts(cx)?;
                     } else {
                         result?;
-                        if let Some(repo) = repo {
-                            this.store.discard_draft(repo, &path)?;
+                        if let Some(repo) = repo
+                            && let Err(error) = this.store.discard_draft(repo, &path)
+                        {
+                            this.show_error(error, window, cx);
                         }
                     }
                     Ok(wrote)
                 });
+                this.queue_drafts(window, cx);
                 if conflicted {
                     if this.tabs.active() == Some(&path) {
                         this.language_format = Task::ready(());

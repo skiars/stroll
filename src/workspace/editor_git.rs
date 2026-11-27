@@ -410,6 +410,16 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> Subscription {
         cx.observe_in(editor, window, |this, editor, window, cx| {
+            if !editor.read(cx).is_composing()
+                && this.files.values().any(|file| {
+                    file.editor == editor
+                        && file.pending_draft
+                        && !file.missing
+                        && file.draft_deferred
+                })
+            {
+                this.queue_drafts(window, cx);
+            }
             if this.config.current().keyboard.vim_mode
                 && editor.read(cx).focus_handle(cx).is_focused(window)
                 && let Some(file) = this.tabs.active().and_then(|path| this.files.get_mut(path))

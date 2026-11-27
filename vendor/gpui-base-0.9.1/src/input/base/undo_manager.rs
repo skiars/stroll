@@ -131,32 +131,56 @@ impl UndoManager {
     }
 
     pub(super) fn snapshot(&self) -> serde_json::Result<Option<Vec<u8>>> {
-        if self.transaction_depth != 0 {
+        let pending = self
+            .pending
+            .as_ref()
+            .filter(|pending| !is_noop_batch(&pending.changes));
+        if self.pending.is_some()
+            && pending.is_none()
+            && [&self.undo_transactions, &self.redo_transactions]
+                .iter()
+                .any(|stack| stack.last().is_some_and(|entry| entry.group.is_some()))
+        {
+            // The live group tips remain hidden while the transaction is open.
             return Ok(None);
+        }
+        fn transaction(group: Option<u64>, changes: &[Change]) -> SavedTransaction<&str> {
+            SavedTransaction {
+                group,
+                changes: changes
+                    .iter()
+                    .map(|change| SavedChange {
+                        old_start: change.old_range.start,
+                        new_start: change.new_range.start,
+                        before: change.old_text.as_str(),
+                        after: change.new_text.as_str(),
+                    })
+                    .collect(),
+            }
         }
         fn transactions(entries: &[UndoTransaction]) -> Vec<SavedTransaction<&str>> {
             entries
                 .iter()
-                .map(|entry| SavedTransaction {
-                    group: entry.group,
-                    changes: entry
-                        .changes
-                        .iter()
-                        .map(|change| SavedChange {
-                            old_start: change.old_range.start,
-                            new_start: change.new_range.start,
-                            before: change.old_text.as_str(),
-                            after: change.new_text.as_str(),
-                        })
-                        .collect(),
-                })
+                .map(|entry| transaction(entry.group, &entry.changes))
                 .collect()
         }
-        serde_json::to_vec(&(
-            transactions(&self.undo_transactions),
-            transactions(&self.redo_transactions),
-        ))
-        .map(Some)
+        let (undo, redo) = if let Some(pending) = pending {
+            // Only atomic edits can be checkpointed without coalescing them
+            // into the previous undo entry. Leave the live transaction open.
+            if pending.intent != EditIntent::Atomic {
+                return Ok(None);
+            }
+            let first = usize::from(self.undo_transactions.len() >= MAX_UNDO_TRANSACTIONS);
+            let mut undo = transactions(&self.undo_transactions[first..]);
+            undo.push(transaction(None, &pending.changes));
+            (undo, Vec::new())
+        } else {
+            (
+                transactions(&self.undo_transactions),
+                transactions(&self.redo_transactions),
+            )
+        };
+        serde_json::to_vec(&(undo, redo)).map(Some)
     }
 
     pub(super) fn restore(&mut self, bytes: &[u8]) -> serde_json::Result<()> {

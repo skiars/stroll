@@ -4293,9 +4293,9 @@ impl<M: InputModeKind> InputBaseState<M> {
         self.display_map.wrap_revision()
     }
 
-    /// Serialize the completed undo and redo transactions of a plain text document.
+    /// Serialize text history, checkpointing an open atomic edit without closing it.
     pub fn edit_history_snapshot(&self) -> serde_json::Result<Option<Vec<u8>>> {
-        if self.inline_tokens.is_some() {
+        if self.inline_tokens.is_some() || self.is_composing() {
             return Ok(None);
         }
         self.undo_manager.snapshot()

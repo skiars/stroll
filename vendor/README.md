@@ -29,8 +29,11 @@ example and benchmark targets. The application tests live in `tests/`.
   ranges, including rectangular spans through tabs and short lines. Modal
   vertical navigation reaches the empty row after a final line break. It uses
   the shared scroll animation and honors reduced motion.
-  Edit transactions group modal changes in the shared undo history. Run
-  the `vim_` workspace tests and the `vim_caret` integration test.
+  Edit transactions group modal changes in the shared undo history. Draft
+  snapshots can checkpoint committed edits inside an open atomic transaction
+  while leaving live undo grouping intact. Marked IME text stays out of these
+  snapshots. Run the `vim_` and `workspace::edit_history::tests` workspace tests
+  and the `vim_caret` integration test.
 
 - Markdown image context-menu handlers receive both the image source and its
   enclosing link, including resolved reference links. The handler is opt-in
