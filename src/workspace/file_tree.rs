@@ -1239,6 +1239,14 @@ impl Workspace {
                     None,
                 ));
             }
+            if let Some(details) = self.file_information.remove(&path) {
+                self.file_information
+                    .entry(target.clone())
+                    .or_insert(details);
+            }
+            if let Some(format) = Rc::make_mut(&mut self.file_formats).remove(&path) {
+                Rc::make_mut(&mut self.file_formats).insert(target.clone(), format);
+            }
             if let Some(position) = self.session.files.remove(&path) {
                 self.session.files.insert(target.clone(), position);
             }
@@ -1293,7 +1301,10 @@ impl Workspace {
             }
         }
         if active_moved && self.view == WorkspaceView::Editor {
-            if self.active_file().is_none() && self.active_image_tab().is_none() {
+            if self.active_file().is_none()
+                && self.active_image_tab().is_none()
+                && self.active_file_information().is_none()
+            {
                 self.restore_active_file(window, cx);
             } else {
                 self.watch_editor_git(window, cx);
@@ -1334,7 +1345,9 @@ impl Workspace {
         if let Some(history) = self.source_history_mut() {
             history.remove(target);
         }
+        Rc::make_mut(&mut self.file_formats).retain(|path, _| !path.starts_with(target));
         for path in paths {
+            self.file_information.remove(&path);
             if let Some(file) = self.files.remove(&path) {
                 let mut pending = file.draft_write.lock().unwrap();
                 pending.revision = file.revision;
@@ -2468,6 +2481,93 @@ mod tests {
     }
 
     #[::core::prelude::v1::test]
+    fn file_tree_opens_noneditable_tabs_without_an_editor_buffer() -> Result<()> {
+        use crate::repository::{FileReadIssue, MAX_FILE_BYTES};
+
+        let fixture = tempfile::tempdir()?;
+        let root = fixture.path().join("repo");
+        fs::create_dir(&root)?;
+        assert!(
+            std::process::Command::new("git")
+                .args(["init", "-qb", "main"])
+                .arg(&root)
+                .status()?
+                .success()
+        );
+        let binary = Path::new("program");
+        let large = Path::new("large.txt");
+        fs::write(root.join(binary), b"\0binary")?;
+        fs::File::create(root.join(large))?.set_len(MAX_FILE_BYTES + 1)?;
+        let mut cx = TestAppContext::build_with_text_system(
+            TestDispatcher::new(0),
+            None,
+            crate::test_support::text_system(true),
+        );
+        cx.update(gpui_component::init);
+        let store = Arc::new(Store::new(fixture.path().join("state"))?);
+        let config = ConfigFile::load(Some(fixture.path().join("config.toml")));
+        let mut workspace = None;
+        let (_, visual) = cx.add_window_view(|window, cx| {
+            let view = cx
+                .new(|cx| Workspace::with_config(store, config, WorkspaceView::Editor, window, cx));
+            workspace = Some(view.clone());
+            gpui_component::Root::new(view, window, cx)
+        });
+        let workspace = workspace.unwrap();
+        visual.simulate_resize(size(px(900.), px(620.)));
+        visual.update(|window, cx| {
+            window.activate_window();
+            workspace.update(cx, |this, cx| {
+                this.open_repository(
+                    Location {
+                        root: root.clone(),
+                        file: None,
+                    },
+                    window,
+                    cx,
+                )
+            });
+        });
+        settle(visual, &workspace, |this| {
+            this.rows.iter().any(|row| row.entry.path == binary)
+        });
+
+        for (selector, path, expected) in [
+            ("workspace-tree-row:program", binary, FileReadIssue::Binary),
+            (
+                "workspace-tree-row:large.txt",
+                large,
+                FileReadIssue::TooLarge(MAX_FILE_BYTES + 1),
+            ),
+        ] {
+            let position = visual.debug_bounds(selector).unwrap().center();
+            visual.simulate_click(position, Modifiers::default());
+            settle(visual, &workspace, |this| {
+                this.active_file_information()
+                    .is_some_and(|(active, _)| active == path)
+            });
+            assert!(visual.debug_bounds("editor-file-information").is_some());
+            assert!(visual.debug_bounds("workspace-editor").is_none());
+            visual.update(|window, cx| {
+                workspace.update(cx, |this, cx| {
+                    assert_eq!(this.active_file_information().unwrap().1.issue, expected);
+                    assert!(!this.tab_is_dirty(path));
+                    this.keep_tab(path, cx);
+                    this.save(&SaveFile, window, cx);
+                    assert!(this.saving.is_empty());
+                })
+            });
+        }
+        visual.update(|_, cx| {
+            let this = workspace.read(cx);
+            assert_eq!(this.tabs.paths().len(), 2);
+            assert!(this.file_formats.get(binary) == Some(&file_icons::KnownFormat::Binary));
+            assert!(!this.file_formats.contains_key(large));
+        });
+        Ok(())
+    }
+
+    #[::core::prelude::v1::test]
     fn file_tree_context_menus_open_docs_and_source_and_copy_paths() -> Result<()> {
         let fixture = tempfile::tempdir()?;
         let root = fixture.path().join("repo");
@@ -2580,6 +2680,10 @@ mod tests {
         fs::write(root.join("notes.txt"), "Keep this buffer focused.\n")?;
         fs::write(root.join("clip.wav"), b"Invalid audio fixture")?;
         fs::write(root.join("broken.webp"), b"Invalid image fixture")?;
+        fs::write(
+            root.join("tiny.svg"),
+            r#"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="16"><rect width="24" height="16" fill="blue"/></svg>"#,
+        )?;
         let image = image::RgbaImage::from_pixel(1600, 960, image::Rgba([93, 146, 223, 160]));
         image.save(root.join("picture.png"))?;
         fs::copy(root.join("picture.png"), root.join("second.png"))?;
@@ -2665,6 +2769,17 @@ mod tests {
             .advance_clock(hover_delay + Duration::from_millis(32));
         settle(visual, &workspace, |this| this.active_file().is_some());
         assert!(visual.debug_bounds("hover-info").is_some());
+
+        let tiny = visual
+            .debug_bounds("workspace-tree-row:tiny.svg")
+            .unwrap()
+            .center();
+        visual.simulate_mouse_move(tiny, None, Modifiers::default());
+        settle(visual, &workspace, |this| this.active_file().is_some());
+        let tiny_preview = visual
+            .debug_bounds("image-hover-loaded")
+            .expect("SVG hover handoff");
+        assert!(tiny_preview.size.width <= px(24.) && tiny_preview.size.height <= px(16.));
 
         visual.simulate_mouse_move(image_row, None, Modifiers::default());
         visual
@@ -2765,9 +2880,13 @@ mod tests {
         });
         visual.simulate_keystrokes("down");
         settle(visual, &workspace, |this| {
+            this.tabs.active() == Some(Path::new("tiny.svg"))
+        });
+        visual.simulate_keystrokes("down");
+        settle(visual, &workspace, |this| {
             this.tabs.active() == Some(broken)
         });
-        visual.simulate_keystrokes("up left");
+        visual.simulate_keystrokes("up up left");
         settle(visual, &workspace, |this| {
             this.tabs.active() == Some(picture)
         });

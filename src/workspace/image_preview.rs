@@ -1,12 +1,12 @@
 use gpui::{
-    Anchor, AnyElement, App, AppContext, Context, ImageSource, InteractiveElement as _,
+    AnyElement, App, AppContext, Context, DevicePixels, ImageSource, InteractiveElement as _,
     IntoElement, ObjectFit, ParentElement, Pixels, Render, RenderImage, SharedString, Size,
-    Stateful, Styled, StyledImage as _, SvgRenderer, Task, WeakEntity, Window, div, img, point, px,
-    size,
+    Stateful, Styled, StyledImage as _, SvgRenderer, SvgSize, Task, WeakEntity, Window, div, img,
+    px, size,
 };
 use gpui_component::{
-    Placement, ThemeStyled as _,
-    tooltip::{ManagedTooltipExt as _, Positioner, TooltipRequest},
+    Placement,
+    tooltip::{ManagedTooltipExt as _, TooltipRequest},
 };
 use rust_i18n::t;
 use std::{
@@ -19,7 +19,7 @@ use std::{
 
 use super::{
     Workspace,
-    hover_info::{Card, FileInfo},
+    hover_info::{ArrowHover, Card, FileInfo},
 };
 use crate::image_viewer::{self, Preview};
 
@@ -78,8 +78,20 @@ pub(super) fn decode_preview(
     use image::ImageFormat::*;
     let format = match image_viewer::format(path) {
         Some(GpuiFormat::Svg) => {
-            return Ok(renderer
-                .render_standalone_svg(std::str::from_utf8(bytes)?, max_width.max(max_height))?);
+            let svg = renderer.parse_standalone_svg(std::str::from_utf8(bytes)?)?;
+            let intrinsic = svg.size();
+            let scale = (max_width as f32 / intrinsic.width.as_f32())
+                .min(max_height as f32 / intrinsic.height.as_f32())
+                .min(1.);
+            let dimension =
+                |length: Pixels| DevicePixels((length.as_f32() * scale).round().max(1.) as i32);
+            return Ok(renderer.render_parsed(
+                &svg,
+                SvgSize::ExactSize(size(
+                    dimension(intrinsic.width),
+                    dimension(intrinsic.height),
+                )),
+            )?);
         }
         Some(GpuiFormat::Png) => Png,
         Some(GpuiFormat::Jpeg) => Jpeg,
@@ -182,31 +194,16 @@ fn hover_image_with_info(
     info: Option<FileInfo>,
 ) -> Stateful<gpui::Div> {
     const MAX_SIZE: Size<Pixels> = size(px(320.), px(240.));
-    let beside_tree = dismiss_on_diff_scroll.is_none();
     trigger.managed_tooltip_request(true, move |bounds, window, _| {
         // A moving row should dismiss the preview without starting another decode.
         if !window.is_pointer_motion() {
             return None;
         }
-        let viewport = Positioner::viewport_bounds(window, px(8.));
-        let gap = px(8.);
-        let mut dimensions = size(
-            MAX_SIZE.width.min(viewport.size.width),
-            MAX_SIZE.height.min(viewport.size.height),
+        let arrow = ArrowHover::new(bounds, Placement::Right, window);
+        let dimensions = size(
+            MAX_SIZE.width.min(arrow.width),
+            MAX_SIZE.height.min(arrow.height),
         );
-        let positioner = if beside_tree {
-            let right = viewport.right() - bounds.right() - gap;
-            let left = bounds.left() - viewport.left() - gap;
-            let (anchor, x, available) = if right >= px(160.) || right >= left {
-                (Anchor::TopLeft, bounds.right() + gap, right)
-            } else {
-                (Anchor::TopRight, bounds.left() - gap, left)
-            };
-            dimensions.width = dimensions.width.min(available);
-            Some((anchor, point(x, bounds.top())))
-        } else {
-            None
-        };
         if dimensions.width < px(32.) || dimensions.height < px(32.) {
             return None;
         }
@@ -224,7 +221,7 @@ fn hover_image_with_info(
                 let renderer = cx.svg_renderer();
                 let inset = (HOVER_PADDING + px(1.)) * 2.;
                 let info = info.as_ref().map(|info| {
-                    let card = info.build(window, cx);
+                    let card = info.build(None, cx);
                     card.update(cx, |card, _| card.embed(dimensions.width));
                     card
                 });
@@ -253,6 +250,7 @@ fn hover_image_with_info(
                     });
                     ImageHover {
                         dimensions,
+                        arrow,
                         info,
                         image: None,
                         task,
@@ -267,18 +265,15 @@ fn hover_image_with_info(
             .clone()
             .into()
         })
-        .with_placement(Placement::Right)
+        .with_positioner(move || arrow.positioner())
         .paint_only();
-        Some(if let Some((anchor, position)) = positioner {
-            request.with_positioner(move || Positioner::corner(anchor, position).margin(px(8.)))
-        } else {
-            request
-        })
+        Some(request)
     })
 }
 
 struct ImageHover {
     dimensions: Size<Pixels>,
+    arrow: ArrowHover,
     info: Option<gpui::Entity<Card>>,
     image: Option<anyhow::Result<Arc<RenderImage>>>,
     task: Task<()>,
@@ -286,18 +281,25 @@ struct ImageHover {
 }
 
 impl Render for ImageHover {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if self.closed {
             return div().into_any_element();
         }
         let width = self.dimensions.width;
         let height = self.dimensions.height;
         let content = match &self.image {
-            Some(Ok(image)) => img(image.clone())
-                .debug_selector(|| "image-hover-loaded".into())
-                .size_full()
-                .object_fit(ObjectFit::Contain)
-                .into_any_element(),
+            Some(Ok(image)) => {
+                let pixels = image.size(0);
+                let device_scale = window.scale_factor();
+                img(image.clone())
+                    .debug_selector(|| "image-hover-loaded".into())
+                    .w(px(pixels.width.0 as f32 / device_scale))
+                    .h(px(pixels.height.0 as f32 / device_scale))
+                    .max_w_full()
+                    .max_h_full()
+                    .object_fit(ObjectFit::Contain)
+                    .into_any_element()
+            }
             Some(Err(_)) => div().child(t!("image.open_failed")).into_any_element(),
             None => div().child(t!("image.loading")).into_any_element(),
         };
@@ -308,17 +310,18 @@ impl Render for ImageHover {
             .justify_center()
             .w(width)
             .h(height)
+            .min_h_0()
+            .overflow_hidden()
             .p(HOVER_PADDING)
             .child(content);
-        if let Some(info) = &self.info {
-            gpui_component::v_flex()
-                .w(width)
-                .popover_style(cx)
-                .child(info.clone())
-                .child(preview)
-                .into_any_element()
-        } else {
-            preview.popover_style(cx).into_any_element()
-        }
+        self.arrow
+            .surface(window, cx)
+            .debug_selector(|| "image-hover-surface".into())
+            .relative()
+            .w(width)
+            .max_h(self.arrow.height)
+            .children(self.info.clone())
+            .child(preview)
+            .into_any_element()
     }
 }

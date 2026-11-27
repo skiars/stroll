@@ -262,6 +262,7 @@ impl Server {
                             | super::RECREATE_DOCUMENT_VERSION
                             | super::SOURCE_HISTORY_VERSION
                             | super::FILE_DETAILS_VERSION
+                            | super::READ_EDITOR_VERSION
                     ),
                     "SSH workspace protocol version mismatch. Update the remote helper."
                 );
@@ -550,6 +551,7 @@ impl Server {
             Request::FileDetails(path) => value(crate::repository::file_details_at(
                 &repo.resolve(path.as_path())?,
             )?),
+            Request::ReadEditor(path) => value(repo.read_editor_disk(path.as_path())?),
             Request::ReadForSync(path) => value(repo.bytes_if_present(path.as_path())?.map(Bytes)),
             Request::Read(path, asset) => value(Bytes(repo.bytes(path.as_path(), asset)?)),
             Request::ReadResource {

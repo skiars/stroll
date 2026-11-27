@@ -9,6 +9,7 @@ mod documents;
 mod edit_history;
 mod editor_git;
 mod editor_preview;
+mod file_details;
 mod file_drop;
 mod file_icons;
 mod file_tabs;
@@ -51,6 +52,7 @@ pub(crate) use document_translation::TranslationView;
 pub use window_bounds::{repository_window_bounds, standalone_window_bounds};
 
 use editor_preview::{EditorPreviews, PreviewKind};
+use file_details::{EditorLoad, FileInformation};
 use file_icons::file_type_icon;
 use git_panel::GitPanel;
 use language_service::{
@@ -887,6 +889,8 @@ pub struct Workspace {
     source_caret: Option<(u64, crate::session::SourceLocation)>,
     source_click: Option<(u64, crate::session::SourceLocation)>,
     files: HashMap<PathBuf, OpenFile>,
+    file_information: HashMap<PathBuf, FileInformation>,
+    file_formats: Rc<HashMap<PathBuf, file_icons::KnownFormat>>,
     tab_scroll: ScrollHandle,
     tab_viewport_width: Pixels,
     tabs_overflow: bool,
@@ -1115,6 +1119,8 @@ impl Workspace {
             source_caret: None,
             source_click: None,
             files: HashMap::new(),
+            file_information: HashMap::new(),
+            file_formats: Rc::default(),
             tab_scroll: ScrollHandle::new(),
             tab_viewport_width: px(0.),
             tabs_overflow: false,
@@ -1821,6 +1827,8 @@ impl Workspace {
         self.restore_panel_preferences();
         self.session_revision += 1;
         self.files.clear();
+        self.file_information.clear();
+        self.file_formats = Rc::default();
         self.language_action_groups.clear();
         self.git_history = Default::default();
         self.language_rename = Task::ready(());
@@ -2798,27 +2806,25 @@ impl Workspace {
             self.select_loaded_file(path, request, window, cx);
             return;
         }
-        if self.repository.is_some()
-            && crate::image_viewer::is_image(&path)
+        if crate::image_viewer::is_image(&path)
+            && (self.repository.is_some() || path.is_absolute())
             && (!is_svg || request.is_image_browse())
         {
+            self.file_information.remove(&path);
             if !self.images.contains_key(&path) {
                 self.load_image_tab(path.clone(), window, cx);
             }
             self.select_loaded_file(path, request, window, cx);
             return;
         }
-        let load = if let Some(repo) = self.repository.clone() {
-            self.load_file_buffer(repo, path.clone(), cx)
-        } else if self.standalone.is_some() && path.is_absolute() {
-            let path = path.clone();
-            let store = self.store.clone();
-            cx.background_spawn(async move {
-                let buffer = FileBuffer::new(Document::open_local(&path, &store)?);
-                Ok((buffer, ServerProject::for_local_file(&path)))
-            })
-        } else {
+        if self.repository.is_none() && !(self.standalone.is_some() && path.is_absolute()) {
             return;
+        }
+        let load = {
+            let path = path.clone();
+            let repo = self.repository.clone();
+            let store = self.store.clone();
+            cx.background_spawn(async move { EditorLoad::read(repo.as_deref(), &path, &store) })
         };
         self.loading_file = Some((path, request));
         self.file_task = cx.spawn_in(window, async move |this, cx| {
@@ -2828,11 +2834,9 @@ impl Workspace {
                     return;
                 };
                 match result {
-                    Ok((buffer, project)) => {
+                    Ok(load) => {
                         this.editor_previews.svg_source_errors.remove(&path);
-                        if !this.files.contains_key(&path) {
-                            this.install_file(&path, buffer, project, window, cx);
-                        }
+                        this.install_editor_load(&path, load, window, cx);
                         this.select_loaded_file(path, request, window, cx);
                     }
                     Err(error) => {
@@ -3186,6 +3190,7 @@ impl Workspace {
         let preview = preview && !path.is_absolute() && !self.tab_is_dirty(path);
         if let Some(replaced) = self.tabs.open(path.to_owned(), preview) {
             self.files.remove(&replaced);
+            self.file_information.remove(&replaced);
             self.remove_image_tab(&replaced, window);
             self.forget_editor_preview(&replaced);
         }
@@ -3299,6 +3304,14 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.file_information.remove(path);
+        let format = if buffer.document.disk_issue == Some(crate::repository::FileReadIssue::Binary)
+        {
+            file_icons::KnownFormat::Binary
+        } else {
+            file_icons::KnownFormat::Text
+        };
+        Rc::make_mut(&mut self.file_formats).insert(path.to_owned(), format);
         let language = self.source_language(path, &buffer.text);
         let syntax = self.associated_highlight(path).map(|(_, syntax)| syntax);
         self.source_resources(path).configure_editor(path, cx);
@@ -3713,6 +3726,7 @@ impl Workspace {
             return;
         }
         if self.view == WorkspaceView::Editor
+            && self.active_file_information().is_none()
             && let Some(path) = self.tabs.active().map(Path::to_owned)
         {
             self.keep_tab(&path, cx);
@@ -3739,6 +3753,14 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         if self.tree_busy || self.saving.contains(&path) || self.git_edit.contains(&path) {
+            return;
+        }
+        if let Some(issue) = self
+            .files
+            .get(&path)
+            .and_then(|file| file.document.disk_issue)
+        {
+            toast::info(window, cx, file_details::reason(issue));
             return;
         }
         if self
@@ -4261,9 +4283,9 @@ impl Workspace {
 
     /// Whether the tab needs attention because its disk state changed.
     fn tab_needs_attention(&self, path: &Path) -> bool {
-        self.files
-            .get(path)
-            .is_some_and(|file| file.document.conflict || file.missing)
+        self.files.get(path).is_some_and(|file| {
+            file.document.conflict || file.missing || file.document.disk_issue.is_some()
+        })
     }
 
     fn activate_tab(&mut self, path: &Path, window: &mut Window, cx: &mut Context<Self>) {
@@ -4450,7 +4472,9 @@ impl Workspace {
                 return;
             }
         } else if previous != self.tabs.active()
-            || (self.active_file().is_none() && self.active_image_tab().is_none())
+            || (self.active_file().is_none()
+                && self.active_image_tab().is_none()
+                && self.active_file_information().is_none())
         {
             self.restore_active_file(window, cx);
         }
@@ -4478,6 +4502,7 @@ impl Workspace {
             self.tabs.open(preferred, true);
         }
         self.files.remove(path);
+        self.file_information.remove(path);
         self.remove_image_tab(path, window);
         self.forget_editor_preview(path);
     }
@@ -4494,9 +4519,9 @@ impl Workspace {
         window.open_dialog(cx, move |dialog, _, cx| {
             let locked = workspace
                 .read_with(cx, |this, _| {
-                    this.files
-                        .get(&path)
-                        .is_some_and(|file| file.document.conflict)
+                    this.files.get(&path).is_some_and(|file| {
+                        file.document.conflict || file.document.disk_issue.is_some()
+                    })
                 })
                 .unwrap_or_default();
             let cancel = workspace.clone();
@@ -4563,7 +4588,10 @@ impl Workspace {
         self.vim.close_preference = None;
         self.closing_standalone_window = false;
         self.close_queue.clear();
-        if self.active_file().is_none() && self.active_image_tab().is_none() {
+        if self.active_file().is_none()
+            && self.active_image_tab().is_none()
+            && self.active_file_information().is_none()
+        {
             self.restore_active_file(window, cx);
         }
         cx.notify();
@@ -4882,6 +4910,7 @@ impl Workspace {
         } else {
             px(0.)
         };
+        let formats = self.file_formats.clone();
         let list = tree_motion::tree_list(
             cx.entity(),
             "file-tree",
@@ -4943,6 +4972,7 @@ impl Workspace {
                         repository.as_deref(),
                         &associations,
                         &entry.path,
+                        formats.get(&entry.path).copied(),
                         colors,
                         file_tree::TREE_ICON_SIZE,
                     )
@@ -5270,6 +5300,13 @@ impl Workspace {
                     main.child(self.tab_bar(cx, colors, corner))
                 })
                 .child(self.image_tab_content(path, image, cx, colors));
+        } else if let Some((path, details)) = self.active_file_information() {
+            main = main
+                .when(self.standalone.is_none(), |main| {
+                    main.child(self.tab_bar(cx, colors, corner))
+                })
+                .child(self.file_information_content(path, details, cx, colors))
+                .children(if maximized { None } else { terminal.take() });
         } else if let Some(file) = self.active_file() {
             let path = &file.path;
             let name = file_name(path).to_owned();
@@ -5396,6 +5433,17 @@ impl Workspace {
             main = main
                 .when(self.standalone.is_none(), |main| {
                     main.child(self.tab_bar(cx, colors, corner))
+                })
+                .when_some(file.document.disk_issue, |main, issue| {
+                    main.child(
+                        v_flex()
+                            .px_3()
+                            .py_2()
+                            .text_sm()
+                            .text_color(colors.warning)
+                            .child(t!("file_details.disk_changed"))
+                            .child(file_details::reason(issue)),
+                    )
                 })
                 .child(self.editor_tab_body(path, source, cx, colors))
                 .children(if maximized { None } else { terminal.take() });

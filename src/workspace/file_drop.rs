@@ -4,7 +4,8 @@ use rust_i18n::t;
 use super::*;
 
 enum DroppedFile {
-    Editor(Option<(FileBuffer, Option<ServerProject>)>),
+    Editor(Option<EditorLoad>),
+    Image,
     Document(Option<docs::PreparedDocument>),
 }
 
@@ -107,21 +108,16 @@ impl Workspace {
                                     )?)
                                 };
                                 DroppedFile::Document(prepared)
+                            } else if !welcome
+                                && !loaded.contains(&path)
+                                && crate::image_viewer::is_image(&path)
+                                && PreviewKind::for_path(&path) != Some(PreviewKind::Svg)
+                            {
+                                DroppedFile::Image
                             } else {
-                                let buffer = if loaded.contains(&path) {
-                                    None
-                                } else {
-                                    Some(match &repo {
-                                        Some(repo) => {
-                                            FileBuffer::new(Document::open(repo, &path, &store)?)
-                                                .with_project(repo, &path)
-                                        }
-                                        None => (
-                                            FileBuffer::new(Document::open_local(&path, &store)?),
-                                            ServerProject::for_local_file(&path),
-                                        ),
-                                    })
-                                };
+                                let buffer = (!welcome && !loaded.contains(&path))
+                                    .then(|| EditorLoad::read(repo.as_deref(), &path, &store))
+                                    .transpose()?;
                                 DroppedFile::Editor(buffer)
                             };
                             Ok(Some((path, file)))
@@ -164,12 +160,20 @@ impl Workspace {
                                 errors.push(format!("{} — {error:#}", paths::display(&path)));
                             }
                         }
+                        Ok((path, DroppedFile::Image)) => {
+                            this.file_information.remove(&path);
+                            if !this.images.contains_key(&path) {
+                                this.load_image_tab(path.clone(), window, cx);
+                            }
+                            editor_paths.push(path);
+                            view = Some(WorkspaceView::Editor);
+                        }
                         Ok((path, DroppedFile::Editor(buffer))) => {
                             if !this.files.contains_key(&path) {
-                                let Some((buffer, project)) = buffer else {
+                                let Some(load) = buffer else {
                                     continue;
                                 };
-                                this.install_file(&path, buffer, project, window, cx);
+                                this.install_editor_load(&path, load, window, cx);
                             }
                             editor_paths.push(path);
                             view = Some(WorkspaceView::Editor);
@@ -295,16 +299,25 @@ mod tests {
             });
         });
         drop_files(visual, &[repo_file.clone(), notes.clone(), binary.clone()]);
+        visual.update(|window, cx| {
+            workspace.update(cx, |this, cx| {
+                let (path, details) = this.active_file_information().unwrap();
+                assert_eq!(path, binary);
+                assert_eq!(details.issue, crate::repository::FileReadIssue::Binary);
+                assert!(window.notifications(cx).is_empty());
+                this.activate_tab(&notes, window, cx);
+            });
+        });
         let editor = visual.update(|window, cx| {
             let this = workspace.read(cx);
             assert_eq!(
                 this.tabs.paths(),
-                &[PathBuf::from("existing.txt"), notes.clone()]
+                &[PathBuf::from("existing.txt"), notes.clone(), binary.clone()]
             );
             assert_eq!(this.view, WorkspaceView::Editor);
             assert!(this.doc.is_none());
             assert_eq!(this.tabs.active(), Some(notes.as_path()));
-            assert_eq!(window.notifications(cx).len(), 1);
+            assert!(window.notifications(cx).is_empty());
             let editor = workspace.read(cx).active_file().unwrap().editor.clone();
             editor.update(cx, |editor, cx| editor.select_all(window, cx));
             window.draw(cx).clear(cx);
@@ -326,7 +339,7 @@ mod tests {
         visual.update(|_, cx| {
             let this = workspace.read(cx);
             assert_eq!(this.view, WorkspaceView::Docs);
-            assert_eq!(this.tabs.paths().len(), 2);
+            assert_eq!(this.tabs.paths().len(), 3);
             assert!(!this.files.contains_key(&guide));
             assert_eq!(this.doc.as_ref().unwrap().read(cx).path, notes);
             assert_eq!(this.session.open_documents.as_ref().unwrap().len(), 2);
@@ -336,7 +349,7 @@ mod tests {
         visual.update(|_, cx| {
             let this = workspace.read(cx);
             assert_eq!(this.view, WorkspaceView::Docs);
-            assert_eq!(this.tabs.paths().len(), 2);
+            assert_eq!(this.tabs.paths().len(), 3);
             assert_eq!(this.doc.as_ref().unwrap().read(cx).path, guide);
         });
         drop_files(visual, &[guide, repo_file]);

@@ -2081,8 +2081,18 @@ fn git_ref_picker_keeps_checkout_first_and_browses_remote_refs_and_annotated_tag
         Box::leak(format!("worktree-info:{}", crate::paths::display(&linked)).into_boxed_str());
     let row = visual.debug_bounds(linked_row).unwrap();
     visual.simulate_mouse_move(row.center(), None, Modifiers::default());
-    visual.executor().advance_clock(Duration::from_millis(550));
+    visual.executor().advance_clock(Duration::from_millis(350));
+    visual.simulate_mouse_move(
+        row.center() + point(px(4.), px(0.)),
+        None,
+        Modifiers::default(),
+    );
+    visual.executor().advance_clock(Duration::from_millis(180));
+    draw_frame(visual);
+    assert!(visual.debug_bounds("hover-copy-branch").is_some());
     settle(visual);
+    let copy = visual.debug_bounds("hover-copy-branch").unwrap().center();
+    visual.simulate_mouse_move(copy, None, Modifiers::default());
     click(visual, "hover-copy-branch");
     assert_eq!(
         visual

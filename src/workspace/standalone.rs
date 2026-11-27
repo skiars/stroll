@@ -247,6 +247,10 @@ impl Workspace {
         let dirty = path.is_some_and(|path| self.tab_is_dirty(path));
         let can_save = path.is_some_and(|path| {
             !self.saving.contains(path)
+                && self
+                    .files
+                    .get(path)
+                    .is_none_or(|file| file.document.disk_issue.is_none())
                 && (dirty
                     || self
                         .files
@@ -329,6 +333,7 @@ impl Workspace {
                                 self.repository.as_deref(),
                                 &self.config.file_associations,
                                 path,
+                                self.file_formats.get(path).copied(),
                                 colors,
                                 15.,
                             ))

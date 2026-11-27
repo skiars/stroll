@@ -480,7 +480,56 @@ impl From<Repository> for RepositoryInfo {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub(crate) enum FileReadIssue {
+    Binary,
+    UnsupportedEncoding,
+    Utf16,
+    Utf32,
+    TooLarge(u64),
+    PermissionDenied,
+}
+
+impl std::fmt::Display for FileReadIssue {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TooLarge(_) => formatter.write_str(&t!("storage.legacy_file_limit")),
+            Self::PermissionDenied => formatter.write_str(&t!("file_details.permission")),
+            _ => formatter.write_str(&t!("storage.text_only")),
+        }
+    }
+}
+
+impl std::error::Error for FileReadIssue {}
+
 #[derive(Serialize, Deserialize)]
+pub(crate) enum EditorRead {
+    Missing,
+    Bytes(crate::remote::Bytes),
+    Unavailable(FileReadIssue),
+}
+
+impl Repository {
+    pub(crate) fn read_editor_disk(&self, path: &Path) -> Result<EditorRead> {
+        let result = self.resolve(path).and_then(|target| read_bytes(&target));
+        match result {
+            Ok(bytes) => Ok(EditorRead::Bytes(crate::remote::Bytes(bytes))),
+            Err(error)
+                if error
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|error| error.kind() == ErrorKind::NotFound) =>
+            {
+                Ok(EditorRead::Missing)
+            }
+            Err(error) => match error.downcast_ref::<FileReadIssue>() {
+                Some(issue) => Ok(EditorRead::Unavailable(*issue)),
+                None => Err(error),
+            },
+        }
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize)]
 pub(crate) struct FileDetails {
     pub(crate) size: u64,
     pub(crate) modified: Option<std::time::SystemTime>,
@@ -584,6 +633,8 @@ pub struct Document {
     // Tracks the on-disk representation after the editor text has been normalized.
     pub mixed_newlines: bool,
     pub(crate) missing: bool,
+    #[cfg(feature = "desktop")]
+    pub(crate) disk_issue: Option<FileReadIssue>,
     pub(crate) identity: Option<LocalFileIdentity>,
     bom: bool,
     crlf: bool,
@@ -609,6 +660,22 @@ impl Document {
         )
     }
 
+    #[cfg(feature = "desktop")]
+    pub(crate) fn recover_uneditable(
+        repo: Option<&Repository>,
+        path: &Path,
+        store: &Store,
+        issue: FileReadIssue,
+    ) -> Result<Option<Self>> {
+        let Some(draft) = store.editor_draft(repo, path)? else {
+            return Ok(None);
+        };
+        let mut document = Self::open_with_draft(None, Some(draft))?;
+        document.missing = false;
+        document.disk_issue = Some(issue);
+        Ok(Some(document))
+    }
+
     fn open_with_draft(disk: Option<Self>, draft: Option<Draft>) -> Result<Self> {
         if let Some(mut document) = disk {
             document.apply_draft(draft);
@@ -622,6 +689,8 @@ impl Document {
             conflict: false,
             mixed_newlines: false,
             missing: true,
+            #[cfg(feature = "desktop")]
+            disk_issue: None,
             identity: None,
             bom: draft.format & 1 != 0,
             crlf: draft.format & 2 != 0,
@@ -655,7 +724,30 @@ impl Document {
 
     pub(crate) fn read_for_sync(repo: Option<&Repository>, path: &Path) -> Result<Option<Self>> {
         if let Some(repo) = repo.filter(|repo| !path.is_absolute() && repo.ssh.is_some()) {
-            return repo.bytes_if_present(path)?.map(Self::decode).transpose();
+            #[cfg(feature = "desktop")]
+            if let Some(ssh) = &repo.ssh
+                && ssh.supports_editor_read()
+            {
+                return match ssh.call(crate::remote::Request::ReadEditor(
+                    crate::remote::RepoPath::from_local(path)?,
+                ))? {
+                    EditorRead::Missing => Ok(None),
+                    EditorRead::Bytes(bytes) => Self::decode(bytes.0).map(Some),
+                    EditorRead::Unavailable(issue) => Err(issue.into()),
+                };
+            }
+            return match repo.bytes_if_present(path) {
+                Ok(bytes) => bytes.map(Self::decode).transpose(),
+                Err(error) => {
+                    #[cfg(feature = "desktop")]
+                    if let Ok(details) = file_details(Some(repo), path)
+                        && details.size > MAX_FILE_BYTES
+                    {
+                        return Err(FileReadIssue::TooLarge(details.size).into());
+                    }
+                    Err(error)
+                }
+            };
         }
         match repo.map_or_else(|| Self::read_local(path), |repo| Self::read(repo, path)) {
             Ok(document) => Ok(Some(document)),
@@ -676,7 +768,7 @@ impl Document {
     }
 
     fn read_resolved(path: &Path) -> Result<Self> {
-        let file = File::open(path)?;
+        let file = open_document_file(path)?;
         let identity = file_identity(&file.metadata()?);
         let mut document = Self::decode(read_document_bytes(file)?)?;
         document.identity = identity;
@@ -684,11 +776,36 @@ impl Document {
     }
 
     pub(crate) fn decode(bytes: Vec<u8>) -> Result<Self> {
-        let baseline = digest(&bytes);
+        for (prefix, issue) in [
+            (&b"\xff\xfe\0\0"[..], FileReadIssue::Utf32),
+            (b"\0\0\xfe\xff", FileReadIssue::Utf32),
+            (b"\xff\xfe", FileReadIssue::Utf16),
+            (b"\xfe\xff", FileReadIssue::Utf16),
+        ] {
+            if bytes.starts_with(prefix) {
+                return Err(issue.into());
+            }
+        }
+        if [
+            b"\x7fELF".as_slice(),
+            b"\0asm",
+            b"PK\x03\x04",
+            b"%PDF-",
+            b"\x1f\x8b",
+        ]
+        .iter()
+        .any(|magic| bytes.starts_with(magic))
+        {
+            return Err(FileReadIssue::Binary.into());
+        }
         let bom = bytes.starts_with(b"\xef\xbb\xbf");
-        let disk = std::str::from_utf8(if bom { &bytes[3..] } else { &bytes })
-            .context(t!("storage.text_only"))?;
-        ensure!(!disk.contains('\0'), t!("storage.text_only"));
+        let disk = std::str::from_utf8(if bom { &bytes[3..] } else { &bytes });
+        let disk = match disk {
+            Ok(disk) if !disk.contains('\0') => disk,
+            _ if bytes.contains(&0) => return Err(FileReadIssue::Binary.into()),
+            _ => return Err(FileReadIssue::UnsupportedEncoding.into()),
+        };
+        let baseline = digest(&bytes);
         let mut endings = disk
             .match_indices('\n')
             .map(|(index, _)| index > 0 && disk.as_bytes()[index - 1] == b'\r');
@@ -707,6 +824,8 @@ impl Document {
             conflict: false,
             mixed_newlines,
             missing: false,
+            #[cfg(feature = "desktop")]
+            disk_issue: None,
             identity: None,
             bom,
             crlf,
@@ -1049,17 +1168,32 @@ fn read_asset(root: &Path, path: &Path) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
+fn open_document_file(path: &Path) -> Result<File> {
+    match File::open(path) {
+        Err(error)
+            if error.kind() == ErrorKind::PermissionDenied
+                && path.metadata().is_ok_and(|metadata| metadata.is_file()) =>
+        {
+            Err(FileReadIssue::PermissionDenied.into())
+        }
+        result => Ok(result?),
+    }
+}
+
 fn read_bytes(path: &Path) -> Result<Vec<u8>> {
-    read_document_bytes(File::open(path)?)
+    read_document_bytes(open_document_file(path)?)
 }
 
 fn read_document_bytes(file: File) -> Result<Vec<u8>> {
+    let size = file.metadata()?.len();
+    if size > MAX_FILE_BYTES {
+        return Err(FileReadIssue::TooLarge(size).into());
+    }
     let mut bytes = Vec::new();
-    file.take(MAX_FILE_BYTES + 1).read_to_end(&mut bytes)?;
-    ensure!(
-        bytes.len() as u64 <= MAX_FILE_BYTES,
-        t!("storage.legacy_file_limit")
-    );
+    (&file).take(MAX_FILE_BYTES + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_FILE_BYTES {
+        return Err(FileReadIssue::TooLarge(file.metadata()?.len().max(bytes.len() as u64)).into());
+    }
     Ok(bytes)
 }
 

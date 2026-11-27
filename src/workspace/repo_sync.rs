@@ -1035,6 +1035,19 @@ impl Workspace {
                         .any(|changed| path.starts_with(changed)))
         };
         if !changes.paths.is_empty() || changes.refs || changes.rescan {
+            Rc::make_mut(&mut self.file_formats).retain(|path, _| !changed(path));
+            if self.loading_file.is_none()
+                && self.view == WorkspaceView::Editor
+                && let Some((path, _)) = self.active_file_information()
+                && changed(path)
+            {
+                self.request_file(
+                    path.to_owned(),
+                    FileOpen::Restore { from: None },
+                    window,
+                    cx,
+                );
+            }
             let paths = self
                 .files
                 .keys()
@@ -1325,8 +1338,28 @@ impl Workspace {
                         retry.push((path, editor_id, revision));
                         continue;
                     }
+                    if let Err(error) = &disk
+                        && let Some(&issue) =
+                            error.downcast_ref::<crate::repository::FileReadIssue>()
+                    {
+                        if file.document.disk_issue != Some(issue) {
+                            file.document.disk_issue = Some(issue);
+                            changed = true;
+                        }
+                        if issue == crate::repository::FileReadIssue::Binary {
+                            Rc::make_mut(&mut this.file_formats)
+                                .insert(path, file_icons::KnownFormat::Binary);
+                        }
+                        continue;
+                    }
+                    let was_uneditable = disk.is_ok() && file.document.disk_issue.take().is_some();
+                    changed |= was_uneditable;
                     let disk = match disk {
-                        Ok(Some(disk)) => disk,
+                        Ok(Some(disk)) => {
+                            Rc::make_mut(&mut this.file_formats)
+                                .insert(path.clone(), file_icons::KnownFormat::Text);
+                            disk
+                        }
                         Ok(None) => {
                             if !file.missing {
                                 changed = true;
@@ -1348,6 +1381,7 @@ impl Workspace {
                     file.document.identity = disk.identity;
                     if disk.draft_baseline() == baseline
                         && !was_missing
+                        && !was_uneditable
                         && !file.document.conflict
                         && file.unconfirmed_save.is_none()
                     {

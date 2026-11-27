@@ -61,7 +61,7 @@ impl SystemFiles {
         Self { launchers, manager }
     }
 
-    fn manager_label(&self, historical: bool) -> SharedString {
+    pub(super) fn manager_label(&self, historical: bool) -> SharedString {
         #[cfg(target_os = "linux")]
         let manager = self.manager.as_ref().map(|manager| manager.name);
         #[cfg(target_os = "windows")]
@@ -86,14 +86,14 @@ impl SystemFiles {
         cfg!(any(target_os = "windows", target_os = "macos"))
     }
 
-    fn can_reveal(&self) -> bool {
+    pub(super) fn can_reveal(&self) -> bool {
         #[cfg(target_os = "linux")]
         return self.manager.is_some() || self.can_open();
         #[cfg(not(target_os = "linux"))]
         self.can_open()
     }
 
-    fn open(self, path: PathBuf, reveal: bool, window: &mut Window, cx: &mut App) {
+    pub(super) fn open(self, path: PathBuf, reveal: bool, window: &mut Window, cx: &mut App) {
         #[cfg(target_os = "linux")]
         {
             use std::process::{Command, Stdio};

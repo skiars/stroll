@@ -236,6 +236,7 @@ impl Workspace {
                 self.repository.as_deref(),
                 &self.config.file_associations,
                 path,
+                self.file_formats.get(path).copied(),
                 colors,
                 15.,
             ))

@@ -4334,16 +4334,17 @@ mod tests {
             .debug_bounds("image-hover-preview")
             .expect("image diff hover");
         assert_eq!(popup.size, size(px(320.), px(240.)));
+        let surface = visual.debug_bounds("image-hover-surface").unwrap();
         visual.update(|window, cx| {
             let scale = window.scale_factor();
             let expected = cx.theme().popover.alpha(0.5);
             assert!(window.painted_quads().iter().any(|quad| {
-                quad.bounds.size == popup.size.scale(scale)
-                    && (quad.bounds.left() - popup.left().scale(scale))
+                quad.bounds.size == surface.size.scale(scale)
+                    && (quad.bounds.left() - surface.left().scale(scale))
                         .as_f32()
                         .abs()
                         <= scale
-                    && (quad.bounds.top() - popup.top().scale(scale))
+                    && (quad.bounds.top() - surface.top().scale(scale))
                         .as_f32()
                         .abs()
                         <= scale

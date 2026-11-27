@@ -10,10 +10,17 @@ use crate::{
 
 use super::{Palette, associated_highlight, audio_preview, icon, language_for};
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum KnownFormat {
+    Text,
+    Binary,
+}
+
 pub(super) fn file_type_icon(
     repository: Option<&Repository>,
     associations: &FileAssociations,
     path: &Path,
+    confirmed: Option<KnownFormat>,
     colors: Palette,
     size: f32,
 ) -> Icon {
@@ -28,6 +35,15 @@ pub(super) fn file_type_icon(
             .flex_shrink_0()
     };
 
+    let extension = path.extension().and_then(|extension| extension.to_str());
+    let wasm = extension.is_some_and(|extension| extension.eq_ignore_ascii_case("wasm"));
+    if confirmed == Some(KnownFormat::Binary) {
+        return if wasm {
+            mark(include_bytes!("file_icons/wasm.svg"), 0x654ff0, 0xaa9cff)
+        } else {
+            glyph(IconName::Binary, 0x605187, 0xb5a0e4)
+        };
+    }
     if path
         .file_name()
         .is_some_and(|name| name.eq_ignore_ascii_case("AGENTS.md"))
@@ -43,11 +59,11 @@ pub(super) fn file_type_icon(
     }
     let resources = LanguageResources::for_file(repository, path);
     let association = associated_highlight(associations, resources, path).map(|(_, syntax)| syntax);
-    let extension = path.extension().and_then(|extension| extension.to_str());
     if association.is_none()
+        && confirmed.is_none()
         && let Some(extension) = extension
     {
-        if extension.eq_ignore_ascii_case("wasm") {
+        if wasm {
             return mark(include_bytes!("file_icons/wasm.svg"), 0x654ff0, 0xaa9cff);
         }
         if [
@@ -122,6 +138,7 @@ fn file_icons_render_at_tree_and_tab_sizes() -> anyhow::Result<()> {
     struct IconProbe {
         config: ConfigFile,
         name: &'static str,
+        confirmed: Option<KnownFormat>,
         mode: ThemeMode,
         size: f32,
     }
@@ -139,6 +156,7 @@ fn file_icons_render_at_tree_and_tab_sizes() -> anyhow::Result<()> {
                     None,
                     &self.config.file_associations,
                     Path::new(self.name),
+                    self.confirmed,
                     colors,
                     self.size,
                 ))
@@ -169,6 +187,7 @@ fn file_icons_render_at_tree_and_tab_sizes() -> anyhow::Result<()> {
         let view = cx.new(|_| IconProbe {
             config,
             name: "mapped.ux",
+            confirmed: None,
             mode: ThemeMode::Light,
             size: 15.,
         });
@@ -176,10 +195,11 @@ fn file_icons_render_at_tree_and_tab_sizes() -> anyhow::Result<()> {
         view
     })?;
     let probe = probe.unwrap();
-    let mut paint = |name, mode, size| -> anyhow::Result<_> {
+    let mut paint = |name, confirmed, mode, size| -> anyhow::Result<_> {
         app.update(|cx| {
             probe.update(cx, |probe, cx| {
                 probe.name = name;
+                probe.confirmed = confirmed;
                 probe.mode = mode;
                 probe.size = size;
                 cx.notify();
@@ -190,30 +210,33 @@ fn file_icons_render_at_tree_and_tab_sizes() -> anyhow::Result<()> {
     };
     for mode in [ThemeMode::Light, ThemeMode::Dark] {
         for size in [15., 12.] {
-            let mut paint = |name| paint(name, mode, size);
-            let text = paint("reference.txt")?;
-            let wasm = paint("module.wasm")?;
-            let binary = paint("payload.bin")?;
-            let python = paint("app.py")?;
+            let mut render = |name| paint(name, None, mode, size);
+            let text = render("reference.txt")?;
+            let wasm = render("module.wasm")?;
+            let binary = render("payload.bin")?;
+            let python = render("app.py")?;
             let icons = [&text, &wasm, &binary, &python];
             for (index, icon) in icons.iter().enumerate() {
                 assert!(icon.pixels().any(|pixel| pixel != icon.get_pixel(0, 0)));
                 assert!(!icons[..index].contains(icon));
             }
-            assert!(paint("module.WASM")? == wasm);
-            assert!(paint("stroll.EXE")? == binary);
-            assert!(paint("library.so")? == binary);
-            assert!(paint("app.pyi")? == python);
-            assert!(paint("module.wat")? == text);
+            assert!(render("module.WASM")? == wasm);
+            assert!(render("stroll.EXE")? == binary);
+            assert!(render("library.so")? == binary);
+            assert!(render("app.pyi")? == python);
+            assert!(render("module.wat")? == text);
 
-            let html = paint("reference.html")?;
-            assert!(paint("mapped.ux")? == html);
-            assert!(paint("mapped.bin")? == html);
-            assert!(paint("mapped.wasm")? == html);
+            let html = render("reference.html")?;
+            assert!(render("mapped.ux")? == html);
+            assert!(render("mapped.bin")? == html);
+            assert!(render("mapped.wasm")? == html);
             assert!(text != html);
-            let image = paint("reference.png")?;
-            assert!(paint("photo.png")? == image);
+            let image = render("reference.png")?;
+            assert!(render("photo.png")? == image);
             assert!(image != html);
+            assert!(paint("no-extension", Some(KnownFormat::Binary), mode, size)? == binary);
+            assert!(paint("mapped.bin", Some(KnownFormat::Binary), mode, size)? == binary);
+            assert!(paint("mapped.bin", Some(KnownFormat::Text), mode, size)? == html);
         }
     }
     Ok(())
