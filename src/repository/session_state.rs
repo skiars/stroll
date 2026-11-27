@@ -142,13 +142,15 @@ impl Store {
     }
 
     #[cfg(feature = "desktop")]
-    pub(crate) fn update_standalone_session(
+    pub(crate) fn update_standalone_session<'a>(
         &self,
         path: &Path,
         previous: &StandaloneSession,
         session: &StandaloneSession,
+        relocations: impl IntoIterator<Item = &'a DraftRelocation>,
     ) -> Result<()> {
-        if previous == session {
+        let mut relocations = relocations.into_iter().peekable();
+        if previous == session && relocations.peek().is_none() {
             return Ok(());
         }
         self.with_state(|db| {
@@ -176,6 +178,9 @@ impl Store {
                 current.editor_svg_split = session.editor_svg_split;
             }
             write_standalone(&tx, path, &current)?;
+            for relocation in relocations {
+                relocation.apply(&tx)?;
+            }
             tx.commit()?;
             Ok(())
         })
@@ -511,7 +516,7 @@ mod tests {
         session.tabs.open(renamed.to_owned(), false);
         session.files.remove(old);
         session.files.insert(renamed.to_owned(), position(10));
-        let relocation = store.draft_relocation(&repo, old, renamed, None);
+        let relocation = store.draft_relocation(Some(&repo), old, renamed, None);
         let save = || {
             store.update_worktree_session(
                 repo.storage_key(),
@@ -538,6 +543,7 @@ mod tests {
             db.execute_batch("DROP TRIGGER reject_draft_removal;")?;
             Ok(())
         })?;
+        save()?;
         save()?;
         assert_eq!(store.read_worktree_session(&repo)?, session);
         assert!(!store.has_draft(&repo, old));

@@ -175,7 +175,14 @@ fn launch() -> Result<()> {
     let standalone = requested
         .as_ref()
         .filter(|location| {
-            location.file.is_none() && view != Some(WorkspaceView::Git) && location.root.is_file()
+            location.file.is_none()
+                && view != Some(WorkspaceView::Git)
+                && !location.root.is_dir()
+                && !location
+                    .root
+                    .as_os_str()
+                    .to_string_lossy()
+                    .starts_with("ssh://")
         })
         .map(|location| location.root.clone());
     gpui_platform::application()
@@ -185,13 +192,21 @@ fn launch() -> Result<()> {
             Workspace::bind_terminal_keys(cx);
             Workspace::bind_ui_scale_keys(cx);
             bind_workspace_keys(cx);
-            if let Some(path) = standalone {
-                if let Err(error) = Workspace::open_standalone(store, config, path, None, cx) {
-                    eprintln!("{error:#}");
-                    cx.quit();
-                    return;
+            let opened_standalone = if let Some(path) = standalone {
+                let existing = path.is_file();
+                match Workspace::open_standalone(store.clone(), config.clone(), path, None, cx) {
+                    Ok(()) => true,
+                    Err(error) if existing => {
+                        eprintln!("{error:#}");
+                        cx.quit();
+                        return;
+                    }
+                    Err(_) => false,
                 }
             } else {
+                false
+            };
+            if !opened_standalone {
                 let mut options = Workspace::window_options(&config);
                 if let Some(titlebar) = options.titlebar.as_mut() {
                     titlebar.title = Some("Stroll".into());

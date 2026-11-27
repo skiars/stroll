@@ -565,9 +565,7 @@ impl ActionSource {
                     let version = target_version(&repo, path, started)?;
                     let document = super::Document::open(&repo, path, &store)?;
                     ensure!(
-                        !document.conflict
-                            && !document.mixed_newlines
-                            && target_version(&repo, path, started)? == version,
+                        !document.conflict && target_version(&repo, path, started)? == version,
                         actions::stale()
                     );
                     let snapshot = snapshot.documents.get(&uri);
@@ -672,7 +670,6 @@ impl ActionSource {
                         && editor.current(cx)
                         && file.editor.read(cx).is_editable()
                         && !file.document.conflict
-                        && !file.document.mixed_newlines
                         && !file.missing,
                     actions::stale()
                 ),

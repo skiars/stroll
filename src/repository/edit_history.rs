@@ -10,6 +10,7 @@ pub(crate) struct SavedEditHistory {
     pub baseline: [u8; 32],
     pub buffer: [u8; 32],
     pub draft: Option<String>,
+    pub format: u8,
     pub history: Vec<u8>,
     pub undo_group: Option<u64>,
     pub redo_group: Option<u64>,
@@ -36,14 +37,14 @@ impl Store {
     #[cfg(feature = "desktop")]
     pub(crate) fn draft_relocation(
         &self,
-        repo: &Repository,
+        repo: Option<&Repository>,
         from: &Path,
         to: &Path,
         current: Option<([u8; 32], Option<String>)>,
     ) -> DraftRelocation {
         DraftRelocation {
-            from: self.edit_history_key(Some(repo), from),
-            to: self.edit_history_key(Some(repo), to),
+            from: self.edit_history_key(repo, from),
+            to: self.edit_history_key(repo, to),
             current,
         }
     }
@@ -58,7 +59,7 @@ impl Store {
             let key = self.edit_history_key(repo, path);
             Ok(db
                 .query_row(
-                    "SELECT baseline, buffer, draft, history, undo_group, redo_group FROM documents WHERE key = ?1 AND history IS NOT NULL",
+                    "SELECT baseline, buffer, draft, history, undo_group, redo_group, format FROM documents WHERE key = ?1 AND history IS NOT NULL",
                     [&key],
                     |row| {
                         Ok(SavedEditHistory {
@@ -69,6 +70,7 @@ impl Store {
                             history: row.get(3)?,
                             undo_group: row.get::<_, Option<i64>>(4)?.map(|id| id as u64),
                             redo_group: row.get::<_, Option<i64>>(5)?.map(|id| id as u64),
+                            format: row.get(6)?,
                         })
                     },
                 )
@@ -76,7 +78,7 @@ impl Store {
         })
     }
 
-    pub(super) fn editor_draft(
+    pub(crate) fn editor_draft(
         &self,
         repo: Option<&Repository>,
         path: &Path,
@@ -107,10 +109,10 @@ impl Store {
             let tx = db.transaction()?;
             {
                 let mut update = tx.prepare_cached(
-                    "INSERT INTO documents (key, baseline, buffer, draft, history, undo_group, redo_group) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                    "INSERT INTO documents (key, baseline, buffer, draft, history, undo_group, redo_group, format) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
                     ON CONFLICT(key) DO UPDATE SET baseline = excluded.baseline, buffer = excluded.buffer,
                         draft = excluded.draft, history = excluded.history,
-                        undo_group = excluded.undo_group, redo_group = excluded.redo_group",
+                        undo_group = excluded.undo_group, redo_group = excluded.redo_group, format = excluded.format",
                 )?;
                 for file in files {
                     update.execute(params![
@@ -121,6 +123,7 @@ impl Store {
                         file.history,
                         file.undo_group.map(|id| id as i64),
                         file.redo_group.map(|id| id as i64),
+                        file.format,
                     ])?;
                 }
             }
@@ -193,12 +196,13 @@ impl Store {
 fn read_draft(db: &Connection, key: &str) -> Result<Option<Draft>> {
     Ok(db
         .query_row(
-            "SELECT baseline, draft FROM documents WHERE key = ?1 AND draft IS NOT NULL",
+            "SELECT baseline, draft, format FROM documents WHERE key = ?1 AND draft IS NOT NULL",
             [key],
             |row| {
                 Ok(Draft {
                     baseline: row.get(0)?,
                     text: row.get(1)?,
+                    format: row.get(2)?,
                 })
             },
         )
@@ -237,11 +241,26 @@ pub(crate) struct DraftRelocation {
 #[cfg(feature = "desktop")]
 impl DraftRelocation {
     pub(super) fn apply(&self, db: &Connection) -> Result<()> {
+        if self.from == self.to {
+            return Ok(());
+        }
+        db.execute(
+            "INSERT INTO documents (key, baseline, buffer, draft, history, undo_group, redo_group, format)
+             SELECT ?1, baseline, buffer, draft, history, undo_group, redo_group, format FROM documents
+             WHERE key = ?2 AND (draft IS NOT NULL OR history IS NOT NULL)
+             ON CONFLICT(key) DO UPDATE SET baseline = excluded.baseline, buffer = excluded.buffer,
+                 draft = excluded.draft, history = excluded.history,
+                 undo_group = excluded.undo_group, redo_group = excluded.redo_group, format = excluded.format",
+            params![self.to, self.from],
+        )?;
         if let Some((baseline, text)) = &self.current {
             update_draft(db, &self.to, Some(*baseline), text.as_deref())?;
-        } else if let Some(draft) = read_draft(db, &self.from)? {
-            update_draft(db, &self.to, Some(draft.baseline), Some(&draft.text))?;
         }
-        update_draft(db, &self.from, None, None)
+        db.execute(
+            "UPDATE documents SET draft = NULL, history = NULL, undo_group = NULL, redo_group = NULL
+             WHERE key = ?1 AND (draft IS NOT NULL OR history IS NOT NULL)",
+            [&self.from],
+        )?;
+        Ok(())
     }
 }

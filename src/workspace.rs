@@ -3405,6 +3405,7 @@ impl Workspace {
         let input_edits = self.track_editor_edits(&editor, window, cx);
         let committed = editor.read(cx).text().clone();
         let dirty = document.restored;
+        let missing = document.missing;
         self.files.insert(
             path.to_owned(),
             OpenFile {
@@ -3432,7 +3433,7 @@ impl Workspace {
                 pending_draft: false,
                 unconfirmed_save: None,
                 external: None,
-                missing: false,
+                missing,
                 sync_revision: 0,
                 wrap,
                 git,
@@ -3740,7 +3741,7 @@ impl Workspace {
         if self
             .files
             .get(&path)
-            .is_some_and(|file| (file.document.conflict && overwrite.is_none()) || file.missing)
+            .is_some_and(|file| !file.missing && file.document.conflict && overwrite.is_none())
         {
             self.prompt_conflict(path, window, cx);
             return;
@@ -3758,12 +3759,25 @@ impl Workspace {
                 file.document.clone(),
                 file.committed.clone(),
                 file.committed != file.saved,
+                file.missing,
             )
         });
         let store = self.store.clone();
         let target = path.clone();
+        let open_paths = self.tabs.paths().iter().cloned().collect::<HashSet<_>>();
+        enum SaveOutcome {
+            Renamed(PathBuf),
+            Finished {
+                document: Document,
+                text: Rope,
+                wrote: bool,
+                recreate: bool,
+                result: Result<()>,
+                external: Option<Document>,
+            },
+        }
         let task = cx.background_spawn(async move {
-            let (mut document, text, dirty) = match buffer {
+            let (mut document, text, dirty, missing) = match buffer {
                 Some(buffer) => buffer,
                 None => {
                     let repo = repo
@@ -3772,43 +3786,89 @@ impl Workspace {
                     let document = Document::open(repo, &target, &store)?;
                     let text = Rope::from(document.text.as_str());
                     let dirty = document.text != document.saved_text;
-                    (document, text, dirty)
+                    let missing = document.missing;
+                    (document, text, dirty, missing)
                 }
             };
-            let result = if let Some(expected) = overwrite {
-                let mut disk = Document::read_for_sync(repo.as_deref(), &target)?
-                    .ok_or_else(|| anyhow::anyhow!(t!("workspace.tree_file_missing")))?;
-                if disk.draft_baseline() != expected {
-                    Err(anyhow::anyhow!(t!("storage.changed_on_disk")))
-                } else {
-                    match disk.save_target(repo.as_deref(), &target, &text.to_string()) {
-                        Ok(()) => {
-                            document = disk;
-                            Ok(())
-                        }
-                        Err(error) if disk.conflict => Err(error),
-                        Err(error) => return Err(error),
+            let read_disk = || Document::read_for_sync(repo.as_deref(), &target);
+            let renamed_sibling = || {
+                document
+                    .renamed_sibling(repo.as_deref(), &target)
+                    .filter(|to| !open_paths.contains(to))
+            };
+            let inspected = (missing || editor_id.is_some() && (overwrite.is_some() || !dirty))
+                .then(read_disk)
+                .transpose()?;
+            let mut wrote = dirty || missing || overwrite.is_some();
+            let mut recreate = matches!(inspected, Some(None));
+            let mut result = if recreate {
+                if let Some(to) = renamed_sibling() {
+                    return Ok(SaveOutcome::Renamed(to));
+                }
+                wrote = true;
+                document.recreate_target(repo.as_deref(), &target, &text.to_string())
+            } else if let Some(Some(mut disk)) = inspected
+                && (overwrite.is_some()
+                    || missing
+                    || disk.mixed_newlines && text == disk.saved_text.as_str())
+            {
+                if disk.draft_baseline() == overwrite.unwrap_or_else(|| document.draft_baseline())
+                    || (overwrite.is_none() && text == disk.saved_text.as_str())
+                {
+                    if overwrite.is_some() {
+                        disk.retain_buffer_line_ending(&document);
                     }
+                    wrote = true;
+                    let result = disk.save_target(repo.as_deref(), &target, &text.to_string());
+                    if result.is_ok() {
+                        document = disk;
+                    } else if disk.conflict {
+                        document.conflict = true;
+                    }
+                    result
+                } else {
+                    document.conflict = true;
+                    Err(anyhow::anyhow!(t!("storage.changed_on_disk")))
                 }
             } else if dirty {
                 document.save_target(repo.as_deref(), &target, &text.to_string())
             } else {
                 Ok(())
             };
-            let external = if document.conflict && result.is_err() {
-                Document::read_for_sync(repo.as_deref(), &target)
-                    .ok()
-                    .flatten()
+            // The watcher can report the deletion after the save command.
+            let external = if result.is_err() && editor_id.is_some() {
+                match read_disk() {
+                    Ok(None) if !recreate => {
+                        if let Some(to) = document
+                            .renamed_sibling(repo.as_deref(), &target)
+                            .filter(|to| !open_paths.contains(to))
+                        {
+                            return Ok(SaveOutcome::Renamed(to));
+                        }
+                        recreate = true;
+                        result =
+                            document.recreate_target(repo.as_deref(), &target, &text.to_string());
+                        wrote = true;
+                        if result.is_err() && document.conflict {
+                            read_disk().ok().flatten()
+                        } else {
+                            None
+                        }
+                    }
+                    Ok(disk) if document.conflict => disk,
+                    _ => None,
+                }
             } else {
                 None
             };
-            Ok::<_, anyhow::Error>((
+            Ok::<_, anyhow::Error>(SaveOutcome::Finished {
                 document,
                 text,
-                dirty || overwrite.is_some(),
+                wrote,
+                recreate,
                 result,
                 external,
-            ))
+            })
         });
         self.saving.insert(path.clone());
         cx.spawn_in(window, async move |this, cx| {
@@ -3834,15 +3894,54 @@ impl Workspace {
                     }
                     _ => {}
                 }
+                if let Ok(SaveOutcome::Renamed(to)) = result {
+                    if this.tabs.index(&to).is_some() || this.files.contains_key(&to) {
+                        this.show_error(
+                            anyhow::anyhow!(t!("workspace.tree_destination_exists")),
+                            window,
+                            cx,
+                        );
+                    } else {
+                        let affected = this.files_for_external_rename(&path);
+                        this.relocate_tree_path(&path, &to, affected, window, cx);
+                        if !to.is_absolute()
+                            && let Some(parent) = to.parent()
+                        {
+                            this.refresh_tree_paths([parent.to_owned()], window, cx);
+                        }
+                        this.save_buffer(to, close, overwrite, window, cx);
+                    }
+                    cx.notify();
+                    return;
+                }
                 // The write itself detects a file that changed on disk, so the
                 // conflict can surface on the very first save. It then belongs
                 // to the prompt, not to an error toast next to a dialog.
                 let mut conflicted = false;
-                let result = result.and_then(|(document, text, wrote, result, external)| {
+                let result = result.and_then(|outcome| {
+                    let SaveOutcome::Finished {
+                        document,
+                        text,
+                        wrote,
+                        recreate,
+                        result,
+                        external,
+                    } = outcome
+                    else {
+                        unreachable!("Rename outcome is handled before updating the save result")
+                    };
                     let repo = this.repository.as_ref();
                     if let Some(file) = this.files.get_mut(&path) {
                         file.document = document;
-                        conflicted = file.document.conflict;
+                        conflicted = file.document.conflict
+                            && (external.is_some() || !file.missing && !recreate);
+                        if result.is_ok() || external.is_some() {
+                            file.missing = false;
+                        } else if recreate && !file.missing {
+                            file.missing = true;
+                            file.pending_draft = true;
+                            file.revision += 1;
+                        }
                         file.external = external.map(|disk| {
                             (disk.draft_baseline(), Rope::from(disk.saved_text.as_str()))
                         });
@@ -3873,7 +3972,7 @@ impl Workspace {
                             this.show_error(error, window, cx);
                         }
                     }
-                    Ok(wrote)
+                    Ok((wrote, recreate))
                 });
                 this.queue_drafts(window, cx);
                 if conflicted {
@@ -3890,7 +3989,10 @@ impl Workspace {
                     this.prompt_conflict(path, window, cx);
                 } else {
                     match result {
-                        Ok(wrote) => {
+                        Ok((wrote, recreate)) => {
+                            if recreate && this.standalone.as_ref() == Some(&path) {
+                                this.watch_repository(window, cx);
+                            }
                             if wrote && !path.is_absolute() {
                                 this.refresh_git_after_save(&path, window, cx);
                             }
@@ -3926,7 +4028,6 @@ impl Workspace {
     fn prompt_conflict(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
         let workspace = cx.weak_entity();
         let file = self.files.get(&path);
-        let missing = file.is_some_and(|file| file.missing);
         let overwrite = file.filter(|file| !file.missing).and_then(|file| {
             file.external
                 .as_ref()
@@ -3948,11 +4049,7 @@ impl Workspace {
                 .close_button(false)
                 .title(t!("workspace.conflict_title"))
                 .child(div().child(paths::display(&path)))
-                .child(div().text_sm().child(if missing {
-                    t!("workspace.tree_file_missing")
-                } else {
-                    t!("workspace.draft_conflict")
-                }))
+                .child(div().text_sm().child(t!("workspace.draft_conflict")))
                 .footer(
                     h_flex()
                         .justify_end()
@@ -4146,7 +4243,7 @@ impl Workspace {
     }
 
     fn file_editor_locked(&self, file: &OpenFile) -> bool {
-        file.missing || file.document.mixed_newlines || self.git_edit.contains(&file.path)
+        self.git_edit.contains(&file.path)
     }
 
     fn tab_is_dirty(&self, path: &Path) -> bool {
@@ -4396,7 +4493,7 @@ impl Workspace {
                 .read_with(cx, |this, _| {
                     this.files
                         .get(&path)
-                        .is_some_and(|file| file.document.conflict || file.document.mixed_newlines)
+                        .is_some_and(|file| file.document.conflict)
                 })
                 .unwrap_or_default();
             let cancel = workspace.clone();
@@ -7047,7 +7144,7 @@ mod layout_tests {
 
         for (file, ending) in [
             ("crlf.txt", "status-file-line-ending: CRLF"),
-            ("mixed.txt", "status-file-line-ending: Mixed"),
+            ("mixed.txt", "status-file-line-ending: CRLF"),
             ("single-line.txt", "status-file-line-ending: LF"),
         ] {
             visual.update(|window, cx| {

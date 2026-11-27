@@ -25,7 +25,9 @@ use crate::{
     },
     locator::{self, PathCache, Results, TextHit, TextSearch},
     pty,
-    repository::{Repository, RepositoryInfo, files::WorkspaceImport, write_checked},
+    repository::{
+        Repository, RepositoryInfo, files::WorkspaceImport, recreate_document, write_checked,
+    },
 };
 
 #[derive(Default)]
@@ -257,6 +259,7 @@ impl Server {
                             | super::PUSH_REVIEW_VERSION
                             | super::PUSH_BRANCHES_VERSION
                             | super::WORKTREE_REMOVAL_PREVIEW_VERSION
+                            | super::RECREATE_DOCUMENT_VERSION
                     ),
                     "SSH workspace protocol version mismatch. Update the remote helper."
                 );
@@ -565,6 +568,10 @@ impl Server {
             } => {
                 let _guard = self.mutations.lock().unwrap();
                 value(write_checked(root, path.as_path(), baseline, &bytes.0)?)
+            }
+            Request::RecreateDocument { path, bytes } => {
+                let _guard = self.mutations.lock().unwrap();
+                value(recreate_document(root, path.as_path(), &bytes.0)?)
             }
             Request::History => value(git::history(root)?),
             Request::Commits(oid, query, offset) => {

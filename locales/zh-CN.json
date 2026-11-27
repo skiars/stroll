@@ -853,7 +853,7 @@
   "ssh.timeout": "SSH 请求超时或连接已关闭",
   "ssh.version_mismatch": "SSH 工作区协议版本不匹配",
   "storage.changed_on_disk": "文件已在磁盘上更改，已保留草稿",
-  "storage.draft_conflict": "磁盘内容有冲突或使用混合换行，已保留草稿",
+  "storage.draft_conflict": "磁盘内容有冲突，已保留草稿",
   "storage.file_limit": "最多支持 8 MiB 的文件",
   "storage.image_limit": "资源文件超过 16 MiB",
   "storage.image_outside_repo": "资源文件须位于仓库内",

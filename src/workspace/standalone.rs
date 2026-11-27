@@ -20,8 +20,23 @@ impl Workspace {
         view: Option<WorkspaceView>,
         cx: &mut App,
     ) -> Result<()> {
-        let path = path.canonicalize()?;
-        anyhow::ensure!(path.is_file(), t!("storage.local_regular_file"));
+        let (path, missing) = match path.canonicalize() {
+            Ok(path) => {
+                anyhow::ensure!(path.is_file(), t!("storage.local_regular_file"));
+                (path, false)
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let path = std::path::absolute(path)?;
+                anyhow::ensure!(
+                    path.symlink_metadata()
+                        .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+                        && store.editor_draft(None, &path)?.is_some(),
+                    t!("storage.local_regular_file")
+                );
+                (path, true)
+            }
+            Err(error) => return Err(error.into()),
+        };
         for handle in cx.windows() {
             let activated = handle
                 .update(cx, |root, window, cx| {
@@ -55,17 +70,21 @@ impl Workspace {
                 StandaloneSession::default()
             }
         };
-        let view = view.unwrap_or_else(|| {
-            if docs::is_markdown(&path) {
-                if fragment.is_none() && session.view == Some(WorkspaceView::Editor) {
-                    WorkspaceView::Editor
+        let view = if missing {
+            WorkspaceView::Editor
+        } else {
+            view.unwrap_or_else(|| {
+                if docs::is_markdown(&path) {
+                    if fragment.is_none() && session.view == Some(WorkspaceView::Editor) {
+                        WorkspaceView::Editor
+                    } else {
+                        WorkspaceView::Docs
+                    }
                 } else {
-                    WorkspaceView::Docs
+                    WorkspaceView::Editor
                 }
-            } else {
-                WorkspaceView::Editor
-            }
-        });
+            })
+        };
         let prepared = (view == WorkspaceView::Docs).then(|| {
             let path = path.clone();
             cx.background_spawn(async move { docs::load_local(&path) })
@@ -226,6 +245,14 @@ impl Workspace {
         let path = self.standalone_active_path();
         let editing = self.view == WorkspaceView::Editor;
         let dirty = path.is_some_and(|path| self.tab_is_dirty(path));
+        let can_save = path.is_some_and(|path| {
+            !self.saving.contains(path)
+                && (dirty
+                    || self
+                        .files
+                        .get(path)
+                        .is_some_and(|file| file.missing || file.document.mixed_newlines))
+        });
         let show_tabs = editing && self.tabs.paths().len() > 1;
         let document_list_title = path.filter(|_| !editing && self.shows_document_list());
         let actions = titlebar_actions()
@@ -253,7 +280,7 @@ impl Workspace {
                 )
                 .child(
                     icon_button("standalone-save", IconName::Save, t!("common.save"))
-                        .disabled(!dirty || path.is_some_and(|path| self.saving.contains(path)))
+                        .disabled(!can_save)
                         .on_click(
                             cx.listener(|this, _, window, cx| this.save(&SaveFile, window, cx)),
                         ),

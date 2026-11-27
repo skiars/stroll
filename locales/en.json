@@ -853,7 +853,7 @@
   "ssh.timeout": "The SSH request timed out or the connection closed",
   "ssh.version_mismatch": "SSH workspace protocol version mismatch",
   "storage.changed_on_disk": "The file changed on disk. Your draft was preserved.",
-  "storage.draft_conflict": "The file conflicts with the draft or uses mixed line endings. Your draft was preserved.",
+  "storage.draft_conflict": "The file conflicts with the draft. Your draft was preserved.",
   "storage.file_limit": "Files up to 8 MiB are supported",
   "storage.image_limit": "The resource exceeds 16 MiB",
   "storage.image_outside_repo": "The resource must be inside the repository",

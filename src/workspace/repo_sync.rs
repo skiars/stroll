@@ -487,8 +487,8 @@ impl Workspace {
                 window,
                 cx,
             );
-        } else if let Some(path) = self.standalone.clone() {
-            self.sync_document_paths(vec![path], window, cx);
+        } else if self.standalone.is_some() {
+            self.sync_document_paths(self.files.keys().cloned().collect(), window, cx);
             self.refresh_selected_document(window, cx);
         }
     }
@@ -535,7 +535,18 @@ impl Workspace {
             .clone()
             .unwrap_or_else(|| repo.clone());
         let source = repo.clone();
-        let renames = changes.renames.clone();
+        let renames: Vec<_> = changes
+            .renames
+            .iter()
+            .enumerate()
+            .map(|(index, (from, to))| {
+                (
+                    from.clone(),
+                    final_rename_destination(to, &changes.renames[index + 1..]).clone(),
+                )
+            })
+            .filter(|(from, to)| from != to)
+            .collect();
         let status_needed = !changes.is_empty();
         let refresh_all = changes.rescan
             || changes.index
@@ -638,33 +649,62 @@ impl Workspace {
                                     entries.iter().any(|entry| entry.path == path)
                                 })
                         };
-                        let moves: Vec<_> = renames
+                        let (moves, deferred): (Vec<_>, Vec<_>) = renames
                             .into_iter()
                             .filter(|(from, to)| {
                                 let (from, to) = (Path::new(from), Path::new(to));
+                                (contains(&previous, from)
+                                    || this.tabs.paths().iter().any(|path| path.starts_with(from))
+                                    || this.expanded.contains(from))
+                                    && !contains(&tree, from)
+                                    && contains(&tree, to)
+                                    && !this.tabs.paths().iter().any(|path| path.starts_with(to))
+                            })
+                            .partition(|(from, _)| {
                                 !this.tree_busy
                                     && !this
                                         .saving
                                         .iter()
                                         .chain(this.git_edit.iter())
                                         .any(|path| path.starts_with(from))
-                                    && (contains(&previous, from)
-                                        || this
-                                            .tabs
-                                            .paths()
+                            });
+                        if !deferred.is_empty() {
+                            let repo = repo.clone();
+                            cx.spawn_in(window, async move |this, cx| {
+                                cx.background_executor().timer(DEBOUNCE).await;
+                                _ = this.update_in(cx, |this, window, cx| {
+                                    if this
+                                        .repository
+                                        .as_ref()
+                                        .is_some_and(|current| Arc::ptr_eq(current, &repo))
+                                    {
+                                        let directories = deferred
                                             .iter()
-                                            .any(|path| path.starts_with(from))
-                                        || this.expanded.contains(from))
-                                    && !contains(&tree, from)
-                                    && contains(&tree, to)
-                                    && !this.tabs.paths().iter().any(|path| path.starts_with(to))
+                                            .flat_map(|(from, to)| [from, to])
+                                            .filter_map(|path| {
+                                                Path::new(path).parent().map(Path::to_owned)
+                                            })
+                                            .collect();
+                                        this.queue_workspace_refresh(
+                                            RepoChanges {
+                                                directories,
+                                                renames: deferred,
+                                                structure: true,
+                                                ..Default::default()
+                                            },
+                                            window,
+                                            cx,
+                                        );
+                                    }
+                                });
                             })
-                            .collect();
+                            .detach();
+                        }
                         let previous_rows = this.rows.clone();
                         for (from, to) in &moves {
                             let (from, to) = (Path::new(from), Path::new(to));
                             let affected = this.files_for_external_rename(from);
-                            this.relocate_tree_path(&repo, from, to, affected, window, cx);
+                            this.relocate_tree_path(from, to, affected, window, cx);
                             let paths = this
                                 .files
                                 .keys()
@@ -783,6 +823,41 @@ impl Workspace {
                         cx.background_executor().timer(DEBOUNCE).await;
                     }
                     let mut changes = events.take();
+                    if !changes.unpaired_renames.is_empty() && ssh.is_none() {
+                        let paths = this.update_in(cx, |this, _, _| {
+                            this.files
+                                .values()
+                                .filter_map(|file| {
+                                    let absolute = if let Some(repo) = &repo {
+                                        repo.root.join(&file.path)
+                                    } else {
+                                        file.path.clone()
+                                    };
+                                    Some((absolute, file.document.identity?))
+                                })
+                                .collect::<Vec<_>>()
+                        });
+                        let Ok(paths) = paths else {
+                            return;
+                        };
+                        let candidates = std::mem::take(&mut changes.unpaired_renames);
+                        let moves = cx
+                            .background_spawn(async move {
+                                crate::git::watch::match_unpaired_renames(candidates, paths)
+                            })
+                            .await;
+                        if let Some(repo) = &repo {
+                            changes
+                                .renames
+                                .extend(moves.into_iter().filter_map(|(from, to)| {
+                                    let from = from.strip_prefix(&repo.root).ok()?.to_str()?;
+                                    let to = to.strip_prefix(&repo.root).ok()?.to_str()?;
+                                    Some((from.to_owned(), to.to_owned()))
+                                }));
+                        } else {
+                            changes.local_renames.extend(moves);
+                        }
+                    }
                     if let Some(repo) = repo.as_ref().filter(|repo| repo.ssh.is_none())
                         && !changes.paths.is_empty()
                     {
@@ -807,8 +882,20 @@ impl Workspace {
                             .update_in(cx, |this, window, cx| {
                                 if let Some(repo) = &repo {
                                     this.apply_repository_changes(repo, changes, window, cx);
-                                } else {
-                                    this.rescan_workspace(window, cx);
+                                } else if changes.rescan
+                                    || !changes.local_renames.is_empty()
+                                    || changes.local_paths.iter().any(|changed| {
+                                        this.standalone
+                                            .iter()
+                                            .chain(this.files.keys())
+                                            .any(|file| file.starts_with(changed))
+                                    })
+                                {
+                                    this.apply_standalone_changes(
+                                        changes.local_renames,
+                                        window,
+                                        cx,
+                                    );
                                 }
                             })
                             .is_err()
@@ -843,7 +930,72 @@ impl Workspace {
         });
     }
 
-    fn apply_repository_changes(
+    pub(super) fn apply_standalone_changes(
+        &mut self,
+        renames: Vec<(PathBuf, PathBuf)>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(anchor) = self.standalone.clone() else {
+            return;
+        };
+        let mut paths = self.files.keys().cloned().collect::<BTreeSet<_>>();
+        paths.insert(anchor.clone());
+        let candidates = paths
+            .into_iter()
+            .filter_map(|path| {
+                let target = final_rename_destination(&path, &renames);
+                (target != &path).then(|| (path.clone(), target.to_owned()))
+            })
+            .collect::<Vec<_>>();
+        if candidates.is_empty() {
+            self.rescan_workspace(window, cx);
+            return;
+        }
+        let check = cx.background_spawn(async move {
+            candidates
+                .into_iter()
+                .filter(|(from, to)| {
+                    fs::symlink_metadata(from)
+                        .is_err_and(|err| err.kind() == std::io::ErrorKind::NotFound)
+                        && crate::repository::canonical_local_file(to).is_ok_and(|path| path == *to)
+                })
+                .collect::<Vec<_>>()
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let moves = check.await;
+            let retry = this.update_in(cx, |this, window, cx| {
+                if this.standalone.as_ref() != Some(&anchor) {
+                    return Vec::new();
+                }
+                let mut retry = Vec::new();
+                for (from, to) in moves {
+                    if this.tabs.index(&to).is_some() || this.files.contains_key(&to) {
+                        continue;
+                    }
+                    if this.saving.contains(&from) {
+                        retry.push((from, to));
+                    } else {
+                        let affected = this.files_for_external_rename(&from);
+                        this.relocate_tree_path(&from, &to, affected, window, cx);
+                    }
+                }
+                this.rescan_workspace(window, cx);
+                retry
+            });
+            if let Ok(retry) = retry
+                && !retry.is_empty()
+            {
+                cx.background_executor().timer(DEBOUNCE).await;
+                _ = this.update_in(cx, |this, window, cx| {
+                    this.apply_standalone_changes(retry, window, cx);
+                });
+            }
+        })
+        .detach();
+    }
+
+    pub(super) fn apply_repository_changes(
         &mut self,
         repo: &Arc<Repository>,
         mut changes: RepoChanges,
@@ -1180,6 +1332,8 @@ impl Workspace {
                                 changed = true;
                                 file.missing = true;
                                 file.external = None;
+                                file.pending_draft = true;
+                                file.revision += 1;
                                 if let Some(panel) = &this.git {
                                     panel.update(cx, |panel, cx| {
                                         panel.repository_source_changed(path, cx)
@@ -1191,6 +1345,7 @@ impl Workspace {
                         Err(_) => continue,
                     };
                     let was_missing = file.missing;
+                    file.document.identity = disk.identity;
                     if disk.draft_baseline() == baseline
                         && !was_missing
                         && !file.document.conflict
@@ -1278,4 +1433,13 @@ impl Workspace {
         })
         .detach();
     }
+}
+
+fn final_rename_destination<'a, P: PartialEq>(mut path: &'a P, renames: &'a [(P, P)]) -> &'a P {
+    for (from, to) in renames {
+        if path == from {
+            path = to;
+        }
+    }
+    path
 }

@@ -81,7 +81,6 @@ impl Workspace {
             .values()
             .filter(|file| {
                 file.pending_draft
-                    && !file.missing
                     && (include_queued || file.queued_revision != Some(file.revision))
             })
             .collect::<Vec<_>>();
@@ -112,6 +111,7 @@ impl Workspace {
                     baseline: file.document.edit_baseline(),
                     buffer: Sha256::digest(text.as_bytes()).into(),
                     draft: (file.committed != file.saved).then_some(text),
+                    format: file.document.draft_format(),
                     history,
                     undo_group: editor.history_group(true),
                     redo_group: editor.history_group(false),
@@ -279,9 +279,14 @@ mod tests {
     ) -> (Entity<Workspace>, &'a mut VisualTestContext) {
         let store = Arc::new(Store::new(state.to_owned()).unwrap());
         let config = crate::config::ConfigFile::load(Some(state.join("config.toml")));
-        let (workspace, visual) = app.add_window_view(|window, cx| {
-            Workspace::with_config(store, config, WorkspaceView::Editor, window, cx)
+        let mut workspace = None;
+        let (_, visual) = app.add_window_view(|window, cx| {
+            let view = cx
+                .new(|cx| Workspace::with_config(store, config, WorkspaceView::Editor, window, cx));
+            workspace = Some(view.clone());
+            gpui_component::Root::new(view, window, cx)
         });
+        let workspace = workspace.unwrap();
         visual.update(|window, cx| {
             workspace.update(cx, |workspace, cx| {
                 workspace.open_repository(
@@ -306,6 +311,435 @@ mod tests {
                 .text()
                 .to_string()
         })
+    }
+
+    fn open_for_external_change(
+        app: &mut TestAppContext,
+        root: &Path,
+        state: &Path,
+        standalone: bool,
+    ) -> (Entity<Workspace>, VisualTestContext, PathBuf) {
+        let absolute = root.join("a.txt");
+        let (workspace, path) = if standalone {
+            let store = Arc::new(Store::new(state.to_owned()).unwrap());
+            let config = crate::config::ConfigFile::load(Some(state.join("config.toml")));
+            app.update(|cx| Workspace::open_standalone(store, config, absolute.clone(), None, cx))
+                .unwrap();
+            let handle = app.windows()[0];
+            let workspace = app
+                .update_window(handle, |root, _, cx| {
+                    root.downcast::<gpui_component::Root>()
+                        .unwrap()
+                        .read(cx)
+                        .view()
+                        .clone()
+                        .downcast::<Workspace>()
+                        .unwrap()
+                })
+                .unwrap();
+            (workspace, absolute)
+        } else {
+            (open(app, root, state).0, "a.txt".into())
+        };
+        let visual = VisualTestContext::from_window(app.windows()[0], app);
+        visual.run_until_parked();
+        (workspace, visual, path)
+    }
+
+    #[::core::prelude::v1::test]
+    fn external_rename_keeps_the_buffer_and_saves_its_draft_at_the_new_path() {
+        for standalone in [false, true] {
+            let (_fixture, root, state) = fixture();
+            let root = root.canonicalize().unwrap();
+            let mut app = test_app();
+            let (workspace, mut visual, path) =
+                open_for_external_change(&mut app, &root, &state, standalone);
+            let editor = visual.update(|window, cx| {
+                let editor = workspace.read(cx).files[&path].editor.clone();
+                editor.update(cx, |editor, cx| {
+                    editor.replace_text_in_range(None, "draft ", window, cx);
+                });
+                editor
+            });
+            let renamed = root.join("renamed.txt");
+            fs::rename(root.join(&path), &renamed).unwrap();
+            visual.update(|window, cx| {
+                workspace.update(cx, |this, cx| {
+                    if standalone {
+                        this.apply_standalone_changes(
+                            vec![(path.clone(), renamed.clone())],
+                            window,
+                            cx,
+                        );
+                    } else {
+                        let repo = this.repository.clone().unwrap();
+                        this.apply_repository_changes(
+                            &repo,
+                            crate::git::watch::RepoChanges {
+                                paths: ["a.txt".to_owned(), "renamed.txt".to_owned()].into(),
+                                directories: [PathBuf::new()].into(),
+                                renames: vec![("a.txt".into(), "renamed.txt".into())],
+                                structure: true,
+                                ..Default::default()
+                            },
+                            window,
+                            cx,
+                        );
+                    }
+                });
+            });
+            visual.run_until_parked();
+            visual.update(|window, cx| {
+                workspace.update(cx, |this, cx| {
+                    let file = this.active_file().unwrap();
+                    assert_eq!(
+                        file.path,
+                        if standalone {
+                            renamed.clone()
+                        } else {
+                            "renamed.txt".into()
+                        }
+                    );
+                    assert_eq!(file.editor, editor);
+                    assert!(!file.missing && !this.file_editor_locked(file));
+                    assert_eq!(file.committed, "draft original\n");
+                    assert_eq!(
+                        stored_history(this, &file.path).unwrap().draft.as_deref(),
+                        Some("draft original\n")
+                    );
+                    assert!(stored_history(this, &path).is_none_or(|saved| saved.draft.is_none()));
+                    this.save(&SaveFile, window, cx);
+                });
+            });
+            visual.run_until_parked();
+            assert_eq!(fs::read_to_string(&renamed).unwrap(), "draft original\n");
+            assert!(!root.join("a.txt").exists());
+        }
+    }
+
+    #[cfg(unix)]
+    #[::core::prelude::v1::test]
+    fn save_before_a_rename_notification_follows_the_file_identity() {
+        for standalone in [false, true] {
+            let (_fixture, root, state) = fixture();
+            let root = root.canonicalize().unwrap();
+            let mut app = test_app();
+            let (workspace, mut visual, path) =
+                open_for_external_change(&mut app, &root, &state, standalone);
+            visual.update(|window, cx| {
+                workspace.read(cx).files[&path]
+                    .editor
+                    .clone()
+                    .update(cx, |editor, cx| {
+                        editor.replace_text_in_range(None, "draft ", window, cx);
+                    });
+            });
+            let renamed = root.join("renamed.txt");
+            fs::rename(root.join(&path), &renamed).unwrap();
+            visual.update(|window, cx| {
+                workspace.update(cx, |this, cx| this.save(&SaveFile, window, cx));
+            });
+            visual.run_until_parked();
+            assert_eq!(fs::read_to_string(&renamed).unwrap(), "draft original\n");
+            assert!(!root.join(&path).exists());
+        }
+    }
+
+    #[::core::prelude::v1::test]
+    fn deleted_buffers_can_save_with_or_without_a_watcher_update() {
+        for standalone in [false, true] {
+            for watcher_updated in [false, true] {
+                let (_fixture, root, state) = fixture();
+                let root = root.canonicalize().unwrap();
+                let mut app = test_app();
+                let (workspace, mut visual, path) =
+                    open_for_external_change(&mut app, &root, &state, standalone);
+                let absolute = root.join(&path);
+                fs::remove_file(&absolute).unwrap();
+                if watcher_updated {
+                    visual.update(|window, cx| {
+                        workspace.update(cx, |this, cx| {
+                            this.sync_document_paths(vec![path.clone()], window, cx);
+                        });
+                    });
+                    visual.run_until_parked();
+                }
+                visual.update(|_, cx| {
+                    let this = workspace.read(cx);
+                    let file = &this.files[&path];
+                    assert_eq!(file.missing, watcher_updated);
+                    assert!(!this.file_editor_locked(file));
+                    assert!(!file.is_dirty());
+                });
+                if !watcher_updated {
+                    visual.update(|window, cx| {
+                        workspace.read(cx).files[&path]
+                            .editor
+                            .clone()
+                            .update(cx, |editor, cx| {
+                                editor.replace_text_in_range(None, "draft ", window, cx);
+                            });
+                    });
+                }
+                visual.update(|window, cx| {
+                    workspace.update(cx, |this, cx| this.save(&SaveFile, window, cx));
+                });
+                visual.run_until_parked();
+                assert_eq!(
+                    fs::read_to_string(&absolute).unwrap(),
+                    if watcher_updated {
+                        "original\n"
+                    } else {
+                        "draft original\n"
+                    }
+                );
+                visual.update(|_, cx| {
+                    let file = &workspace.read(cx).files[&path];
+                    assert!(!file.missing && !file.is_dirty());
+                });
+            }
+        }
+    }
+
+    #[::core::prelude::v1::test]
+    fn a_file_deleted_after_overwrite_confirmation_can_be_recreated() {
+        for standalone in [false, true] {
+            let (_fixture, root, state) = fixture();
+            let root = root.canonicalize().unwrap();
+            let mut app = test_app();
+            let (workspace, mut visual, path) =
+                open_for_external_change(&mut app, &root, &state, standalone);
+            let absolute = root.join(&path);
+            visual.update(|window, cx| {
+                workspace.read(cx).files[&path]
+                    .editor
+                    .clone()
+                    .update(cx, |editor, cx| {
+                        editor.replace_text_in_range(None, "draft ", window, cx);
+                    });
+            });
+            fs::write(&absolute, "external\n").unwrap();
+            visual.update(|window, cx| {
+                workspace.update(cx, |this, cx| {
+                    this.sync_document_paths(vec![path.clone()], window, cx)
+                });
+            });
+            visual.run_until_parked();
+            let expected =
+                visual.update(|_, cx| workspace.read(cx).files[&path].external.as_ref().unwrap().0);
+            fs::remove_file(&absolute).unwrap();
+            visual.update(|window, cx| {
+                workspace.update(cx, |this, cx| {
+                    this.save_buffer(path.clone(), false, Some(expected), window, cx);
+                });
+            });
+            visual.run_until_parked();
+            assert_eq!(fs::read_to_string(&absolute).unwrap(), "draft original\n");
+        }
+    }
+
+    #[::core::prelude::v1::test]
+    fn edits_after_deletion_restore_with_the_original_encoding_and_history() {
+        for standalone in [false, true] {
+            let (_fixture, root, state) = fixture();
+            let root = root.canonicalize().unwrap();
+            let absolute = root.join("a.txt");
+            fs::write(&absolute, "\u{feff}original\r\n").unwrap();
+            {
+                let mut app = test_app();
+                let (workspace, mut visual, path) =
+                    open_for_external_change(&mut app, &root, &state, standalone);
+                fs::remove_file(&absolute).unwrap();
+                visual.update(|window, cx| {
+                    workspace.update(cx, |this, cx| {
+                        this.sync_document_paths(vec![path.clone()], window, cx)
+                    });
+                });
+                visual.run_until_parked();
+                visual.update(|window, cx| {
+                    let this = workspace.read(cx);
+                    let file = &this.files[&path];
+                    assert!(file.missing && !this.file_editor_locked(file));
+                    file.editor.clone().update(cx, |editor, cx| {
+                        editor.replace_text_in_range(None, "draft ", window, cx);
+                        assert_eq!(editor.text(), "draft original\n");
+                    });
+                });
+                flush(&workspace, &mut visual);
+            }
+            let mut app = test_app();
+            let (workspace, mut visual, path) =
+                open_for_external_change(&mut app, &root, &state, standalone);
+            visual.update(|window, cx| {
+                let file = &workspace.read(cx).files[&path];
+                assert!(file.missing);
+                assert_eq!(file.committed, "draft original\n");
+                file.editor.clone().update(cx, |editor, cx| {
+                    editor.replay_text_history(true, window, cx);
+                    assert_eq!(editor.text(), "original\n");
+                    editor.replay_text_history(false, window, cx);
+                });
+            });
+            visual.update(|window, cx| {
+                workspace.update(cx, |this, cx| this.save(&SaveFile, window, cx));
+            });
+            visual.run_until_parked();
+            assert_eq!(
+                fs::read(&absolute).unwrap(),
+                b"\xef\xbb\xbfdraft original\r\n"
+            );
+        }
+    }
+
+    #[::core::prelude::v1::test]
+    fn mixed_newlines_reload_as_editable_and_normalize_on_save() {
+        for standalone in [false, true] {
+            let (_fixture, root, state) = fixture();
+            let root = root.canonicalize().unwrap();
+            let mut app = test_app();
+            let (workspace, mut visual, path) =
+                open_for_external_change(&mut app, &root, &state, standalone);
+            let absolute = root.join(&path);
+            let mixed = b"\xef\xbb\xbfexternal\r\nsecond\n";
+            fs::write(&absolute, mixed).unwrap();
+            visual.update(|window, cx| {
+                workspace.update(cx, |this, cx| {
+                    this.sync_document_paths(vec![path.clone()], window, cx);
+                });
+            });
+            visual.run_until_parked();
+            assert_eq!(fs::read(&absolute).unwrap(), mixed);
+            visual.update(|window, cx| {
+                window.draw(cx).clear(cx);
+                let this = workspace.read(cx);
+                let file = &this.files[&path];
+                assert!(!this.file_editor_locked(file));
+                assert!(!file.is_dirty() && !file.document.conflict);
+                assert_eq!(file.committed, "external\nsecond\n");
+                assert_eq!(file.document.line_ending_label(), "CRLF");
+                file.editor.clone().update(cx, |editor, cx| {
+                    assert!(editor.is_editable());
+                    editor.replace_text_in_range(Some(0..0), "edited ", window, cx);
+                });
+            });
+            visual.update(|window, cx| {
+                workspace.update(cx, |this, cx| this.save(&SaveFile, window, cx));
+            });
+            visual.run_until_parked();
+            assert_eq!(
+                fs::read(&absolute).unwrap(),
+                b"\xef\xbb\xbfedited external\r\nsecond\r\n"
+            );
+            visual.update(|_, cx| {
+                let file = &workspace.read(cx).files[&path];
+                assert!(!file.document.mixed_newlines);
+                assert!(!file.is_dirty());
+            });
+
+            // An explicit save also normalizes line endings without a text edit.
+            // The disk read in the save can see this before the watcher does.
+            fs::write(&absolute, b"edited external\nsecond\r\n").unwrap();
+            visual.update(|window, cx| {
+                workspace.update(cx, |this, cx| this.save(&SaveFile, window, cx));
+            });
+            visual.run_until_parked();
+            assert_eq!(fs::read(&absolute).unwrap(), b"edited external\nsecond\n");
+            visual.update(|_, cx| {
+                let file = &workspace.read(cx).files[&path];
+                assert_eq!(file.document.line_ending_label(), "LF");
+                assert!(!file.document.mixed_newlines && !file.is_dirty());
+            });
+        }
+    }
+
+    #[::core::prelude::v1::test]
+    fn mixed_newlines_allow_overwriting_live_and_restored_drafts() {
+        for standalone in [false, true] {
+            for reopen in [false, true] {
+                let (_fixture, root, state) = fixture();
+                let root = root.canonicalize().unwrap();
+                let absolute = root.join("a.txt");
+                let mixed = b"external\r\nsecond\nthird\n";
+                let newer = b"external\r\nsecond\r\nthird\n";
+                let mut app = test_app();
+                let (workspace, mut visual, path) =
+                    open_for_external_change(&mut app, &root, &state, standalone);
+                visual.update(|window, cx| {
+                    workspace.read(cx).files[&path]
+                        .editor
+                        .clone()
+                        .update(cx, |editor, cx| {
+                            editor.replace_text_in_range(None, "draft ", window, cx);
+                        });
+                });
+                flush(&workspace, &mut visual);
+                fs::write(&absolute, mixed).unwrap();
+                let (workspace, mut visual, path) = if reopen {
+                    drop(visual);
+                    drop(workspace);
+                    drop(app);
+                    app = test_app();
+                    open_for_external_change(&mut app, &root, &state, standalone)
+                } else {
+                    (workspace, visual, path)
+                };
+                visual.update(|window, cx| {
+                    workspace.update(cx, |this, cx| this.save(&SaveFile, window, cx));
+                });
+                visual.run_until_parked();
+                assert_eq!(fs::read(&absolute).unwrap(), mixed);
+                let expected = visual.update(|window, cx| {
+                    window.draw(cx).clear(cx);
+                    assert!(window.has_active_dialog(cx));
+                    let this = workspace.read(cx);
+                    let file = &this.files[&path];
+                    assert!(file.document.conflict && file.is_dirty());
+                    assert_eq!(file.document.restored, reopen);
+                    assert!(!this.file_editor_locked(file));
+                    assert!(file.editor.read(cx).is_editable());
+                    assert_eq!(file.committed, "draft original\n");
+                    assert_eq!(file.document.line_ending_label(), "LF");
+                    if reopen {
+                        file.document.draft_baseline()
+                    } else {
+                        file.external.as_ref().unwrap().0
+                    }
+                });
+
+                // The text is identical after normalization, but the disk bytes changed.
+                fs::write(&absolute, newer).unwrap();
+                visual.update(|window, cx| {
+                    window.close_dialog(cx);
+                    workspace.update(cx, |this, cx| {
+                        this.save_buffer(path.clone(), false, Some(expected), window, cx);
+                    });
+                });
+                visual.run_until_parked();
+                assert_eq!(fs::read(&absolute).unwrap(), newer);
+                let latest = visual.update(|window, cx| {
+                    assert!(window.has_active_dialog(cx));
+                    let file = &workspace.read(cx).files[&path];
+                    assert_eq!(file.committed, "draft original\n");
+                    let latest = file.external.as_ref().unwrap().0;
+                    assert_ne!(latest, expected);
+                    latest
+                });
+
+                visual.update(|window, cx| {
+                    window.close_dialog(cx);
+                    workspace.update(cx, |this, cx| {
+                        this.save_buffer(path.clone(), false, Some(latest), window, cx);
+                    });
+                });
+                visual.run_until_parked();
+                assert_eq!(fs::read(&absolute).unwrap(), b"draft original\n");
+                visual.update(|_, cx| {
+                    let file = &workspace.read(cx).files[&path];
+                    assert!(!file.document.conflict && !file.document.mixed_newlines);
+                    assert!(!file.is_dirty());
+                });
+            }
+        }
     }
 
     fn replay(workspace: &Entity<Workspace>, visual: &mut VisualTestContext, undo: bool) {

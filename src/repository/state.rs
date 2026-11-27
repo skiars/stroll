@@ -5,7 +5,7 @@ use rusqlite::{Connection, TransactionBehavior};
 
 use super::Store;
 
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
 
 impl Store {
     #[cfg(feature = "desktop")]
@@ -87,6 +87,9 @@ impl Store {
                 "ALTER TABLE lsp_prompt_dismissals ADD COLUMN explicit INTEGER NOT NULL DEFAULT 0",
             )?;
         }
+        if version < 5 {
+            tx.execute_batch("ALTER TABLE documents ADD COLUMN format INTEGER NOT NULL DEFAULT 0")?;
+        }
         if version < SCHEMA_VERSION {
             tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         }
@@ -103,6 +106,7 @@ mod tests {
     fn only_the_dismiss_action_suppresses_future_lsp_prompts() -> Result<()> {
         let temporary = tempfile::tempdir()?;
         let db = Connection::open(temporary.path().join("state.sqlite3"))?;
+        db.execute_batch(include_str!("state.sql"))?;
         db.execute_batch(
             "CREATE TABLE lsp_prompt_dismissals (
                 host TEXT NOT NULL,

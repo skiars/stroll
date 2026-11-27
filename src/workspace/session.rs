@@ -84,7 +84,15 @@ impl SessionWriter {
                     }) if current == path => session,
                     _ => &StandaloneSession::default(),
                 };
-                store.update_standalone_session(path, previous, session)?;
+                store.update_standalone_session(
+                    path,
+                    previous,
+                    session,
+                    self.relocations[..moves]
+                        .iter()
+                        .map(|(_, relocation)| relocation),
+                )?;
+                self.relocations.drain(..moves);
             }
         }
         self.revision = revision;

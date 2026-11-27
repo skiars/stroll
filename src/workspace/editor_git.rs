@@ -411,12 +411,10 @@ impl Workspace {
     ) -> Subscription {
         cx.observe_in(editor, window, |this, editor, window, cx| {
             if !editor.read(cx).is_composing()
-                && this.files.values().any(|file| {
-                    file.editor == editor
-                        && file.pending_draft
-                        && !file.missing
-                        && file.draft_deferred
-                })
+                && this
+                    .files
+                    .values()
+                    .any(|file| file.editor == editor && file.pending_draft && file.draft_deferred)
             {
                 this.queue_drafts(window, cx);
             }

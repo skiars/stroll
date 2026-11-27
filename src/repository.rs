@@ -548,25 +548,53 @@ pub struct Document {
     pub saved_text: String,
     pub restored: bool,
     pub conflict: bool,
+    // Tracks the on-disk representation after the editor text has been normalized.
     pub mixed_newlines: bool,
+    pub(crate) missing: bool,
+    pub(crate) identity: Option<LocalFileIdentity>,
     bom: bool,
     crlf: bool,
     baseline: [u8; 32],
     recovered_baseline: Option<[u8; 32]>,
 }
 
+pub(crate) type LocalFileIdentity = (u64, u64, Option<std::time::SystemTime>);
+
 impl Document {
     pub fn open(repo: &Repository, path: &Path, store: &Store) -> Result<Self> {
-        let mut document = Self::read(repo, path)?;
-        document.apply_draft(store.draft(repo, path)?);
-        Ok(document)
+        Self::open_with_draft(
+            Self::read_for_sync(Some(repo), path)?,
+            store.draft(repo, path)?,
+        )
     }
 
     #[cfg(feature = "desktop")]
     pub(crate) fn open_local(path: &Path, store: &Store) -> Result<Self> {
-        let mut document = Self::read_local(path)?;
-        document.apply_draft(store.editor_draft(None, path)?);
-        Ok(document)
+        Self::open_with_draft(
+            Self::read_for_sync(None, path)?,
+            store.editor_draft(None, path)?,
+        )
+    }
+
+    fn open_with_draft(disk: Option<Self>, draft: Option<Draft>) -> Result<Self> {
+        if let Some(mut document) = disk {
+            document.apply_draft(draft);
+            return Ok(document);
+        }
+        let draft = draft.ok_or_else(|| std::io::Error::from(ErrorKind::NotFound))?;
+        Ok(Self {
+            text: draft.text,
+            saved_text: String::new(),
+            restored: true,
+            conflict: false,
+            mixed_newlines: false,
+            missing: true,
+            identity: None,
+            bom: draft.format & 1 != 0,
+            crlf: draft.format & 2 != 0,
+            baseline: draft.baseline,
+            recovered_baseline: None,
+        })
     }
 
     fn apply_draft(&mut self, draft: Option<Draft>) {
@@ -574,6 +602,9 @@ impl Document {
             self.restored = true;
             self.conflict = draft.baseline != self.baseline;
             self.recovered_baseline = self.conflict.then_some(draft.baseline);
+            if self.conflict && self.mixed_newlines {
+                self.crlf = draft.format & 2 != 0;
+            }
             self.text = draft.text;
         }
     }
@@ -583,15 +614,17 @@ impl Document {
         if path.is_absolute() {
             return Self::read_local(path);
         }
+        if repo.ssh.is_none() {
+            return Self::read_resolved(&repo.resolve(path)?);
+        }
         Self::decode(repo.bytes(path, false)?)
     }
 
-    #[cfg(feature = "desktop")]
     pub(crate) fn read_for_sync(repo: Option<&Repository>, path: &Path) -> Result<Option<Self>> {
-        if let Some(repo) = repo.filter(|_| !path.is_absolute()) {
+        if let Some(repo) = repo.filter(|repo| !path.is_absolute() && repo.ssh.is_some()) {
             return repo.bytes_if_present(path)?.map(Self::decode).transpose();
         }
-        match Self::read_local(path) {
+        match repo.map_or_else(|| Self::read_local(path), |repo| Self::read(repo, path)) {
             Ok(document) => Ok(Some(document)),
             Err(error)
                 if error
@@ -606,7 +639,15 @@ impl Document {
 
     #[cfg_attr(not(feature = "desktop"), allow(dead_code))]
     pub(crate) fn read_local(path: &Path) -> Result<Self> {
-        Self::decode(read_bytes(&resolve_local_file(path)?)?)
+        Self::read_resolved(&resolve_local_file(path)?)
+    }
+
+    fn read_resolved(path: &Path) -> Result<Self> {
+        let file = File::open(path)?;
+        let identity = file_identity(&file.metadata()?);
+        let mut document = Self::decode(read_document_bytes(file)?)?;
+        document.identity = identity;
+        Ok(document)
     }
 
     pub(crate) fn decode(bytes: Vec<u8>) -> Result<Self> {
@@ -615,19 +656,25 @@ impl Document {
         let disk = std::str::from_utf8(if bom { &bytes[3..] } else { &bytes })
             .context(t!("storage.text_only"))?;
         ensure!(!disk.contains('\0'), t!("storage.text_only"));
-        let crlf = disk.contains("\r\n");
-        let normalized = disk.replace("\r\n", "\n");
-        let mixed_newlines = normalized.contains('\r')
-            || (crlf
-                && disk.as_bytes().iter().enumerate().any(|(index, &byte)| {
-                    byte == b'\n' && (index == 0 || disk.as_bytes()[index - 1] != b'\r')
-                }));
+        let mut endings = disk
+            .match_indices('\n')
+            .map(|(index, _)| index > 0 && disk.as_bytes()[index - 1] == b'\r');
+        let crlf = endings.next().unwrap_or(false);
+        let mut normalized = disk.replace("\r\n", "\n");
+        let has_crlf = normalized.len() != disk.len();
+        let has_lone_cr = normalized.contains('\r');
+        let mixed_newlines = has_lone_cr || (has_crlf && endings.any(|ending| ending != crlf));
+        if has_lone_cr {
+            normalized = normalized.replace('\r', "\n");
+        }
         Ok(Self {
             text: normalized.clone(),
             saved_text: normalized,
             restored: false,
             conflict: false,
             mixed_newlines,
+            missing: false,
+            identity: None,
             bom,
             crlf,
             baseline,
@@ -647,20 +694,13 @@ impl Document {
     }
 
     #[cfg(feature = "desktop")]
-    #[cfg(feature = "desktop")]
     pub(crate) fn has_bom(&self) -> bool {
         self.bom
     }
 
     #[cfg(feature = "desktop")]
     pub(crate) fn line_ending_label(&self) -> &'static str {
-        if self.mixed_newlines {
-            "Mixed"
-        } else if self.crlf {
-            "CRLF"
-        } else {
-            "LF"
-        }
+        if self.crlf { "CRLF" } else { "LF" }
     }
 
     #[cfg(feature = "desktop")]
@@ -696,6 +736,58 @@ impl Document {
         encoded
     }
 
+    #[cfg(feature = "desktop")]
+    pub(crate) fn retain_buffer_line_ending(&mut self, buffer: &Self) {
+        if self.mixed_newlines {
+            self.crlf = buffer.crlf;
+        }
+    }
+
+    #[cfg(feature = "desktop")]
+    pub(crate) fn draft_format(&self) -> u8 {
+        u8::from(self.bom) | (u8::from(self.crlf) << 1)
+    }
+
+    #[cfg(feature = "desktop")]
+    pub(crate) fn renamed_sibling(
+        &self,
+        repo: Option<&Repository>,
+        path: &Path,
+    ) -> Option<PathBuf> {
+        let identity = self.identity?;
+        let absolute = if path.is_absolute() {
+            path.to_owned()
+        } else {
+            let repo = repo.filter(|repo| repo.ssh.is_none())?;
+            repo.root.join(path)
+        };
+        let parent = absolute.parent()?;
+        let mut matches = fs::read_dir(parent).ok()?.filter_map(|entry| {
+            let entry = entry.ok()?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::DirEntryExt as _;
+                if entry.ino() != identity.1 {
+                    return None;
+                }
+            }
+            let candidate = entry.path();
+            (candidate != absolute
+                && local_file_identity(&candidate) == Some(identity)
+                && canonical_local_file(&candidate).ok().as_ref() == Some(&candidate))
+            .then_some(candidate)
+        });
+        let target = matches.next()?;
+        if matches.next().is_some() {
+            return None;
+        }
+        if path.is_absolute() {
+            Some(target)
+        } else {
+            Some(path.with_file_name(target.file_name()?))
+        }
+    }
+
     pub fn save(
         &mut self,
         repo: &Repository,
@@ -717,10 +809,7 @@ impl Document {
         path: &Path,
         text: &str,
     ) -> Result<()> {
-        ensure!(
-            !self.conflict && !self.mixed_newlines,
-            t!("storage.draft_conflict")
-        );
+        ensure!(!self.conflict, t!("storage.draft_conflict"));
         let encoded = self.encode_text(text);
         let new_baseline = digest(&encoded);
         let written = if path.is_absolute() {
@@ -736,6 +825,48 @@ impl Document {
                 None => write_checked(&repo.root, path, self.baseline, &encoded),
             }
         };
+        self.finish_save(written, new_baseline, text, repo, path)
+    }
+
+    #[cfg(feature = "desktop")]
+    pub(crate) fn recreate_target(
+        &mut self,
+        repo: Option<&Repository>,
+        path: &Path,
+        text: &str,
+    ) -> Result<()> {
+        let encoded = self.encode_text(text);
+        let new_baseline = digest(&encoded);
+        let written = if path.is_absolute() {
+            create_document_at(path, &encoded)
+        } else {
+            let repo = repo.context("A relative file path requires a repository")?;
+            if let Some(ssh) = &repo.ssh {
+                let version = crate::remote::RECREATE_DOCUMENT_VERSION;
+                ensure!(
+                    ssh.call::<u32>(Request::Hello(version))
+                        .is_ok_and(|reply| reply == version),
+                    t!("workspace.tree_requires_helper")
+                );
+                ssh.call(Request::RecreateDocument {
+                    path: RepoPath::from_local(path)?,
+                    bytes: Bytes(encoded),
+                })
+            } else {
+                recreate_document(&repo.root, path, &encoded)
+            }
+        };
+        self.finish_save(written, new_baseline, text, repo, path)
+    }
+
+    fn finish_save(
+        &mut self,
+        written: Result<bool>,
+        baseline: [u8; 32],
+        text: &str,
+        repo: Option<&Repository>,
+        path: &Path,
+    ) -> Result<()> {
         match written {
             Ok(true) => {}
             Ok(false) => {
@@ -745,11 +876,77 @@ impl Document {
             Err(error) => return Err(error),
         }
         self.saved_text = text.to_owned();
-        self.baseline = new_baseline;
+        self.baseline = baseline;
+        self.conflict = false;
+        self.mixed_newlines = false;
+        self.missing = false;
+        self.identity = if path.is_absolute() {
+            local_file_identity(path)
+        } else {
+            repo.filter(|repo| repo.ssh.is_none())
+                .and_then(|repo| local_file_identity(&repo.root.join(path)))
+        };
         self.restored = false;
         self.recovered_baseline = None;
         Ok(())
     }
+}
+
+pub(crate) fn recreate_document(root: &Path, path: &Path, bytes: &[u8]) -> Result<bool> {
+    ensure!(
+        root.canonicalize()? == root
+            && !path.as_os_str().is_empty()
+            && path
+                .components()
+                .all(|part| matches!(part, Component::Normal(name) if name != ".git")),
+        t!("common.path_outside_repo")
+    );
+    create_document_at(&root.join(path), bytes)
+}
+
+fn create_document_at(target: &Path, bytes: &[u8]) -> Result<bool> {
+    ensure!(
+        bytes.len() as u64 <= MAX_FILE_BYTES,
+        t!("storage.file_limit")
+    );
+    ensure!(
+        target.is_absolute() && target.components().all(|part| part.as_os_str() != ".git"),
+        t!("storage.local_regular_file")
+    );
+    let parent = target.parent().context(t!("storage.no_parent"))?;
+    ensure_document_parent(parent)?;
+    let mut staged = NamedTempFile::new_in(parent)?;
+    staged.write_all(bytes)?;
+    staged.as_file().sync_all()?;
+    ensure!(
+        parent.canonicalize()? == parent,
+        t!("storage.local_regular_file")
+    );
+    match staged.persist_noclobber(target) {
+        Ok(_) => Ok(true),
+        Err(error) if error.error.kind() == ErrorKind::AlreadyExists => Ok(false),
+        Err(error) => Err(error.error.into()),
+    }
+}
+
+fn ensure_document_parent(path: &Path) -> Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => {}
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            ensure_document_parent(path.parent().context(t!("storage.no_parent"))?)?;
+            match fs::create_dir(path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Err(error) => return Err(error.into()),
+    }
+    ensure!(
+        path.canonicalize()? == path && path.is_dir(),
+        t!("storage.local_regular_file")
+    );
+    Ok(())
 }
 
 pub(crate) fn write_checked(
@@ -820,15 +1017,35 @@ fn read_asset(root: &Path, path: &Path) -> Result<Vec<u8>> {
 }
 
 fn read_bytes(path: &Path) -> Result<Vec<u8>> {
+    read_document_bytes(File::open(path)?)
+}
+
+fn read_document_bytes(file: File) -> Result<Vec<u8>> {
     let mut bytes = Vec::new();
-    File::open(path)?
-        .take(MAX_FILE_BYTES + 1)
-        .read_to_end(&mut bytes)?;
+    file.take(MAX_FILE_BYTES + 1).read_to_end(&mut bytes)?;
     ensure!(
         bytes.len() as u64 <= MAX_FILE_BYTES,
         t!("storage.legacy_file_limit")
     );
     Ok(bytes)
+}
+
+pub(crate) fn local_file_identity(path: &Path) -> Option<LocalFileIdentity> {
+    file_identity(&path.symlink_metadata().ok()?)
+}
+
+fn file_identity(metadata: &fs::Metadata) -> Option<LocalFileIdentity> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        (metadata.is_file() && metadata.nlink() == 1)
+            .then(|| (metadata.dev(), metadata.ino(), metadata.created().ok()))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = metadata;
+        None
+    }
 }
 
 fn digest(bytes: &[u8]) -> [u8; 32] {
@@ -863,9 +1080,10 @@ pub struct Store {
     state: std::sync::Mutex<Option<rusqlite::Connection>>,
 }
 
-struct Draft {
+pub(crate) struct Draft {
     baseline: [u8; 32],
     text: String,
+    format: u8,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -987,7 +1205,7 @@ impl Store {
 
     pub(crate) fn session_file_exists(&self, repo: &Repository, path: &Path) -> bool {
         if path.is_absolute() {
-            resolve_local_file(path).is_ok()
+            resolve_local_file(path).is_ok() || self.has_draft(repo, path)
         } else if repo.ssh.is_some() {
             repo.children
                 .get(path.parent().unwrap_or(Path::new("")))
@@ -998,7 +1216,7 @@ impl Store {
                 })
                 || self.has_draft(repo, path)
         } else {
-            repo.exists(path)
+            repo.exists(path) || self.has_draft(repo, path)
         }
     }
 
@@ -1037,4 +1255,76 @@ pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     temp.as_file().sync_all()?;
     temp.persist(path)?;
     Ok(())
+}
+
+#[cfg(test)]
+#[test]
+fn document_newlines_normalize_without_losing_the_disk_baseline() -> Result<()> {
+    for (raw, expected, encoded, mixed) in [
+        ("", "", "", false),
+        ("one\ntwo", "one\ntwo", "one\ntwo", false),
+        ("one\r\ntwo", "one\ntwo", "one\r\ntwo", false),
+        ("one\ntwo\r\n", "one\ntwo\n", "one\ntwo\n", true),
+        (
+            "\u{feff}一\r\ntwo\n",
+            "一\ntwo\n",
+            "\u{feff}一\r\ntwo\r\n",
+            true,
+        ),
+        (
+            "\rfirst\r\nlast\r",
+            "\nfirst\nlast\n",
+            "\r\nfirst\r\nlast\r\n",
+            true,
+        ),
+        ("one\rtwo\r", "one\ntwo\n", "one\ntwo\n", true),
+    ] {
+        let bytes = raw.as_bytes();
+        let document = Document::decode(bytes.to_vec())?;
+        assert_eq!(document.saved_text, expected, "{raw:?}");
+        assert_eq!(document.text, expected, "{raw:?}");
+        assert_eq!(document.mixed_newlines, mixed, "{raw:?}");
+        assert_eq!(document.edit_baseline(), digest(bytes), "{raw:?}");
+        assert_eq!(
+            document.encode_text(&document.text),
+            encoded.as_bytes(),
+            "{raw:?}"
+        );
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod document_recreation_tests {
+    use super::*;
+
+    #[test]
+    fn recreation_creates_missing_parents_and_reserves_the_name_without_clobbering() -> Result<()> {
+        let fixture = tempfile::tempdir()?;
+        let root = fixture.path().canonicalize()?;
+        let path = Path::new("deleted/directory/file.txt");
+        assert!(recreate_document(&root, path, b"first\n")?);
+        assert!(!recreate_document(&root, path, b"other\n")?);
+        assert_eq!(fs::read(root.join(path))?, b"first\n");
+        assert!(recreate_document(&root, Path::new("../outside"), b"no").is_err());
+        assert!(recreate_document(&root, Path::new(".git/new-file"), b"no").is_err());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recreation_rejects_symlinked_parents_and_preserves_dangling_symlinks() -> Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let fixture = tempfile::tempdir()?;
+        let root = fixture.path().canonicalize()?;
+        fs::create_dir(root.join("real"))?;
+        symlink(root.join("real"), root.join("linked"))?;
+        symlink(root.join("absent"), root.join("target.txt"))?;
+        assert!(recreate_document(&root, Path::new("linked/file.txt"), b"no").is_err());
+        assert!(!recreate_document(&root, Path::new("target.txt"), b"no")?);
+        assert!(!root.join("real/file.txt").exists() && !root.join("absent").exists());
+        assert!(root.join("target.txt").is_symlink());
+        Ok(())
+    }
 }

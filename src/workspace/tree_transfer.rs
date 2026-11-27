@@ -420,14 +420,7 @@ impl Workspace {
                         Ok((destination, Some(source))) if move_entry => {
                             refresh.insert(source.parent().unwrap_or(Path::new("")).to_owned());
                             let affected = this.files_for_external_rename(&source);
-                            this.relocate_tree_path(
-                                &repo,
-                                &source,
-                                &destination,
-                                affected,
-                                window,
-                                cx,
-                            );
+                            this.relocate_tree_path(&source, &destination, affected, window, cx);
                         }
                         Ok(_) => {}
                         Err(error) => {

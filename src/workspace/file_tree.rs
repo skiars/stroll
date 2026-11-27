@@ -1064,14 +1064,7 @@ impl Workspace {
                         this.finish_tree_edit(window, cx);
                         if let Some(action) = action {
                             if let Some(destination) = action {
-                                this.relocate_tree_path(
-                                    &repo,
-                                    &path,
-                                    &destination,
-                                    affected,
-                                    window,
-                                    cx,
-                                );
+                                this.relocate_tree_path(&path, &destination, affected, window, cx);
                             } else {
                                 this.remove_tree_path(&repo, &path, affected, window, cx);
                             }
@@ -1099,7 +1092,6 @@ impl Workspace {
 
     pub(super) fn relocate_tree_path(
         &mut self,
-        repo: &Repository,
         from: &Path,
         to: &Path,
         paths: BTreeSet<PathBuf>,
@@ -1109,6 +1101,7 @@ impl Workspace {
         if from == to {
             return;
         }
+        let repo = self.repository.clone();
         let map = |path: &Path| {
             path.strip_prefix(from).map_or_else(
                 |_| path.to_owned(),
@@ -1127,6 +1120,13 @@ impl Workspace {
             .is_some_and(|path| path.starts_with(from));
         self.capture_active_file_position(cx);
         self.capture_document_position(cx);
+        if let Some(anchor) = &mut self.standalone {
+            let target = map(anchor);
+            if target != *anchor {
+                window.set_window_title(file_name(&target));
+                *anchor = target;
+            }
+        }
         let mut relocations = Vec::new();
         for path in paths {
             let target = map(&path);
@@ -1139,15 +1139,18 @@ impl Workspace {
                 let mut pending = state.lock().unwrap();
                 let draft = (file.committed != file.saved).then(|| file.committed.to_string());
                 relocations.push(self.store.draft_relocation(
-                    repo,
+                    repo.as_deref(),
                     &path,
                     &target,
-                    Some((file.document.draft_baseline(), draft)),
+                    Some((file.document.edit_baseline(), draft)),
                 ));
                 pending.revision = file.revision;
                 pending.result = None;
+                file.revision += 1;
+                file.queued_revision = None;
+                file.pending_draft = true;
                 file.path = target.clone();
-                repo.language_resources().configure_editor(&target, cx);
+                self.source_resources(&target).configure_editor(&target, cx);
                 let old_syntax = self.associated_highlight(&path).map(|(_, syntax)| syntax);
                 let new_syntax = self.associated_highlight(&target).map(|(_, syntax)| syntax);
                 let syntax_changed = old_syntax != new_syntax;
@@ -1166,11 +1169,21 @@ impl Workspace {
                     }
                 });
                 file.language_server = None;
-                file.server_project = ServerProject::for_file(repo, &target);
+                file.server_project = if target.is_absolute() {
+                    ServerProject::for_local_file(&target)
+                } else {
+                    repo.as_deref()
+                        .and_then(|repo| ServerProject::for_file(repo, &target))
+                };
                 self.files.insert(target.clone(), file);
                 self.connect_file_to_language_service(&target, cx);
             } else {
-                relocations.push(self.store.draft_relocation(repo, &path, &target, None));
+                relocations.push(self.store.draft_relocation(
+                    repo.as_deref(),
+                    &path,
+                    &target,
+                    None,
+                ));
             }
             if let Some(position) = self.session.files.remove(&path) {
                 self.session.files.insert(target.clone(), position);
@@ -1236,6 +1249,8 @@ impl Workspace {
         self.queue_draft_relocations(relocations);
         if let Err(error) = self.flush_session(cx) {
             self.show_error(error, window, cx);
+        } else {
+            self.queue_drafts(window, cx);
         }
         self.rebuild_tree();
     }
