@@ -15,6 +15,7 @@ use serde_json::{Map, Value, json};
 use crate::config::{CodeContrast, CodeTheme};
 
 const ACTIVE_LINE_ALPHA: u8 = 0x0f;
+const COMMENT_OPACITY: f32 = 0.8;
 const MIN_ADDED_CODE_CONTRAST: f64 = 4.5;
 const SEMANTIC_UNDERLINE_CONTRAST: f64 = 3.;
 
@@ -705,14 +706,14 @@ fn build_highlight_theme(
     Arc::new(base)
 }
 
-fn syntax_style(colors: &Colors, semantics: bool) -> Value {
+fn syntax_style(colors: &Colors, background: Hsla, semantics: bool) -> Value {
     let color = |value: &str| json!({ "color": value });
+    // Text highlights blend translucent colors over the text foreground.
+    let comment = hsla_hex(background.blend(hsla(&colors.comment).opacity(COMMENT_OPACITY)));
     let mut syntax = Map::new();
     for (capture, value) in [
         ("attribute", &colors.macro_fg),
         ("boolean", &colors.literal),
-        ("comment", &colors.comment),
-        ("comment.doc", &colors.comment),
         ("constant", &colors.constant),
         ("constructor", &colors.number),
         ("embedded", &colors.text),
@@ -763,7 +764,7 @@ fn syntax_style(colors: &Colors, semantics: bool) -> Value {
     for name in ["comment", "comment.doc"] {
         syntax.insert(
             name.into(),
-            json!({ "color": colors.comment, "font_style": "italic" }),
+            json!({ "color": comment, "font_style": "italic" }),
         );
     }
 
@@ -823,7 +824,7 @@ fn syntax_style(colors: &Colors, semantics: bool) -> Value {
                 "boolean" => &colors.literal,
                 "string" | "string.regex" => &colors.string,
                 "number" => &colors.number,
-                "comment" | "comment.doc" => &colors.comment,
+                "comment" | "comment.doc" => &comment,
                 "operator" | "punctuation" => &colors.text,
                 // Keep the grammar's flow, modifier and literal colors for generic LSP keywords.
                 "keyword" | "keyword.self" => &colors.keyword,
@@ -882,7 +883,8 @@ pub(crate) fn apply_diff_contrast(
             let colors = colors(theme, contrast, mode, &[hsla_hex(background)], None);
             TintedSyntax {
                 background,
-                syntax: serde_json::from_value(syntax_style(&colors, false)).expect("diff syntax"),
+                syntax: serde_json::from_value(syntax_style(&colors, background, false))
+                    .expect("diff syntax"),
             }
         });
         (row, inline)
@@ -926,7 +928,10 @@ fn style(colors: &Colors, mode: ThemeMode) -> Value {
     );
     style.insert("info".into(), json!(info));
     style.insert("hint".into(), json!(hint));
-    style.insert("syntax".into(), syntax_style(colors, true));
+    style.insert(
+        "syntax".into(),
+        syntax_style(colors, hsla(&colors.surface), true),
+    );
     Value::Object(style)
 }
 
@@ -1294,6 +1299,45 @@ mod tests {
     }
 
     #[test]
+    fn comments_blend_twenty_percent_toward_the_background() {
+        for mode in [ThemeMode::Light, ThemeMode::Dark] {
+            let hunk = HunkPalette::for_mode(mode);
+            for theme in CodeTheme::ALL {
+                for contrast in CodeContrast::ALL {
+                    for background in [
+                        surface(theme, mode),
+                        hunk.added_row,
+                        hunk.added_inline,
+                        hunk.removed_row,
+                        hunk.removed_inline,
+                    ] {
+                        let colors = colors(theme, contrast, mode, &[hsla_hex(background)], None);
+                        let syntax: gpui_component::highlighter::SyntaxColors =
+                            serde_json::from_value(syntax_style(&colors, background, false))
+                                .unwrap();
+                        let background = channels(&hsla_hex(background));
+                        let original = channels(&colors.comment);
+                        for capture in ["comment", "comment.doc"] {
+                            let color = syntax.style(capture).unwrap().color.unwrap();
+                            assert_eq!(color.a, 1.);
+                            for (actual, (original, background)) in channels(&hsla_hex(color))
+                                .into_iter()
+                                .zip(original.into_iter().zip(background))
+                            {
+                                let expected = original * 0.8 + background * 0.2;
+                                assert!(
+                                    (actual - expected).abs() <= 0.5,
+                                    "{theme:?} {mode:?} {contrast:?}: {capture}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn every_theme_builds_a_parseable_highlight_theme() {
         for theme in ALL {
             for mode in [ThemeMode::Light, ThemeMode::Dark] {
@@ -1309,11 +1353,18 @@ mod tests {
                     let highlight = highlight_theme(theme, contrast, mode, &backgrounds);
                     assert_eq!(highlight.appearance, mode);
                     assert!(highlight.style.editor_background.is_some());
-                    for capture in ["keyword", "string", "comment", "function", "type"] {
+                    for capture in ["keyword", "string", "function", "type"] {
                         assert!(
                             highlight.style(capture).is_some(),
                             "{theme:?} {mode:?} {contrast:?}: {capture}"
                         );
+                    }
+                    for capture in ["comment", "comment.doc"] {
+                        let color = highlight.style(capture).unwrap().color.unwrap();
+                        for flags in 0..crate::lsp::SEMANTIC_VARIANTS {
+                            let key = crate::lsp::semantic_style_key(capture, flags);
+                            assert_eq!(highlight.style(&key).unwrap().color, Some(color));
+                        }
                     }
                     let surface = highlight.style.editor_background.unwrap();
                     let active_line = surface.blend(highlight.style.editor_active_line.unwrap());
@@ -1350,7 +1401,6 @@ mod tests {
                     let highlight = highlight_theme(theme, contrast, mode, &app);
                     for capture in [
                         "primary",
-                        "comment",
                         "keyword",
                         "type",
                         "function",

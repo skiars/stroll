@@ -95,6 +95,25 @@ pub(crate) struct CommitPage {
     pub more: bool,
 }
 
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct SourceHistoryTarget {
+    pub head: String,
+    pub path: String,
+    pub ranges: Vec<(usize, usize)>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+pub(crate) struct SourceHistoryCommit {
+    pub commit: Commit,
+    pub path: String,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+pub(crate) struct SourceHistoryPage {
+    pub commits: Vec<SourceHistoryCommit>,
+    pub more: bool,
+}
+
 #[derive(serde::Serialize, serde::Deserialize)]
 pub(crate) struct RevisionMatch {
     pub oid: String,
@@ -239,24 +258,28 @@ fn parse_log(bytes: &[u8]) -> Result<Vec<Commit>> {
     let (chunks, remainder) = fields.as_chunks::<11>();
     ensure!(remainder.is_empty(), t!("git.invalid_log"));
     for fields in chunks {
-        commits.push(Commit {
-            oid: text(fields[0]),
-            short: text(fields[1]),
-            parents: text(fields[2])
-                .split_ascii_whitespace()
-                .map(str::to_owned)
-                .collect(),
-            author: text(fields[3]),
-            author_email: text(fields[4]),
-            authored_at: text(fields[5]),
-            committer: text(fields[6]),
-            committer_email: text(fields[7]),
-            committed_at: text(fields[8]),
-            subject: text(fields[9]),
-            body: text(fields[10]).trim_end().to_owned(),
-        });
+        commits.push(log_commit(fields));
     }
     Ok(commits)
+}
+
+fn log_commit(fields: &[&[u8]; 11]) -> Commit {
+    Commit {
+        oid: text(fields[0]),
+        short: text(fields[1]),
+        parents: text(fields[2])
+            .split_ascii_whitespace()
+            .map(str::to_owned)
+            .collect(),
+        author: text(fields[3]),
+        author_email: text(fields[4]),
+        authored_at: text(fields[5]),
+        committer: text(fields[6]),
+        committer_email: text(fields[7]),
+        committed_at: text(fields[8]),
+        subject: text(fields[9]),
+        body: text(fields[10]).trim_end().to_owned(),
+    }
 }
 
 pub(crate) fn commit(root: &Path, oid: &str) -> Result<Commit> {
@@ -328,6 +351,126 @@ pub(crate) fn commits(root: &Path, oid: &str, query: &str, offset: usize) -> Res
     let more = commits.len() > PAGE_SIZE;
     commits.truncate(PAGE_SIZE);
     Ok(CommitPage { commits, more })
+}
+
+pub(crate) fn source_history(
+    root: &Path,
+    target: &SourceHistoryTarget,
+    offset: usize,
+) -> Result<SourceHistoryPage> {
+    super::worktree_edit::validate_path(&target.path)?;
+    ensure!(object_id(&target.head), t!("git.invalid_commit_id"));
+    ensure!(
+        target
+            .ranges
+            .iter()
+            .all(|&(first, last)| first > 0 && first <= last),
+        t!("git.invalid_source_history_range")
+    );
+    let file_history = target.ranges.is_empty();
+    // Skipping commits in Git's --follow walk can skip the rename itself.
+    let skip_records = if file_history { offset } else { 0 };
+    let limit = skip_records.saturating_add(PAGE_SIZE + 1);
+    let mut args = vec![
+        "log".to_owned(),
+        "--no-notes".into(),
+        "--no-color".into(),
+        "--no-ext-diff".into(),
+        "--no-textconv".into(),
+        "--encoding=UTF-8".into(),
+        "-z".into(),
+        format!("--format=tformat:%x00{LOG_FORMAT}"),
+        format!("-n{limit}"),
+        target.head.clone(),
+    ];
+    if file_history {
+        args.extend([
+            "--follow".into(),
+            "--name-status".into(),
+            "--".into(),
+            target.path.clone(),
+        ]);
+    } else {
+        args.extend([
+            format!("--skip={offset}"),
+            "--no-follow".into(),
+            "--src-prefix=a/".into(),
+            "--dst-prefix=b/".into(),
+        ]);
+        for (first, last) in &target.ranges {
+            args.extend(["-L".into(), format!("{first},{last}:{}", target.path)]);
+        }
+    }
+
+    let output = read(root, &args)?;
+    let mut rest = output.as_slice();
+    let mut commits = Vec::new();
+    let mut skipped = 0;
+    while !rest.is_empty() {
+        let record = rest.strip_prefix(b"\0").context(t!("git.invalid_log"))?;
+        let mut tokens = record.splitn(12, |&byte| byte == 0);
+        let (fields, remaining) = read_history_fields(&mut tokens)?;
+        let commit = log_commit(&fields);
+        ensure!(object_id(&commit.oid), t!("git.invalid_log"));
+        let (path, remaining) = if file_history {
+            file_history_path(remaining, &target.path)?
+        } else {
+            let end = remaining
+                .iter()
+                .position(|&byte| byte == 0)
+                .unwrap_or(remaining.len());
+            let (patch, remaining) = remaining.split_at(end);
+            let path = patch.split(|&byte| byte == b'\n').find_map(|line| {
+                line.strip_prefix(b"+++ ")
+                    .and_then(|path| super::worktree_edit::header_path(path, "b/"))
+            });
+            (path.unwrap_or_else(|| target.path.clone()), remaining)
+        };
+        if skipped < skip_records {
+            skipped += 1;
+        } else {
+            commits.push(SourceHistoryCommit { commit, path });
+        }
+        rest = remaining;
+    }
+    let more = commits.len() > PAGE_SIZE;
+    commits.truncate(PAGE_SIZE);
+    Ok(SourceHistoryPage { commits, more })
+}
+
+fn read_history_fields<'a>(
+    tokens: &mut impl Iterator<Item = &'a [u8]>,
+) -> Result<([&'a [u8]; 11], &'a [u8])> {
+    let mut fields = [&[][..]; 11];
+    for field in &mut fields {
+        *field = tokens.next().context(t!("git.invalid_log"))?;
+    }
+    Ok((fields, tokens.next().unwrap_or_default()))
+}
+
+fn file_history_path<'a>(mut rest: &'a [u8], default: &str) -> Result<(String, &'a [u8])> {
+    let mut path = None;
+    while !rest.is_empty() && rest[0] != 0 {
+        let mut fields = rest.splitn(3, |&byte| byte == 0);
+        let status = fields.next().unwrap_or_default().trim_ascii_start();
+        let name = fields.next().context(t!("git.invalid_log"))?;
+        rest = fields.next().context(t!("git.invalid_log"))?;
+        let name = if matches!(status.first(), Some(b'R' | b'C')) {
+            let end = rest
+                .iter()
+                .position(|&byte| byte == 0)
+                .context(t!("git.invalid_log"))?;
+            let name = &rest[..end];
+            rest = &rest[end + 1..];
+            name
+        } else {
+            name
+        };
+        if path.is_none() || name == default.as_bytes() {
+            path = Some(text(name));
+        }
+    }
+    Ok((path.unwrap_or_else(|| default.to_owned()), rest))
 }
 
 pub(crate) fn search_revisions(root: &Path, query: &str) -> Result<Vec<RevisionMatch>> {

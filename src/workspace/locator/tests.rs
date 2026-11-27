@@ -461,7 +461,7 @@ fn workflow(authority: Option<String>, vim: bool) -> Result<()> {
     })?;
     visual.update(|_, cx| source.update(cx, |editor, cx| editor.set_selected_range(0..0, cx)));
     open_menu(visual)?;
-    visual.simulate_keystrokes("up enter");
+    visual.simulate_keystrokes("up up enter");
     wait_for_results(visual, 1, "context menu results")?;
     visual.simulate_keystrokes("enter");
     wait_for(visual, "reference jump", |visual| {

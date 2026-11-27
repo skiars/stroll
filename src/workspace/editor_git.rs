@@ -1504,6 +1504,54 @@ pub(super) fn hunk_toolbar(
         .into_any_element()
 }
 
+impl Workspace {
+    pub(super) fn open_editor_git_history(
+        &mut self,
+        selected: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        use gpui_component::input::RopeExt as _;
+
+        let Some(file) = self.active_file() else {
+            return;
+        };
+        let Some(path) = self
+            .repository
+            .as_ref()
+            .and_then(|repo| git_path(repo, &file.path))
+        else {
+            return;
+        };
+        let selection = if selected {
+            let editor = file.editor.read(cx);
+            let range = editor.selected_range();
+            if range.is_empty() || editor.is_composing() {
+                return;
+            }
+            let text = editor.text();
+            let first = text.offset_to_position(range.start).line as usize + 1;
+            let end = text.offset_to_position(range.end);
+            let last = end.line as usize + usize::from(end.character != 0);
+            Some(super::git_panel::source_history::HistorySelection {
+                rows: (first, last),
+                saved: file.saved.clone(),
+                draft: text.clone(),
+            })
+        } else {
+            None
+        };
+        self.switch_view(super::WorkspaceView::Git, window, cx);
+        if self.view == super::WorkspaceView::Git
+            && let Some(panel) = &self.git
+        {
+            panel.update(cx, |panel, cx| {
+                panel.open_source_history(path, selection, window, cx)
+            });
+        }
+    }
+}
+
 fn git_path(repo: &Repository, path: &Path) -> Option<String> {
     if path.is_absolute() {
         return None;

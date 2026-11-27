@@ -197,6 +197,14 @@ fn diff_toolbar_navigates_in_unified_split_and_single_file_modes() {
     assert!(visual.update(|window, cx| {
         gpui_component::input::Editor::search_has_focus(&left, window, cx)
     }));
+
+    visual.simulate_keystrokes("escape");
+    visual.simulate_resize(size(px(760.), px(850.)));
+    settle(visual);
+    assert!(visual.debug_bounds("git-diff-split").is_none());
+    assert!(visual.debug_bounds("git-diff-back-to-top").is_some());
+    click(visual, "git-diff-single-file");
+    assert_eq!(paths(visual).len(), 1);
 }
 
 #[::core::prelude::v1::test]
@@ -583,20 +591,58 @@ fn worktree_panel_preferences_survive_compact_layout_switching_and_reopen() {
         settle(visual);
     };
 
+    let check_toolbar = |visual: &mut VisualTestContext, history_visible, tree_visible| {
+        let toolbar = visual.debug_bounds("git-toolbar").unwrap();
+        let history = visual.debug_bounds("git-history-toolbar");
+        let tree = visual.debug_bounds("git-tree-toolbar");
+        assert_eq!(history.is_some(), history_visible);
+        assert_eq!(tree.is_some(), tree_visible);
+        if let Some(history) = history {
+            assert!(history.right() <= toolbar.left());
+            assert_eq!(history.top(), toolbar.top());
+            assert_eq!(history.bottom(), toolbar.bottom());
+        }
+        if let Some(tree) = tree {
+            assert!(toolbar.right() <= tree.left());
+            assert_eq!(tree.top(), toolbar.top());
+            assert_eq!(tree.bottom(), toolbar.bottom());
+        }
+        let history_toggle = visual.debug_bounds("git-toggle-history").unwrap();
+        let files_toggle = visual.debug_bounds("git-toggle-files").unwrap();
+        assert!((px(0.)..=px(12.)).contains(&(history_toggle.left() - toolbar.left())));
+        let files_band = tree.unwrap_or(toolbar);
+        assert!((px(0.)..=px(12.)).contains(&(files_band.right() - files_toggle.right())));
+        assert!(files_toggle.left() >= files_band.left());
+        assert_eq!(files_toggle.center().y, files_band.center().y);
+        assert!(visual.debug_bounds("git-hide-history").is_none());
+        assert!(visual.debug_bounds("git-close-files").is_none());
+
+        let history_remote = visual.debug_bounds("git-remote-menu");
+        let center_remote = visual.debug_bounds("git-remote-menu-center");
+        let (band, remote) = if let Some(history) = history {
+            assert!(center_remote.is_none());
+            (history, history_remote.unwrap())
+        } else {
+            assert!(history_remote.is_none());
+            (toolbar, center_remote.unwrap())
+        };
+        assert!(remote.left() >= band.left() && remote.right() <= band.right());
+    };
+
     let (workspace, visual) = make_window(&mut app, &store, &config);
     open(&workspace, visual, &root);
-    assert_eq!(panes(visual), (true, true));
+    check_toolbar(visual, true, true);
     visual.simulate_resize(size(px(760.), px(760.)));
     settle(visual);
-    assert_eq!(panes(visual), (true, false));
+    check_toolbar(visual, true, false);
     click(visual, "git-toggle-files");
-    assert_eq!(panes(visual), (false, true));
+    check_toolbar(visual, false, true);
     visual.simulate_resize(size(px(1280.), px(760.)));
     settle(visual);
-    assert_eq!(panes(visual), (true, true));
-    click(visual, "git-hide-history");
-    click(visual, "git-close-files");
-    assert_eq!(panes(visual), (false, false));
+    check_toolbar(visual, true, true);
+    click(visual, "git-toggle-history");
+    click(visual, "git-toggle-files");
+    check_toolbar(visual, false, false);
     switch(&workspace, visual, WorkspaceView::Editor);
     click(visual, "hide-file-tree");
     assert!(visual.debug_bounds("show-file-tree").is_some());
@@ -2606,4 +2652,137 @@ fn git_push_reviews_edits_to_the_destination_and_pull_runs_directly() {
     assert_eq!(tip(&backup, "release"), tip(&root, "main"));
     assert_ne!(tip(&backup, "main"), tip(&root, "main"));
     assert_ne!(tip(&origin, "main"), tip(&root, "main"));
+}
+
+#[::core::prelude::v1::test]
+fn editor_git_submenu_opens_scoped_history_and_reveals_the_historical_path() -> Result<()> {
+    let fixture = tempfile::tempdir()?;
+    let root = fixture.path().join("repo");
+    fs::create_dir(&root)?;
+    git(&root, &["init", "-qb", "main"]);
+    git(&root, &["config", "user.name", "History Test"]);
+    git(&root, &["config", "user.email", "history@example.invalid"]);
+    git(&root, &["config", "commit.gpgsign", "false"]);
+    let path = PathBuf::from("current file.txt");
+    fs::write(root.join("old file.txt"), "before\noriginal\nafter\n")?;
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-qm", "Add file"]);
+    git(&root, &["mv", "old file.txt", "current file.txt"]);
+    git(&root, &["commit", "-qm", "Rename file"]);
+    fs::write(root.join(&path), "before\nchanged\nafter\n")?;
+    git(&root, &["commit", "-qam", "Change selected line"]);
+
+    let mut app = TestAppContext::build_with_text_system(
+        TestDispatcher::new(0),
+        None,
+        gpui_platform::current_platform(true).text_system(),
+    );
+    app.update(gpui_component::init);
+    let store = Arc::new(Store::new(fixture.path().join("state"))?);
+    let config = crate::config::ConfigFile::load(Some(fixture.path().join("config.toml")));
+    let mut workspace = None;
+    let (_, visual) = app.add_window_view(|window, cx| {
+        let view =
+            cx.new(|cx| Workspace::with_config(store, config, WorkspaceView::Editor, window, cx));
+        workspace = Some(view.clone());
+        gpui_component::Root::new(view, window, cx)
+    });
+    let workspace = workspace.unwrap();
+    visual.simulate_resize(size(px(1280.), px(760.)));
+    visual.update(|window, cx| {
+        workspace.update(cx, |workspace, cx| {
+            workspace.open_repository(
+                Location {
+                    root,
+                    file: Some(path.clone()),
+                },
+                window,
+                cx,
+            );
+        });
+    });
+    settle(visual);
+    let editor = visual.update(|_, cx| workspace.read(cx).files[&path].editor.clone());
+    let text = "local\nbefore\nchanged\nafter\n";
+    let menu = |visual: &mut VisualTestContext, selected: bool| {
+        visual.update(|window, cx| {
+            editor.update(cx, |editor, cx| {
+                editor.focus(window, cx);
+                if selected {
+                    editor.set_value(text, window, cx);
+                    editor.set_selected_range(0.."local\nbefore\nchanged\n".len(), cx);
+                } else {
+                    editor.set_selected_range(0..0, cx);
+                }
+            });
+        });
+        settle(visual);
+        let hit = visual.update(|_, cx| editor.read(cx).range_to_bounds(&(0..3)).unwrap().center());
+        visual.simulate_mouse_down(hit, MouseButton::Right, Modifiers::default());
+        visual.simulate_mouse_up(hit, MouseButton::Right, Modifiers::default());
+        settle(visual);
+        visual.simulate_keystrokes("up enter");
+        settle(visual);
+        visual.simulate_keystrokes(if selected { "down enter" } else { "enter" });
+        settle(visual);
+    };
+
+    menu(visual, true);
+    let panel = visual.update(|_, cx| {
+        assert_eq!(workspace.read(cx).view, WorkspaceView::Git);
+        workspace.read(cx).git.clone().unwrap()
+    });
+    assert!(visual.debug_bounds("git-source-history-scope").is_some());
+    assert!(visual.debug_bounds("git-source-history-skipped").is_some());
+    visual.update(|_, cx| {
+        let panel = panel.read(cx);
+        assert!(panel.history_error.is_none(), "{:?}", panel.history_error);
+        assert_eq!(
+            panel
+                .commits
+                .iter()
+                .map(|row| row.subject.as_str())
+                .collect::<Vec<_>>(),
+            ["Change selected line", "Add file"],
+        );
+    });
+    visual.simulate_keystrokes("down down");
+    settle(visual);
+    visual.update(|_, cx| {
+        let panel = panel.read(cx);
+        assert_eq!(
+            panel.diff.read(cx).top_file().map(SharedString::as_str),
+            Some("old file.txt")
+        );
+    });
+    let clear = visual
+        .debug_bounds("git-clear-source-history")
+        .unwrap()
+        .center();
+    visual.simulate_click(clear, Modifiers::default());
+    settle(visual);
+    assert!(visual.debug_bounds("git-source-history-scope").is_none());
+    assert!(visual.debug_bounds("git-commit-search").is_some());
+
+    visual.update(|window, cx| {
+        workspace.update(cx, |workspace, cx| {
+            workspace.switch_view(WorkspaceView::Editor, window, cx)
+        });
+    });
+    settle(visual);
+    menu(visual, false);
+    visual.update(|_, cx| {
+        let panel = panel.read(cx);
+        assert!(panel.history_error.is_none(), "{:?}", panel.history_error);
+        assert_eq!(
+            panel
+                .commits
+                .iter()
+                .map(|row| row.subject.as_str())
+                .collect::<Vec<_>>(),
+            ["Change selected line", "Rename file", "Add file"],
+        );
+        assert_eq!(editor.read(cx).text(), text);
+    });
+    Ok(())
 }

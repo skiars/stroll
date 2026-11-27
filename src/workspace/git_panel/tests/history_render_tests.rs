@@ -2871,6 +2871,8 @@ fn commit_markers_share_the_editor_gutter_and_keep_local_priority() -> Result<()
     right_click(visual, markers.3);
     visual.simulate_keystrokes("up enter");
     draw(visual);
+    visual.simulate_keystrokes("up enter");
+    draw(visual);
     visual.update(|window, cx| {
         assert!(!workspace.read(cx).commit_markers.active());
         assert!(

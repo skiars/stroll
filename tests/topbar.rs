@@ -212,6 +212,10 @@ fn project_gradient_joins_the_file_tree_at_the_editor_corner() -> anyhow::Result
         "-qm",
         "Add example files",
     ])?;
+    fs::write(
+        repo.join("main.rs"),
+        "fn main() {\n    println!(\"Hello, workspace!\");\n}\n",
+    )?;
     let config_path = temp.path().join("config.toml");
     fs::write(
         &config_path,
@@ -232,14 +236,14 @@ fn project_gradient_joins_the_file_tree_at_the_editor_corner() -> anyhow::Result
             }
         },
     );
-    let handle = cx.update(|cx| {
-        gpui_component::init(cx);
+    cx.update(gpui_component::init);
+    let open = |cx: &mut gpui::App, viewport| {
         cx.open_window(
             gpui::WindowOptions {
                 window_decorations: Some(WindowDecorations::Client),
                 window_bounds: Some(WindowBounds::Windowed(Bounds::new(
                     point(px(0.), px(0.)),
-                    size(px(940.), px(480.)),
+                    viewport,
                 ))),
                 focus: false,
                 show: false,
@@ -247,13 +251,19 @@ fn project_gradient_joins_the_file_tree_at_the_editor_corner() -> anyhow::Result
             },
             |window, cx| {
                 let workspace = cx.new(|cx| {
-                    Workspace::with_config(store, config, WorkspaceView::Editor, window, cx)
+                    Workspace::with_config(
+                        store.clone(),
+                        config.clone(),
+                        WorkspaceView::Editor,
+                        window,
+                        cx,
+                    )
                 });
                 workspace.update(cx, |workspace, cx| {
                     workspace.open_repository(
                         Location {
                             file: Some(PathBuf::from("main.rs")),
-                            root: repo,
+                            root: repo.clone(),
                         },
                         window,
                         cx,
@@ -262,7 +272,8 @@ fn project_gradient_joins_the_file_tree_at_the_editor_corner() -> anyhow::Result
                 cx.new(|cx| Root::new(workspace, window, cx))
             },
         )
-    })?;
+    };
+    let handle = cx.update(|cx| open(cx, size(px(940.), px(480.))))?;
     cx.run_until_parked();
 
     for (mode, theme, base) in [
@@ -553,6 +564,20 @@ fn project_gradient_joins_the_file_tree_at_the_editor_corner() -> anyhow::Result
             cx.capture_screenshot(handle.into())?
                 .save(output.join(format!("project-gradient-{name}.png")))?;
         }
+    }
+
+    if let Some(output) = &screenshots {
+        let wide = cx.update(|cx| open(cx, size(px(1440.), px(720.))))?;
+        cx.run_until_parked();
+        cx.update_window(wide.into(), |_, window, cx| {
+            window.dispatch_action(Box::new(SwitchWorkspaceView(WorkspaceView::Git)), cx);
+        })?;
+        for _ in 0..4 {
+            cx.run_until_parked();
+            cx.update_window(wide.into(), |_, window, cx| window.draw(cx).clear(cx))?;
+        }
+        cx.capture_screenshot(wide.into())?
+            .save(output.join("project-gradient-git-wide.png"))?;
     }
 
     let position = history_toggle.unwrap();

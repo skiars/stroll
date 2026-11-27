@@ -422,6 +422,28 @@ impl Backend {
         )
     }
 
+    pub(crate) fn check_source_history_support(&self) -> Result<()> {
+        if let Some(ssh) = &self.ssh {
+            let version = crate::remote::SOURCE_HISTORY_VERSION;
+            anyhow::ensure!(
+                ssh.call::<u32>(crate::remote::Request::Hello(version)).ok() == Some(version),
+                t!("git.upgrade_source_history")
+            );
+        }
+        Ok(())
+    }
+
+    pub(crate) fn source_history(
+        &self,
+        target: &SourceHistoryTarget,
+        offset: usize,
+    ) -> Result<SourceHistoryPage> {
+        self.call(
+            crate::remote::Request::SourceHistory(target.clone(), offset),
+            |state| source_history(state.root(), target, offset),
+        )
+    }
+
     pub fn commit(&self, oid: &str) -> Result<Commit> {
         self.call(crate::remote::Request::Commit(oid.into()), |state| {
             commit(state.root(), oid)

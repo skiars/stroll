@@ -11,6 +11,7 @@ mod operations;
 mod ref_picker;
 mod review;
 mod revisions;
+pub(super) mod source_history;
 mod tree;
 mod vim;
 
@@ -117,6 +118,7 @@ struct CommitRow {
     body_preview: SharedString,
     merge: bool,
     first_parent: Option<SharedString>,
+    source_path: Option<String>,
 }
 
 impl From<Commit> for CommitRow {
@@ -131,6 +133,7 @@ impl From<Commit> for CommitRow {
             body_preview: history_preview::preview_body(commit.body),
             merge: commit.parents.len() > 1,
             first_parent: commit.parents.into_iter().next().map(Into::into),
+            source_path: None,
         }
     }
 }
@@ -322,6 +325,7 @@ pub(super) struct GitPanel {
     startup_session: Option<GitSession>,
     restore_history: Option<HistoryRestore>,
     history_before_search: Option<HistoryViewport>,
+    source_history: Option<source_history::SourceHistory>,
     history_pane: Entity<GitPane>,
     review_pane: Entity<GitPane>,
     tree_pane: Entity<GitPane>,
@@ -597,6 +601,7 @@ impl GitPanel {
             startup_session: session.git.clone(),
             restore_history: None,
             history_before_search: None,
+            source_history: None,
             history_pane,
             review_pane,
             tree_pane,
@@ -856,7 +861,9 @@ impl GitPanel {
                         if checkout_changed {
                             this.clear_commit_amend(window, cx);
                         }
-                        this.history_error = None;
+                        if this.source_history.is_none() {
+                            this.history_error = None;
+                        }
                         if only_changed && !retry_history && this.history.as_ref() == Some(&history)
                         {
                             if !paths.is_empty() {
@@ -896,10 +903,12 @@ impl GitPanel {
                             && history.has_browsable_ref(&state.reference)
                         {
                             this.branch.clone_from(&state.reference);
-                            this.restore_history = state
-                                .history
-                                .clone()
-                                .map(|position| HistoryRestore::Session { position, pages: 0 });
+                            if this.source_history.is_none() {
+                                this.restore_history = state
+                                    .history
+                                    .clone()
+                                    .map(|position| HistoryRestore::Session { position, pages: 0 });
+                            }
                         }
                         this.update_history_ref_heights(&history);
                         this.ref_picker.update(&history, &this.branch, window, cx);
@@ -920,9 +929,9 @@ impl GitPanel {
                         {
                             this.load_review(Selection::Worktree(Mode::All), false, window, cx);
                         }
-                        if first_load
-                            || retry_history && this.commits.is_empty()
-                            || previous_oid.as_deref() != this.branch_oid()
+                        if retry_history && this.commits.is_empty()
+                            || this.source_history.is_none()
+                                && (first_load || previous_oid.as_deref() != this.branch_oid())
                         {
                             this.load_commits(false, window, cx);
                         }
@@ -1088,9 +1097,7 @@ impl GitPanel {
         }
         self.restore_history = None;
         self.history_before_search = None;
-        self.history_scroll.reset(0);
-        self.commits = Rc::default();
-        self.graph = Rc::default();
+        self.reset_history_rows();
         self.load_commits(false, window, cx);
         if worktree || self.branch_oid().is_none() {
             self.load_review(Selection::Worktree(Mode::All), false, window, cx);
@@ -1100,7 +1107,7 @@ impl GitPanel {
     }
 
     fn set_query(&mut self, query: String, window: &mut Window, cx: &mut Context<Self>) {
-        if self.query == query {
+        if self.query == query || self.source_history.is_some() {
             return;
         }
         if query.is_empty() {
@@ -1134,9 +1141,7 @@ impl GitPanel {
             self.clear_history_selection(window, cx);
         }
         self.query = query;
-        self.history_scroll.reset(0);
-        self.commits = Rc::default();
-        self.graph = Rc::default();
+        self.reset_history_rows();
         self.load_commits(false, window, cx);
     }
 
@@ -1164,7 +1169,12 @@ impl GitPanel {
             self.history_page_error = None;
             self.more = false;
         }
-        let Some(oid) = self.branch_oid().map(str::to_owned) else {
+        let oid = self.branch_oid().map(str::to_owned);
+        let source = self
+            .source_history
+            .as_ref()
+            .map(|scope| (scope.request.clone(), scope.prepared.clone()));
+        if oid.is_none() && source.is_none() {
             self.commits = Rc::default();
             self.graph = Rc::default();
             self.restore_history = None;
@@ -1185,21 +1195,51 @@ impl GitPanel {
             graph::Graph::default()
         };
         let task = cx.background_spawn(async move {
-            let page = backend.commits(&oid, &query, offset)?;
-            let graph = layout.append(&page.commits, !query.is_empty());
+            let (page, paths, prepared) = if let Some((request, prepared)) = source {
+                let prepared = match prepared {
+                    Some(prepared) => prepared,
+                    None => request.prepare(&backend)?,
+                };
+                let (commits, paths, more) = match &prepared.target {
+                    Some(target) => {
+                        let result = backend.source_history(target, offset)?;
+                        let (commits, paths) = result
+                            .commits
+                            .into_iter()
+                            .map(|row| (row.commit, row.path))
+                            .unzip();
+                        (commits, paths, result.more)
+                    }
+                    None => (Vec::new(), Vec::new(), false),
+                };
+                (git::CommitPage { commits, more }, paths, Some(prepared))
+            } else {
+                let oid = oid.as_deref().expect("unscoped history has a branch tip");
+                (backend.commits(oid, &query, offset)?, Vec::new(), None)
+            };
+            let graph = layout.append(&page.commits, prepared.is_some() || !query.is_empty());
+            let mut paths = paths.into_iter();
             let commits = page
                 .commits
                 .into_iter()
-                .map(CommitRow::from)
+                .map(|commit| {
+                    let mut row = CommitRow::from(commit);
+                    row.source_path = paths.next();
+                    row
+                })
                 .collect::<Vec<_>>();
-            Ok::<_, anyhow::Error>((commits, page.more, graph, layout))
+            Ok::<_, anyhow::Error>((commits, page.more, graph, layout, prepared))
         });
         self.commits_task = cx.spawn_in(window, async move |this, cx| {
             let result = task.await;
             _ = this.update_in(cx, move |this, window, cx| {
                 this.commits_loading = false;
                 match result {
-                    Ok((commits, has_more, graph, layout)) => {
+                    Ok((commits, has_more, graph, layout, prepared)) => {
+                        if let Some(scope) = &mut this.source_history {
+                            scope.prepared = prepared;
+                            this.history_error = None;
+                        }
                         this.history_page_error = None;
                         this.graph_layout = layout;
                         if !more {
@@ -1229,7 +1269,7 @@ impl GitPanel {
         if self.layout(window.viewport_size().width).show_history
             && self.history_page_error.is_none()
             && self.history_error.is_none()
-            && self.commits.len() + 1 == count
+            && self.commits.len() + usize::from(self.show_worktree_history_row()) == count
             && self.history_scroll.item_count() == count
         {
             self.load_commits(true, window, cx);
@@ -1389,8 +1429,9 @@ impl GitPanel {
         if self.history_focus.is_focused(window) {
             match key {
                 Some('k')
-                    if self.selection.as_ref().and_then(Selection::target_commit)
-                        == self.commits.first().map(|row| row.oid.as_str()) =>
+                    if self.show_worktree_history_row()
+                        && self.selection.as_ref().and_then(Selection::target_commit)
+                            == self.commits.first().map(|row| row.oid.as_str()) =>
                 {
                     self.select_worktree(window, cx);
                     self.vim_history(window, cx);
@@ -1416,7 +1457,14 @@ impl GitPanel {
         cx.notify();
     }
 
+    fn show_worktree_history_row(&self) -> bool {
+        self.history.is_some() && self.source_history.is_none()
+    }
+
     fn history_view_position(&self) -> Option<HistoryPosition> {
+        if self.source_history.is_some() {
+            return None;
+        }
         if let Some(restore) = &self.restore_history {
             return Some(restore.position().clone());
         }
@@ -1470,7 +1518,7 @@ impl GitPanel {
                 self.commits
                     .iter()
                     .position(|row| row.oid.as_str() == oid)?
-                    + 1
+                    + usize::from(self.show_worktree_history_row())
             }
             None => 0,
         };
@@ -1487,7 +1535,7 @@ impl GitPanel {
             && self.more
         {
             // Keep the list from clamping the saved viewport to the end of a page.
-            let item_count = self.commits.len() + usize::from(self.history.is_some());
+            let item_count = self.commits.len() + usize::from(self.show_worktree_history_row());
             if item_count - position.item_ix < viewport.visible_rows {
                 return None;
             }
@@ -1567,7 +1615,8 @@ impl GitPanel {
             )
         });
         let weak = cx.weak_entity();
-        let show_worktree = history.is_some();
+        let show_worktree = self.show_worktree_history_row();
+        let scoped = self.source_history.is_some();
         let count = commits.len() + usize::from(show_worktree);
         let page_available = self.more
             && !self.commits_loading
@@ -1730,6 +1779,9 @@ impl GitPanel {
                     title_y,
                 ))
                 .map(|row| {
+                    if scoped {
+                        return row.into_any_element();
+                    }
                     let comparison_target = comparison_target.clone();
                     row.context_menu(move |menu, window, cx| {
                         let backend = menu_view
@@ -1849,32 +1901,23 @@ impl GitPanel {
                                     cx.listener(|this, _, window, cx| this.refresh(window, cx)),
                                 ),
                             )
-                            .child(self.remote_control("git-remote-menu", cx))
-                            .child(
-                                icon_control(
-                                    "git-hide-history",
-                                    IconName::PanelLeftClose,
-                                    t!("git.close_history"),
-                                    false,
-                                )
-                                .debug_selector(|| "git-hide-history".into())
-                                .on_click(cx.listener(
-                                    |this, _, _, cx| {
-                                        this.set_history_visible(false, cx);
-                                    },
-                                )),
-                            ),
+                            .child(self.remote_control("git-remote-menu", cx)),
                     )
-                    .child(self.render_ref_picker(window, cx, colors))
-                    .child(
-                        div().debug_selector(|| "git-commit-search".into()).child(
-                            Input::new(&self.commit_input)
-                                .w_full()
-                                .bg(ref_picker::field_background(cx))
-                                .cleanable(true)
-                                .prefix(icon(IconName::Search, colors.muted, 13.)),
-                        ),
-                    ),
+                    .when_some(self.source_history.as_ref(), |pane, scope| {
+                        pane.child(self.source_history_header(scope, colors, cx))
+                    })
+                    .when(!scoped, |pane| {
+                        pane.child(self.render_ref_picker(window, cx, colors))
+                            .child(
+                                div().debug_selector(|| "git-commit-search".into()).child(
+                                    Input::new(&self.commit_input)
+                                        .w_full()
+                                        .bg(ref_picker::field_background(cx))
+                                        .cleanable(true)
+                                        .prefix(icon(IconName::Search, colors.muted, 13.)),
+                                ),
+                            )
+                    }),
             )
             .when_some(self.history_error.clone(), |panel, error| {
                 panel.child(message(error, colors.warning))
@@ -1948,6 +1991,8 @@ impl GitPanel {
                     panel.child(message(
                         if self.history.is_none() && self.history_loading || self.commits_loading {
                             t!("git.loading_commits")
+                        } else if scoped {
+                            self.source_history_empty()
                         } else if !self.query.is_empty() {
                             t!("git.no_matching_commits")
                         } else {
@@ -2024,13 +2069,15 @@ impl GitPanel {
         cx: &mut Context<Self>,
     ) {
         self.history_pick.clear();
-        if !self.query.is_empty()
+        if self.source_history.is_none()
+            && !self.query.is_empty()
             && let Some(oid) = target
         {
             self.history_pick.record_search_pick(oid.into());
         }
         let current = self.selection.as_ref().filter(|selection| {
-            !matches!(selection, Selection::CommitRange { .. })
+            self.source_history.is_none()
+                && !matches!(selection, Selection::CommitRange { .. })
                 && selection.target_commit() == target
         });
         let selection = match current {
@@ -2039,7 +2086,10 @@ impl GitPanel {
                 Selection::Commit(oid.to_owned(), None)
             }),
         };
-        self.load_review(selection, false, window, cx);
+        let position = target
+            .filter(|_| self.source_history.is_some())
+            .and_then(|oid| self.source_history_position(oid));
+        self.load_review_at(selection, position.is_some(), position, false, window, cx);
         if window.viewport_size().width < px(850.) {
             self.compact_pane = CompactPane::HistoryDismissed;
             cx.notify();

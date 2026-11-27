@@ -550,7 +550,7 @@ fn chunk_path(chunk: &[u8]) -> Option<String> {
         .and_then(|path| header_path(path.as_bytes(), "b/"))
 }
 
-fn header_path(value: &[u8], prefix: &str) -> Option<String> {
+pub(super) fn header_path(value: &[u8], prefix: &str) -> Option<String> {
     let value = value.strip_suffix(b"\n").unwrap_or(value);
     let value = value.strip_suffix(b"\r").unwrap_or(value);
     // Paths containing spaces are terminated by a tab in `---` and `+++` lines.

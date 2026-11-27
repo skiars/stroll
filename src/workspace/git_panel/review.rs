@@ -3151,8 +3151,16 @@ impl GitPanel {
             .child(
                 icon_control(
                     "git-toggle-history",
-                    IconName::PanelLeft,
-                    t!("git.history"),
+                    if show_history {
+                        IconName::PanelLeftClose
+                    } else {
+                        IconName::PanelLeft
+                    },
+                    if show_history {
+                        t!("git.close_history")
+                    } else {
+                        t!("git.open_history")
+                    },
                     show_history,
                 )
                 .debug_selector(|| "git-toggle-history".into())
@@ -3187,6 +3195,7 @@ impl GitPanel {
                             t!("git.split_diff"),
                             self.split,
                         )
+                        .debug_selector(|| "git-diff-split".into())
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.split = !this.split;
                             cx.notify();
@@ -3217,19 +3226,8 @@ impl GitPanel {
                 )
                 .child(self.reading_menu(cx))
             })
-            .when(review.is_some(), |row| {
-                row.child(
-                    icon_control(
-                        "git-toggle-files",
-                        IconName::ListTree,
-                        t!("git.files_index"),
-                        show_tree,
-                    )
-                    .debug_selector(|| "git-toggle-files".into())
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.set_tree_visible(!show_tree, cx);
-                    })),
-                )
+            .when(review.is_some() && !show_tree, |row| {
+                row.child(self.file_tree_toggle(false, cx))
             })
     }
 
@@ -3776,7 +3774,7 @@ impl GitPanel {
                 .h(slot.size.height);
             let status = match images.map(|sides| &sides[index]) {
                 Some(DiffImage::Ready(thumbnail)) => {
-                    let fitted = ObjectFit::Contain.get_bounds(slot, thumbnail.image.size(0));
+                    let fitted = ObjectFit::ScaleDown.get_bounds(slot, thumbnail.image.size(0));
                     thumbnails[index] = Some((thumbnail.image.clone(), fitted));
                     return hover_image_source(
                         preview,

@@ -1745,3 +1745,90 @@ fn pinned_diff_file_header_blocks_hover_and_keeps_popups_below_it() {
         assert!(visual.update(|_, cx| modified.read(cx).scroll_offset().y) < before);
     }
 }
+
+#[::core::prelude::v1::test]
+fn image_diff_thumbnails_only_scale_down_and_stay_centered() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("repo");
+    fs::create_dir(&root).unwrap();
+    setup(&root);
+    let save = |path, width, height, color| {
+        image::RgbImage::from_pixel(width, height, image::Rgb(color))
+            .save(root.join(path))
+            .unwrap();
+    };
+    save("wide.png", 24, 12, [35, 160, 150]);
+    save("tall.png", 12, 24, [80, 168, 95]);
+    command(&root, &["add", "."]);
+    command(&root, &["commit", "-qm", "Small image"]);
+    save("wide.png", 400, 200, [185, 90, 65]);
+    save("tall.png", 200, 400, [59, 122, 208]);
+    command(&root, &["commit", "-qam", "Wide image"]);
+
+    let mut app = test_context();
+    let (panel, visual) = open(&mut app, temp.path(), &root);
+    visual.update(|window, cx| {
+        panel.update(cx, |panel, cx| {
+            let oid = panel.history.as_ref().unwrap().head.clone().unwrap();
+            panel.select_history_target(Some(&oid), window, cx);
+        });
+    });
+    wait_for_review(visual, "committed image diff", |visual| {
+        visual.update(|_, cx| {
+            panel
+                .read(cx)
+                .review
+                .as_ref()
+                .is_some_and(|review| review.detail.comparison.commit_target().is_some())
+        })
+    });
+    visual.update(|_, cx| panel.update(cx, |panel, cx| panel.toggle_single_file(cx)));
+    for (width, scale) in [(1280., 1.), (520., 2.)] {
+        visual.simulate_scale_factor_change(scale);
+        visual.simulate_resize(size(px(width), px(760.)));
+        for (path, sizes) in [
+            (
+                "wide.png",
+                [
+                    ("git-image-thumbnail:before:wide.png", 24., 12.),
+                    ("git-image-thumbnail:after:wide.png", 400., 200.),
+                ],
+            ),
+            (
+                "tall.png",
+                [
+                    ("git-image-thumbnail:before:tall.png", 12., 24.),
+                    ("git-image-thumbnail:after:tall.png", 200., 400.),
+                ],
+            ),
+        ] {
+            visual.update(|window, cx| {
+                panel.update(cx, |panel, cx| {
+                    let index = panel.review.as_ref().unwrap().by_path[path];
+                    panel.reveal_file(index, true, window, cx);
+                });
+            });
+            for (selector, w, h) in sizes {
+                let mut painted = None;
+                wait_for_review(visual, selector, |visual| {
+                    let Some(logical) = visual.debug_bounds(selector) else {
+                        return false;
+                    };
+                    let slot = logical.scale(scale);
+                    painted = visual.update(|window, _| {
+                        window.painted_images().iter().find_map(|image| {
+                            let offset = image.bounds.center() - slot.center();
+                            (offset.x.0.abs() < 1. && offset.y.0.abs() < 1.)
+                                .then_some((slot, image.bounds))
+                        })
+                    });
+                    painted.is_some()
+                });
+                let (slot, image) = painted.unwrap();
+                let factor = scale.min(slot.size.width.0 / w).min(slot.size.height.0 / h);
+                assert!((image.size.width.0 - w * factor).abs() < 1.);
+                assert!((image.size.height.0 - h * factor).abs() < 1.);
+            }
+        }
+    }
+}

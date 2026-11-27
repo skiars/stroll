@@ -391,6 +391,35 @@ enum Reply {
     Lines(std::ops::RangeInclusive<usize>, Vec<git::BlameLine>),
 }
 
+pub(in crate::workspace) fn map_history_selection(
+    baseline: &str,
+    saved: &Rope,
+    draft: &Rope,
+    (first, last): (usize, usize),
+) -> (Vec<(usize, usize)>, Vec<(usize, usize)>) {
+    fn push_line(ranges: &mut Vec<(usize, usize)>, line: usize) {
+        if let Some((_, end)) = ranges.last_mut()
+            && line == *end + 1
+        {
+            *end = line;
+        } else {
+            ranges.push((line, line));
+        }
+    }
+
+    let mapping = Mapping::new(baseline, saved, draft);
+    let total = line_count(baseline);
+    let mut committed = Vec::new();
+    let mut skipped = Vec::new();
+    for row in first..=last {
+        match mapping.line(row - 1, total) {
+            Line::Committed(line) => push_line(&mut committed, line),
+            Line::Local | Line::Unsaved => push_line(&mut skipped, row),
+        }
+    }
+    (committed, skipped)
+}
+
 fn line_count(text: &str) -> usize {
     text.bytes().filter(|&byte| byte == b'\n').count() + usize::from(!text.ends_with('\n'))
 }

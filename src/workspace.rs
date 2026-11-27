@@ -118,6 +118,8 @@ actions!(
         PreviousTab,
         ToggleTerminal,
         ClearCommitMarkers,
+        ViewFileGitHistory,
+        ViewSelectionGitHistory,
         ToggleSettings,
         CloseSettings
     ]
@@ -5292,6 +5294,14 @@ impl Workspace {
                     .on_action(cx.listener(|this, _: &ClearCommitMarkers, _, cx| {
                         this.clear_editor_commit_markers(cx);
                     }))
+                    .on_action(cx.listener(|this, _: &ViewFileGitHistory, window, cx| {
+                        this.open_editor_git_history(false, window, cx);
+                    }))
+                    .on_action(
+                        cx.listener(|this, _: &ViewSelectionGitHistory, window, cx| {
+                            this.open_editor_git_history(true, window, cx);
+                        }),
+                    )
                     .on_action(cx.listener(Self::show_signature_help))
                     .capture_key_down(cx.listener(Self::dismiss_signature_help))
                     .capture_action(cx.listener(|this, action: &Enter, window, cx| {
@@ -5317,6 +5327,8 @@ impl Workspace {
                             .aria_label(name)
                             .map(|editor| {
                                 let workspace = cx.weak_entity();
+                                let git = self.repository.is_some() && !file.path.is_absolute();
+                                let editor_state = file.editor.clone();
                                 editor.extend_context_menu(move |menu, _, app| {
                                     let menu = if language_server
                                         .as_ref()
@@ -5331,19 +5343,34 @@ impl Workspace {
                                     } else {
                                         menu
                                     };
+                                    if !git {
+                                        return menu;
+                                    }
+                                    let editor = editor_state.read(app);
+                                    let mut actions =
+                                        gpui_component::native_menu::NativeMenu::new()
+                                            .menu(
+                                                t!("git.view_file_history"),
+                                                Box::new(ViewFileGitHistory),
+                                            )
+                                            .menu_with_disabled(
+                                                t!("git.view_selection_history"),
+                                                editor.selected_range().is_empty()
+                                                    || editor.is_composing(),
+                                                Box::new(ViewSelectionGitHistory),
+                                            );
                                     if workspace
                                         .read_with(app, |workspace, _| {
                                             workspace.commit_markers.active()
                                         })
                                         .unwrap_or(false)
                                     {
-                                        menu.menu(
+                                        actions = actions.separator().menu(
                                             t!("git.editor_clear_commit_markers"),
                                             Box::new(ClearCommitMarkers),
-                                        )
-                                    } else {
-                                        menu
+                                        );
                                     }
+                                    menu.separator().submenu("Git", actions)
                                 })
                             }),
                     )

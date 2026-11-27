@@ -1772,3 +1772,60 @@ fn helper_reviews_the_live_push_target_and_requires_an_exact_lease() {
     let updated = preview(&mut helper, &fast_forward);
     assert_eq!(updated["lease"]["target_oid"], newer["head"]);
 }
+
+#[test]
+fn helper_lists_file_and_selection_history_through_renames() {
+    let repo = fixture();
+    let root = repo.path();
+    git(root, &["commit", "-qam", "modify both files"]);
+    git(root, &["mv", "b with space.txt", "renamed file.txt"]);
+    git(root, &["commit", "-qm", "rename"]);
+    std::fs::write(root.join("renamed file.txt"), "alpha\nLatest\n").unwrap();
+    git(root, &["commit", "-qam", "selected line"]);
+
+    let mut helper = Helper::start();
+    assert_eq!(helper.ok(json!({"Hello": 39})), 39);
+    helper.ok(json!({"OpenWorkspace": root}));
+    let head = helper.ok(json!("History"))["head"].clone();
+    let mut target = json!({"head": head, "path": "renamed file.txt", "ranges": []});
+    let file = helper.ok(json!({"SourceHistory": [target, 0]}));
+    let actual = |history: Value| {
+        history["commits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| {
+                (
+                    row["commit"]["subject"].as_str().unwrap().to_owned(),
+                    row["path"].as_str().unwrap().to_owned(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    let entry = |subject: &str, path: &str| (subject.to_owned(), path.to_owned());
+    let expected = [
+        entry("selected line", "renamed file.txt"),
+        entry("rename", "renamed file.txt"),
+        entry("modify both files", "b with space.txt"),
+        entry("initial", "b with space.txt"),
+    ];
+    assert_eq!(actual(file), expected);
+    assert_eq!(
+        actual(helper.ok(json!({"SourceHistory": [target, 2]}))),
+        expected[2..],
+    );
+
+    target["ranges"] = json!([[2, 2]]);
+    assert_eq!(
+        actual(helper.ok(json!({"SourceHistory": [target, 0]}))),
+        [
+            expected[0].clone(),
+            expected[2].clone(),
+            expected[3].clone()
+        ],
+    );
+    assert_eq!(
+        actual(helper.ok(json!({"SourceHistory": [target, 1]}))),
+        expected[2..],
+    );
+}

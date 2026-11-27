@@ -147,6 +147,13 @@ impl GitPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.source_history.is_some() {
+            if let Some(index) = self.commits.iter().position(|row| &row.oid == oid) {
+                self.history_scroll.scroll_to_reveal_item(index);
+                self.select_history_target(Some(oid), window, cx);
+            }
+            return;
+        }
         let additive = if cfg!(target_os = "macos") {
             modifiers.platform
         } else {

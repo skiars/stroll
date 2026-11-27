@@ -360,6 +360,19 @@ impl GitPanel {
         true
     }
 
+    pub(super) fn file_tree_toggle(&self, visible: bool, cx: &Context<Self>) -> Button {
+        let (icon, label) = if visible {
+            (IconName::PanelRightClose, t!("git.close_files_index"))
+        } else {
+            (IconName::PanelRight, t!("git.open_files_index"))
+        };
+        icon_control("git-toggle-files", icon, label, visible)
+            .debug_selector(|| "git-toggle-files".into())
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.set_tree_visible(!visible, cx);
+            }))
+    }
+
     pub(super) fn tree_panel(
         &mut self,
         width: Pixels,
@@ -894,20 +907,7 @@ impl GitPanel {
                                     }
                                 }),
                             )
-                            .child(
-                                icon_control(
-                                    "git-close-files",
-                                    IconName::PanelRightClose,
-                                    t!("git.close_files_index"),
-                                    false,
-                                )
-                                .debug_selector(|| "git-close-files".into())
-                                .on_click(cx.listener(
-                                    |this, _, _, cx| {
-                                        this.set_tree_visible(false, cx);
-                                    },
-                                )),
-                            ),
+                            .child(self.file_tree_toggle(true, cx)),
                     )
                     .child(
                         div().debug_selector(|| "git-file-filter".into()).child(

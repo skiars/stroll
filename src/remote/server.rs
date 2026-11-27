@@ -260,6 +260,7 @@ impl Server {
                             | super::PUSH_BRANCHES_VERSION
                             | super::WORKTREE_REMOVAL_PREVIEW_VERSION
                             | super::RECREATE_DOCUMENT_VERSION
+                            | super::SOURCE_HISTORY_VERSION
                     ),
                     "SSH workspace protocol version mismatch. Update the remote helper."
                 );
@@ -662,6 +663,9 @@ impl Server {
                     .map(|path| git::file_version(state, path).ok())
                     .collect::<Vec<_>>())
             })?),
+            Request::SourceHistory(target, offset) => {
+                value(session.call(|state| git::source_history(state.root(), &target, offset))?)
+            }
             Request::BlameBaseline(path, head) => {
                 value(session.call(|state| git::blame_baseline(state, &path, &head))?)
             }

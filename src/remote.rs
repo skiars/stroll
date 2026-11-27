@@ -60,6 +60,7 @@ pub(crate) const PUSH_REVIEW_VERSION: u32 = 34;
 pub(crate) const PUSH_BRANCHES_VERSION: u32 = 35;
 pub(crate) const WORKTREE_REMOVAL_PREVIEW_VERSION: u32 = 37;
 pub(crate) const RECREATE_DOCUMENT_VERSION: u32 = 38;
+pub(crate) const SOURCE_HISTORY_VERSION: u32 = 39;
 const MAX_FRAME: usize = 40 * 1024 * 1024;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -354,6 +355,7 @@ pub(crate) enum Request {
     RegisterLspMemory,
     LspMemory(u64),
     ReleaseLspMemory(u64),
+    SourceHistory(git::SourceHistoryTarget, usize),
 }
 
 #[derive(Serialize, Deserialize)]
