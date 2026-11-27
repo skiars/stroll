@@ -38,6 +38,8 @@ pub(crate) struct Branch {
     pub label: String,
     pub oid: String,
     pub remote: bool,
+    #[serde(default)]
+    pub tracking: Option<super::Tracking>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -108,7 +110,7 @@ pub(crate) fn history(root: &Path) -> Result<History> {
         root,
         [
             "for-each-ref",
-            "--format=%(refname)%00%(objectname)%00%(*objectname)%00%(objecttype)%00%(*objecttype)%00%(symref)",
+            "--format=%(refname)%00%(objectname)%00%(*objectname)%00%(objecttype)%00%(*objecttype)%00%(symref)%00%(upstream)%00%(upstream:remotename)%00%(upstream:remoteref)%00%(upstream:track,nobracket)",
             "refs/heads",
             "refs/remotes",
             "refs/tags",
@@ -130,7 +132,19 @@ pub(crate) fn history(root: &Path) -> Result<History> {
         .filter(|line| !line.is_empty())
     {
         let fields = line.split(|&byte| byte == 0).map(text).collect::<Vec<_>>();
-        let [reference, oid, peeled, kind, peeled_kind, symbolic] = fields.as_slice() else {
+        let [
+            reference,
+            oid,
+            peeled,
+            kind,
+            peeled_kind,
+            symbolic,
+            upstream,
+            remote,
+            target,
+            status,
+        ] = fields.as_slice()
+        else {
             continue;
         };
         if !symbolic.is_empty() {
@@ -171,6 +185,7 @@ pub(crate) fn history(root: &Path) -> Result<History> {
                 label: label.to_owned(),
                 oid: oid.clone(),
                 remote: namespace == "remotes",
+                tracking: super::Tracking::parse(upstream, remote, target, status),
             });
         }
     }

@@ -1251,3 +1251,495 @@ fn image_diff_versions_agree_with_disk_and_git_objects() {
         STANDARD.encode(bytes(3))
     );
 }
+
+#[test]
+fn helper_manages_worktrees_and_branches_independently() {
+    let repo = fixture();
+    let root = repo.path();
+    let checkouts = tempfile::tempdir().unwrap();
+    let linked = checkouts.path().join("linked checkout");
+    let mut helper = Helper::start();
+    assert_eq!(helper.ok(json!({"Hello": 32})), 32);
+    assert_eq!(helper.ok(json!({"Hello": 33})), 33);
+    helper.ok(json!({"OpenWorkspace": root}));
+
+    helper.ok(json!({"ManageGit": {"AddTree": {
+        "path": linked, "branch": "topic", "start": "HEAD"
+    }}}));
+    let state = helper.ok(json!("GitManagement"));
+    let topic = state["branches"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["branch"]["label"] == "topic")
+        .unwrap();
+    let oid = topic["branch"]["oid"].clone();
+    assert_eq!(topic["worktree"], json!(linked));
+    let tree = state["trees"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["tree"]["reference"] == "topic")
+        .unwrap();
+    assert_eq!(tree["clean"], true);
+
+    assert!(
+        helper
+            .call(json!({"ManageGit": {"DeleteBranch": {
+                "name": "topic", "oid": oid
+            }}}))
+            .get("Err")
+            .is_some()
+    );
+    let remove = json!({"ManageGit": {"RemoveTree": {"path": linked, "reference": "topic"}}});
+    helper.ok(json!({"ManageGit": {"LockTree": {"path": linked, "locked": true}}}));
+    assert!(helper.call(remove.clone()).get("Err").is_some());
+    helper.ok(json!({"ManageGit": {"LockTree": {"path": linked, "locked": false}}}));
+    let ignored = linked.join("ignored.tmp");
+    git(
+        &linked,
+        &[
+            "config",
+            "core.excludesFile",
+            checkouts.path().join("git-ignore").to_str().unwrap(),
+        ],
+    );
+    std::fs::write(checkouts.path().join("git-ignore"), "ignored.tmp\n").unwrap();
+    std::fs::write(&ignored, "Keep this file").unwrap();
+    assert!(helper.call(remove.clone()).get("Err").is_some());
+    assert!(ignored.is_file());
+    let delete = |mode| {
+        json!({"ManageGit": {"RemoveTree": {
+            "path": linked, "reference": "topic", "mode": mode
+        }}})
+    };
+    assert!(helper.call(delete("MissingDirectory")).get("Err").is_some());
+    assert!(ignored.is_file());
+
+    helper.ok(delete("Discard"));
+    assert!(!linked.exists());
+    git(root, &["show-ref", "--verify", "refs/heads/topic"]);
+    helper.ok(json!({"ManageGit": {"RenameBranch": {"name": "topic", "new_name": "archived", "oid": oid}}}));
+    helper.ok(json!({"ManageGit": {"DeleteBranch": {"name": "archived", "oid": oid}}}));
+    let state = helper.ok(json!("GitManagement"));
+    assert!(
+        !state["branches"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["branch"]["label"] == "archived")
+    );
+
+    git(
+        root,
+        &["worktree", "add", "--detach", linked.to_str().unwrap()],
+    );
+    git(
+        &linked,
+        &["commit", "--allow-empty", "-qm", "detached work"],
+    );
+    let state = helper.ok(json!("GitManagement"));
+    let detached = state["trees"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["tree"]["root"] == json!(linked))
+        .unwrap();
+    assert_eq!(detached["detached_unreferenced"], true);
+    let remove = json!({"ManageGit": {"RemoveTree": {
+        "path": linked, "reference": detached["tree"]["reference"]
+    }}});
+    assert!(helper.call(remove.clone()).get("Err").is_some());
+    git(&linked, &["branch", "keep-detached-commit"]);
+    helper.ok(remove);
+    git(
+        root,
+        &["show-ref", "--verify", "refs/heads/keep-detached-commit"],
+    );
+
+    let stale = checkouts.path().join("stale checkout");
+    let moved = checkouts.path().join("moved checkout");
+    git(
+        root,
+        &["worktree", "add", "-qb", "stale", stale.to_str().unwrap()],
+    );
+    git(
+        root,
+        &["worktree", "add", "-qb", "other", linked.to_str().unwrap()],
+    );
+    std::fs::rename(&stale, &moved).unwrap();
+    let other = checkouts.path().join("other checkout moved");
+    std::fs::rename(&linked, other).unwrap();
+    let state = helper.ok(json!("GitManagement"));
+    assert!(state["trees"].as_array().unwrap().iter().any(|entry| {
+        entry["tree"]["root"] == json!(stale) && entry["tree"]["missing"] == true
+    }));
+    helper.ok(json!({"ManageGit": {"RemoveTree": {
+        "path": stale, "reference": "stale", "mode": "MissingDirectory"
+    }}}));
+    let state = helper.ok(json!("GitManagement"));
+    let trees = state["trees"].as_array().unwrap();
+    assert!(
+        !trees
+            .iter()
+            .any(|entry| entry["tree"]["root"] == json!(stale))
+    );
+    assert!(
+        trees
+            .iter()
+            .any(|entry| entry["tree"]["root"] == json!(linked))
+    );
+    assert!(moved.is_dir());
+    git(root, &["show-ref", "--verify", "refs/heads/stale"]);
+}
+
+#[test]
+fn helper_reviews_and_cleans_only_the_selected_stale_worktree() {
+    let repo = fixture();
+    let root = repo.path();
+    let checkouts = tempfile::tempdir().unwrap();
+    let stale = checkouts.path().join("stale");
+    let other = checkouts.path().join("other");
+    for path in [&stale, &other] {
+        git(
+            root,
+            &["worktree", "add", "--detach", path.to_str().unwrap()],
+        );
+    }
+    git(&stale, &["commit", "--allow-empty", "-qm", "Detached work"]);
+    for path in [&stale, &other] {
+        std::fs::remove_file(path.join(".git")).unwrap();
+        std::fs::write(path.join("local.txt"), "keep").unwrap();
+    }
+    let mut helper = Helper::start();
+    assert_eq!(helper.ok(json!({"Hello": 36})), 36);
+    helper.ok(json!({"OpenWorkspace": root}));
+    let management = helper.ok(json!("GitManagement"));
+    let tree = management["trees"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["tree"]["root"] == json!(stale))
+        .unwrap();
+    let preview_request = json!({"PreviewWorktreeRemoval": [stale, tree["tree"]["reference"]]});
+    let preview = helper.ok(preview_request.clone());
+    assert_eq!(preview["detached_unreferenced"], true);
+    assert_eq!(
+        preview["entries"],
+        json!([["", "a.txt"], ["", "b with space.txt"], ["", "local.txt"]])
+    );
+    let destination = checkouts.path().join("stale.stroll-saved");
+    assert_eq!(
+        preview["action"]["MoveDirectory"]["destination"],
+        json!(destination)
+    );
+
+    std::fs::create_dir(&destination).unwrap();
+    let confirm = |preview| json!({"ManageGit": {"RemoveReviewedTree": preview}});
+    assert!(helper.call(confirm(preview)).get("Err").is_some());
+    assert!(stale.join("local.txt").is_file());
+
+    let preview = helper.ok(preview_request);
+    let updated_destination = checkouts.path().join("stale.stroll-saved-2");
+    assert_eq!(
+        preview["action"]["MoveDirectory"]["destination"],
+        json!(updated_destination)
+    );
+    helper.ok(confirm(preview));
+    assert!(!stale.exists());
+    assert!(other.join("local.txt").is_file());
+    assert_eq!(
+        std::fs::read_to_string(updated_destination.join("local.txt")).unwrap(),
+        "keep"
+    );
+    assert!(destination.is_dir());
+    let management = helper.ok(json!("GitManagement"));
+    let trees = management["trees"].as_array().unwrap();
+    assert!(
+        !trees
+            .iter()
+            .any(|entry| entry["tree"]["root"] == json!(stale))
+    );
+    assert!(
+        trees
+            .iter()
+            .any(|entry| entry["tree"]["root"] == json!(other))
+    );
+}
+
+#[test]
+fn helper_fetches_publishes_and_fast_forwards_an_explicit_upstream() {
+    let repo = fixture();
+    let root = repo.path();
+    git(root, &["restore", "."]);
+    let host = tempfile::tempdir().unwrap();
+    let bare = host.path().join("remote.git");
+    git(
+        host.path(),
+        &[
+            "init",
+            "--bare",
+            "-qb",
+            "integration",
+            bare.to_str().unwrap(),
+        ],
+    );
+
+    let mut helper = Helper::start();
+    helper.ok(json!({"OpenWorkspace": root}));
+    helper.ok(json!({"ManageGit": {"AddRemote": {"name": "origin", "url": bare}}}));
+    let before = helper.ok(json!("History"));
+    helper.ok(json!({"ManageGit": {"Push": {
+        "source": "refs/heads/main", "oid": before["head"], "remote": "origin",
+        "branch": "integration", "set_upstream": true
+    }}}));
+    let tracked = helper.ok(json!("History"));
+    let main = tracked["branches"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|branch| branch["label"] == "main")
+        .unwrap();
+    assert_eq!(
+        main["tracking"]["reference"],
+        "refs/remotes/origin/integration"
+    );
+
+    git(root, &["commit", "--allow-empty", "-qm", "push normally"]);
+    let before = helper.ok(json!("History"));
+    helper.ok(json!({"ManageGit": {"Push": {
+        "source": "refs/heads/main", "oid": before["head"], "remote": "origin",
+        "branch": "integration", "set_upstream": false
+    }}}));
+
+    let peer = host.path().join("peer");
+    git(
+        host.path(),
+        &[
+            "clone",
+            "-q",
+            bare.to_str().unwrap(),
+            peer.to_str().unwrap(),
+        ],
+    );
+    git(
+        &peer,
+        &[
+            "-c",
+            "user.name=Peer",
+            "-c",
+            "user.email=peer@example.invalid",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "--allow-empty",
+            "-qm",
+            "upstream",
+        ],
+    );
+    git(&peer, &["push", "-q"]);
+    helper.ok(json!({"ManageGit": {"Fetch": {"remote": "origin"}}}));
+    let fetched = helper.ok(json!("History"));
+    assert_eq!(fetched["head"], before["head"]);
+    let main = fetched["branches"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|branch| branch["label"] == "main")
+        .unwrap();
+    assert_eq!(main["tracking"]["behind"], 1);
+
+    let pull = |oid: &Value| {
+        json!({"ManageGit": {"Pull": {
+            "source": "refs/heads/main", "oid": oid, "remote": "origin", "upstream": "refs/remotes/origin/integration"
+        }}})
+    };
+    helper.ok(pull(&before["head"]));
+    let pulled = helper.ok(json!("History"));
+    assert_ne!(pulled["head"], before["head"]);
+
+    git(
+        &peer,
+        &[
+            "-c",
+            "user.name=Peer",
+            "-c",
+            "user.email=peer@example.invalid",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "--allow-empty",
+            "-qm",
+            "more upstream",
+        ],
+    );
+    git(&peer, &["push", "-q"]);
+    git(root, &["commit", "--allow-empty", "-qm", "local only"]);
+    let diverged = helper.ok(json!("History"));
+    assert!(helper.call(pull(&diverged["head"])).get("Err").is_some());
+    let still_diverged = helper.ok(json!("History"));
+    assert_eq!(still_diverged["head"], diverged["head"]);
+    let main = still_diverged["branches"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|branch| branch["label"] == "main")
+        .unwrap();
+    assert_eq!(main["tracking"]["ahead"], 1);
+    assert_eq!(main["tracking"]["behind"], 1);
+    let comparison = helper
+        .ok(json!({"CompareUpstream": ["refs/heads/main", "refs/remotes/origin/integration"]}));
+    assert_eq!(comparison["outgoing"][0]["subject"], "local only");
+    assert_eq!(comparison["incoming"][0]["subject"], "more upstream");
+}
+
+#[test]
+fn helper_reviews_the_live_push_target_and_requires_an_exact_lease() {
+    let repo = fixture();
+    let root = repo.path();
+    let temp = tempfile::tempdir().unwrap();
+    let bare = |name| {
+        let path = temp.path().join(name);
+        std::fs::create_dir(&path).unwrap();
+        git(&path, &["init", "--bare", "-qb", "main"]);
+        path
+    };
+    let fetch = bare("fetch");
+    let publish = bare("publish");
+    let publish_url = publish.to_str().unwrap();
+    git(root, &["push", publish_url, "main"]);
+    git(root, &["remote", "add", "origin", fetch.to_str().unwrap()]);
+    git(
+        root,
+        &["remote", "set-url", "--push", "origin", publish_url],
+    );
+    git(root, &["remote", "add", "secondary", publish_url]);
+    git(root, &["config", "branch.main.pushRemote", "secondary"]);
+
+    let peer = temp.path().join("peer");
+    git(root, &["clone", "-q", publish_url, peer.to_str().unwrap()]);
+    git(&peer, &["config", "user.name", "Peer"]);
+    git(&peer, &["config", "user.email", "peer@example.invalid"]);
+    git(&peer, &["config", "commit.gpgsign", "false"]);
+    git(root, &["commit", "-qm", "local change", "--", "a.txt"]);
+
+    let mut helper = Helper::start();
+    assert_eq!(helper.ok(json!({"Hello": 34})), 34);
+    assert_eq!(helper.ok(json!({"Hello": 35})), 35);
+    helper.ok(json!({"OpenWorkspace": root}));
+    assert_eq!(
+        helper.ok(json!({"PushBranches": "origin"})),
+        json!(["main"])
+    );
+    let history = helper.ok(json!("History"));
+    let options = helper.ok(json!({"PushOptions": history["checkout"]}));
+    assert_eq!(options["remote"], "secondary");
+    assert_eq!(options["remotes"], json!(["origin", "secondary"]));
+    assert_eq!(options["set_upstream"], true);
+    let target = |branch| {
+        json!({
+            "source": history["checkout"], "oid": history["head"], "remote": "origin", "branch": branch,
+        })
+    };
+    let main = target("main");
+    let alternate = target("review/alternate");
+    let preview = |helper: &mut Helper, target: &Value| helper.ok(json!({"PreviewPush": target}));
+    let push = |target: &Value, review: &Value, force, set_upstream| {
+        json!({
+            "ManageGit": {"PushReviewed": {"target": target, "lease": review["lease"], "force": force, "set_upstream": set_upstream}}
+        })
+    };
+
+    let creating = preview(&mut helper, &alternate);
+    assert!(creating["lease"]["target_oid"].is_null());
+    assert_eq!(creating["new_branch_base"], "main");
+    assert_eq!(creating["outgoing"].as_array().unwrap().len(), 1);
+    assert_eq!(creating["outgoing"][0]["subject"], "local change");
+    assert_eq!(creating["files"].as_array().unwrap().len(), 1);
+    assert_eq!(creating["files"][0]["path"], "a.txt");
+    assert_eq!(creating["files"][0]["counts"], json!([1, 1]));
+    assert_eq!(creating["overwritten"], 0);
+    helper.ok(push(&alternate, &creating, false, true));
+    git(
+        &publish,
+        &["show-ref", "--verify", "refs/heads/review/alternate"],
+    );
+    assert_eq!(
+        helper.ok(json!({"PushBranches": "origin"})),
+        json!(["main", "review/alternate"])
+    );
+    git(root, &["rev-parse", "--verify", "main@{upstream}"]);
+    let initial = preview(&mut helper, &main);
+    assert_eq!(initial["overwritten"], 0);
+    assert!(!initial["lease"]["target_oid"].is_null());
+
+    std::fs::write(peer.join("from-peer.txt"), "remote change\n").unwrap();
+    git(&peer, &["add", "from-peer.txt"]);
+    git(&peer, &["commit", "-qm", "remote change"]);
+    git(&peer, &["push", "origin", "main"]);
+    assert!(
+        helper
+            .call(push(&main, &initial, true, false))
+            .get("Err")
+            .is_some()
+    );
+    assert!(
+        helper
+            .call(push(&main, &initial, false, false))
+            .get("Err")
+            .is_some()
+    );
+
+    let diverged = preview(&mut helper, &main);
+    assert_eq!(diverged["overwritten"], 1);
+    assert_eq!(diverged["outgoing"][0]["subject"], "local change");
+    assert_eq!(diverged["files"][1]["path"], "from-peer.txt");
+    assert_eq!(diverged["files"][1]["code"], "D");
+    assert!(!root.join(".git/FETCH_HEAD").exists());
+    assert!(
+        helper
+            .call(push(&main, &diverged, false, false))
+            .get("Err")
+            .is_some()
+    );
+
+    git(
+        root,
+        &[
+            "remote",
+            "set-url",
+            "--push",
+            "origin",
+            fetch.to_str().unwrap(),
+        ],
+    );
+    assert!(
+        helper
+            .call(push(&main, &diverged, true, false))
+            .get("Err")
+            .is_some()
+    );
+    git(
+        root,
+        &["remote", "set-url", "--push", "origin", publish_url],
+    );
+    helper.ok(push(&main, &diverged, true, false));
+    let up_to_date = preview(&mut helper, &main);
+    assert_eq!(up_to_date["lease"]["target_oid"], history["head"]);
+    assert_eq!(up_to_date["outgoing"], json!([]));
+    assert_eq!(up_to_date["files"], json!([]));
+
+    git(
+        root,
+        &["commit", "-qm", "second change", "--", "b with space.txt"],
+    );
+    let newer = helper.ok(json!("History"));
+    let mut fast_forward = main.clone();
+    fast_forward["oid"] = newer["head"].clone();
+    let reviewed = preview(&mut helper, &fast_forward);
+    assert_eq!(reviewed["outgoing"][0]["subject"], "second change");
+    assert_eq!(reviewed["overwritten"], 0);
+    helper.ok(push(&fast_forward, &reviewed, false, false));
+    let updated = preview(&mut helper, &fast_forward);
+    assert_eq!(updated["lease"]["target_oid"], newer["head"]);
+}

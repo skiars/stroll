@@ -547,7 +547,7 @@ fn is_link(metadata: &fs::Metadata) -> bool {
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-fn rename_no_replace(source: &Path, destination: &Path) -> Result<()> {
+pub(crate) fn rename_no_replace(source: &Path, destination: &Path) -> Result<()> {
     use std::{ffi::CString, os::unix::ffi::OsStrExt};
     let source = CString::new(source.as_os_str().as_bytes())?;
     let destination = CString::new(destination.as_os_str().as_bytes())?;
@@ -571,7 +571,7 @@ fn rename_no_replace(source: &Path, destination: &Path) -> Result<()> {
 }
 
 #[cfg(windows)]
-fn rename_no_replace(source: &Path, destination: &Path) -> Result<()> {
+pub(crate) fn rename_no_replace(source: &Path, destination: &Path) -> Result<()> {
     use std::os::windows::ffi::OsStrExt;
     #[link(name = "kernel32")]
     unsafe extern "system" {
@@ -586,7 +586,7 @@ fn rename_no_replace(source: &Path, destination: &Path) -> Result<()> {
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
-fn rename_no_replace(_: &Path, _: &Path) -> Result<()> {
+pub(crate) fn rename_no_replace(_: &Path, _: &Path) -> Result<()> {
     anyhow::bail!(t!("workspace.tree_unsupported"))
 }
 

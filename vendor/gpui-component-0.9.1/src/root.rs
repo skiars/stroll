@@ -160,6 +160,15 @@ impl WindowState {
             })
     }
 
+    pub(crate) fn active_dialog_layer(window: &Window, cx: &App) -> Option<usize> {
+        Self::try_read(window, cx)?
+            .active_dialogs
+            .iter()
+            .rev()
+            .find(|dialog| !dialog.closing)
+            .map(|dialog| gpui_base::MODAL_POPUP_PRIORITY + dialog.id)
+    }
+
     pub fn update<F, R>(window: &mut Window, cx: &mut App, f: F) -> R
     where
         F: FnOnce(&mut Self, &mut Window, &mut Context<Self>) -> R,
@@ -409,6 +418,7 @@ impl WindowState {
         let focus_handle = cx.focus_handle();
         focus_handle.focus(window, cx);
 
+        self.clear_tooltip(cx);
         let id = self.next_dialog_id;
         self.next_dialog_id += 1;
         let selection_scope = self.allocate_text_selection_scope();
@@ -437,6 +447,7 @@ impl WindowState {
             .active_dialogs
             .iter()
             .rposition(|dialog| !dialog.closing)?;
+        self.clear_tooltip(cx);
         let previous_focused_handle = self.active_dialogs[ix]
             .previous_focused_handle
             .clone()
@@ -510,6 +521,7 @@ impl WindowState {
 
     pub fn close_all_dialogs(&mut self, window: &mut Window, cx: &mut Context<'_, WindowState>) {
         self.focused_input = None;
+        self.clear_tooltip(cx);
         let previous_focused_handle = self
             .active_dialogs
             .first()
@@ -620,6 +632,13 @@ impl WindowState {
     }
 
     /// Get the tooltip overlay entity for this window.
+    fn clear_tooltip(&mut self, cx: &mut App) {
+        self.tooltip_hovered_trigger = None;
+        self.tooltip_trigger_lifetime = std::rc::Weak::new();
+        self.tooltip_overlay
+            .update(cx, |overlay, cx| overlay.clear(cx));
+    }
+
     pub(crate) fn tooltip_overlay(
         window: &Window,
         cx: &App,

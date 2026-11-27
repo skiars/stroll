@@ -6,7 +6,7 @@ use crate::{
     notification::Notification,
     sheet::Sheet,
 };
-use gpui::{App, ElementId, Entity, Window};
+use gpui::{App, ElementId, Entity, FocusHandle, Window};
 use std::rc::Rc;
 
 /// Extension trait for [`Window`] to add dialog, sheet .. functionality.
@@ -114,6 +114,9 @@ pub trait WindowExt: Sized {
     /// Closes all active Dialogs.
     fn close_all_dialogs(&mut self, cx: &mut App);
 
+    /// The paint priority for an anchored popup belonging to this focus handle.
+    fn anchored_popup_priority(&self, trigger: &FocusHandle, cx: &App) -> usize;
+
     /// Pushes a notification to the notification list.
     fn push_notification(&mut self, note: impl Into<Notification>, cx: &mut App);
 
@@ -212,6 +215,10 @@ impl WindowExt for Window {
         WindowState::update(self, cx, |root, window, cx| {
             root.close_all_dialogs(window, cx);
         })
+    }
+
+    fn anchored_popup_priority(&self, trigger: &FocusHandle, cx: &App) -> usize {
+        WindowState::anchored_popup_priority(self, cx, trigger)
     }
 
     #[inline]

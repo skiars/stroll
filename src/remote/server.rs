@@ -252,6 +252,11 @@ impl Server {
                             | super::WORKTREE_IDENTITY_VERSION
                             | super::WORKSPACE_LOCATOR_VERSION
                             | super::LOCATOR_GLOB_VERSION
+                            | super::GIT_MANAGEMENT_VERSION
+                            | super::WORKTREE_REMOVAL_VERSION
+                            | super::PUSH_REVIEW_VERSION
+                            | super::PUSH_BRANCHES_VERSION
+                            | super::WORKTREE_REMOVAL_PREVIEW_VERSION
                     ),
                     "SSH workspace protocol version mismatch. Update the remote helper."
                 );
@@ -705,6 +710,22 @@ impl Server {
                 }
             }
             Request::OperationHistory => value(git::operation_history(root)?),
+            Request::GitManagement => value(git::git_management(root)?),
+            Request::PreviewWorktreeRemoval(path, reference) => {
+                value(git::preview_worktree_removal(root, &path, &reference)?)
+            }
+            Request::CompareUpstream(source, upstream) => {
+                value(git::compare_upstream(root, &source, &upstream)?)
+            }
+            Request::PushOptions(source) => value(git::push_options(root, &source)?),
+            Request::PushBranches(remote) => value(git::push_branches(root, &remote)?),
+            Request::PreviewPush(target) => value(git::preview_push(root, target)?),
+            Request::ManageGit(operation) => {
+                let _guard = self.mutations.lock().unwrap();
+                let result = git::manage_git(root, operation);
+                session.invalidate();
+                value(result?)
+            }
             Request::RestoreHistoryText(id, undo) => {
                 value(git::restore_history_text(root, id, undo)?)
             }

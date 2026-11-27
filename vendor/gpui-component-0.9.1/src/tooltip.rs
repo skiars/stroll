@@ -374,7 +374,10 @@ pub trait ManagedTooltipExt: StatefulInteractiveElement + crate::ElementExt + Si
                     let Some(request) = request(bounds, window, cx) else {
                         return;
                     };
-                    Some(request)
+                    Some(match WindowState::active_dialog_layer(window, cx) {
+                        Some(layer) => request.above_layer(layer),
+                        None => request,
+                    })
                 } else {
                     None
                 };

@@ -54,6 +54,11 @@ pub(crate) const LSP_MEMORY_VERSION: u32 = 28;
 pub(crate) const WORKTREE_IDENTITY_VERSION: u32 = 29;
 pub(crate) const WORKSPACE_LOCATOR_VERSION: u32 = 30;
 pub(crate) const LOCATOR_GLOB_VERSION: u32 = 31;
+pub(crate) const GIT_MANAGEMENT_VERSION: u32 = 32;
+pub(crate) const WORKTREE_REMOVAL_VERSION: u32 = 33;
+pub(crate) const PUSH_REVIEW_VERSION: u32 = 34;
+pub(crate) const PUSH_BRANCHES_VERSION: u32 = 35;
+pub(crate) const WORKTREE_REMOVAL_PREVIEW_VERSION: u32 = 36;
 const MAX_FRAME: usize = 40 * 1024 * 1024;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -308,6 +313,13 @@ pub(crate) enum Request {
     StageOperation(git::WorktreeStatus, Vec<String>, bool),
     EditOperation(git::FileEdit),
     OperationHistory,
+    GitManagement,
+    PreviewWorktreeRemoval(PathBuf, String),
+    CompareUpstream(String, String),
+    PushOptions(String),
+    PushBranches(String),
+    PreviewPush(git::PushTarget),
+    ManageGit(git::ManageGit),
     UndoOperation(u64),
     StageWithHistory(git::WorktreeStatus, Vec<String>, bool),
     EditWithHistory(git::FileEdit),

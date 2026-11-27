@@ -3149,10 +3149,12 @@ impl GitPanel {
                     .disabled(self.staging)
                     .on_click(cx.listener(|this, _, window, cx| this.refresh(window, cx))),
                 )
+                .child(self.remote_control("git-remote-menu-center", cx))
             })
             .when_some(self.comparison_control(cx), |row, control| {
                 row.child(div().min_w_0().child(control))
             })
+            .child(self.management_control(cx))
             .child(div().flex_1().min_w_0())
             .when(has_changes, |row| {
                 row.when(!compact, |row| {

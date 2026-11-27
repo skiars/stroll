@@ -271,6 +271,12 @@ dialogs in a Wayland window after changes to paint order or focus handling.
 - The editor can reveal a caret with context once the target row has been wrapped and
   laid out. Inline hunk jumps can anchor to the virtual deletion block. The workspace
   definition jump test covers a newly opened buffer, soft wrapping, and EOF.
+- Both halves of a split button use the same standard height, including custom pixel sizes.
+  Run `cargo test --release --locked --lib git_push_reviews_edits_to_the_destination`
+  to check the split control in the Git toolbar.
+- Managed tooltips use the active dialog's layer, and changing dialogs clears tooltips from the
+  previous surface. Custom anchored popups can use the same focus-based priority as dropdowns.
+  Run `cargo test --release --locked --test tooltips` for tooltip timing and dialog paint order.
 - Mouse-triggered tooltips and editor hovers validate their original target after layout.
   A target moved under a stationary pointer waits for a pointer move. The release tests
   `editor_hover_waits_for_pointer_motion_after_scrolling` and

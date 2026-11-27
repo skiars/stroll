@@ -123,6 +123,7 @@ pub struct TooltipRequest {
     build: TooltipBuilder,
     trigger_bounds: Bounds<Pixels>,
     preferred_placement: Option<Placement>,
+    priority: usize,
     show_delay: Option<Duration>,
     restart_delay: bool,
     positioner: Option<Rc<dyn Fn() -> Positioner>>,
@@ -139,6 +140,7 @@ impl TooltipRequest {
             build: Rc::new(build),
             trigger_bounds,
             preferred_placement: None,
+            priority: TOOLTIP_PRIORITY,
             show_delay: None,
             restart_delay: false,
             positioner: None,
@@ -150,6 +152,12 @@ impl TooltipRequest {
     /// Prefers a side for the tooltip, falling back when it does not fit.
     pub fn with_placement(mut self, placement: Placement) -> Self {
         self.preferred_placement = Some(placement);
+        self
+    }
+
+    /// Paint the tooltip above the layer containing its trigger.
+    pub fn above_layer(mut self, priority: usize) -> Self {
+        self.priority = self.priority.max(priority.saturating_add(1));
         self
     }
 
@@ -320,11 +328,15 @@ impl TooltipOverlay {
     }
 
     /// Updates the current trigger's anchor without restarting its delay or motion.
-    pub fn refresh_trigger(&mut self, request: TooltipRequest, cx: &mut Context<Self>) {
-        if self.pending.is_some() {
-            self.pending = Some(request);
-        } else if self.content.is_some() && !self.leaving {
-            self.content = Some(request);
+    pub fn refresh_trigger(&mut self, mut request: TooltipRequest, cx: &mut Context<Self>) {
+        if let Some(pending) = self.pending.as_mut() {
+            request.priority = pending.priority;
+            *pending = request;
+        } else if !self.leaving
+            && let Some(content) = self.content.as_mut()
+        {
+            request.priority = content.priority;
+            *content = request;
             cx.notify();
         }
     }
@@ -374,6 +386,17 @@ impl TooltipOverlay {
         self.motion
             .get_or_insert_with(|| crate::PopupMotion::new(crate::PopupMotionKind::Hover, now))
             .retarget(true, now);
+    }
+
+    /// Dismiss tips immediately when their containing surface changes.
+    pub fn clear(&mut self, cx: &mut Context<Self>) {
+        self.hide(cx);
+        if self.content.take().is_some() {
+            self.motion = None;
+            self.previous_bounds = None;
+            self.is_switching = false;
+            cx.notify();
+        }
     }
 
     pub fn hide(&mut self, cx: &mut Context<Self>) {
@@ -488,7 +511,7 @@ impl Render for TooltipOverlay {
                     self.leaving || content.paint_only,
                 )),
         )
-        .with_priority(TOOLTIP_PRIORITY)
+        .with_priority(content.priority)
         .into_any_element()
     }
 }

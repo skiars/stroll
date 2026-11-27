@@ -198,6 +198,7 @@ impl RenderOnce for DropdownButton {
                         .when(self.outline, |this| this.outline())
                         .with_size(size)
                         .with_variant(variant)
+                        .when(joined, |this| this.h(Button::standard_height(size)))
                         .when(is_ghost, |this| {
                             this.hover_group(HALVES_GROUP)
                                 .hover_group_held(is_menu_open)

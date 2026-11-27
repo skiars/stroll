@@ -4,6 +4,7 @@ mod blame;
 mod changes;
 mod history;
 mod history_edit;
+mod management;
 mod operations;
 mod repo;
 pub(crate) mod watch;
@@ -13,6 +14,7 @@ pub(crate) use blame::*;
 pub(crate) use changes::*;
 pub(crate) use history::*;
 pub(crate) use history_edit::*;
+pub(crate) use management::*;
 pub(crate) use operations::*;
 #[cfg(feature = "desktop")]
 pub(crate) use repo::GitSession;
@@ -265,6 +267,142 @@ impl Backend {
             }
             None => local(&self.root),
         }
+    }
+
+    pub fn management(&self) -> Result<Management> {
+        if let Some(ssh) = &self.ssh {
+            let version = crate::remote::GIT_MANAGEMENT_VERSION;
+            anyhow::ensure!(
+                ssh.call::<u32>(crate::remote::Request::Hello(version)).ok() == Some(version),
+                t!("git.upgrade_management")
+            );
+            ssh.call(crate::remote::Request::GitManagement)
+        } else {
+            git_management(&self.root)
+        }
+    }
+
+    pub fn compare_upstream(&self, source: String, upstream: String) -> Result<UpstreamComparison> {
+        if let Some(ssh) = &self.ssh {
+            let version = crate::remote::GIT_MANAGEMENT_VERSION;
+            anyhow::ensure!(
+                ssh.call::<u32>(crate::remote::Request::Hello(version)).ok() == Some(version),
+                t!("git.upgrade_management")
+            );
+            ssh.call(crate::remote::Request::CompareUpstream(source, upstream))
+        } else {
+            compare_upstream(&self.root, &source, &upstream)
+        }
+    }
+
+    pub fn push_options(&self, source: String) -> Result<PushOptions> {
+        self.push_review_request(
+            crate::remote::Request::PushOptions(source.clone()),
+            |root| push_options(root, &source),
+        )
+    }
+
+    pub fn push_branches(&self, remote: String) -> Result<Vec<String>> {
+        let branches = match &self.ssh {
+            Some(ssh) => {
+                let version = crate::remote::PUSH_BRANCHES_VERSION;
+                if ssh.call::<u32>(crate::remote::Request::Hello(version)).ok() == Some(version) {
+                    ssh.call(crate::remote::Request::PushBranches(remote.clone()))
+                        .ok()
+                } else {
+                    None
+                }
+            }
+            None => push_branches(&self.root, &remote).ok(),
+        };
+        if let Some(branches) = branches {
+            return Ok(branches);
+        }
+        let prefix = format!("refs/remotes/{remote}/");
+        Ok(self
+            .history()?
+            .branches
+            .into_iter()
+            .filter_map(|branch| {
+                branch
+                    .reference
+                    .strip_prefix(&prefix)
+                    .map(ToOwned::to_owned)
+            })
+            .collect())
+    }
+
+    pub fn preview_push(&self, target: PushTarget) -> Result<PushPreview> {
+        self.push_review_request(
+            crate::remote::Request::PreviewPush(target.clone()),
+            |root| preview_push(root, target),
+        )
+    }
+
+    fn push_review_request<T: serde::de::DeserializeOwned>(
+        &self,
+        request: crate::remote::Request,
+        local: impl FnOnce(&Path) -> Result<T>,
+    ) -> Result<T> {
+        if let Some(ssh) = &self.ssh {
+            let version = crate::remote::PUSH_REVIEW_VERSION;
+            anyhow::ensure!(
+                ssh.call::<u32>(crate::remote::Request::Hello(version)).ok() == Some(version),
+                t!("git.upgrade_push_review")
+            );
+            ssh.call(request)
+        } else {
+            local(&self.root)
+        }
+    }
+
+    pub fn preview_worktree_removal(
+        &self,
+        path: &Path,
+        reference: &str,
+    ) -> Result<WorktreeRemovalPreview> {
+        if let Some(ssh) = &self.ssh {
+            let version = crate::remote::WORKTREE_REMOVAL_PREVIEW_VERSION;
+            anyhow::ensure!(
+                ssh.call::<u32>(crate::remote::Request::Hello(version)).ok() == Some(version),
+                t!("git.upgrade_management")
+            );
+            ssh.call(crate::remote::Request::PreviewWorktreeRemoval(
+                path.to_owned(),
+                reference.to_owned(),
+            ))
+        } else {
+            preview_worktree_removal(&self.root, path, reference)
+        }
+    }
+
+    pub fn manage(&self, operation: ManageGit) -> Result<()> {
+        let result = if let Some(ssh) = &self.ssh {
+            let version = if matches!(&operation, ManageGit::PushReviewed { .. }) {
+                crate::remote::PUSH_REVIEW_VERSION
+            } else if matches!(&operation, ManageGit::RemoveReviewedTree(_)) {
+                crate::remote::WORKTREE_REMOVAL_PREVIEW_VERSION
+            } else if matches!(
+                &operation,
+                ManageGit::RemoveTree {
+                    mode: WorktreeRemoval::Discard | WorktreeRemoval::MissingDirectory,
+                    ..
+                }
+            ) {
+                crate::remote::WORKTREE_REMOVAL_VERSION
+            } else {
+                crate::remote::GIT_MANAGEMENT_VERSION
+            };
+            anyhow::ensure!(
+                ssh.call::<u32>(crate::remote::Request::Hello(version)).ok() == Some(version),
+                t!("git.upgrade_management")
+            );
+            ssh.call(crate::remote::Request::ManageGit(operation))
+        } else {
+            manage_git(&self.root, operation)
+        };
+        self.invalidate();
+        result
     }
 
     pub fn disconnected(&self) -> bool {

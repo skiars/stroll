@@ -86,12 +86,22 @@ pub(super) fn path_from_git(bytes: &[u8]) -> Result<OsString> {
     }
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct Worktree {
     pub(crate) root: PathBuf,
     pub(crate) reference: String,
     pub(crate) main: bool,
     pub(crate) available: bool,
+    #[serde(default)]
+    pub(crate) locked: bool,
+    #[serde(default)]
+    pub(crate) branch: Option<String>,
+    #[serde(default)]
+    pub(crate) head: Option<String>,
+    #[serde(default)]
+    pub(crate) missing: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) prunable: Option<String>,
 }
 
 impl Repository {
@@ -107,7 +117,7 @@ impl Repository {
     }
 }
 
-pub(super) fn local_worktrees(root: &Path) -> Result<Vec<Worktree>> {
+pub(crate) fn local_worktrees(root: &Path) -> Result<Vec<Worktree>> {
     let output = git(root, &["worktree", "list", "--porcelain", "-z"])?;
     let mut records = output.split(|byte| *byte == 0).peekable();
     let mut worktrees = Vec::new();
@@ -120,29 +130,45 @@ pub(super) fn local_worktrees(root: &Path) -> Result<Vec<Worktree>> {
         let mut branch = None;
         let mut head = None;
         let mut bare = false;
-        let mut prunable = false;
+        let mut prunable = None;
+        let mut locked = false;
         while records.peek().is_some_and(|field| !field.is_empty()) {
             let field = records.next().expect("peeked worktree field");
             if let Some(name) = field.strip_prefix(b"branch refs/heads/") {
                 branch = Some(String::from_utf8_lossy(name).into_owned());
             } else if let Some(oid) = field.strip_prefix(b"HEAD ") {
-                head = Some(String::from_utf8_lossy(&oid[..oid.len().min(7)]).into_owned());
+                head = Some(String::from_utf8_lossy(oid).into_owned());
             } else if field == b"bare" {
                 bare = true;
-            } else if field.starts_with(b"prunable") {
-                prunable = true;
+            } else if field == b"prunable" || field.starts_with(b"prunable ") {
+                let reason = field.strip_prefix(b"prunable ").unwrap_or_default();
+                prunable = Some(String::from_utf8_lossy(reason).into_owned());
+            } else if field == b"locked" || field.starts_with(b"locked ") {
+                locked = true;
             }
         }
         if !bare {
-            let available = !prunable && path.is_dir();
+            let available = prunable.is_none() && path.is_dir();
+            let missing = path
+                .symlink_metadata()
+                .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound);
             worktrees.push(Worktree {
-                root: path.canonicalize().unwrap_or(path),
+                root: if available {
+                    path.canonicalize().unwrap_or(path)
+                } else {
+                    path
+                },
+                branch: branch.as_ref().map(|name| format!("refs/heads/{name}")),
+                locked,
+                missing,
+                head: head.clone(),
                 reference: branch.unwrap_or_else(|| match head {
-                    Some(oid) => format!("HEAD · {oid}"),
+                    Some(oid) => format!("HEAD · {}", oid.get(..7).unwrap_or(&oid)),
                     None => "HEAD".into(),
                 }),
                 main: first,
                 available,
+                prunable,
             });
         }
         first = false;

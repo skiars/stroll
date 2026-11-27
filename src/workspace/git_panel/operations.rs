@@ -28,6 +28,7 @@ impl GitPanel {
 
     pub(super) fn writes_busy(&self, cx: &App) -> bool {
         self.staging
+            || self.management_busy
             || self
                 .workspace
                 .read_with(cx, |workspace, _| {

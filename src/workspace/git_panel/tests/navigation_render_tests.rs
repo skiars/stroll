@@ -1937,3 +1937,473 @@ fn narrow_worktree_summary_commits_and_expands_the_full_message_inline() {
     settle(visual);
     assert_eq!(visual.debug_bounds("git-commit-message"), Some(preview));
 }
+
+#[::core::prelude::v1::test]
+fn git_management_removes_a_worktree_and_keeps_its_branch_in_the_branch_tab() {
+    let fixture = tempfile::tempdir().unwrap();
+    let root = fixture.path().join("repo");
+    let linked = fixture.path().join("linked");
+    fs::create_dir(&root).unwrap();
+    git(&root, &["init", "-qb", "main"]);
+    git(&root, &["commit", "--allow-empty", "-qm", "Initial"]);
+    git(
+        &root,
+        &["worktree", "add", "-qb", "topic", linked.to_str().unwrap()],
+    );
+
+    let untracked = linked.join("local.txt");
+
+    let mut app = TestAppContext::build_with_text_system(
+        TestDispatcher::new(0),
+        None,
+        gpui_platform::current_platform(true).text_system(),
+    );
+    app.update(gpui_component::init);
+    let store = Arc::new(Store::new(fixture.path().join("state")).unwrap());
+    let config = crate::config::ConfigFile::load(Some(fixture.path().join("config.toml")));
+    let mut workspace = None;
+    let (_, visual) = app.add_window_view(|window, cx| {
+        let view =
+            cx.new(|cx| Workspace::with_config(store, config, WorkspaceView::Git, window, cx));
+        workspace = Some(view.clone());
+        gpui_component::Root::new(view, window, cx)
+    });
+    let workspace = workspace.unwrap();
+    visual.simulate_resize(size(px(960.), px(680.)));
+    visual.update(|window, cx| {
+        workspace.update(cx, |workspace, cx| {
+            workspace.open_repository(
+                Location {
+                    root: root.clone(),
+                    file: None,
+                },
+                window,
+                cx,
+            );
+        });
+    });
+    settle(visual);
+    let click = |visual: &mut VisualTestContext, selector| {
+        let center = visual.debug_bounds(selector).unwrap().center();
+        visual.simulate_click(center, Modifiers::default());
+        settle(visual);
+    };
+    for mode in [
+        gpui_component::ThemeMode::Light,
+        gpui_component::ThemeMode::Dark,
+    ] {
+        visual.update(|_, cx| crate::workspace::apply_theme(mode, cx));
+        settle(visual);
+        let comparison = visual.debug_bounds("git-worktree-mode").unwrap();
+        let management = visual.debug_bounds("git-management").unwrap();
+        assert_eq!(comparison.top(), management.top());
+        assert_eq!(comparison.bottom(), management.bottom());
+        assert!(comparison.right() < management.left());
+
+        click(visual, "git-management");
+        assert!(visual.debug_bounds("git-management-trees").is_some());
+        assert!(visual.debug_bounds("git-management-branches").is_some());
+        let remove = visual.debug_bounds("git-worktree-remove:1").unwrap();
+        visual.simulate_mouse_move(remove.center(), None, Modifiers::default());
+        settle(visual);
+        visual.update(|window, _| {
+            let bounds = remove.scale(window.scale_factor());
+            let danger = Palette::for_mode(mode).danger;
+            assert!(window.painted_quads().iter().any(|quad| {
+                quad.bounds == bounds && quad.background.as_solid() == Some(danger.alpha(0.12))
+            }));
+        });
+        click(visual, "git-management-close");
+    }
+
+    click(visual, "git-management");
+    click(visual, "git-worktree-remove:0");
+    assert!(visual.debug_bounds("git-management-apply").is_none());
+    click(visual, "git-worktree-remove:1");
+    assert!(
+        visual
+            .debug_bounds("git-worktree-removal-details")
+            .is_some()
+    );
+    assert!(linked.is_dir());
+    fs::write(&untracked, "untracked\n").unwrap();
+    fs::write(root.join(".git/info/exclude"), "ignored.tmp\n").unwrap();
+    let ignored = linked.join("ignored.tmp");
+    fs::write(&ignored, "ignored\n").unwrap();
+    click(visual, "git-management-apply");
+    assert!(untracked.is_file());
+    assert!(
+        visual
+            .debug_bounds("git-worktree-removal-entries")
+            .is_some()
+    );
+    click(visual, "git-management-cancel");
+    assert!(untracked.is_file());
+    assert!(ignored.is_file());
+    click(visual, "git-worktree-remove:1");
+    click(visual, "git-management-apply");
+    assert!(!linked.exists());
+    git(&root, &["show-ref", "--verify", "refs/heads/topic"]);
+
+    click(visual, "git-management-branches");
+    click(visual, "git-branch-delete:1");
+    assert!(visual.debug_bounds("git-management-apply").is_none());
+    assert!(
+        !Command::new("git")
+            .arg("-C")
+            .arg(&root)
+            .args(["show-ref", "--verify", "--quiet", "refs/heads/topic"])
+            .status()
+            .unwrap()
+            .success()
+    );
+
+    let stale = fixture.path().join("stale");
+    git(
+        &root,
+        &["worktree", "add", "--detach", stale.to_str().unwrap()],
+    );
+    git(&stale, &["commit", "--allow-empty", "-qm", "Detached work"]);
+    fs::remove_file(stale.join(".git")).unwrap();
+    fs::write(stale.join("local.txt"), "keep").unwrap();
+
+    click(visual, "git-management-close");
+    click(visual, "git-management");
+    click(visual, "git-worktree-remove:1");
+    assert!(
+        visual
+            .debug_bounds("git-worktree-removal-entries")
+            .is_some()
+    );
+    assert!(stale.join("local.txt").is_file());
+    click(visual, "git-management-apply");
+    assert!(!stale.exists());
+    assert_eq!(
+        fs::read_to_string(fixture.path().join("stale.stroll-saved/local.txt")).unwrap(),
+        "keep"
+    );
+    assert!(visual.debug_bounds("git-worktree-remove:1").is_none());
+}
+
+#[::core::prelude::v1::test]
+fn git_push_reviews_edits_to_the_destination_and_pull_runs_directly() {
+    let fixture = tempfile::tempdir().unwrap();
+    let root = fixture.path().join("repo");
+    let origin = fixture.path().join("origin");
+    let backup = fixture.path().join("backup");
+    let peer = fixture.path().join("peer");
+    for path in [&root, &origin, &backup] {
+        fs::create_dir(path).unwrap();
+    }
+    git(&root, &["init", "-qb", "main"]);
+    git(&origin, &["init", "--bare", "-qb", "main"]);
+    git(&backup, &["init", "--bare", "-qb", "main"]);
+    git(&root, &["commit", "--allow-empty", "-qm", "Initial"]);
+    git(
+        &root,
+        &["remote", "add", "origin", origin.to_str().unwrap()],
+    );
+    git(
+        &root,
+        &["remote", "add", "backup", backup.to_str().unwrap()],
+    );
+    git(&root, &["push", "--set-upstream", "origin", "main"]);
+    git(
+        &root,
+        &[
+            "clone",
+            "-q",
+            origin.to_str().unwrap(),
+            peer.to_str().unwrap(),
+        ],
+    );
+    fs::write(peer.join("pulled.txt"), "Fast-forward change\n").unwrap();
+    git(&peer, &["add", "pulled.txt"]);
+    git(&peer, &["commit", "-qm", "Pull this commit"]);
+    git(&peer, &["push", "origin", "main"]);
+
+    let mut app = TestAppContext::build_with_text_system(
+        TestDispatcher::new(0),
+        None,
+        gpui_platform::current_platform(true).text_system(),
+    );
+    app.update(|cx| {
+        gpui_component::init(cx);
+        cx.set_reduce_motion(true);
+    });
+    let store = Arc::new(Store::new(fixture.path().join("state")).unwrap());
+    let config = crate::config::ConfigFile::load(Some(fixture.path().join("config.toml")));
+    let mut workspace = None;
+    let (_, visual) = app.add_window_view(|window, cx| {
+        let view =
+            cx.new(|cx| Workspace::with_config(store, config, WorkspaceView::Git, window, cx));
+        workspace = Some(view.clone());
+        gpui_component::Root::new(view, window, cx)
+    });
+    let workspace = workspace.unwrap();
+    visual.simulate_resize(size(px(1000.), px(480.)));
+    visual.update(|window, cx| {
+        workspace.update(cx, |workspace, cx| {
+            workspace.open_repository(
+                Location {
+                    root: root.clone(),
+                    file: None,
+                },
+                window,
+                cx,
+            );
+        });
+    });
+    settle(visual);
+    let click = |visual: &mut VisualTestContext, selector| {
+        let center = visual.debug_bounds(selector).unwrap().center();
+        visual.simulate_click(center, Modifiers::default());
+        settle(visual);
+    };
+    let (remote_menu, push_button) = if visual.debug_bounds("git-remote-menu").is_some() {
+        ("git-remote-menu", "git-remote-menu-push")
+    } else {
+        ("git-remote-menu-center", "git-remote-menu-center-push")
+    };
+    let click_remote_menu = |visual: &mut VisualTestContext| {
+        let split = visual.debug_bounds(remote_menu).unwrap();
+        let push = visual.debug_bounds(push_button).unwrap();
+        assert_eq!(split.size.height, px(24.));
+        assert_eq!(push.top(), split.top());
+        assert_eq!(push.bottom(), split.bottom());
+        assert!(push.right() < split.right());
+        visual.simulate_click(
+            point(split.right() - px(8.), split.center().y),
+            Modifiers::default(),
+        );
+        settle(visual);
+        assert!(visual.debug_bounds("popup-menu-surface").is_some());
+    };
+    let menu_icons = Rc::new(std::cell::RefCell::new(BTreeSet::new()));
+    visual.update(|_, cx| {
+        let menu_icons = menu_icons.clone();
+        gpui_component::set_icon_resolver(cx, move |path, _| {
+            menu_icons.borrow_mut().insert(path.to_owned());
+            None
+        });
+    });
+    click_remote_menu(visual);
+    for icon in [
+        "cloud-download",
+        "download",
+        "git-compare-arrows",
+        "link-2",
+        "server",
+    ] {
+        assert!(
+            menu_icons.borrow().contains(&format!("icons/{icon}.svg")),
+            "{icon}"
+        );
+    }
+    visual.update(|_, cx| gpui_component::set_icon_resolver(cx, |_, _| None));
+    visual.simulate_keystrokes("down down enter");
+    settle(visual);
+    assert!(root.join("pulled.txt").is_file());
+    assert!(visual.debug_bounds("git-management-apply").is_none());
+
+    fs::write(root.join("local.txt"), "Local change\n").unwrap();
+    git(&root, &["add", "local.txt"]);
+    git(&root, &["commit", "-qm", "Push this commit"]);
+    git(
+        &peer,
+        &[
+            "push",
+            backup.to_str().unwrap(),
+            "HEAD:refs/heads/main",
+            "HEAD:refs/heads/rel-archive",
+        ],
+    );
+    git(
+        &peer,
+        &["commit", "--allow-empty", "-qm", "Alternate branch change"],
+    );
+    git(
+        &peer,
+        &["push", backup.to_str().unwrap(), "HEAD:refs/heads/release"],
+    );
+    visual.update(|window, cx| {
+        let panel = workspace.read(cx).git.clone().unwrap();
+        panel.update(cx, |panel, cx| panel.refresh(window, cx));
+    });
+    settle(visual);
+
+    let select_branch_text = |visual: &mut VisualTestContext| {
+        let branch = visual.debug_bounds("git-push-branch").unwrap();
+        visual.simulate_click(
+            point(branch.center().x, branch.bottom() - px(8.)),
+            Modifiers::default(),
+        );
+        #[cfg(target_os = "macos")]
+        visual.simulate_keystrokes("cmd-a");
+        #[cfg(not(target_os = "macos"))]
+        visual.simulate_keystrokes("ctrl-a");
+    };
+    let update_preview = |visual: &mut VisualTestContext, name| {
+        select_branch_text(visual);
+        visual.simulate_input(name);
+        visual.run_until_parked();
+        visual.executor().advance_clock(Duration::from_millis(500));
+        settle(visual);
+    };
+
+    let push = visual.debug_bounds(push_button).unwrap().center();
+    // Render before the test executor runs the first preview request.
+    visual.update(|window, cx| {
+        window.dispatch_event(
+            PlatformInput::MouseDown(MouseDownEvent {
+                position: push,
+                button: MouseButton::Left,
+                click_count: 1,
+                ..Default::default()
+            }),
+            cx,
+        );
+        window.dispatch_event(
+            PlatformInput::MouseUp(MouseUpEvent {
+                position: push,
+                button: MouseButton::Left,
+                click_count: 1,
+                ..Default::default()
+            }),
+            cx,
+        );
+    });
+    visual.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(visual.debug_bounds("git-push-preview").is_none());
+    let pending_footer = visual.debug_bounds("git-push-footer").unwrap();
+    settle(visual);
+    assert_eq!(visual.debug_bounds("git-push-footer"), Some(pending_footer));
+    update_preview(visual, "preview-only");
+    let hint = visual.debug_bounds("git-push-new-target").unwrap();
+    let field = visual.debug_bounds("git-push-branch").unwrap();
+    assert!(hint.left() >= field.right());
+    assert!((hint.center().y - field.center().y).abs() < px(1.));
+    update_preview(visual, "invalid branch");
+    assert!(visual.debug_bounds("git-push-error").is_some());
+    click(visual, "git-push-cancel");
+    click(visual, push_button);
+    click(visual, "git-push-cancel");
+    // Reopening advances the modal layer id. Both mouse and keyboard completion must still work.
+    click(visual, push_button);
+    let dialog = visual.debug_bounds("dialog-0").unwrap();
+    assert_eq!(dialog.size.width, px(620.));
+    assert!(dialog.top() >= px(79.));
+    let commit_panel = visual.debug_bounds("git-push-commits-panel").unwrap();
+    let file_panel = visual.debug_bounds("git-push-files-panel").unwrap();
+    assert!(commit_panel.size.width < file_panel.size.width);
+    assert_eq!(commit_panel.top(), file_panel.top());
+    assert_eq!(commit_panel.bottom(), file_panel.bottom());
+    assert!(commit_panel.size.height >= px(120.));
+    assert!(
+        (visual.debug_bounds("git-push-force").unwrap().center().y
+            - visual.debug_bounds("git-push-apply").unwrap().center().y)
+            .abs()
+            < px(1.)
+    );
+    assert!(
+        (visual
+            .debug_bounds("git-push-upstream-field")
+            .unwrap()
+            .center()
+            .y
+            - visual.debug_bounds("git-push-cancel").unwrap().center().y)
+            .abs()
+            < px(1.)
+    );
+    let remote = visual.debug_bounds("git-push-remote").unwrap();
+    let arrow = visual.debug_bounds("git-push-target-arrow").unwrap();
+    let field = visual.debug_bounds("git-push-branch").unwrap();
+    assert!(remote.right() <= arrow.left() && arrow.right() <= field.left());
+    assert!((remote.center().y - field.center().y).abs() < px(1.));
+    let commit = visual.debug_bounds("git-push-commit:0").unwrap();
+    visual.simulate_mouse_move(commit.center(), None, Modifiers::default());
+    visual.run_until_parked();
+    visual.executor().advance_clock(Duration::from_secs(1));
+    settle(visual);
+    visual.update(|window, cx| {
+        let row = commit.scale(window.scale_factor());
+        let fill: Background = cx.theme().popover.alpha(0.5).into();
+        let tooltip = window
+            .painted_quads()
+            .into_iter()
+            .rev()
+            .find(|quad| quad.background == fill)
+            .expect("the outgoing commit tooltip must be painted above the dialog");
+        let scale = window.scale_factor();
+        let left_offset = (tooltip.bounds.left().0 - row.left().0) / scale;
+        let gap = (tooltip.bounds.top().0 - row.bottom().0) / scale;
+        assert!(
+            left_offset.abs() <= 1.,
+            "tooltip left offset: {left_offset}"
+        );
+        assert!(
+            (3. ..=5.).contains(&gap),
+            "tooltip gap below the row: {gap}"
+        );
+    });
+    assert!(visual.debug_bounds("git-push-file:0").is_some());
+    assert!(visual.debug_bounds("git-push-overwrite-warning").is_none());
+
+    click(visual, "git-push-remote");
+    visual.simulate_keystrokes("down enter");
+    settle(visual);
+    let previous_preview = visual.debug_bounds("git-push-preview").unwrap();
+    select_branch_text(visual);
+    visual.simulate_input("rel");
+    visual.run_until_parked();
+    draw_frame(visual);
+    assert_eq!(
+        visual.debug_bounds("git-push-preview"),
+        Some(previous_preview)
+    );
+    assert_eq!(visual.debug_bounds("dialog-0"), Some(dialog));
+    assert!(
+        visual
+            .debug_bounds("git-push-branch-option:release")
+            .is_some()
+    );
+    assert!(
+        visual
+            .debug_bounds("git-push-branch-option:rel-archive")
+            .is_some()
+    );
+    click(visual, "git-push-branch-option:rel-archive");
+    assert!(
+        visual
+            .debug_bounds("git-push-branch-option:release")
+            .is_none()
+    );
+    assert!(visual.debug_bounds("git-push-overwrite-warning").is_none());
+    select_branch_text(visual);
+    visual.simulate_input("rel");
+    visual.simulate_keystrokes("down down enter");
+    settle(visual);
+    let updated = visual.debug_bounds("dialog-0").unwrap();
+    assert!((updated.top() - dialog.top()).abs() <= px(1.));
+    assert!(updated.size.height > dialog.size.height);
+    assert!(visual.debug_bounds("git-push-overwrite-warning").is_some());
+    click(visual, "git-push-apply");
+    assert!(visual.debug_bounds("git-push-dialog").is_some());
+    click(visual, "git-push-force");
+    click(visual, "git-push-apply");
+    assert!(visual.debug_bounds("git-push-dialog").is_none());
+
+    let tip = |repo: &Path, name| {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(["rev-parse", name])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        output.stdout
+    };
+    assert_eq!(tip(&backup, "release"), tip(&root, "main"));
+    assert_ne!(tip(&backup, "main"), tip(&root, "main"));
+    assert_ne!(tip(&origin, "main"), tip(&root, "main"));
+}

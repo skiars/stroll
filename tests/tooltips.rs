@@ -8,7 +8,7 @@ use gpui::{
     Styled as _, TestAppContext, VisualTestContext, Window, div, point, px, rgb,
 };
 use gpui_component::{
-    Placement, Root,
+    Placement, Root, WindowExt as _,
     tooltip::{ManagedTooltipExt as _, Tooltip},
 };
 
@@ -126,4 +126,63 @@ fn restarting_tooltips_wait_on_every_entry() {
         "the swapped tooltip must sit below the trigger: {tooltip:?}"
     );
     assert_hidden(&mut cx, 0);
+}
+
+#[test]
+fn modal_tooltip_paints_above_the_dialog_and_clears_between_surfaces() {
+    const MODAL_COLOR: u32 = 0x193457;
+    let mut app = TestAppContext::build_with_text_system(
+        gpui::TestDispatcher::new(0),
+        None,
+        test_support::text_system(cfg!(target_os = "linux")),
+    );
+    let mut cx = open(&mut app);
+    cx.simulate_mouse_move(point(px(50.), px(25.)), None, Default::default());
+    wait(&mut cx);
+    assert_shown(&mut cx, 0);
+
+    cx.update(|window, cx| {
+        window.open_dialog(cx, |dialog, _, _| {
+            dialog
+                .margin_top(px(60.))
+                .width(px(320.))
+                .bg(rgb(MODAL_COLOR))
+                .child(
+                    div().h(px(150.)).child(
+                        div()
+                            .id("modal-tooltip-trigger")
+                            .debug_selector(|| "modal-tooltip-trigger".into())
+                            .w(px(60.))
+                            .h(px(25.))
+                            .managed_tooltip_at(Placement::Bottom, |_, cx| {
+                                cx.new(|_| Tooltip::new("modal-tip").bg(rgb(TOOLTIP_COLORS[1])))
+                                    .into()
+                            }),
+                    ),
+                )
+        });
+    });
+    draw(&mut cx);
+    assert_hidden(&mut cx, 0);
+    let trigger = cx.debug_bounds("modal-tooltip-trigger").unwrap().center();
+    cx.simulate_mouse_move(trigger, None, Default::default());
+    wait(&mut cx);
+    cx.update(|window, _| {
+        let quads = window.painted_quads();
+        let dialog_fill: gpui::Background = rgb(MODAL_COLOR).into();
+        let tip_fill: gpui::Background = rgb(TOOLTIP_COLORS[1]).into();
+        let dialog = quads
+            .iter()
+            .position(|quad| quad.background == dialog_fill)
+            .unwrap();
+        let tip = quads
+            .iter()
+            .position(|quad| quad.background == tip_fill)
+            .unwrap();
+        assert!(quads[dialog].bounds.intersects(&quads[tip].bounds));
+        assert!(dialog < tip, "the modal must paint before its tooltip");
+    });
+
+    cx.update(|window, cx| window.close_dialog(cx));
+    assert_hidden(&mut cx, 1);
 }

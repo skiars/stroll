@@ -6,6 +6,7 @@ mod graph;
 mod history_edit;
 mod history_preview;
 mod history_rows;
+mod management;
 mod operations;
 mod review;
 mod revisions;
@@ -34,7 +35,7 @@ use gpui_component::{
     menu::{ContextMenuExt as _, PopupMenu, PopupMenuItem},
     resizable::HandleEdge,
     scroll::{Scrollbar, ScrollbarMode},
-    select::{SearchableVec, Select, SelectEvent, SelectItem, SelectState},
+    select::{SearchableVec, Select, SelectEvent, SelectGroup, SelectItem, SelectState},
     tooltip::{ManagedTooltipExt as _, Tooltip},
     v_flex,
 };
@@ -95,7 +96,7 @@ fn diff_anchor(position: &DiffPosition) -> DiffViewportAnchor {
     )
 }
 
-type Branches = SearchableVec<Choice>;
+type Branches = SearchableVec<SelectGroup<Choice>>;
 
 fn worktree_counts(status: &git::WorktreeStatus) -> (usize, usize, usize) {
     status.values().fold((0, 0, 0), |(s, u, n), file| {
@@ -141,6 +142,9 @@ struct Choice {
     value: String,
     label: SharedString,
     remote: bool,
+    checked_out: bool,
+    upstream: Option<SharedString>,
+    divergence: SharedString,
 }
 
 impl SelectItem for Choice {
@@ -148,12 +152,66 @@ impl SelectItem for Choice {
 
     fn title(&self) -> SharedString {
         if self.value == "HEAD" {
-            t!("git.detached_head").into()
-        } else if self.remote {
-            t!("git.remote_tracking", branch = self.label).into()
+            return t!("git.detached_head").into();
+        }
+        let mut title = self.label.to_string();
+        if let Some(upstream) = &self.upstream {
+            title.push_str(&format!(" · {upstream}{}", self.divergence));
+        }
+        if self.checked_out {
+            title.push_str(&format!(" · {}", t!("git.checked_out")));
+        }
+        title.into()
+    }
+
+    fn display_title(&self) -> Option<AnyElement> {
+        (self.value != "HEAD").then(|| {
+            h_flex()
+                .flex_1()
+                .min_w_0()
+                .gap_1()
+                .child(div().min_w_0().truncate().child(self.label.clone()))
+                .when_some(self.upstream.clone(), |row, upstream| {
+                    row.child(div().min_w_0().truncate().opacity(0.72).child(upstream))
+                        .child(div().flex_shrink_0().child(self.divergence.clone()))
+                })
+                .into_any_element()
+        })
+    }
+
+    fn render(&self, _: &mut Window, cx: &mut App) -> impl IntoElement {
+        let colors = Palette::for_mode(cx.theme().mode);
+        let label = if self.value == "HEAD" {
+            self.title()
         } else {
             self.label.clone()
-        }
+        };
+        v_flex()
+            .min_w_0()
+            .w_full()
+            .child(
+                h_flex()
+                    .gap_2()
+                    .child(div().min_w_0().truncate().child(label))
+                    .when(self.checked_out, |row| {
+                        row.child(
+                            div()
+                                .flex_shrink_0()
+                                .text_color(colors.accent)
+                                .child(t!("git.checked_out")),
+                        )
+                    }),
+            )
+            .when_some(self.upstream.clone(), |row, upstream| {
+                row.child(
+                    h_flex()
+                        .gap_1()
+                        .text_color(colors.muted)
+                        .text_size(GIT_BADGE_SIZE)
+                        .child(div().min_w_0().truncate().child(upstream))
+                        .child(div().flex_shrink_0().child(self.divergence.clone())),
+                )
+            })
     }
 
     fn value(&self) -> &String {
@@ -389,6 +447,7 @@ pub(super) struct GitPanel {
     commits_requests: usize,
     detail_loading: bool,
     staging: bool,
+    management_busy: bool,
     confirm_restore: Option<(String, usize)>,
     whitespace: bool,
     split: bool,
@@ -430,8 +489,9 @@ impl GitPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let branches: Entity<SelectState<Branches>> =
-            cx.new(|cx| SelectState::new(Vec::new().into(), None, window, cx).searchable(true));
+        let branches: Entity<SelectState<Branches>> = cx.new(|cx| {
+            SelectState::new(SearchableVec::new(Vec::new()), None, window, cx).searchable(true)
+        });
         let query = session
             .git
             .as_ref()
@@ -669,6 +729,7 @@ impl GitPanel {
             commits_requests: 0,
             detail_loading: false,
             staging: false,
+            management_busy: false,
             confirm_restore: None,
             whitespace: config.ignore_whitespace,
             split: config.diff_layout == DiffLayout::Split,
@@ -919,6 +980,9 @@ impl GitPanel {
                                 value: "HEAD".into(),
                                 label: SharedString::default(),
                                 remote: false,
+                                checked_out: true,
+                                upstream: None,
+                                divergence: SharedString::default(),
                             });
                         } else if !history
                             .branches
@@ -929,12 +993,38 @@ impl GitPanel {
                                 value: checkout.to_owned(),
                                 label: branch_name(checkout).to_owned().into(),
                                 remote: false,
+                                checked_out: true,
+                                upstream: None,
+                                divergence: SharedString::default(),
                             });
                         }
-                        items.extend(history.branches.iter().map(|branch| Choice {
-                            value: branch.reference.clone(),
-                            label: branch.label.clone().into(),
-                            remote: branch.remote,
+                        items.extend(history.branches.iter().map(|branch| {
+                            Choice {
+                                value: branch.reference.clone(),
+                                label: branch.label.clone().into(),
+                                remote: branch.remote,
+                                checked_out: branch.reference == checkout,
+                                upstream: branch.tracking.as_ref().map(|tracking| {
+                                    branch_name(&tracking.reference).to_owned().into()
+                                }),
+                                divergence: branch
+                                    .tracking
+                                    .as_ref()
+                                    .map(|tracking| {
+                                        if tracking.gone {
+                                            return format!(" · {}", t!("git.upstream_gone"))
+                                                .into();
+                                        }
+                                        let up = (tracking.ahead > 0)
+                                            .then(|| format!(" ↑{}", tracking.ahead))
+                                            .unwrap_or_default();
+                                        let down = (tracking.behind > 0)
+                                            .then(|| format!(" ↓{}", tracking.behind))
+                                            .unwrap_or_default();
+                                        format!("{up}{down}").into()
+                                    })
+                                    .unwrap_or_default(),
+                            }
                         }));
                         let restore = this
                             .startup_session
@@ -951,7 +1041,17 @@ impl GitPanel {
                         }
                         let selected = this.branch.clone();
                         this.branches.update(cx, |state, cx| {
-                            state.set_items(items.into(), window, cx);
+                            let (remote, local): (Vec<_>, Vec<_>) =
+                                items.into_iter().partition(|item| item.remote);
+                            let groups = [
+                                (t!("git.local_branches"), local),
+                                (t!("git.remote_branches"), remote),
+                            ]
+                            .into_iter()
+                            .filter(|(_, items)| !items.is_empty())
+                            .map(|(title, items)| SelectGroup::new(title).items(items))
+                            .collect::<Vec<_>>();
+                            state.set_items(SearchableVec::new(groups), window, cx);
                             state.set_selected_value(&selected, window, cx);
                         });
                         this.update_history_ref_heights(&history);
@@ -1905,6 +2005,7 @@ impl GitPanel {
                                     cx.listener(|this, _, window, cx| this.refresh(window, cx)),
                                 ),
                             )
+                            .child(self.remote_control("git-remote-menu", cx))
                             .child(
                                 icon_control(
                                     "git-hide-history",
@@ -1926,7 +2027,25 @@ impl GitPanel {
                             .debug_selector(|| "git-branch-picker".into())
                             .w_full()
                             .when(history.is_some() && self.branch != "HEAD", |field| {
-                                let name = SharedString::from(branch_name(&self.branch).to_owned());
+                                let name = history
+                                    .and_then(|history| {
+                                        history
+                                            .branches
+                                            .iter()
+                                            .find(|branch| branch.reference == self.branch)
+                                    })
+                                    .and_then(|branch| branch.tracking.as_ref())
+                                    .map_or_else(
+                                        || branch_name(&self.branch).to_owned(),
+                                        |tracking| {
+                                            format!(
+                                                "{} · {}",
+                                                branch_name(&self.branch),
+                                                branch_name(&tracking.reference)
+                                            )
+                                        },
+                                    );
+                                let name = SharedString::from(name);
                                 field.managed_tooltip(move |window, cx| {
                                     Tooltip::new(name.clone()).build(window, cx)
                                 })
