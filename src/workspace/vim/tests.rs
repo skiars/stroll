@@ -212,6 +212,62 @@ fn vim_k_requests_hover_at_the_caret_and_escape_preserves_visual_mode() -> anyho
 }
 
 #[::core::prelude::v1::test]
+fn vim_insert_escape_closes_hover_and_returns_to_normal() -> anyhow::Result<()> {
+    use lsp_types::{CompletionItem, Hover, HoverContents, MarkedString};
+
+    with_vim_workspace("symbol next\n", |visual, workspace| {
+        visual.simulate_keystrokes("a");
+        draw(visual);
+        let editor =
+            visual.update(|_, cx| workspace.read(cx).active_file().unwrap().editor.clone());
+        visual.update(|_, cx| {
+            editor.update(cx, |editor, cx| {
+                editor.present_hover(
+                    0..6,
+                    Hover {
+                        contents: HoverContents::Scalar(MarkedString::String("Symbol docs".into())),
+                        range: None,
+                    },
+                    cx,
+                );
+                editor.present_completion_items(
+                    0,
+                    "s",
+                    vec![CompletionItem::new_simple("symbol".into(), "Item".into())],
+                    cx,
+                );
+            });
+        });
+        draw(visual);
+        assert!(visual.debug_bounds("status-vim-mode: INSERT").is_some());
+        visual.update(|_, cx| {
+            assert!(editor.read(cx).has_language_hover());
+            assert!(editor.read(cx).completion_menu_state().open);
+        });
+
+        visual.simulate_keystrokes("escape");
+        draw(visual);
+        assert!(visual.debug_bounds("status-vim-mode: INSERT").is_some());
+        visual.update(|_, cx| {
+            assert!(editor.read(cx).has_language_hover());
+            assert!(!editor.read(cx).completion_menu_state().open);
+        });
+
+        visual.simulate_keystrokes("escape");
+        draw(visual);
+        assert!(visual.debug_bounds("status-vim-mode: NORMAL").is_some());
+        visual.update(|_, cx| assert!(!editor.read(cx).has_language_hover()));
+
+        visual.simulate_keystrokes("l");
+        visual.update(|_, cx| {
+            let editor = editor.read(cx);
+            assert_eq!(editor.text().to_string(), "symbol next\n");
+            assert_eq!(editor.cursor(), 1);
+        });
+    })
+}
+
+#[::core::prelude::v1::test]
 fn vim_status_toggle_renders_open_corners_and_a_short_disabled_slash() -> anyhow::Result<()> {
     let renderer = SvgRenderer::new(Arc::new(()));
     let side = (STATUS_ICON_SIZE.as_f32() * 2.) as usize;

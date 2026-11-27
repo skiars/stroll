@@ -6,7 +6,8 @@ use std::{path::PathBuf, time::Duration};
 use gpui::*;
 use gpui_component::{
     ActiveTheme as _, Icon, Sizable as _, StyledExt as _, ThemeStyled as _, WindowExt as _, h_flex,
-    input, v_flex,
+    input::{self, EditorMode, InputModeKind as _},
+    v_flex,
 };
 use rust_i18n::t;
 
@@ -792,21 +793,26 @@ impl Workspace {
     }
 
     pub(super) fn vim_escape(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.vim_source(window, cx).is_some_and(|file| {
-            let editor = file.editor.read(cx);
-            editor.is_composing()
-                || editor.completion_menu_state().open
-                || editor.code_action_menu_state().open
-                || editor.has_language_hover()
-        }) {
-            return;
-        }
         if !self.config.current().keyboard.vim_mode
             || self.locator.open
             || self.repository_overlay_open()
         {
             return;
         }
+        let (path, dismiss_hover) = if let Some(file) = self.vim_source(window, cx) {
+            let editor = file.editor.read(cx);
+            let hover = editor.has_language_hover();
+            if editor.is_composing()
+                || editor.completion_menu_state().open
+                || editor.code_action_menu_state().open
+                || (hover && file.vim.mode() != source::Mode::Insert)
+            {
+                return;
+            }
+            (Some(file.path.clone()), hover)
+        } else {
+            (None, false)
+        };
         if self
             .vim
             .hint
@@ -815,15 +821,20 @@ impl Workspace {
         {
             self.cancel_vim_keys(cx);
             consume(window, cx);
-        } else if self.vim_source(window, cx).is_some() && self.dismiss_active_signature(cx) {
+        } else if !dismiss_hover && path.is_some() && self.dismiss_active_signature(cx) {
             consume(window, cx);
-        } else if self.config.current().keyboard.vim_mode
-            && let Some(path) = self.vim_source(window, cx).map(|file| file.path.clone())
+        } else if let Some(path) = path
             && let Some(file) = self.files.get_mut(&path)
-            && file.vim.escape(&file.editor, window, cx)
         {
-            consume(window, cx);
-            cx.notify();
+            if dismiss_hover {
+                file.editor.update(cx, |editor, cx| {
+                    EditorMode::dismiss_hover(editor, window, cx);
+                });
+            }
+            if file.vim.escape(&file.editor, window, cx) {
+                consume(window, cx);
+                cx.notify();
+            }
         }
     }
 
