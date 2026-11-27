@@ -1837,6 +1837,77 @@ fn hunk_arrows_align_under_the_pointer_across_files_in_both_layouts() {
 }
 
 #[::core::prelude::v1::test]
+fn path_filter_keeps_the_tree_position_and_restores_it_when_cleared() {
+    let fixture = tempfile::tempdir().unwrap();
+    let root = fixture.path().join("repo");
+    fs::create_dir(&root).unwrap();
+    git(&root, &["init", "-qb", "main"]);
+    for index in 0..64 {
+        let tag = if index % 2 == 0 { "even" } else { "odd" };
+        fs::write(root.join(format!("file-{index:02}-{tag}.txt")), "content\n").unwrap();
+    }
+
+    let mut app = TestAppContext::build_with_text_system(
+        TestDispatcher::new(0),
+        None,
+        gpui_platform::current_platform(true).text_system(),
+    );
+    app.update(gpui_component::init);
+    let store = Arc::new(Store::new(fixture.path().join("state")).unwrap());
+    let config = crate::config::ConfigFile::load(Some(fixture.path().join("config.toml")));
+    let (workspace, visual) = app.add_window_view(|window, cx| {
+        Workspace::with_config(store, config, WorkspaceView::Git, window, cx)
+    });
+    visual.simulate_resize(size(px(1280.), px(720.)));
+    visual.simulate_scale_factor_change(1.);
+    visual.update(|window, cx| {
+        workspace.update(cx, |workspace, cx| {
+            workspace.open_repository(Location { root, file: None }, window, cx);
+        });
+    });
+    settle(visual);
+    let panel = visual.update(|_, cx| workspace.read(cx).git.clone().unwrap());
+    visual.update(|_, cx| {
+        panel.update(cx, |panel, cx| panel.set_tree_visible(true, cx));
+    });
+    settle(visual);
+
+    let inset = px(4.);
+    let expected = -21. * ROW_HEIGHT - inset;
+    visual.update(|window, cx| {
+        panel.update(cx, |panel, cx| {
+            let mut tree = panel.tree_scroll.0.borrow_mut();
+            tree.deferred_scroll_to_item = None;
+            tree.base_handle.set_offset(point(px(0.), expected));
+            assert!(tree.base_handle.max_offset().y >= -expected);
+            App::notify(cx, panel.tree_pane.entity_id());
+        });
+        assert_eq!(window.scale_factor(), 1.);
+    });
+    settle(visual);
+    let filter = |visual: &mut VisualTestContext, query: &'static str, expected: Pixels| {
+        visual.update(|window, cx| {
+            let input = panel.read(cx).filter_input.clone();
+            input.update(cx, |input, cx| input.replace_all(query, window, cx));
+        });
+        settle(visual);
+        visual.update(|_, cx| {
+            let panel = panel.read(cx);
+            assert_eq!(panel.filter, query);
+            assert_eq!(
+                panel.tree_scroll.0.borrow().base_handle.offset().y,
+                expected
+            );
+        });
+    };
+    filter(visual, "txt", expected);
+    // The old top row was odd. Its nearest surviving successor is file 22.
+    filter(visual, "even", -11. * ROW_HEIGHT - inset);
+    filter(visual, "no-matches", px(0.));
+    filter(visual, "", expected);
+}
+
+#[::core::prelude::v1::test]
 fn narrow_worktree_summary_commits_and_expands_the_full_message_inline() {
     let fixture = tempfile::tempdir().unwrap();
     let root = fixture.path().join("repo");
@@ -1924,6 +1995,27 @@ fn narrow_worktree_summary_commits_and_expands_the_full_message_inline() {
     let message = visual.update(|_, cx| panel.read(cx).commit_message.read(cx).input_bounds());
     assert!(button.top() >= message.bottom());
     assert!(field.bottom() - button.bottom() <= px(16.));
+    visual.update(|window, cx| {
+        let input = panel.read(cx).commit_message.clone();
+        input.update(cx, |input, cx| {
+            input.set_cursor_position(lsp_types::Position::new(44, 0), window, cx);
+        });
+    });
+    settle(visual);
+    visual.simulate_keystrokes("enter");
+    settle(visual);
+    visual.update(|_, cx| {
+        let input = panel.read(cx).commit_message.read(cx);
+        assert_eq!(input.cursor_position().line, 45);
+        let caret = input.prepaint_caret_geometry().unwrap();
+        let bottom = caret.cursor_bounds().bottom() + caret.scroll_offset().y;
+        assert!(
+            bottom <= viewport.bottom() + px(0.5),
+            "{bottom:?} in {viewport:?}"
+        );
+        assert!(bottom >= viewport.bottom() - caret.line_height());
+    });
+    let button = visual.debug_bounds("git-create-commit").unwrap();
     visual.simulate_event(ScrollEvent {
         position: point(viewport.right() - px(8.), viewport.center().y),
         delta: ScrollDelta::Pixels(point(px(0.), viewport.bottom() - button.bottom() - px(24.))),

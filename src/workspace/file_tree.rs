@@ -654,7 +654,11 @@ impl Workspace {
     fn scroll_tree_row_into_view(&self, index: usize) {
         let inset = if self.config.current().appearance.file_tree_sticky_scroll {
             let viewport = self.tree_scroll.0.borrow().base_handle.bounds();
-            tree_sticky_scroll::row_limit(viewport.size.height).min(self.rows[index].depth)
+            tree_sticky_scroll::row_limit(
+                viewport.size.height,
+                self.tree_motion.borrow().row_height(),
+            )
+            .min(self.rows[index].depth)
         } else {
             0
         };
@@ -1829,6 +1833,44 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[::core::prelude::v1::test]
+    fn tree_rows_keep_their_position_at_fractional_zoom_when_motion_ends() -> Result<()> {
+        let fixture = tempfile::tempdir()?;
+        let (_, workspace, mut visual) = watched_tree(&fixture, WorkspaceView::Editor)?;
+        visual.simulate_scale_factor_change(1.);
+        let row_height = visual.update(|window, cx| {
+            window.set_ui_scale(0.8, cx);
+            assert!((window.scale_factor() - 0.8).abs() < f32::EPSILON);
+            window.pixel_snap(tree_motion::ROW_HEIGHT)
+        });
+        assert_ne!(row_height, tree_motion::ROW_HEIGHT);
+        draw_tree_frame(&mut visual, Duration::ZERO);
+
+        let id = "workspace-tree-row:row-12.md";
+        let closed = visual.debug_bounds(id).unwrap().top();
+        for (expanded, target) in [(true, closed + 5. * row_height), (false, closed)] {
+            visual.update(|window, cx| {
+                workspace.update(cx, |this, cx| {
+                    this.toggle_tree_directory("a".into(), window, cx);
+                });
+            });
+            settle_with_frame_step(&mut visual, &workspace, Duration::ZERO, |this| {
+                tree_row(this, "a/child-3.md").is_some() == expanded
+            });
+            draw_tree_frame(&mut visual, Duration::from_millis(179));
+            let before_end = visual.debug_bounds(id).unwrap().top();
+            draw_tree_frame(&mut visual, Duration::from_millis(1));
+            let after_end = visual.debug_bounds(id).unwrap().top();
+            assert_eq!(before_end, after_end, "expanded: {expanded}");
+            assert!(
+                (after_end - target).abs() < px(0.01),
+                "{after_end} vs {target}"
+            );
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[::core::prelude::v1::test]
     fn externally_renamed_tree_keeps_expanded_descendants_in_the_first_frame() -> Result<()> {
         let fixture = tempfile::tempdir()?;
         let (root, workspace, mut visual) = watched_tree(&fixture, WorkspaceView::Editor)?;
@@ -2444,18 +2486,75 @@ mod tests {
             let collapse = visual
                 .debug_bounds("workspace-tree-sticky-collapse:a/c")
                 .unwrap();
+            let offset = |visual: &mut VisualTestContext| {
+                visual.update(|_, cx| {
+                    workspace
+                        .read(cx)
+                        .tree_scroll
+                        .0
+                        .borrow()
+                        .base_handle
+                        .offset()
+                        .y
+                })
+            };
+            let before = offset(visual);
             visual.simulate_click(collapse.center(), Modifiers::default());
-            settle(visual, &workspace, |this| {
-                this.rows
-                    .iter()
-                    .any(|row| row.entry.path == Path::new("a/c") && !row.expanded)
+            draw_tree_frame(visual, Duration::ZERO);
+            assert_eq!(
+                offset(visual),
+                before,
+                "{view:?} collapse snapped the viewport"
+            );
+            let mut previous = before;
+            for _ in 0..12 {
+                draw_tree_frame(visual, Duration::from_millis(16));
+                let current = offset(visual);
+                assert!(current >= previous, "{view:?} reveal reversed direction");
+                previous = current;
+            }
+            assert!(previous > before);
+            visual.update(|_, cx| {
+                assert!(
+                    workspace
+                        .read(cx)
+                        .rows
+                        .iter()
+                        .any(|row| { row.entry.path == Path::new("a/c") && !row.expanded })
+                );
             });
             assert!(visual.debug_bounds(c_id).is_none());
             assert!(visual.debug_bounds("workspace-tree-row:a/c").is_some());
-            visual.executor().advance_clock(Duration::from_millis(200));
-            settle(visual, &workspace, |_| true);
-            assert!(visual.debug_bounds(c_id).is_none());
-            assert!(visual.debug_bounds("workspace-tree-row:a/c").is_some());
+
+            if view == WorkspaceView::Editor {
+                // A short viewport gives the nested folder the only sticky slot.
+                visual.update(|window, cx| {
+                    workspace.update(cx, |this, cx| {
+                        this.toggle_tree_directory("a/c".into(), window, cx);
+                    });
+                });
+                settle(visual, &workspace, |this| {
+                    this.rows
+                        .iter()
+                        .any(|row| row.entry.path == Path::new("a/c/00.md"))
+                });
+                visual.simulate_resize(size(px(900.), px(238.)));
+                let list = initial.center();
+                scroll(visual, list, -100.);
+                scroll(visual, list, 6.);
+                assert!(visual.debug_bounds(root_id).is_none());
+                let collapse = visual.debug_bounds(b_icon_id).unwrap();
+                visual.simulate_click(collapse.center(), Modifiers::default());
+                draw_tree_frame(visual, Duration::ZERO);
+                draw_tree_frame(visual, Duration::from_millis(200));
+                let parent = visual
+                    .debug_bounds(root_id)
+                    .or_else(|| visual.debug_bounds("workspace-tree-row:a"))
+                    .unwrap();
+                let folder = visual.debug_bounds("workspace-tree-row:a/b").unwrap();
+                assert!(folder.top() >= parent.bottom());
+                visual.simulate_resize(size(px(900.), px(560.)));
+            }
         }
 
         let root_id = "workspace-tree-sticky-row:a";

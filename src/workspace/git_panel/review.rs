@@ -932,7 +932,10 @@ impl GitPanel {
             }
             self.diff.update(cx, |diff, cx| diff.set_files([], cx));
             self.tree_scroll = UniformListScrollHandle::new();
+            self.tree_before_filter = None;
             self.tree_followed_file = None;
+            self.empty_review_scroll = ScrollHandle::new();
+            self.commit_caret.set(None);
             self.show_details = false;
         }
         let restoring_commit = restoring && matches!(selection, Selection::Commit(..));
@@ -3097,9 +3100,11 @@ impl GitPanel {
                         panel.child(
                             v_flex()
                                 .id("git-empty-review")
+                                .debug_selector(|| "git-empty-review".into())
                                 .flex_1()
                                 .min_h_0()
                                 .overflow_y_scroll()
+                                .track_scroll(&self.empty_review_scroll)
                                 .child(self.summary(review, cx, colors))
                                 .child(center_empty(label, icon, colors)),
                         )

@@ -17,6 +17,7 @@ mod vim;
 
 use std::{
     borrow::Cow,
+    cell::Cell,
     collections::{BTreeSet, HashMap, HashSet, VecDeque},
     path::PathBuf,
     rc::Rc,
@@ -302,6 +303,8 @@ pub(super) struct GitPanel {
     ref_picker: ref_picker::RefPicker,
     commit_input: Entity<InputState>,
     commit_message: Entity<TextareaState>,
+    commit_caret: Rc<Cell<Option<(u64, usize)>>>,
+    empty_review_scroll: ScrollHandle,
     commit_amend: Option<operations::CommitAmend>,
     commit_state: Option<Result<git::CommitState, String>>,
     commit_state_task: Task<()>,
@@ -334,6 +337,7 @@ pub(super) struct GitPanel {
     vim_tree_return: Option<FocusHandle>,
     diff_vim: vim::DiffVim,
     tree_scroll: UniformListScrollHandle,
+    tree_before_filter: Option<tree::TreeScrollAnchor>,
     tree_followed_file: Option<String>,
     worktree_directories: Arc<BTreeSet<String>>,
     worktree_collapsed_files: Arc<BTreeSet<String>>,
@@ -490,13 +494,7 @@ impl GitPanel {
             }),
             cx.subscribe(&filter_input, |this, input, event, cx| {
                 if matches!(event, InputEvent::Change) {
-                    this.filter = input.read(cx).value().trim().to_lowercase();
-                    this.tree_scroll = UniformListScrollHandle::new();
-                    this.tree_followed_file = None;
-                    if this.only_matching {
-                        this.sync_documents(cx);
-                    }
-                    cx.notify();
+                    this.set_tree_filter(input.read(cx).value().trim().to_lowercase(), cx);
                 }
             }),
             cx.subscribe_in(&diff, window, |this, _, event, window, cx| {
@@ -578,6 +576,8 @@ impl GitPanel {
             ref_picker,
             commit_input,
             commit_message,
+            commit_caret: Rc::new(Cell::new(None)),
+            empty_review_scroll: ScrollHandle::new(),
             commit_amend: None,
             ai_commit_pending: false,
             ai_commit_task: Task::ready(()),
@@ -610,6 +610,7 @@ impl GitPanel {
             vim_tree_return: None,
             diff_vim: vim::DiffVim::new(editor.vim_edit_guard(workspace.clone())),
             tree_scroll: UniformListScrollHandle::new(),
+            tree_before_filter: None,
             tree_followed_file: None,
             worktree_directories: session
                 .git

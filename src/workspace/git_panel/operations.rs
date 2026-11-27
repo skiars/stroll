@@ -241,6 +241,73 @@ impl GitPanel {
         App::notify(cx, self.review_pane.entity_id());
     }
 
+    fn reveal_commit_caret(&self, cx: &Context<Self>) -> impl IntoElement {
+        let input = self.commit_message.clone();
+        let last_caret = self.commit_caret.clone();
+        let panel = cx.weak_entity();
+        canvas(
+            move |_, window, cx| {
+                let state = input.read(cx);
+                if !state.focus_handle(cx).is_focused(window) {
+                    last_caret.set(None);
+                    return;
+                }
+                let Some(geometry) = state.prepaint_caret_geometry() else {
+                    return;
+                };
+                let caret = (state.document_revision(), state.cursor());
+                if last_caret.replace(Some(caret)) == Some(caret) {
+                    return;
+                }
+                let viewport = window.content_mask().bounds;
+                let bounds = geometry.cursor_bounds();
+                let scroll = geometry.scroll_offset().y;
+                let delta = if bounds.top() + scroll < viewport.top() {
+                    viewport.top() - bounds.top() - scroll
+                } else if bounds.bottom() + scroll > viewport.bottom() {
+                    viewport.bottom() - bounds.bottom() - scroll
+                } else {
+                    return;
+                };
+                let panel = panel.clone();
+                window.defer(cx, move |window, cx| {
+                    _ = panel.update(cx, |panel, cx| {
+                        let state = panel.commit_message.read(cx);
+                        if !state.focus_handle(cx).is_focused(window)
+                            || (state.document_revision(), state.cursor()) != caret
+                        {
+                            return;
+                        }
+                        if panel.diff.read(cx).files().is_empty() {
+                            let handle = &panel.empty_review_scroll;
+                            let offset = handle.offset();
+                            let y = (offset.y + delta).clamp(-handle.max_offset().y, px(0.));
+                            if y != offset.y {
+                                handle.set_offset(point(offset.x, y));
+                                App::notify(cx, panel.review_pane.entity_id());
+                            }
+                        } else {
+                            let right = panel.editor.modified_state().clone();
+                            let y = (right.read(cx).scroll_offset().y + delta).min(px(0.));
+                            let columns = [panel.editor.original_state().clone(), right];
+                            for column in columns.into_iter().skip(usize::from(!panel.split)) {
+                                column.update(cx, |editor, cx| {
+                                    let offset = editor.scroll_offset();
+                                    if offset.y != y {
+                                        editor.set_scroll_offset(point(offset.x, y), cx);
+                                    }
+                                });
+                            }
+                        }
+                    });
+                });
+            },
+            |_, (), _, _| {},
+        )
+        .absolute()
+        .inset_0()
+    }
+
     pub(super) fn commit_controls(&self, cx: &Context<Self>) -> impl IntoElement {
         let amend = self.commit_amend.is_some();
         let reason = self.commit_disabled_reason(cx);
@@ -323,6 +390,7 @@ impl GitPanel {
                             .child(commit),
                     ),
             )
+            .child(self.reveal_commit_caret(cx))
     }
 
     fn submit_commit(&mut self, window: &mut Window, cx: &mut Context<Self>) {

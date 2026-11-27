@@ -143,6 +143,12 @@ impl Directory {
     }
 }
 
+pub(super) struct TreeScrollAnchor {
+    directory: bool,
+    path: String,
+    inset: Pixels,
+}
+
 pub(super) struct TreeRows {
     filter: String,
     rows: Rc<Vec<Row>>,
@@ -200,6 +206,54 @@ impl TreeRows {
         }
     }
 
+    fn identity<'a>(row: &'a Row, review: &'a Review) -> (bool, &'a str) {
+        match row {
+            Row::Folder { path, .. } => (true, path),
+            Row::File { ix, .. } => (false, &review.detail.files[*ix].path),
+        }
+    }
+
+    fn top_index(&self, y: Pixels, row_height: Pixels) -> usize {
+        ((-y / row_height) as usize).min(self.rows.len().saturating_sub(1))
+    }
+
+    fn scroll_anchor(
+        &self,
+        review: &Review,
+        y: Pixels,
+        row_height: Pixels,
+    ) -> Option<TreeScrollAnchor> {
+        let top = self.top_index(y, row_height);
+        let (directory, path) = Self::identity(self.rows.get(top)?, review);
+        Some(TreeScrollAnchor {
+            directory,
+            path: path.to_owned(),
+            inset: y + row_height * top,
+        })
+    }
+
+    fn nearest_scroll_y(
+        &self,
+        previous: &Review,
+        next: &Self,
+        review: &Review,
+        y: Pixels,
+        row_height: Pixels,
+    ) -> Option<Pixels> {
+        let positions = next
+            .rows
+            .iter()
+            .enumerate()
+            .map(|(index, row)| (Self::identity(row, review), index))
+            .collect::<HashMap<_, _>>();
+        let top = self.top_index(y, row_height);
+        let nearest = self.rows[top..]
+            .iter()
+            .chain(self.rows[..top].iter().rev())
+            .find_map(|row| positions.get(&Self::identity(row, previous)))?;
+        Some(y + row_height * (top as f32 - *nearest as f32))
+    }
+
     /// Keep the top surviving row in place as the staged/unstaged filter changes membership.
     pub(super) fn preserve_scroll(
         previous: &Review,
@@ -216,35 +270,65 @@ impl TreeRows {
         if offset.y >= px(0.) {
             return;
         }
-        let top = ((-offset.y / TREE_ROW_HEIGHT) as usize).min(old.rows.len().saturating_sub(1));
         let rows = Self::build(review, filter);
-        let identity = |row: &Row, review: &Review| match row {
-            Row::Folder { path, .. } => (true, path.clone()),
-            Row::File { ix, .. } => (false, review.detail.files[*ix].path.clone()),
-        };
-        let positions = rows
-            .rows
-            .iter()
-            .enumerate()
-            .map(|(ix, row)| (identity(row, review), ix))
-            .collect::<HashMap<_, _>>();
-        let nearest = old
-            .rows
-            .iter()
-            .skip(top)
-            .chain(old.rows[..top].iter().rev())
-            .find_map(|row| positions.get(&identity(row, previous)).copied());
-        if let Some(nearest) = nearest {
-            handle.set_offset(point(
-                offset.x,
-                offset.y + TREE_ROW_HEIGHT * (top as f32 - nearest as f32),
-            ));
+        let row_height = previous.tree_motion.borrow().row_height();
+        if let Some(y) = old.nearest_scroll_y(previous, &rows, review, offset.y, row_height) {
+            handle.set_offset(point(offset.x, y));
         }
         *review.tree_rows.borrow_mut() = Some(rows);
     }
 }
 
 impl GitPanel {
+    pub(super) fn set_tree_filter(&mut self, filter: String, cx: &mut Context<Self>) {
+        if filter == self.filter {
+            return;
+        }
+        if let Some(review) = &self.review {
+            let mut cached = review.tree_rows.borrow_mut();
+            let old = cached
+                .take()
+                .filter(|rows| rows.filter == self.filter)
+                .unwrap_or_else(|| TreeRows::build(review, &self.filter));
+            let rows = TreeRows::build(review, &filter);
+            let mut scroll = self.tree_scroll.0.borrow_mut();
+            let offset = scroll.base_handle.offset();
+            let row_height = review.tree_motion.borrow().row_height();
+            if self.filter.is_empty() {
+                self.tree_before_filter = old.scroll_anchor(review, offset.y, row_height);
+            }
+            let restored = if filter.is_empty() {
+                self.tree_before_filter.take().and_then(|anchor| {
+                    let index = rows.rows.iter().position(|row| {
+                        TreeRows::identity(row, review) == (anchor.directory, anchor.path.as_str())
+                    })?;
+                    Some(anchor.inset - row_height * index)
+                })
+            } else {
+                None
+            };
+            let y = restored
+                .or_else(|| old.nearest_scroll_y(review, &rows, review, offset.y, row_height))
+                .unwrap_or_default();
+            scroll.deferred_scroll_to_item = None;
+            scroll
+                .base_handle
+                .set_offset(point(offset.x, y.min(px(0.))));
+            *cached = Some(rows);
+        }
+        self.filter = filter;
+        if self.only_matching {
+            self.sync_documents(cx);
+        }
+        self.tree_followed_file = self.active_file(cx).and_then(|ix| {
+            let review = self.review.as_ref()?;
+            let cache = review.tree_rows.borrow();
+            cache.as_ref()?.file_rows.get(ix).copied().flatten()?;
+            Some(review.detail.files[ix].path.clone())
+        });
+        cx.notify();
+    }
+
     pub(super) fn focus_vim_file_tree(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.focus_vim_file_tree_at(None, window, cx);
     }
@@ -417,10 +501,11 @@ impl GitPanel {
             window,
             cx,
         );
+        let row_height = tree_motion::row_height(window);
         let selected_row = target.and_then(|(_, row)| {
             let top = match &frame {
                 Some(frame) => frame.row_top(row)?,
-                None => TREE_ROW_HEIGHT * row,
+                None => row_height * row,
             };
             Some((row, top))
         });
@@ -958,7 +1043,7 @@ impl GitPanel {
                                         move |bounds, _, _| {
                                             let handle = scroll.0.borrow().base_handle.clone();
                                             let top = row_top + handle.offset().y;
-                                            let bottom = top + TREE_ROW_HEIGHT;
+                                            let bottom = top + row_height;
                                             // Keep the selected row visible if the tree shrinks.
                                             if top >= px(0.)
                                                 && bottom <= handle.bounds().size.height

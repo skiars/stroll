@@ -1,6 +1,6 @@
 use gpui_component::tooltip::{ManagedTooltipExt as _, Tooltip};
 
-use super::{tree_motion::ROW_HEIGHT, *};
+use super::*;
 
 const MAX_ROWS: usize = 3;
 
@@ -9,8 +9,8 @@ struct PinnedRow {
     height: Pixels,
 }
 
-pub(super) fn row_limit(viewport_height: Pixels) -> usize {
-    ((viewport_height / (ROW_HEIGHT * 3.)) as usize).min(MAX_ROWS)
+pub(super) fn row_limit(viewport_height: Pixels, row_height: Pixels) -> usize {
+    ((viewport_height / (row_height * 3.)) as usize).min(MAX_ROWS)
 }
 
 fn pinned_rows(
@@ -18,20 +18,21 @@ fn pinned_rows(
     frame: Option<&tree_motion::TreeFrame<TreeRow>>,
     scroll_top: Pixels,
     viewport_height: Pixels,
+    row_height: Pixels,
 ) -> Vec<PinnedRow> {
     let row_top = |index| match frame {
         Some(frame) if index == rows.len() => Some(frame.height()),
         Some(frame) => frame.row_top(index),
-        None => Some(ROW_HEIGHT * index),
+        None => Some(row_height * index),
     };
-    let limit = row_limit(viewport_height);
+    let limit = row_limit(viewport_height, row_height);
     let mut pinned: Vec<PinnedRow> = Vec::with_capacity(limit);
     let mut ancestors = Vec::new();
     for slot in 0..limit {
-        let edge = scroll_top + ROW_HEIGHT * slot;
+        let edge = scroll_top + row_height * slot;
         let index = match frame {
             Some(frame) => frame.row_at(edge),
-            None => Some((edge / ROW_HEIGHT) as usize),
+            None => Some((edge / row_height) as usize),
         };
         let Some(index) = index.filter(|index| *index < rows.len()) else {
             break;
@@ -63,12 +64,12 @@ fn pinned_rows(
         let Some(bottom) = row_top(rows[index].subtree_end) else {
             break;
         };
-        let height = (bottom - edge).min(ROW_HEIGHT);
+        let height = (bottom - edge).min(row_height);
         if height <= px(0.) {
             break;
         }
         pinned.push(PinnedRow { index, height });
-        if height < ROW_HEIGHT {
+        if height < row_height {
             break;
         }
     }
@@ -89,11 +90,13 @@ pub(super) fn overlay(
         move |bounds, window, cx| {
             // The list prepaints first, so this includes wheel, scrollbar,
             // deferred jumps, and any clamping after a resize.
+            let row_height = tree_motion::row_height(window);
             let pinned = pinned_rows(
                 &rows,
                 frame.as_deref(),
                 -scroll.offset().y,
                 bounds.size.height,
+                row_height,
             );
             let omitted_ancestors = rows[pinned.first()?.index].depth > 0;
             let tree = workspace.clone();
@@ -138,7 +141,7 @@ pub(super) fn overlay(
                     colors,
                     cx,
                 );
-                let element = element.top(pinned.height - ROW_HEIGHT);
+                let element = element.top(pinned.height - row_height);
                 let menu = if in_workspace {
                     file_tree::tree_menu
                 } else {
@@ -287,15 +290,42 @@ impl Workspace {
         self.focus_tree(path.to_owned(), window, cx);
         if collapse {
             self.toggle_tree_directory(path.to_owned(), window, cx);
+            let mut scroll = self.tree_scroll.0.borrow_mut();
+            scroll.deferred_scroll_to_item = None;
+            let viewport_height = scroll.base_handle.bounds().size.height;
+            let current_top = -scroll.base_handle.offset().y;
+            drop(scroll);
+            let row_height = tree_motion::row_height(window);
+            let row_top = row_height * index;
+            let max_top = (row_height * self.rows.len() - viewport_height).max(px(0.));
+            // Closing a directory can give its sticky slot to an ancestor.
+            let slots = row_limit(viewport_height, row_height).min(self.rows[index].depth);
+            let inset = (0..=slots)
+                .map(|slots| row_height * slots)
+                .find(|&inset| {
+                    let top = (row_top - inset).min(current_top).clamp(px(0.), max_top);
+                    let pinned_height: Pixels =
+                        pinned_rows(&self.rows, None, top, viewport_height, row_height)
+                            .iter()
+                            .map(|row| row.height)
+                            .sum();
+                    row_top >= top + pinned_height
+                })
+                .unwrap_or(row_height * slots);
+            self.tree_motion
+                .get_mut()
+                .reveal_collapsed_directory(index, inset, &self.tree_scroll);
+        } else {
+            self.tree_scroll
+                .scroll_to_item_strict(index, ScrollStrategy::Center);
         }
-        self.tree_scroll
-            .scroll_to_item_strict(index, ScrollStrategy::Center);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::workspace::tree_motion::ROW_HEIGHT;
 
     #[::core::prelude::v1::test]
     fn sticky_scroll_keeps_the_deepest_directories_within_the_height_limit() {
@@ -316,7 +346,7 @@ mod tests {
             })
             .collect();
         let indices = |height| {
-            pinned_rows(&rows, None, ROW_HEIGHT * 6., height)
+            pinned_rows(&rows, None, ROW_HEIGHT * 6., height, ROW_HEIGHT)
                 .into_iter()
                 .map(|row| row.index)
                 .collect::<Vec<_>>()

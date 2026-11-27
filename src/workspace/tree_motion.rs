@@ -11,25 +11,96 @@ use gpui_component::{VirtualListScrollHandle, animation::ease_in_out_cubic, v_vi
 pub(super) const ROW_HEIGHT: Pixels = px(28.);
 const DURATION: Duration = Duration::from_millis(180);
 
+pub(super) fn row_height(window: &Window) -> Pixels {
+    // UniformList measures the laid-out row after device-pixel rounding.
+    // Use that same step for the animated VirtualList and scroll anchors.
+    window.pixel_snap(ROW_HEIGHT)
+}
+
 pub(super) struct TreeMotion<R> {
     last: Option<Rc<Vec<R>>>,
+    row_height: Pixels,
     transition: Option<Transition<R>>,
     requested: bool,
+    collapse_reveal: Option<CollapseReveal>,
+}
+
+struct CollapseReveal {
+    scroll: UniformListScrollHandle,
+    index: usize,
+    inset: Pixels,
+    start: Pixels,
+    previous: Pixels,
 }
 
 impl<R> Default for TreeMotion<R> {
     fn default() -> Self {
         Self {
             last: None,
+            row_height: ROW_HEIGHT,
             transition: None,
             requested: false,
+            collapse_reveal: None,
         }
     }
 }
 
 impl<R: Clone + 'static> TreeMotion<R> {
+    pub(super) fn row_height(&self) -> Pixels {
+        self.row_height
+    }
+
     pub(super) fn start(&mut self) {
         self.requested = true;
+        self.collapse_reveal = None;
+    }
+
+    pub(super) fn reveal_collapsed_directory(
+        &mut self,
+        index: usize,
+        inset: Pixels,
+        scroll: &UniformListScrollHandle,
+    ) {
+        let start = scroll.0.borrow().base_handle.offset().y;
+        self.collapse_reveal = Some(CollapseReveal {
+            scroll: scroll.clone(),
+            index,
+            inset,
+            start,
+            previous: start,
+        });
+    }
+
+    pub(super) fn apply_collapse_reveal(
+        &mut self,
+        frame: Option<&TreeFrame<R>>,
+        count: usize,
+        scroll: &UniformListScrollHandle,
+    ) {
+        let Some(reveal) = &mut self.collapse_reveal else {
+            return;
+        };
+        let state = scroll.0.borrow();
+        let handle = &state.base_handle;
+        let offset = handle.offset();
+        if !Rc::ptr_eq(&reveal.scroll.0, &scroll.0)
+            || (offset.y - reveal.previous).abs() > px(0.5)
+            || state.deferred_scroll_to_item.is_some()
+        {
+            self.collapse_reveal = None;
+            return;
+        }
+        let target = (reveal.inset - self.row_height * reveal.index).clamp(reveal.start, px(0.));
+        let (height, progress) = frame.map_or((self.row_height * count, 1.), |frame| {
+            (frame.height(), frame.progress)
+        });
+        let min_offset = (handle.bounds().size.height - height).min(px(0.));
+        let y = (reveal.start + (target - reveal.start) * progress).max(min_offset);
+        handle.set_offset(point(offset.x, y));
+        reveal.previous = y;
+        if frame.is_none() {
+            self.collapse_reveal = None;
+        }
     }
 
     pub(super) fn frame<K: Eq + Hash>(
@@ -41,6 +112,7 @@ impl<R: Clone + 'static> TreeMotion<R> {
         cx: &App,
     ) -> Option<Rc<TreeFrame<R>>> {
         let now = cx.background_executor().now();
+        self.row_height = row_height(window);
         self.update(rows, &key, enabled && !cx.reduce_motion(), false, now);
         let frame = self.current_frame(now, rows.len())?;
         window.request_animation_frame();
@@ -74,7 +146,10 @@ impl<R: Clone + 'static> TreeMotion<R> {
         let Some(scroll) = scroll else { return };
         let mut state = scroll.0.borrow_mut();
         let offset = state.base_handle.offset();
-        if offset.y >= px(0.) && state.deferred_scroll_to_item.is_none() {
+        if offset.y >= px(0.)
+            && state.deferred_scroll_to_item.is_none()
+            && self.collapse_reveal.is_none()
+        {
             return;
         }
         let indices: HashMap<_, _> = rows
@@ -83,6 +158,13 @@ impl<R: Clone + 'static> TreeMotion<R> {
             .map(|(index, row)| (key(row), index))
             .collect();
         let new_index = |row: &R| indices.get(&key(row)).copied();
+        self.collapse_reveal = self.collapse_reveal.take().and_then(|mut reveal| {
+            let index = new_index(previous.get(reveal.index)?)?;
+            let delta = self.row_height * (reveal.index as f32 - index as f32);
+            reveal.index = index;
+            reveal.start = (reveal.start + delta).min(px(0.));
+            Some(reveal)
+        });
         state.deferred_scroll_to_item = state.deferred_scroll_to_item.and_then(|mut request| {
             request.item_index = new_index(previous.get(request.item_index)?)?;
             Some(request)
@@ -91,7 +173,7 @@ impl<R: Clone + 'static> TreeMotion<R> {
         if offset.y < px(0.) {
             let top = match &before {
                 Some(frame) => frame.anchor_index(-offset.y),
-                None => Some((-offset.y / ROW_HEIGHT) as usize),
+                None => Some((-offset.y / self.row_height) as usize),
             };
             let Some(top) = top.filter(|top| *top < previous.len()) else {
                 return;
@@ -99,7 +181,7 @@ impl<R: Clone + 'static> TreeMotion<R> {
             let after = self.current_frame(now, rows.len());
             let row_top = |frame: &Option<TreeFrame<R>>, index| match frame {
                 Some(frame) => frame.row_top(index),
-                None => Some(ROW_HEIGHT * index),
+                None => Some(self.row_height * index),
             };
             // Prefer the top row, then the nearest surviving row below it.
             let anchor = (top..previous.len()).chain((0..top).rev()).find_map(|old| {
@@ -107,9 +189,13 @@ impl<R: Clone + 'static> TreeMotion<R> {
                 Some(row_top(&before, old)? - row_top(&after, new)?)
             });
             if let Some(delta) = anchor {
-                state
-                    .base_handle
-                    .set_offset(point(offset.x, (offset.y + delta).min(px(0.))));
+                let y = (offset.y + delta).min(px(0.));
+                state.base_handle.set_offset(point(offset.x, y));
+                if let Some(reveal) = &mut self.collapse_reveal
+                    && (reveal.previous - offset.y).abs() <= px(0.5)
+                {
+                    reveal.previous = y;
+                }
             }
         }
     }
@@ -157,7 +243,7 @@ impl<R: Clone + 'static> TreeMotion<R> {
     fn current_frame(&self, now: Instant, row_count: usize) -> Option<TreeFrame<R>> {
         let motion = self.transition.as_ref()?;
         let progress = motion.progress(now);
-        (progress < 1.).then(|| TreeFrame::new(motion, progress, row_count))
+        (progress < 1.).then(|| TreeFrame::new(motion, progress, row_count, self.row_height))
     }
 }
 
@@ -329,6 +415,7 @@ pub(super) struct TreeFrame<R> {
     visible: Vec<PlacedRow>,
     positions: Vec<Option<(usize, Pixels)>>,
     height: Pixels,
+    progress: f32,
 }
 
 struct PlacedRow {
@@ -339,12 +426,12 @@ struct PlacedRow {
 }
 
 impl<R: Clone> TreeFrame<R> {
-    fn new(motion: &Transition<R>, progress: f32, count: usize) -> Self {
+    fn new(motion: &Transition<R>, progress: f32, count: usize, row_height: Pixels) -> Self {
         let mut visible = Vec::new();
         let mut positions = vec![None; count];
         let mut top = px(0.);
         for (index, row) in motion.layout.iter().enumerate() {
-            let height = ROW_HEIGHT * row.height(progress);
+            let height = row_height * row.height(progress);
             // Skip fully clipped rows so a large subtree never makes the
             // virtual list render a run of zero-height elements.
             if height <= px(0.) {
@@ -366,6 +453,7 @@ impl<R: Clone> TreeFrame<R> {
             visible,
             positions,
             height: top,
+            progress,
         }
     }
 
@@ -484,7 +572,7 @@ mod tests {
         };
         opening.retarget(closed.iter().map(|id| (id, 1.)), &target, |id| *id);
 
-        let halfway = TreeFrame::new(&opening, 0.5, target.len());
+        let halfway = TreeFrame::new(&opening, 0.5, target.len(), ROW_HEIGHT);
         assert_eq!(halfway.visible.len(), 5_002);
         assert_eq!(halfway.row_top(10_001), Some(ROW_HEIGHT * 5_001));
 
@@ -499,14 +587,14 @@ mod tests {
             layout: Vec::new(),
         };
         closing.retarget(current, &closed, |id| *id);
-        let reversed = TreeFrame::new(&closing, 0., closed.len());
+        let reversed = TreeFrame::new(&closing, 0., closed.len(), ROW_HEIGHT);
         assert_eq!(reversed.row_top(1), halfway.row_top(10_001));
         assert!(
             reversed.visible[1..5_001]
                 .iter()
                 .all(|row| row.target.is_none())
         );
-        let settled = TreeFrame::new(&closing, 1., closed.len());
+        let settled = TreeFrame::new(&closing, 1., closed.len(), ROW_HEIGHT);
         assert_eq!(settled.visible.len(), 2);
         assert_eq!(settled.row_top(1), Some(ROW_HEIGHT));
     }

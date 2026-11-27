@@ -4889,6 +4889,11 @@ impl Workspace {
             window,
             cx,
         );
+        self.tree_motion.borrow_mut().apply_collapse_reveal(
+            frame.as_deref(),
+            row_count,
+            &self.tree_scroll,
+        );
         // Keep the inline create/rename field clear of the overlay while it has focus.
         let sticky = (self.config.current().appearance.file_tree_sticky_scroll && inline.is_none())
             .then(|| {
