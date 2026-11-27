@@ -6,6 +6,7 @@ case "${1:-}" in
   -h|--help)
     echo 'Usage: scripts/package-macos.sh'
     echo 'Build a native Stroll.app ZIP under the Cargo target directory (macos/).'
+    echo 'Create or reuse a per-user, self-signed identity for local installation.'
     exit 0 ;;
 esac
 if [[ $# -ne 0 ]]; then
@@ -49,8 +50,53 @@ plutil -insert CFBundleShortVersionString -string "$bundle_version" "$plist"
 plutil -insert CFBundleVersion -string "$bundle_version" "$plist"
 plutil -lint "$plist"
 
-codesign --force --sign - "$app"
-codesign --verify --deep --strict "$app"
+signing_dir="$HOME/Library/Application Support/Stroll/signing"
+identity="$signing_dir/identity.pem"
+if [[ ! -f "$identity" ]]; then
+  (
+    umask 077
+    mkdir -p "$signing_dir"
+    identity_stage=$(mktemp -d "$signing_dir/.identity.XXXXXXXX")
+    trap 'rm -rf "$identity_stage"' EXIT
+    /usr/bin/openssl req -new -newkey rsa:2048 -x509 -days 3650 -nodes \
+      -subj '/CN=Stroll Local Code Signing' -config /dev/stdin \
+      -out "$identity_stage/certificate.pem" -keyout "$identity_stage/key.pem" <<'OPENSSL'
+[req]
+distinguished_name = subject
+x509_extensions = code_signing
+[subject]
+[code_signing]
+basicConstraints = critical, CA:FALSE
+keyUsage = critical, digitalSignature
+extendedKeyUsage = critical, codeSigning
+OPENSSL
+    cat "$identity_stage/certificate.pem" "$identity_stage/key.pem" > "$identity_stage/identity.pem"
+    # Publish the complete identity without replacing one created by another build.
+    if ! ln "$identity_stage/identity.pem" "$identity" 2>/dev/null && [[ ! -f "$identity" ]]; then
+      echo "Could not save the local signing identity at $identity." >&2
+      exit 1
+    fi
+  )
+fi
+
+keychain="$stage/signing.keychain-db"
+keychain_password=$(/usr/bin/openssl rand -hex 32)
+/usr/bin/openssl pkcs12 -export -in "$identity" -inkey "$identity" \
+  -out "$stage/signing.p12" -passout "pass:$keychain_password"
+/usr/bin/security create-keychain -p "$keychain_password" "$keychain"
+/usr/bin/security unlock-keychain -p "$keychain_password" "$keychain"
+/usr/bin/security import "$stage/signing.p12" -k "$keychain" -f pkcs12 \
+  -P "$keychain_password" -T /usr/bin/codesign >/dev/null
+/usr/bin/security set-key-partition-list -S apple-tool:,apple:,codesign: \
+  -s -k "$keychain_password" "$keychain" >/dev/null
+
+fingerprint=$(/usr/bin/openssl x509 -in "$identity" -noout -fingerprint -sha1 | sed 's/.*=//;s/://g')
+bundle_id=$(plutil -extract CFBundleIdentifier raw -o - "$plist")
+# Bind updates to the signing certificate and bundle ID across rebuilds.
+requirement="identifier \"$bundle_id\" and certificate leaf = H\"$fingerprint\""
+/usr/bin/codesign --force --sign "$fingerprint" --keychain "$keychain" --timestamp=none \
+  -r="designated => $requirement" "$app"
+/usr/bin/codesign --verify --deep --strict -R="$requirement" "$app"
 ditto -c -k --keepParent "$app" "$stage/$archive"
 mv -f "$stage/$archive" "$output/$archive"
 printf '%s\n' "$output/$archive"
