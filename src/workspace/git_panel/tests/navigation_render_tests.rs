@@ -2186,11 +2186,22 @@ fn git_ref_picker_keeps_checkout_first_and_browses_remote_refs_and_annotated_tag
     draw_frame(visual);
     assert!(visual.debug_bounds("hover-copy-branch").is_some());
     settle(visual);
-    let copy = visual.debug_bounds("hover-copy-branch").unwrap();
-    assert_eq!(copy.size, size(px(24.), px(24.)));
-    visual.simulate_mouse_move(copy.center(), None, Modifiers::default());
-    visual.executor().advance_clock(Duration::from_millis(650));
-    settle(visual);
+    let hover_copy = |visual: &mut VisualTestContext| {
+        let copy = visual.debug_bounds("hover-copy-branch").unwrap();
+        assert_eq!(copy.size, size(px(24.), px(24.)));
+        assert!(visual.debug_bounds("copy-branch-tooltip-label").is_none());
+        visual.simulate_mouse_move(copy.center(), None, Modifiers::default());
+        visual.executor().advance_clock(Duration::from_millis(650));
+        settle(visual);
+        let label = visual
+            .debug_bounds("copy-branch-tooltip-label")
+            .expect("copy button shows a tooltip label");
+        assert!(
+            label.size.width > copy.size.width && label.size.height > px(0.),
+            "{label:?}"
+        );
+    };
+    hover_copy(visual);
     click(visual, "hover-copy-branch");
     assert_eq!(
         visual
@@ -2212,6 +2223,7 @@ fn git_ref_picker_keeps_checkout_first_and_browses_remote_refs_and_annotated_tag
     visual.simulate_mouse_move(first.center(), None, Modifiers::default());
     visual.executor().advance_clock(Duration::from_millis(550));
     settle(visual);
+    hover_copy(visual);
     click(visual, "hover-copy-branch");
     assert_eq!(
         visual

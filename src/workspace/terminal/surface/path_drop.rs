@@ -62,27 +62,12 @@ pub(super) fn remote_path(root: &Path, entry: &str, directory: Option<&Path>) ->
 }
 
 fn relative(path: &Path, directory: &Path) -> Option<PathBuf> {
-    for (levels, ancestor) in directory.ancestors().enumerate() {
-        if !ancestor.has_root() {
-            break;
-        }
-        if let Ok(suffix) = path.strip_prefix(ancestor) {
-            let mut relative = PathBuf::new();
-            for _ in 0..levels {
-                relative.push("..");
-            }
-            if !suffix.as_os_str().is_empty() {
-                relative.push(suffix);
-            }
-            if relative.as_os_str().is_empty() {
-                relative.push(".");
-            } else if levels == 0 && suffix.to_str()?.starts_with('-') {
-                relative = Path::new(".").join(relative);
-            }
-            return Some(relative);
-        }
+    let relative = crate::paths::relative(path, directory)?;
+    if relative.to_str()?.starts_with('-') {
+        Some(Path::new(".").join(relative))
+    } else {
+        Some(relative)
     }
-    None
 }
 
 fn plain_word(path: &str) -> bool {

@@ -676,6 +676,32 @@ impl Workspace {
             let path = file.path.clone();
             let locked = self.file_editor_locked(file);
             let file = self.files.get_mut(&path).unwrap();
+            let paste_key;
+            let key = if key.key == "insert"
+                && key.modifiers
+                    == (Modifiers {
+                        shift: true,
+                        ..Modifiers::none()
+                    })
+                && !file.vim.pending().starts_with(':')
+            {
+                if file.vim.mode() == source::Mode::Insert {
+                    if !locked && !file.editor.read(cx).is_composing() {
+                        window.dispatch_action(Box::new(input::Paste), cx);
+                    }
+                    consume(window, cx);
+                    return;
+                }
+                file.vim.clear_pending();
+                paste_key = Keystroke {
+                    key: "p".into(),
+                    key_char: None,
+                    modifiers: key.modifiers,
+                };
+                &paste_key
+            } else {
+                key
+            };
             let action = file
                 .vim
                 .key_down(&file.editor, locked, key, file.wrap, window, cx);

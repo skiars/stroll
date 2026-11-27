@@ -3513,6 +3513,63 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(target_os = "linux")]
+    #[::core::prelude::v1::test]
+    fn workspace_tree_drop_inserts_relative_paths_at_the_editor_caret() -> Result<()> {
+        let fixture = tempfile::tempdir()?;
+        let (root, workspace, mut visual) = watched_tree(&fixture, WorkspaceView::Editor)?;
+        let path = Path::new("a/nested/deep.md");
+        visual.update(|window, cx| {
+            workspace.update(cx, |this, cx| {
+                this.open_file(path.to_owned(), true, window, cx)
+            });
+        });
+        settle(&mut visual, &workspace, |this| {
+            this.tabs.active() == Some(path) && this.active_file().is_some()
+        });
+        let editor = visual.update(|window, cx| {
+            let editor = workspace.read(cx).active_file().unwrap().editor.clone();
+            editor.update(cx, |editor, cx| {
+                editor.set_cursor_position(gpui_component::input::Position::new(0, 2), window, cx);
+            });
+            editor
+        });
+
+        let modifiers = Modifiers::default();
+        for (row, expected) in [
+            ("workspace-tree-row:row-00.md", "# ../../row-00.mdNested\n"),
+            ("workspace-tree-row:a", "# ..Nested\n"),
+        ] {
+            let source = visual.debug_bounds(row).unwrap().center();
+            let target = visual.debug_bounds("workspace-editor").unwrap().center();
+            visual.simulate_mouse_move(source, None, modifiers);
+            visual.simulate_mouse_down(source, MouseButton::Left, modifiers);
+            visual.simulate_mouse_move(
+                source + point(px(30.), px(0.)),
+                MouseButton::Left,
+                modifiers,
+            );
+            settle(&mut visual, &workspace, |_| true);
+            visual.simulate_mouse_move(target, MouseButton::Left, modifiers);
+            visual.simulate_mouse_up(target, MouseButton::Left, modifiers);
+            settle(&mut visual, &workspace, |_| true);
+            visual.update(|window, cx| {
+                assert_eq!(workspace.read(cx).tabs.active(), Some(path));
+                assert!(workspace.read(cx).active_file().unwrap().is_dirty());
+                let editor = editor.read(cx);
+                assert_eq!(editor.text().to_string(), expected);
+                assert!(editor.focus_handle(cx).is_focused(window));
+            });
+            visual.simulate_keystrokes("ctrl-z");
+            settle(&mut visual, &workspace, |_| true);
+            visual.update(|_, cx| assert_eq!(editor.read(cx).text().to_string(), "# Nested\n"));
+        }
+        assert_eq!(fs::read_to_string(root.join(path))?, "# Nested\n");
+        assert!(root.join("row-00.md").is_file());
+        assert!(root.join("a").is_dir());
+        Ok(())
+    }
+
     #[::core::prelude::v1::test]
     fn workspace_tree_drag_moves_drafts_and_imports_external_entries() -> Result<()> {
         let fixture = tempfile::tempdir()?;

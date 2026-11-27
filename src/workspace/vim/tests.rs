@@ -1351,6 +1351,45 @@ fn vim_visual_head_and_repeated_edits_follow_inclusive_ranges() -> anyhow::Resul
 }
 
 #[::core::prelude::v1::test]
+fn vim_shift_insert_pastes_from_the_system_clipboard() -> anyhow::Result<()> {
+    let text = "one two\n";
+    with_vim_workspace(text, |visual, workspace| {
+        visual.update(|_, cx| cx.write_to_clipboard(gpui::ClipboardItem::new_string("XYZ".into())));
+        assert_source(
+            visual,
+            workspace,
+            "l shift-insert",
+            &[],
+            (0, 3),
+            "oXYZne two\n",
+        );
+        assert!(visual.debug_bounds("status-vim-mode: NORMAL").is_some());
+
+        reset_editor(visual, workspace, text);
+        assert_source(
+            visual,
+            workspace,
+            "l i shift-insert",
+            &[],
+            (0, 4),
+            "oXYZne two\n",
+        );
+        assert!(visual.debug_bounds("status-vim-mode: INSERT").is_some());
+        assert_source(visual, workspace, "escape u", &[], (0, 1), text);
+
+        assert_source(
+            visual,
+            workspace,
+            "0 v e shift-insert",
+            &[],
+            (0, 2),
+            "XYZ two\n",
+        );
+        assert!(visual.debug_bounds("status-vim-mode: NORMAL").is_some());
+    })
+}
+
+#[::core::prelude::v1::test]
 fn vim_ctrl_v_selects_and_edits_rectangles() -> anyhow::Result<()> {
     let text = "abcd\nxy\n1234\nlonger\n";
     with_vim_workspace(text, |visual, workspace| {

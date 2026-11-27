@@ -33,6 +33,32 @@ pub(crate) fn simplified(path: &Path) -> PathBuf {
     path.to_owned()
 }
 
+#[cfg(feature = "desktop")]
+pub(crate) fn relative(path: &Path, directory: &Path) -> Option<PathBuf> {
+    if path.has_root() != directory.has_root() {
+        return None;
+    }
+    for (levels, ancestor) in directory.ancestors().enumerate() {
+        if ancestor.has_root() != directory.has_root() {
+            break;
+        }
+        if let Ok(suffix) = path.strip_prefix(ancestor) {
+            let mut relative = PathBuf::new();
+            for _ in 0..levels {
+                relative.push("..");
+            }
+            if !suffix.as_os_str().is_empty() {
+                relative.push(suffix);
+            }
+            if relative.as_os_str().is_empty() {
+                relative.push(".");
+            }
+            return Some(relative);
+        }
+    }
+    None
+}
+
 #[cfg_attr(not(windows), allow(dead_code))]
 fn normalized(text: &str) -> Option<String> {
     let rest = text.strip_prefix(r"\\?\")?;

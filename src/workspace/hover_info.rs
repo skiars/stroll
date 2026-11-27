@@ -4,9 +4,9 @@ use std::{
 };
 
 use gpui_component::{
-    ElementExt as _,
+    ElementExt as _, ThemeStyled as _,
     popover::{Popover, PopoverState},
-    tooltip::{ManagedTooltipExt as _, Positioner, Tooltip, TooltipRequest},
+    tooltip::{ManagedTooltipExt as _, Positioner, TooltipRequest},
 };
 
 use super::*;
@@ -386,6 +386,27 @@ impl Card {
     }
 }
 
+struct CopyBranchTooltip;
+
+impl Render for CopyBranchTooltip {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .id("copy-branch-tooltip")
+            .role(Role::Tooltip)
+            .popover_style(cx)
+            .m_2()
+            .px_2()
+            .py_0p5()
+            .text_sm()
+            .whitespace_nowrap()
+            .child(
+                div()
+                    .debug_selector(|| "copy-branch-tooltip-label".into())
+                    .child(t!("hover.copy_branch")),
+            )
+    }
+}
+
 impl Render for Card {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let muted = cx.theme().muted_foreground;
@@ -442,10 +463,7 @@ impl Render for Card {
                                 })
                                 .debug_selector(|| "hover-copy-branch".into())
                                 // A managed tooltip here would replace the interactive branch card.
-                                .tooltip(|window, cx| {
-                                    Tooltip::new(t!("hover.copy_branch").into_owned())
-                                        .build(window, cx)
-                                })
+                                .tooltip(|_, cx| cx.new(|_| CopyBranchTooltip).into())
                                 .child(
                                     compact_icon_control(
                                         "hover-copy-branch",

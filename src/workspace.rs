@@ -5371,6 +5371,10 @@ impl Workspace {
             let source =
                 editor_scroll_viewport(&file.editor, editor_background, !self.locator.open)
                     .debug_selector(|| "workspace-editor".into())
+                    .when(
+                        !locked && !maximized && self.tree_drag_available(),
+                        |pane| pane.on_drop(cx.listener(Self::drop_tree_path_in_editor)),
+                    )
                     .capture_any_mouse_down(cx.listener(Self::begin_source_click))
                     .on_mouse_up(MouseButton::Left, cx.listener(Self::end_source_click))
                     .on_mouse_up_out(MouseButton::Left, cx.listener(Self::end_source_click))

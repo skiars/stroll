@@ -310,6 +310,57 @@ impl Workspace {
             && drag.path.parent() != Some(directory)
     }
 
+    pub(super) fn drop_tree_path_in_editor(
+        &mut self,
+        drag: &TreeDrag,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.tree_drag_available()
+            || !self
+                .repository
+                .as_ref()
+                .is_some_and(|repo| Arc::ptr_eq(repo, &drag.repo))
+        {
+            return;
+        }
+        let Some(file) = self
+            .active_file()
+            .filter(|file| !self.file_editor_locked(file))
+        else {
+            return;
+        };
+        let remote = drag.repo.ssh.is_some();
+        if remote && file.path.is_absolute() {
+            return;
+        }
+        let Some(directory) = file.path.parent() else {
+            return;
+        };
+        let path = if file.path.is_absolute() {
+            paths::relative(&drag.repo.root.join(&drag.path), directory)
+        } else {
+            paths::relative(&drag.path, directory)
+        };
+        let Some(path) = path else {
+            return;
+        };
+        let Some(path) = path.to_str() else {
+            return;
+        };
+        let text = if remote && cfg!(windows) {
+            path.replace('\\', "/")
+        } else {
+            path.to_owned()
+        };
+        file.editor.update(cx, |editor, cx| {
+            if editor.is_editable() {
+                editor.insert(text, window, cx);
+                editor.focus(window, cx);
+            }
+        });
+    }
+
     fn import_tree_drop(
         &mut self,
         paths: &ExternalPaths,
