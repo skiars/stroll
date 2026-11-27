@@ -2836,6 +2836,33 @@ fn editor_hover_appends_documentation_to_web_diagnostics() -> anyhow::Result<()>
     let assert_hidden = |cx: &mut HeadlessAppContext| {
         cx.update(|cx| assert!(editor.read(cx).hover_popover().is_none()));
     };
+    let move_into_diagnostic =
+        |cx: &mut HeadlessAppContext, shell: Bounds<ScaledPixels>, row: Bounds<ScaledPixels>| {
+            let (step, target) = cx.update_window(window, |_, window, cx| {
+                let scale = window.scale_factor();
+                let target = point(
+                    px(row.right().0 / scale - 23.),
+                    px(row.top().0 / scale + 21.),
+                );
+                let step = point(target.x, symbol.center().y);
+                let state = editor.read(cx);
+                let hover = state.hover_popover().unwrap();
+                let anchor = state
+                    .visible_text_range_bounds(&hover.symbol_range)
+                    .unwrap()
+                    .scale(scale);
+                let scaled_step = step.scale(scale);
+                assert!(shell.union(&anchor).contains(&scaled_step));
+                assert!(!anchor.contains(&scaled_step) && !shell.contains(&scaled_step));
+                assert!(row.contains(&target.scale(scale)));
+                (step, target)
+            })?;
+            move_to(cx, step)?;
+            assert_rows(cx, false);
+            move_to(cx, target)?;
+            assert_rows(cx, false);
+            Ok::<_, anyhow::Error>(target)
+        };
     move_to(&mut cx, symbol.center())?;
     advance(&cx, 150);
     advance(&cx, 149);
@@ -2864,6 +2891,7 @@ fn editor_hover_appends_documentation_to_web_diagnostics() -> anyhow::Result<()>
     assert_eq!(combined_shell.origin, initial_shell.origin);
     assert_eq!(combined_row, initial_row);
     assert!(combined_shell.size.height > initial_shell.size.height);
+    move_into_diagnostic(&mut cx, initial_shell, initial_row)?;
     advance(&cx, 150);
     assert_rows(&mut cx, true);
     for (mode, label) in [(ThemeMode::Light, "light"), (ThemeMode::Dark, "dark")] {
@@ -2903,15 +2931,8 @@ fn editor_hover_appends_documentation_to_web_diagnostics() -> anyhow::Result<()>
     advance(&cx, 150);
     advance(&cx, 150);
     assert_rows(&mut cx, false);
-    let (_, row) = popup(&mut cx)?;
-    let quick_fix = cx.update_window(window, |_, window, _| {
-        let scale = window.scale_factor();
-        point(
-            px(row.right().0 / scale - 23.),
-            px(row.top().0 / scale + 21.),
-        )
-    })?;
-    move_to(&mut cx, quick_fix)?;
+    let (shell, row) = popup(&mut cx)?;
+    let quick_fix = move_into_diagnostic(&mut cx, shell, row)?;
     cx.update_window(window, |_, window, cx| {
         window.dispatch_event(
             MouseDownEvent {
@@ -3004,7 +3025,10 @@ fn editor_hover_appends_documentation_to_web_diagnostics() -> anyhow::Result<()>
     assert_hidden(&mut cx);
     advance(&cx, 1);
     assert_rows(&mut cx, false);
-    popup(&mut cx)?;
+    let (shell, row) = popup(&mut cx)?;
+    move_into_diagnostic(&mut cx, shell, row)?;
+    move_to(&mut cx, point(px(750.), px(550.)))?;
+    assert_hidden(&mut cx);
     Ok(())
 }
 

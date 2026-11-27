@@ -163,7 +163,6 @@ impl Render for HoverPopover {
         });
         let copy_text = document_text.filter(|text| !text.trim().is_empty());
         let copy_button_id = ("copy-hover-documentation", self.content.symbol_range.start);
-        let has_documentation = documentation.is_some();
         // Nested Markdown renderers run under the prose style, so capture the
         // editor font here and pass it through for all hover code.
         let code_font = window.text_style().font().family;
@@ -281,7 +280,6 @@ impl Render for HoverPopover {
         popover.last_trigger_bounds = self.last_trigger_bounds.clone();
         popover.closing = self.closing;
         popover.actions = has_actions;
-        popover.has_documentation = has_documentation;
         popover.prefers_natural_width = self
             .content
             .documentation
@@ -549,7 +547,6 @@ pub(crate) struct Popover {
     last_trigger_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
     closing: bool,
     actions: bool,
-    has_documentation: bool,
     prefers_natural_width: bool,
     position: Option<Rc<Cell<Option<Point<Pixels>>>>>,
     width_limit: Range<Pixels>,
@@ -582,7 +579,6 @@ impl Popover {
             last_trigger_bounds: Rc::default(),
             closing: false,
             actions: false,
-            has_documentation: false,
             prefers_natural_width: false,
             position: None,
             style: StyleRefinement::default(),
@@ -804,7 +800,6 @@ impl Element for Popover {
         let keep_open_region = trigger_bounds.union(&bounds);
         let editor = self.editor.clone();
         let pointer_down = self.pointer_down.clone();
-        let has_documentation = self.has_documentation;
         let symbol_range = self.range.clone();
         window.on_mouse_event(move |event: &MouseMoveEvent, phase, _, cx| {
             if !phase.capture() {
@@ -822,7 +817,8 @@ impl Element for Popover {
             }
             if !pointer_down.get() && !keep_open_region.contains(&event.position) {
                 editor.update(cx, |editor, cx| editor.clear_hover_state(cx));
-            } else if has_documentation {
+            } else {
+                // The editor must keep the anchor while the pointer crosses to the popup.
                 let handing_off = !event.dragging()
                     && !event.modifiers.alt
                     && !event.modifiers.secondary(cx)

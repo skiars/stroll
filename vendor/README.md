@@ -178,7 +178,8 @@ dialogs in a Wayland window after changes to paint order or focus handling.
   The popup integration tests cover timing, cancellation, and scrolling.
 - Pending hover requests are dropped when the pointer leaves the text hitbox,
   and responses are checked against the visible anchor. The popup takes over
-  pointer tracking after its first paint.
+  pointer tracking after its first paint, including for diagnostic-only content
+  and while documentation is loading.
 - Workspace and Git diff editor popups use current-frame text viewport bounds
   for vertical placement. Hover keeps its window-based height limit and uses
   the available editor space to stay within the viewport. Pinned diff file
@@ -260,8 +261,9 @@ dialogs in a Wayland window after changes to paint order or focus handling.
   in both themes. Set `STROLL_SWITCH_SCREENSHOTS` to capture both states offscreen.
 - Run `cargo test --release --locked --test popups editor_hover_appends_documentation_to_web_diagnostics`
   to check that diagnostics, code actions, previews, and documentation share
-  the same editor surface. Set `STROLL_ACTION_SCREENSHOTS` to capture
-  both themes with 14 px pencil and preview icons. The workspace language action
+  the same editor surface, and that the pointer can cross into diagnostics
+  with or without Quick Fix or pending documentation. Set `STROLL_ACTION_SCREENSHOTS`
+  to capture both themes with 14 px pencil and preview icons. The workspace language action
   tests check the 22 × 22 px hit areas for the inline bulb and preview button,
   equal top, bottom, and right insets for the preview button in a single-line row,
   draft edits, and grouped undo and redo.
