@@ -40,6 +40,14 @@ pub(crate) struct Config {
     pub terminal: Terminal,
     pub lsp: Lsp,
     pub ai: crate::ai::Settings,
+    pub translation: Translation,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Serialize)]
+#[serde(default)]
+pub(crate) struct Translation {
+    pub document: bool,
+    pub editor: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Serialize)]

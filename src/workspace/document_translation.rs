@@ -15,6 +15,20 @@ pub(crate) enum TranslationView {
 }
 
 impl TranslationView {
+    fn enabled(self, config: &crate::config::Config) -> bool {
+        match self {
+            Self::Document => config.translation.document,
+            Self::Editor => config.translation.editor,
+        }
+    }
+
+    fn toggle(self, config: &mut crate::config::Config) {
+        match self {
+            Self::Document => config.translation.document = !config.translation.document,
+            Self::Editor => config.translation.editor = !config.translation.editor,
+        }
+    }
+
     fn icon_size(self) -> Pixels {
         match self {
             Self::Document => px(19.),
@@ -25,40 +39,7 @@ impl TranslationView {
 
 #[derive(Default)]
 pub(super) struct DocumentTranslation {
-    documents: HashSet<PathBuf>,
-    editors: HashSet<PathBuf>,
     active: Option<ActiveTranslation>,
-}
-
-impl DocumentTranslation {
-    fn enabled(&self, view: TranslationView, path: &Path) -> bool {
-        match view {
-            TranslationView::Document => self.documents.contains(path),
-            TranslationView::Editor => self.editors.contains(path),
-        }
-    }
-
-    fn toggle(&mut self, view: TranslationView, path: PathBuf) {
-        let paths = match view {
-            TranslationView::Document => &mut self.documents,
-            TranslationView::Editor => &mut self.editors,
-        };
-        if !paths.remove(&path) {
-            paths.insert(path);
-        } else if self
-            .active
-            .as_ref()
-            .is_some_and(|active| active.view == view && active.path == path)
-        {
-            self.active = None;
-        }
-    }
-
-    pub(super) fn forget(&mut self, view: TranslationView, path: &Path) {
-        if self.enabled(view, path) {
-            self.toggle(view, path.to_owned());
-        }
-    }
 }
 
 #[derive(Clone, PartialEq)]
@@ -101,7 +82,7 @@ impl Workspace {
         path: &Path,
         colors: Palette,
     ) -> Div {
-        let enabled = self.document_translation.enabled(view, path);
+        let enabled = view.enabled(self.config.current());
         let available = self.ai.snapshot(false).is_some();
         let status = self
             .document_translation
@@ -125,7 +106,6 @@ impl Workspace {
         let glyph = Icon::default()
             .data(TRANSLATION_ICON)
             .when(available || enabled, |glyph| glyph.text_color(color));
-        let path = path.to_owned();
         div()
             .flex_shrink_0()
             .debug_selector(move || id.into())
@@ -135,10 +115,13 @@ impl Workspace {
                     .icon_size(view.icon_size())
                     .toggled(enabled)
                     .disabled(!available && !enabled)
-                    .on_click(move |_, _, cx| {
+                    .on_click(move |_, window, cx| {
                         workspace.update(cx, |this, cx| {
-                            this.document_translation.toggle(view, path.clone());
-                            cx.notify();
+                            let mut config = this.config.current().clone();
+                            view.toggle(&mut config);
+                            if let Err(error) = this.commit_settings(config, window, cx) {
+                                this.show_error(error, window, cx);
+                            }
                         });
                     }),
             )
@@ -183,9 +166,8 @@ impl Workspace {
             return;
         };
         let path = &reader.read(cx).path;
-        let snapshot = self
-            .document_translation
-            .enabled(view, path)
+        let snapshot = view
+            .enabled(self.config.current())
             .then(|| self.ai.snapshot(false))
             .flatten();
         let Some(snapshot) = snapshot else {
@@ -407,8 +389,8 @@ mod tests {
         let store = Arc::new(Store::new(directory.join("state"))?);
         store.save_editor_preview_preference("markdown", EditorPreviewMode::Source)?;
         let config_path = directory.join("config.toml");
-        let config = ConfigFile::load(Some(config_path.clone()));
         let mut ai = save_provider(&config_path, &Default::default(), base, "model", "mock-key")?;
+        let config = ConfigFile::load(Some(config_path));
         ai.auto_translate = false;
         let mut workspace = None;
         let (_, visual) = app.add_window_view(|window, cx| {
@@ -484,8 +466,7 @@ mod tests {
         settle(visual, &workspace, |this, _| {
             assert_eq!(this.active_editor_preview_mode(), EditorPreviewMode::Source);
             assert!(this.document_translation.active.is_none());
-            this.document_translation
-                .enabled(TranslationView::Editor, Path::new(FILE))
+            TranslationView::Editor.enabled(this.config.current())
         });
         assert!(visual.debug_bounds("editor-preview-full").is_none());
 
@@ -565,6 +546,18 @@ mod tests {
         settle(visual, &workspace, |this, _| translation_ready(this));
         assert!(visual.debug_bounds(FIRST).is_some());
         assert!(visual.debug_bounds(SECOND).is_some());
+
+        let reopened_config = ConfigFile::load(Some(directory.path().join("config.toml")));
+        assert!(TranslationView::Document.enabled(reopened_config.current()));
+        assert!(!TranslationView::Editor.enabled(reopened_config.current()));
+        visual.update(|window, cx| {
+            workspace.update(cx, |this, cx| {
+                this.close_open_document(Path::new(FILE), window, cx);
+                this.navigate_document(FILE.into(), None, window, cx);
+            });
+        });
+        settle(visual, &workspace, |this, _| translation_ready(this));
+        assert!(visual.debug_bounds(FIRST).is_some());
         Ok(())
     }
 

@@ -182,7 +182,7 @@ pub(crate) fn lsp_edit_target(
     Ok(version)
 }
 
-fn operation_path(root: &Path, path: &Path) -> Result<PathBuf> {
+fn validate_operation_path(path: &Path) -> Result<()> {
     ensure!(
         !path.as_os_str().is_empty()
             && path
@@ -191,17 +191,63 @@ fn operation_path(root: &Path, path: &Path) -> Result<PathBuf> {
                 if name.to_str().is_some_and(valid_name))),
         t!("workspace.tree_invalid_name")
     );
-    let target = root.join(path);
+    Ok(())
+}
+
+fn ensure_operation_directory(metadata: &fs::Metadata) -> Result<()> {
+    ensure!(
+        metadata.is_dir() && !is_link(metadata),
+        t!("common.path_outside_repo")
+    );
+    Ok(())
+}
+
+fn operation_path(root: &Path, path: &Path) -> Result<PathBuf> {
+    validate_operation_path(path)?;
     let mut parent = root.to_owned();
     for part in path.parent().into_iter().flat_map(Path::components) {
         parent.push(part);
-        let metadata = parent.symlink_metadata()?;
-        ensure!(
-            metadata.is_dir() && !is_link(&metadata),
-            t!("common.path_outside_repo")
-        );
+        ensure_operation_directory(&parent.symlink_metadata()?)?;
     }
-    Ok(target)
+    Ok(root.join(path))
+}
+
+fn create_entry(path: &Path, directory: bool) -> Result<()> {
+    if directory {
+        fs::create_dir(path)?;
+    } else {
+        File::create_new(path)?;
+    }
+    Ok(())
+}
+
+fn create_with_parents(root: &Path, path: &Path, directory: bool) -> Result<()> {
+    validate_operation_path(path)?;
+    let mut parts = path.components().peekable();
+    let mut parent = root.to_owned();
+    while let Some(part) = parts.next() {
+        let target = parent.join(part);
+        if parts.peek().is_none() {
+            return create_entry(&target, directory);
+        }
+        match target.symlink_metadata() {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                // Publish the new branch only once its leaf exists.
+                let staging = tempfile::tempdir_in(&parent)?;
+                let branch = staging.path().join("entry");
+                fs::create_dir(&branch)?;
+                let mut staged = branch.clone();
+                while let Some(part) = parts.next() {
+                    staged.push(part);
+                    create_entry(&staged, directory || parts.peek().is_some())?;
+                }
+                return rename_no_replace(&branch, &target);
+            }
+            metadata => ensure_operation_directory(&metadata?)?,
+        }
+        parent = target;
+    }
+    unreachable!("Validated creation paths contain at least one component")
 }
 
 pub(crate) fn valid_name(name: &str) -> bool {
@@ -235,15 +281,12 @@ impl Repository {
                 operation,
             ));
         }
+        if let FileOperation::Create { directory } = operation {
+            return create_with_parents(&self.root, path, directory);
+        }
         let target = operation_path(&self.root, path)?;
         match operation {
-            FileOperation::Create { directory: true } => fs::create_dir(target)?,
-            FileOperation::Create { directory: false } => {
-                OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .open(target)?;
-            }
+            FileOperation::Create { .. } => unreachable!(),
             FileOperation::Rename { name, version } => {
                 ensure!(valid_name(&name), t!("workspace.tree_invalid_name"));
                 ensure!(

@@ -871,24 +871,35 @@ impl Workspace {
             return;
         };
         let name = edit.input.read(cx).value().to_string();
-        if !valid_name(&name) {
-            toast::error(window, cx, t!("workspace.tree_invalid_name"));
-            return;
-        }
         let (path, operation) = match &edit.version {
-            Some(version) => (
-                edit.path.clone(),
-                FileOperation::Rename {
-                    name,
-                    version: version.clone(),
-                },
-            ),
-            None => (
-                edit.path.join(name),
-                FileOperation::Create {
-                    directory: edit.directory,
-                },
-            ),
+            Some(version) => {
+                if !valid_name(&name) {
+                    toast::error(window, cx, t!("workspace.tree_invalid_name"));
+                    return;
+                }
+                (
+                    edit.path.clone(),
+                    FileOperation::Rename {
+                        name,
+                        version: version.clone(),
+                    },
+                )
+            }
+            None => {
+                let parts = || name.split(|ch| ch == '/' || cfg!(windows) && ch == '\\');
+                if !parts().all(valid_name) {
+                    toast::error(window, cx, t!("workspace.tree_invalid_create_path"));
+                    return;
+                }
+                let mut path = edit.path.clone();
+                path.extend(parts());
+                (
+                    path,
+                    FileOperation::Create {
+                        directory: edit.directory,
+                    },
+                )
+            }
         };
         self.run_tree_operation(path, operation, window, cx);
     }
@@ -1038,6 +1049,7 @@ impl Workspace {
                 unreachable!("Transfers use the shared tree transfer flow")
             }
         };
+        let create = matches!(operation, FileOperation::Create { .. });
         let open = matches!(operation, FileOperation::Create { directory: false });
         let affected = action
             .as_ref()
@@ -1069,13 +1081,21 @@ impl Workspace {
                                 this.remove_tree_path(&repo, &path, affected, window, cx);
                             }
                         }
-                        this.refresh_tree_paths(
-                            [path.parent().unwrap_or(Path::new("")).to_owned()],
-                            window,
-                            cx,
-                        );
-                        if open && this.view == WorkspaceView::Editor {
-                            this.open_file(path, false, window, cx);
+                        let parents = path.ancestors().skip(1);
+                        if create {
+                            if this.view == WorkspaceView::Editor {
+                                this.reveal_tree_path(&path, cx);
+                            }
+                            this.refresh_tree_paths(parents.map(Path::to_owned), window, cx);
+                            if open && this.view == WorkspaceView::Editor {
+                                this.open_file(path, false, window, cx);
+                            }
+                        } else {
+                            this.refresh_tree_paths(
+                                parents.take(1).map(Path::to_owned),
+                                window,
+                                cx,
+                            );
                         }
                     }
                     Err(error) => {
@@ -2914,6 +2934,68 @@ mod tests {
             assert!(has_row(this, "docs/page.md"));
             assert!(!has_row(this, "editor/nested"));
         });
+        Ok(())
+    }
+
+    #[::core::prelude::v1::test]
+    fn workspace_tree_creates_nested_paths_and_reveals_the_result() -> Result<()> {
+        let fixture = tempfile::tempdir()?;
+        let root = fixture.path().join("repo");
+        fs::create_dir(&root)?;
+        assert!(
+            std::process::Command::new("git")
+                .args(["init", "-qb", "main"])
+                .arg(&root)
+                .status()?
+                .success()
+        );
+        fs::create_dir(root.join("base"))?;
+        fs::write(root.join("base/keep.txt"), "keep")?;
+
+        let mut cx = TestAppContext::single();
+        cx.update(gpui_component::init);
+        let store = Arc::new(Store::new(fixture.path().join("state"))?);
+        let config = ConfigFile::load(Some(fixture.path().join("config.toml")));
+        let mut workspace = None;
+        let (_, mut visual) = cx.add_window_view(|window, cx| {
+            let view = cx
+                .new(|cx| Workspace::with_config(store, config, WorkspaceView::Editor, window, cx));
+            workspace = Some(view.clone());
+            gpui_component::Root::new(view, window, cx)
+        });
+        let workspace = workspace.unwrap();
+        visual.simulate_resize(size(px(1024.), px(650.)));
+        let visual = &mut visual;
+        visual.update(|window, cx| {
+            window.activate_window();
+            workspace.update(cx, |this, cx| {
+                this.open_repository(
+                    Location {
+                        root: root.clone(),
+                        file: None,
+                    },
+                    window,
+                    cx,
+                );
+            });
+        });
+        let listed =
+            |this: &Workspace, path: &Path| this.rows.iter().any(|row| row.entry.path == path);
+        settle(visual, &workspace, |this| listed(this, Path::new("base")));
+        for (name, directory) in [("deep/folders", true), ("deep/folders/note.txt", false)] {
+            visual.update(|window, cx| {
+                workspace.update(cx, |this, cx| {
+                    this.begin_tree_edit("base".into(), directory, None, window, cx);
+                });
+            });
+            visual.simulate_input(name);
+            visual.simulate_keystrokes("enter");
+            let path = Path::new("base").join(name);
+            settle(visual, &workspace, |this| {
+                listed(this, &path) && (directory || this.tabs.active() == Some(path.as_path()))
+            });
+            assert_eq!(root.join(path).is_dir(), directory);
+        }
         Ok(())
     }
 

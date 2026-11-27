@@ -282,6 +282,32 @@ fn git_menus_confirm_restore_and_discard_for_files_and_filtered_directories() {
     });
     settle(visual);
 
+    let click = |visual: &mut VisualTestContext, selector| {
+        let center = visual.debug_bounds(selector).unwrap().center();
+        visual.simulate_click(center, Modifiers::default());
+        settle(visual);
+    };
+    click(visual, "git-tree-row:folder:folder");
+    click(visual, "git-reading-options");
+    visual.simulate_keystrokes("down down down down down down down enter");
+    settle(visual);
+    visual.update(|_, cx| {
+        let panel = panel.read(cx);
+        let diff = panel.diff.read(cx);
+        let saved = panel.session(cx).unwrap();
+        for path in [visible, hidden, untracked, hidden_untracked] {
+            assert!(diff.is_file_collapsed(path), "{path}");
+            assert!(saved.worktree_collapsed_files.contains(path), "{path}");
+        }
+        assert!(!diff.is_file_collapsed(deleted));
+    });
+    click(visual, "git-tree-row:folder:folder");
+    visual.update(|_, cx| {
+        assert!(panel.read(cx).diff.read(cx).is_file_collapsed(hidden));
+        panel.update(cx, |panel, cx| panel.set_files_collapsed(false, cx));
+    });
+    settle(visual);
+
     let open_action = |visual: &mut VisualTestContext, row, keys| {
         let pos = visual.debug_bounds(row).unwrap().center();
         visual.simulate_mouse_down(pos, MouseButton::Right, Modifiers::default());

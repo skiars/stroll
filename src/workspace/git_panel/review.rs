@@ -2287,18 +2287,40 @@ impl GitPanel {
         let Some(review) = &mut self.review else {
             return;
         };
-        self.pending_hunk_navigation = None;
         let paths = Arc::make_mut(&mut review.collapsed);
         if collapsed {
             paths.extend(review.detail.files.iter().map(|file| file.path.clone()));
         } else {
             paths.retain(|path| !review.by_path.contains_key(path));
         }
+        self.sync_file_disclosures(cx);
+    }
+
+    fn collapse_closed_folder_diffs(&mut self, cx: &mut Context<Self>) {
+        let Some(review) = &mut self.review else {
+            return;
+        };
+        let paths = Arc::make_mut(&mut review.collapsed);
+        let before = paths.len();
+        paths.extend(review.detail.files.iter().filter_map(|file| {
+            file.path
+                .match_indices('/')
+                .any(|(end, _)| review.directories.contains(&file.path[..end]))
+                .then(|| file.path.clone())
+        }));
+        if paths.len() != before {
+            self.sync_file_disclosures(cx);
+        }
+    }
+
+    fn sync_file_disclosures(&mut self, cx: &mut Context<Self>) {
+        let review = self.review.as_ref().unwrap();
+        self.pending_hunk_navigation = None;
+        self.confirm_restore = None;
         self.diff.update(cx, |diff, cx| {
-            diff.set_all_files_collapsed(collapsed, cx);
+            diff.restore_collapsed_files(review.collapsed.iter().cloned(), cx);
             diff.invalidate_visible_files(cx);
         });
-        self.confirm_restore = None;
         cx.notify();
     }
 
@@ -3216,6 +3238,10 @@ impl GitPanel {
         let whitespace = self.whitespace;
         let split = self.split;
         let wrap = self.wrap;
+        let has_closed_folders = self
+            .review
+            .as_ref()
+            .is_some_and(|review| !review.directories.is_empty());
         icon_button(
             "git-reading-options",
             IconName::Ellipsis,
@@ -3229,6 +3255,7 @@ impl GitPanel {
             let search_view = view.clone();
             let previous = view.clone();
             let next = view.clone();
+            let fold_view = view.clone();
             menu.item(
                 PopupMenuItem::new(t!("git.ignore_whitespace"))
                     .checked(whitespace)
@@ -3284,6 +3311,14 @@ impl GitPanel {
                         this.diff.update(cx, |diff, cx| diff.next_change(cx))
                     });
                 }),
+            )
+            .separator()
+            .item(
+                PopupMenuItem::new(t!("git.collapse_closed_folder_diffs"))
+                    .disabled(!has_closed_folders)
+                    .on_click(move |_, _, cx| {
+                        _ = fold_view.update(cx, |this, cx| this.collapse_closed_folder_diffs(cx));
+                    }),
             )
         })
     }

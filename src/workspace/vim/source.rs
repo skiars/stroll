@@ -1,7 +1,13 @@
-use std::{ops::Range, rc::Rc, sync::LazyLock};
+use std::{ops::Range, rc::Rc, sync::LazyLock, time::Duration};
 
 use gpui::{App, ClipboardItem, Context, Entity, Keystroke, Window};
-use gpui_component::input::{self, EditorState, Rope, RopeExt as _};
+use gpui_component::{
+    ActiveTheme as _,
+    input::{
+        self, EditorState, RangeDecoration, RangeDecorationCollection, RangeDecorationStyle, Rope,
+        RopeExt as _,
+    },
+};
 use unicode_segmentation::{GraphemeCursor, GraphemeIncomplete};
 
 use super::{Workspace, plain_key};
@@ -199,6 +205,7 @@ pub(in crate::workspace) struct Source {
     last_change: Option<Change>,
     insert: Option<InsertSession>,
     edit_guard: Option<EditGuard>,
+    yank_highlight: Option<RangeDecorationCollection>,
 }
 
 pub(in crate::workspace) type EditGuard = Rc<dyn Fn(&[Range<usize>], &App) -> bool>;
@@ -243,7 +250,45 @@ impl Source {
             .is_none_or(|guard| guard(ranges, cx))
     }
 
+    fn highlight_yank(
+        &mut self,
+        editor: &mut EditorState,
+        ranges: impl IntoIterator<Item = Range<usize>>,
+        cx: &mut Context<EditorState>,
+    ) {
+        let color = cx.theme().accent.opacity(0.30);
+        let decorations = ranges
+            .into_iter()
+            .filter(|range| !range.is_empty())
+            .map(|range| {
+                RangeDecoration::new(range)
+                    .with_style(RangeDecorationStyle::Fill)
+                    .with_color(color)
+            })
+            .collect();
+        let highlight = editor.create_range_decorations_collection(decorations, cx);
+        if let Some(previous) = self.yank_highlight.replace(highlight.clone()) {
+            cx.defer(move |cx| previous.dispose(cx));
+        }
+        let timer = cx.background_executor().timer(Duration::from_millis(180));
+        cx.spawn(async move |_, cx| {
+            timer.await;
+            cx.update(|cx| highlight.dispose(cx));
+        })
+        .detach();
+    }
+
+    #[cfg(test)]
+    pub(super) fn yank_highlight_ranges(&self, cx: &App) -> Vec<Range<usize>> {
+        self.yank_highlight
+            .as_ref()
+            .map_or_else(Vec::new, |highlight| highlight.get_ranges(cx))
+    }
+
     pub(in crate::workspace) fn reset(&mut self, state: &Entity<EditorState>, cx: &mut App) {
+        if let Some(highlight) = self.yank_highlight.take() {
+            highlight.dispose(cx);
+        }
         state.update(cx, |editor, cx| {
             if self.insert.take().is_some() {
                 editor.end_edit_transaction();

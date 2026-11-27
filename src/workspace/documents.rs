@@ -83,7 +83,12 @@ impl Workspace {
         self.session.open_documents.as_deref().unwrap_or(&[])
     }
 
-    fn close_open_document(&mut self, path: &Path, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn close_open_document(
+        &mut self,
+        path: &Path,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.repository_ui.opening.is_some() {
             return;
         }
@@ -95,8 +100,6 @@ impl Workspace {
             return;
         };
         self.session_revision += 1;
-        self.document_translation
-            .forget(super::TranslationView::Document, path);
         if active {
             self.pause_document_images(true, cx);
             self.doc = None;

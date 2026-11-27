@@ -191,6 +191,7 @@ impl Source {
         } else {
             let head = if self.mode.visual() { range.start } else { at };
             self.leave_visual(editor, head, cx);
+            self.highlight_yank(editor, [range], cx);
         }
     }
 
@@ -356,6 +357,9 @@ impl Source {
                 ),
                 cx,
             );
+            if key == 'y' {
+                self.highlight_yank(editor, slices.into_iter().map(|slice| slice.range), cx);
+            }
             if key == 'c' {
                 editor.begin_edit_transaction();
             }

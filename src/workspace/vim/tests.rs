@@ -1128,6 +1128,49 @@ fn vim_document_find_returns_focus_without_dismissing() -> anyhow::Result<()> {
 }
 
 #[::core::prelude::v1::test]
+fn vim_yank_highlights_the_copied_range_until_its_own_timer_expires() -> anyhow::Result<()> {
+    with_vim_workspace(
+        "one
+two
+three
+",
+        |visual, workspace| {
+            let ranges = |visual: &mut VisualTestContext| {
+                visual.update(|_, cx| {
+                    workspace
+                        .read(cx)
+                        .active_file()
+                        .unwrap()
+                        .vim
+                        .yank_highlight_ranges(cx)
+                })
+            };
+            visual.simulate_keystrokes("y");
+            draw(visual);
+            assert!(ranges(visual).is_empty());
+            visual.simulate_keystrokes("y");
+            draw(visual);
+            assert_eq!(ranges(visual), vec![0..4]);
+
+            visual.executor().advance_clock(Duration::from_millis(100));
+            visual.simulate_keystrokes("j 2 y y");
+            draw(visual);
+            assert_eq!(ranges(visual), vec![4..14]);
+            visual.executor().advance_clock(Duration::from_millis(100));
+            draw(visual);
+            assert_eq!(ranges(visual), vec![4..14]);
+            visual.executor().advance_clock(Duration::from_millis(90));
+            draw(visual);
+            assert!(ranges(visual).is_empty());
+
+            visual.simulate_keystrokes("v l y");
+            draw(visual);
+            assert_eq!(ranges(visual), vec![4..6]);
+        },
+    )
+}
+
+#[::core::prelude::v1::test]
 fn vim_indent_supports_operators_visual_blocks_and_undo() -> anyhow::Result<()> {
     let text = "a\n b\nc\n\nd\n";
     with_vim_workspace(text, |visual, workspace| {

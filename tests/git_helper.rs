@@ -869,6 +869,40 @@ fn workspace_file_protocol_lists_mutates_and_reads_large_files() {
     let after = helper.ok(json!({"EntryVersion": "empty"}));
     helper.ok(json!({"FileOperation": ["empty", {"Delete": {"version": after}}]}));
     assert!(!root.join("empty").exists());
+
+    let create = |path: &str, directory| json!({"FileOperation": [path, {"Create": {"directory": directory}}]});
+    helper.ok(create("shared/deep/note.txt", false));
+    helper.ok(create("shared/other/deep", true));
+    assert!(root.join("shared/other/deep").is_dir());
+    fs::write(root.join("shared/deep/note.txt"), "keep").unwrap();
+    for path in [
+        "shared/deep/note.txt",
+        "shared/deep/note.txt/child",
+        "unused/.git/forbidden.txt",
+        "unused/../forbidden.txt",
+    ] {
+        assert!(
+            helper.call(create(path, false)).get("Err").is_some(),
+            "{path}"
+        );
+    }
+    assert_eq!(
+        fs::read_to_string(root.join("shared/deep/note.txt")).unwrap(),
+        "keep"
+    );
+    assert!(!root.join("unused").exists());
+    #[cfg(unix)]
+    {
+        let outside = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(outside.path(), root.join("linked")).unwrap();
+        assert!(
+            helper
+                .call(create("linked/deep/forbidden.txt", false))
+                .get("Err")
+                .is_some()
+        );
+        assert!(!outside.path().join("deep").exists());
+    }
 }
 
 #[test]
