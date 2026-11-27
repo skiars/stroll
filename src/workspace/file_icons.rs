@@ -43,8 +43,23 @@ pub(super) fn file_type_icon(
     }
     let resources = LanguageResources::for_file(repository, path);
     let association = associated_highlight(associations, resources, path).map(|(_, syntax)| syntax);
-    let language = association.as_deref().unwrap_or_else(|| language_for(path));
     let extension = path.extension().and_then(|extension| extension.to_str());
+    if association.is_none()
+        && let Some(extension) = extension
+    {
+        if extension.eq_ignore_ascii_case("wasm") {
+            return mark(include_bytes!("file_icons/wasm.svg"), 0x654ff0, 0xaa9cff);
+        }
+        if [
+            "exe", "bin", "dll", "so", "dylib", "a", "lib", "o", "class", "pyc",
+        ]
+        .iter()
+        .any(|candidate| extension.eq_ignore_ascii_case(candidate))
+        {
+            return glyph(IconName::Binary, 0x605187, 0xb5a0e4);
+        }
+    }
+    let language = association.as_deref().unwrap_or_else(|| language_for(path));
     match language {
         "markdown" => mark(
             include_bytes!("file_icons/markdown.svg"),
@@ -93,7 +108,7 @@ pub(super) fn file_type_icon(
 
 #[cfg(all(test, target_os = "linux"))]
 #[test]
-fn associated_file_uses_the_same_icon_as_its_target_language() -> anyhow::Result<()> {
+fn file_icons_render_at_tree_and_tab_sizes() -> anyhow::Result<()> {
     use std::sync::Arc;
 
     use gpui::{
@@ -107,11 +122,13 @@ fn associated_file_uses_the_same_icon_as_its_target_language() -> anyhow::Result
     struct IconProbe {
         config: ConfigFile,
         name: &'static str,
+        mode: ThemeMode,
+        size: f32,
     }
 
     impl Render for IconProbe {
         fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl gpui::IntoElement {
-            let colors = Palette::for_mode(ThemeMode::Light);
+            let colors = Palette::for_mode(self.mode);
             div()
                 .size_full()
                 .flex()
@@ -123,7 +140,7 @@ fn associated_file_uses_the_same_icon_as_its_target_language() -> anyhow::Result
                     &self.config.file_associations,
                     Path::new(self.name),
                     colors,
-                    16.,
+                    self.size,
                 ))
         }
     }
@@ -132,7 +149,13 @@ fn associated_file_uses_the_same_icon_as_its_target_language() -> anyhow::Result
     let path = fixture.path().join("config.toml");
     std::fs::write(
         &path,
-        "[files.associations]\n\"*.ux\" = \"html\"\n\"photo.png\" = \"html\"\n",
+        concat!(
+            "[files.associations]\n",
+            "\"*.ux\" = \"html\"\n",
+            "\"photo.png\" = \"html\"\n",
+            "\"mapped.bin\" = \"html\"\n",
+            "\"mapped.wasm\" = \"html\"\n",
+        ),
     )?;
     let config = ConfigFile::load(Some(path));
     let mut app = HeadlessAppContext::with_platform(
@@ -146,26 +169,52 @@ fn associated_file_uses_the_same_icon_as_its_target_language() -> anyhow::Result
         let view = cx.new(|_| IconProbe {
             config,
             name: "mapped.ux",
+            mode: ThemeMode::Light,
+            size: 15.,
         });
         probe = Some(view.clone());
         view
     })?;
     let probe = probe.unwrap();
-    let mut paint = |name| -> anyhow::Result<_> {
+    let mut paint = |name, mode, size| -> anyhow::Result<_> {
         app.update(|cx| {
             probe.update(cx, |probe, cx| {
                 probe.name = name;
+                probe.mode = mode;
+                probe.size = size;
                 cx.notify();
             })
         });
         app.run_until_parked();
         app.capture_screenshot(window.into())
     };
-    let html = paint("reference.html")?;
-    assert!(paint("mapped.ux")? == html);
-    assert!(paint("unmatched.txt")? != html);
-    let image = paint("reference.png")?;
-    assert!(paint("photo.png")? == image);
-    assert!(image != html);
+    for mode in [ThemeMode::Light, ThemeMode::Dark] {
+        for size in [15., 12.] {
+            let mut paint = |name| paint(name, mode, size);
+            let text = paint("reference.txt")?;
+            let wasm = paint("module.wasm")?;
+            let binary = paint("payload.bin")?;
+            let python = paint("app.py")?;
+            let icons = [&text, &wasm, &binary, &python];
+            for (index, icon) in icons.iter().enumerate() {
+                assert!(icon.pixels().any(|pixel| pixel != icon.get_pixel(0, 0)));
+                assert!(!icons[..index].contains(icon));
+            }
+            assert!(paint("module.WASM")? == wasm);
+            assert!(paint("stroll.EXE")? == binary);
+            assert!(paint("library.so")? == binary);
+            assert!(paint("app.pyi")? == python);
+            assert!(paint("module.wat")? == text);
+
+            let html = paint("reference.html")?;
+            assert!(paint("mapped.ux")? == html);
+            assert!(paint("mapped.bin")? == html);
+            assert!(paint("mapped.wasm")? == html);
+            assert!(text != html);
+            let image = paint("reference.png")?;
+            assert!(paint("photo.png")? == image);
+            assert!(image != html);
+        }
+    }
     Ok(())
 }

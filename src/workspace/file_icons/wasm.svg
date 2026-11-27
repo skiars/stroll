@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" fill-rule="evenodd">
+  <!-- Adapted from the CC0 WebAssembly logo for use at 12–15 pixels. -->
+  <!-- https://github.com/WebAssembly/web-assembly-logo -->
+  <path d="M1.5 1.5h6.65a3.85 3.85 0 0 0 7.7 0h6.65v21h-21V1.5Z
+           M3.7 11.7h1.75l1.02 5.43 1.45-5.43h1.59l1.43 5.43 1.03-5.43h1.75l-1.8 8.2h-1.78l-1.43-5.45-1.43 5.45H5.5l-1.8-8.2Z
+           M15.84 11.7h1.92l2.98 8.2H18.9l-.59-1.77h-3.02l-.59 1.77h-1.84l2.98-8.2Z
+           M15.78 16.64h2.04l-1.02-3.05-1.02 3.05Z"/>
+</svg>

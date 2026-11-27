@@ -76,6 +76,16 @@ static SOURCE: FolderTheme = FolderTheme::new(
         "9.14,19.06 8.67,17.93",
     ),
 );
+static LIBRARY: FolderTheme = FolderTheme::new(
+    IconName::Library,
+    0x215ba2,
+    0x83b7ff,
+    concat!(
+        "10.00,12.27 10.30,11.13 11.13,10.30 12.27,10.00 20.64,11.36 21.63,11.76 ",
+        "22.44,12.98 25.12,22.31 25.20,22.93 24.90,24.07 24.07,24.90 22.93,25.20 ",
+        "12.27,25.20 11.13,24.90 10.30,24.07 10.00,22.93",
+    ),
+);
 static DOCS: FolderTheme = FolderTheme::new(
     IconName::BookOpen,
     0x215ba2,
@@ -170,15 +180,16 @@ fn folder_theme(path: &Path) -> Option<&'static FolderTheme> {
     }
     let name = path.file_name()?.to_str()?;
     Some(match name {
-        "src" => &SOURCE,
-        "docs" => &DOCS,
-        "tests" => &TESTS,
+        "src" | "include" => &SOURCE,
+        "lib" => &LIBRARY,
+        "docs" | "doc" => &DOCS,
+        "tests" | "test" | "__tests__" => &TESTS,
         "examples" => &EXAMPLES,
-        "vendor" => &VENDOR,
-        "cmake" => &CMAKE,
+        "vendor" | "packages" | "node_modules" => &VENDOR,
+        "cmake" | "scripts" | "tools" => &CMAKE,
         "temp" | "tmp" => &TEMP,
         ".cache" | "cache" => &CACHE,
-        ".build" | "build" | "target" => &BUILD,
+        ".build" | "build" | "target" | "dist" | "out" => &BUILD,
         name if name.starts_with("cmake-build-") => &BUILD,
         _ => return None,
     })
@@ -222,12 +233,44 @@ mod tests {
     use super::*;
 
     #[test]
+    fn folder_names_select_root_folder_themes() {
+        for (names, theme) in [
+            (&["include"][..], &SOURCE),
+            (&["lib"][..], &LIBRARY),
+            (&["doc"][..], &DOCS),
+            (&["test", "__tests__"][..], &TESTS),
+            (&["packages", "node_modules"][..], &VENDOR),
+            (&["scripts", "tools"][..], &CMAKE),
+            (&["dist", "out"][..], &BUILD),
+        ] {
+            for name in names {
+                let path = Path::new(name);
+                assert!(std::ptr::eq(folder_theme(path).unwrap(), theme), "{name}");
+                assert!(folder_theme(&Path::new("project").join(path)).is_none());
+            }
+        }
+    }
+
+    #[test]
     fn hourglass_envelope_clears_folder_strokes_inside_the_mark() -> anyhow::Result<()> {
+        assert_envelope_clears_folder_strokes(&TEMP, 12. ..23., 11. ..22.)
+    }
+
+    #[test]
+    fn library_envelope_clears_folder_strokes_inside_the_mark() -> anyhow::Result<()> {
+        assert_envelope_clears_folder_strokes(&LIBRARY, 12. ..20., 13. ..22.)
+    }
+
+    fn assert_envelope_clears_folder_strokes(
+        theme: &FolderTheme,
+        x_range: std::ops::Range<f32>,
+        y_range: std::ops::Range<f32>,
+    ) -> anyhow::Result<()> {
         let renderer = SvgRenderer::new(Arc::new(AllAssets));
         for name in [IconName::Folder, IconName::FolderOpen] {
             let svg = AllAssets.load(name.path().as_ref())?.unwrap();
             let base = renderer.render_single_frame(&svg, 1.)?;
-            let masked_svg = TEMP.masked_svg(std::str::from_utf8(&svg)?);
+            let masked_svg = theme.masked_svg(std::str::from_utf8(&svg)?);
             let masked = renderer.render_single_frame(masked_svg.as_bytes(), 1.)?;
             let width = base.size(0).width.0 as usize;
             assert_eq!(masked.size(0), base.size(0));
@@ -239,7 +282,7 @@ mod tests {
             {
                 let x = 24. * (index % width) as f32 / width as f32;
                 let y = 24. * (index / width) as f32 / width as f32;
-                if (12. ..23.).contains(&x) && (11. ..22.).contains(&y) {
+                if x_range.contains(&x) && y_range.contains(&y) {
                     assert_eq!(after[3], 0, "{name:?} at ({x}, {y})");
                     removed_stroke |= before[3] != 0;
                 } else if x < 8. {
@@ -248,7 +291,8 @@ mod tests {
             }
             assert!(
                 removed_stroke,
-                "{name:?} must overlap the hourglass envelope"
+                "{name:?} must overlap the {:?} envelope",
+                theme.mark,
             );
         }
         Ok(())
