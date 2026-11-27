@@ -451,39 +451,7 @@ impl Workspace {
         self.docs_tree_seeded = true;
         self.docs_tree_complete = complete;
         if self.view == WorkspaceView::Docs {
-            let (scroll, deferred) = {
-                let state = self.tree_scroll.0.borrow();
-                let deferred = state.deferred_scroll_to_item.and_then(|request| {
-                    let row = self.rows.get(request.item_index)?;
-                    Some((request, row.entry.path.clone()))
-                });
-                (state.base_handle.clone(), deferred)
-            };
-            let offset = scroll.offset();
-            let top = ((-offset.y / tree_motion::ROW_HEIGHT) as usize).min(self.rows.len());
-            let anchor = (offset.y < px(0.))
-                .then(|| self.rows.get(top))
-                .flatten()
-                .map(|row| row.entry.path.clone());
-            self.rebuild_tree();
-            if let Some(path) = anchor
-                && let Some(index) = self.rows.iter().position(|row| row.entry.path == path)
-            {
-                scroll.set_offset(point(
-                    offset.x,
-                    offset.y + tree_motion::ROW_HEIGHT * (top as f32 - index as f32),
-                ));
-            }
-            if let Some((mut request, path)) = deferred {
-                self.tree_scroll.0.borrow_mut().deferred_scroll_to_item = self
-                    .rows
-                    .iter()
-                    .position(|row| row.entry.path == path)
-                    .map(|index| {
-                        request.item_index = index;
-                        request
-                    });
-            }
+            self.rebuild_refreshed_tree(&self.rows.clone(), cx);
             self.resume_document_tree_reveal(cx);
             if self.doc.is_none()
                 && self.doc_loading.is_none()
@@ -494,6 +462,17 @@ impl Workspace {
             }
         }
         cx.notify();
+    }
+
+    fn rebuild_refreshed_tree(&mut self, previous: &Rc<Vec<TreeRow>>, cx: &App) {
+        self.rebuild_tree();
+        self.tree_motion.get_mut().refresh(
+            previous,
+            &self.rows,
+            |row| row.entry.path.clone(),
+            self.tree_edit.is_none().then_some(&self.tree_scroll),
+            cx,
+        );
     }
 
     pub(super) fn rescan_workspace(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -590,14 +569,26 @@ impl Workspace {
                     .cloned(),
             );
         }
-        // Check both parents of a move involving an open tab, even if the tree is collapsed.
+        // Read an expanded subtree at its destination before publishing the rename.
         for (from, to) in &renames {
-            if self.tabs.paths().iter().any(|path| path.starts_with(from)) {
-                for path in [from, to] {
-                    if let Some(parent) = Path::new(path).parent() {
-                        directories.insert(parent.to_owned());
-                    }
-                }
+            let (from, to) = (Path::new(from), Path::new(to));
+            let expanded = self.expanded.contains(from);
+            if expanded || self.tabs.paths().iter().any(|path| path.starts_with(from)) {
+                directories.extend(
+                    [from.parent(), to.parent()]
+                        .into_iter()
+                        .flatten()
+                        .map(Path::to_owned),
+                );
+            }
+            if expanded && to.parent().is_some_and(visible) {
+                directories.extend(self.expanded.iter().filter_map(|path| {
+                    let suffix = path.strip_prefix(from).ok()?;
+                    path.ancestors()
+                        .take_while(|ancestor| ancestor.starts_with(from))
+                        .all(|ancestor| self.expanded.contains(ancestor))
+                        .then(|| to.join(suffix))
+                }));
             }
         }
         let status_task = status_needed.then(|| {
@@ -669,8 +660,9 @@ impl Workspace {
                                     && !this.tabs.paths().iter().any(|path| path.starts_with(to))
                             })
                             .collect();
-                        for (from, to) in moves {
-                            let (from, to) = (Path::new(&from), Path::new(&to));
+                        let previous_rows = this.rows.clone();
+                        for (from, to) in &moves {
+                            let (from, to) = (Path::new(from), Path::new(to));
                             let affected = this.files_for_external_rename(from);
                             this.relocate_tree_path(&repo, from, to, affected, window, cx);
                             let paths = this
@@ -701,19 +693,22 @@ impl Workspace {
                                 && this.expanded.iter().any(|path| {
                                     !previous.children.contains_key(path)
                                         && tree.children.contains_key(path)
+                                        && !moves.iter().any(|(_, to)| path.starts_with(to))
                                 })
                             {
                                 this.tree_motion.get_mut().start();
                             }
                             this.repository_snapshot = Some(Arc::new(tree));
-                            this.rebuild_tree();
-                            if this
-                                .tree_edit
-                                .as_ref()
-                                .is_some_and(|edit| edit.row(&this.rows).is_none())
-                                && !this.tree_busy
-                            {
-                                this.finish_tree_edit(window, cx);
+                            if this.view == WorkspaceView::Editor {
+                                this.rebuild_refreshed_tree(&previous_rows, cx);
+                                if this
+                                    .tree_edit
+                                    .as_ref()
+                                    .is_some_and(|edit| edit.row(&this.rows).is_none())
+                                    && !this.tree_busy
+                                {
+                                    this.finish_tree_edit(window, cx);
+                                }
                             }
                             cx.notify();
                         }

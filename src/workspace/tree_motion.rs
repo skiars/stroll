@@ -40,47 +40,124 @@ impl<R: Clone + 'static> TreeMotion<R> {
         window: &Window,
         cx: &App,
     ) -> Option<Rc<TreeFrame<R>>> {
-        let requested = std::mem::take(&mut self.requested);
         let now = cx.background_executor().now();
+        self.update(rows, &key, enabled && !cx.reduce_motion(), false, now);
+        let frame = self.current_frame(now, rows.len())?;
+        window.request_animation_frame();
+        Some(Rc::new(frame))
+    }
+
+    pub(super) fn refresh<K: Eq + Hash>(
+        &mut self,
+        previous: &Rc<Vec<R>>,
+        rows: &Rc<Vec<R>>,
+        key: impl Fn(&R) -> K,
+        scroll: Option<&UniformListScrollHandle>,
+        cx: &App,
+    ) {
+        let now = cx.background_executor().now();
+        let same_target = self
+            .last
+            .as_ref()
+            .is_some_and(|last| Rc::ptr_eq(last, previous));
+        let before = scroll
+            .filter(|scroll| scroll.0.borrow().base_handle.offset().y < px(0.))
+            .filter(|_| same_target)
+            .and_then(|_| self.current_frame(now, previous.len()));
+        self.update(
+            rows,
+            &key,
+            scroll.is_some() && !cx.reduce_motion(),
+            same_target,
+            now,
+        );
+        let Some(scroll) = scroll else { return };
+        let mut state = scroll.0.borrow_mut();
+        let offset = state.base_handle.offset();
+        if offset.y >= px(0.) && state.deferred_scroll_to_item.is_none() {
+            return;
+        }
+        let indices: HashMap<_, _> = rows
+            .iter()
+            .enumerate()
+            .map(|(index, row)| (key(row), index))
+            .collect();
+        let new_index = |row: &R| indices.get(&key(row)).copied();
+        state.deferred_scroll_to_item = state.deferred_scroll_to_item.and_then(|mut request| {
+            request.item_index = new_index(previous.get(request.item_index)?)?;
+            Some(request)
+        });
+
+        if offset.y < px(0.) {
+            let top = match &before {
+                Some(frame) => frame.anchor_index(-offset.y),
+                None => Some((-offset.y / ROW_HEIGHT) as usize),
+            };
+            let Some(top) = top.filter(|top| *top < previous.len()) else {
+                return;
+            };
+            let after = self.current_frame(now, rows.len());
+            let row_top = |frame: &Option<TreeFrame<R>>, index| match frame {
+                Some(frame) => frame.row_top(index),
+                None => Some(ROW_HEIGHT * index),
+            };
+            // Prefer the top row, then the nearest surviving row below it.
+            let anchor = (top..previous.len()).chain((0..top).rev()).find_map(|old| {
+                let new = new_index(&previous[old])?;
+                Some(row_top(&before, old)? - row_top(&after, new)?)
+            });
+            if let Some(delta) = anchor {
+                state
+                    .base_handle
+                    .set_offset(point(offset.x, (offset.y + delta).min(px(0.))));
+            }
+        }
+    }
+
+    fn update<K: Eq + Hash>(
+        &mut self,
+        rows: &Rc<Vec<R>>,
+        key: impl Fn(&R) -> K,
+        enabled: bool,
+        refresh: bool,
+        now: Instant,
+    ) {
+        let requested = std::mem::take(&mut self.requested);
         let previous = self.last.replace(rows.clone());
-        if !enabled || cx.reduce_motion() {
+        if !enabled {
             self.transition = None;
-            return None;
+            return;
         }
+        self.transition.take_if(|motion| motion.progress(now) >= 1.);
         if let Some(previous) = previous.filter(|previous| !Rc::ptr_eq(previous, rows)) {
-            self.transition = requested
-                .then(|| {
-                    let current = self.transition.as_ref().map(|motion| {
-                        let progress = motion.progress(now);
-                        motion
-                            .rows
-                            .iter()
-                            .zip(&motion.layout)
-                            .map(move |(row, layout)| (row, layout.height(progress)))
-                    });
-                    let settled = || previous.iter().map(|row| (row, 1.));
-                    let mut next = Transition {
-                        started: now,
-                        rows: Rc::new(Vec::new()),
-                        layout: Vec::new(),
-                    };
-                    if let Some(current) = current {
-                        next.retarget(current, rows, &key);
-                    } else {
-                        next.retarget(settled(), rows, &key);
-                    }
-                    next
-                })
-                .filter(Transition::moves);
+            let current = self.transition.take();
+            self.transition = if requested {
+                let mut next = Transition::new(now);
+                if let Some(motion) = current {
+                    let progress = motion.progress(now);
+                    let current = motion
+                        .rows
+                        .iter()
+                        .zip(&motion.layout)
+                        .map(|(row, layout)| (row, layout.height(progress)));
+                    next.retarget(current, rows, &key);
+                } else {
+                    next.retarget(previous.iter().map(|row| (row, 1.)), rows, &key);
+                }
+                Some(next)
+            } else if refresh {
+                current.map(|motion| motion.refresh(rows, &key))
+            } else {
+                None
+            }
+            .filter(Transition::moves);
         }
+    }
+
+    fn current_frame(&self, now: Instant, row_count: usize) -> Option<TreeFrame<R>> {
         let motion = self.transition.as_ref()?;
         let progress = motion.progress(now);
-        if progress >= 1. {
-            self.transition = None;
-            return None;
-        }
-        window.request_animation_frame();
-        Some(Rc::new(TreeFrame::new(motion, progress, rows.len())))
+        (progress < 1.).then(|| TreeFrame::new(motion, progress, row_count))
     }
 }
 
@@ -91,6 +168,14 @@ struct Transition<R> {
 }
 
 impl<R: Clone> Transition<R> {
+    fn new(started: Instant) -> Self {
+        Self {
+            started,
+            rows: Rc::new(Vec::new()),
+            layout: Vec::new(),
+        }
+    }
+
     fn progress(&self, now: Instant) -> f32 {
         ease_in_out_cubic(
             now.saturating_duration_since(self.started).as_secs_f32() / DURATION.as_secs_f32(),
@@ -109,36 +194,9 @@ impl<R: Clone> Transition<R> {
     ) where
         R: 'a,
     {
-        let indices = target
-            .iter()
-            .enumerate()
-            .map(|(index, row)| (key(row), index))
-            .collect::<HashMap<_, _>>();
-        let mut entrances = vec![None; target.len()];
-        let mut exits = vec![Vec::new(); target.len() + 1];
-        let mut before = target.len();
-        // Put an exiting row before its next surviving neighbor. The target
-        // order still determines the order of all live rows.
-        for (row, height) in current.rev() {
-            if let Some(&index) = indices.get(&key(row)) {
-                entrances[index] = Some(height);
-                before = index;
-            } else if height > 0. {
-                exits[before].push((row, height));
-            }
-        }
-        let rows = Rc::get_mut(&mut self.rows).unwrap();
-        for (index, exiting) in exits.into_iter().enumerate() {
-            for (row, height) in exiting.into_iter().rev() {
-                rows.push(row.clone());
-                self.layout.push(RowMotion::new(None, height));
-            }
-            if let Some(row) = target.get(index) {
-                let from = entrances[index].unwrap_or(0.);
-                rows.push(row.clone());
-                self.layout.push(RowMotion::new(Some(index), from));
-            }
-        }
+        self.place_rows(current, target, key, 0., |height, index| {
+            (index.is_some() || height > 0.).then(|| RowMotion::new(index, height))
+        });
         let mut remaining = &mut self.layout[..];
         while let Some(first) = remaining.first() {
             let direction = (first.to - first.from).signum();
@@ -159,6 +217,74 @@ impl<R: Clone> Transition<R> {
                     total - offset - row.delta()
                 };
                 offset += row.delta();
+            }
+        }
+    }
+
+    fn refresh<K: Eq + Hash>(self, target: &[R], key: impl Fn(&R) -> K) -> Self {
+        let mut next = Self::new(self.started);
+        // Keep the original timing and height of each animated row across a passive refresh.
+        next.place_rows(
+            self.rows.iter().zip(self.layout),
+            target,
+            key,
+            1.,
+            |mut motion, index| match (motion.target, index) {
+                (Some(_), None) => None,
+                (None, Some(_)) => Some(RowMotion::new(index, 1.)),
+                _ => {
+                    motion.target = index;
+                    Some(motion)
+                }
+            },
+        );
+        next
+    }
+
+    fn place_rows<'a, M, K: Eq + Hash>(
+        &mut self,
+        current: impl DoubleEndedIterator<Item = (&'a R, M)>,
+        target: &[R],
+        key: impl Fn(&R) -> K,
+        inserted_height: f32,
+        motion_for_row: impl Fn(M, Option<usize>) -> Option<RowMotion>,
+    ) where
+        R: 'a,
+    {
+        let indices: HashMap<_, _> = target
+            .iter()
+            .enumerate()
+            .map(|(index, row)| (key(row), index))
+            .collect();
+        let mut entrances: Vec<_> = (0..target.len()).map(|_| None).collect();
+        let mut exits: Vec<_> = (0..=target.len()).map(|_| Vec::new()).collect();
+        let mut before = target.len();
+        // Keep an exiting row before its next surviving neighbor.
+        for (row, motion) in current.rev() {
+            let index = indices.get(&key(row)).copied();
+            let Some(motion) = motion_for_row(motion, index) else {
+                continue;
+            };
+            if let Some(index) = index {
+                entrances[index] = Some(motion);
+                before = index;
+            } else {
+                exits[before].push((row, motion));
+            }
+        }
+        let rows = Rc::get_mut(&mut self.rows).unwrap();
+        for (index, exiting) in exits.into_iter().enumerate() {
+            for (row, motion) in exiting.into_iter().rev() {
+                rows.push(row.clone());
+                self.layout.push(motion);
+            }
+            if let Some(row) = target.get(index) {
+                rows.push(row.clone());
+                self.layout.push(
+                    entrances[index]
+                        .take()
+                        .unwrap_or_else(|| RowMotion::new(Some(index), inserted_height)),
+                );
             }
         }
     }
@@ -252,6 +378,16 @@ impl<R: Clone> TreeFrame<R> {
             .visible
             .partition_point(|row| row.top + row.height <= offset);
         self.visible.get(index)?.target
+    }
+
+    fn anchor_index(&self, offset: Pixels) -> Option<usize> {
+        let index = self
+            .visible
+            .partition_point(|row| row.top + row.height <= offset);
+        self.visible[index..]
+            .iter()
+            .chain(self.visible[..index].iter().rev())
+            .find_map(|row| row.target)
     }
 
     pub(super) fn height(&self) -> Pixels {

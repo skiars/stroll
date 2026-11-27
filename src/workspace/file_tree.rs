@@ -1518,16 +1518,29 @@ mod tests {
         workspace: &Entity<Workspace>,
         ready: impl Fn(&Workspace) -> bool,
     ) {
+        settle_with_frame_step(visual, workspace, crate::git::watch::DEBOUNCE, ready);
+    }
+
+    fn draw_tree_frame(visual: &mut VisualTestContext, step: Duration) {
+        visual.executor().advance_clock(step);
+        visual.run_until_parked();
+        visual.update(|window, cx| {
+            window.simulate_next_frame(cx);
+            window.draw(cx).clear(cx);
+        });
+    }
+
+    #[track_caller]
+    fn settle_with_frame_step(
+        visual: &mut VisualTestContext,
+        workspace: &Entity<Workspace>,
+        step: Duration,
+        ready: impl Fn(&Workspace) -> bool,
+    ) {
         let deadline = std::time::Instant::now() + Duration::from_secs(15);
         loop {
-            visual.executor().advance_clock(crate::git::watch::DEBOUNCE);
-            visual.run_until_parked();
-            let done = visual.update(|window, cx| {
-                window.simulate_next_frame(cx);
-                window.draw(cx).clear(cx);
-                ready(workspace.read(cx))
-            });
-            if done {
+            draw_tree_frame(visual, step);
+            if visual.update(|_, cx| ready(workspace.read(cx))) {
                 return;
             }
             assert!(
@@ -1536,6 +1549,246 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn watched_tree(
+        fixture: &tempfile::TempDir,
+        view: WorkspaceView,
+    ) -> Result<(PathBuf, Entity<Workspace>, VisualTestContext)> {
+        let root = fixture.path().join("repo");
+        fs::create_dir_all(root.join("a/nested"))?;
+        fs::write(root.join("a/nested/deep.md"), "# Nested\n")?;
+        for index in 0..4 {
+            fs::write(root.join(format!("a/child-{index}.md")), "# Child\n")?;
+        }
+        for index in 0..45 {
+            fs::write(root.join(format!("row-{index:02}.md")), "# Page\n")?;
+        }
+        assert!(
+            std::process::Command::new("git")
+                .args(["init", "-qb", "main"])
+                .arg(&root)
+                .status()?
+                .success()
+        );
+        let mut cx = TestAppContext::build_with_text_system(
+            TestDispatcher::new(0),
+            None,
+            crate::test_support::text_system(true),
+        );
+        cx.update(gpui_component::init);
+        let store = Arc::new(Store::new(fixture.path().join("state"))?);
+        let config = ConfigFile::load(Some(fixture.path().join("config.toml")));
+        let mut workspace = None;
+        let (_, visual) = cx.add_window_view(|window, cx| {
+            let view = cx.new(|cx| Workspace::with_config(store, config, view, window, cx));
+            workspace = Some(view.clone());
+            gpui_component::Root::new(view, window, cx)
+        });
+        let workspace = workspace.unwrap();
+        visual.simulate_resize(size(px(1000.), px(560.)));
+        visual.update(|window, cx| {
+            cx.set_smooth_scrolling(false);
+            window.activate_window();
+            workspace.update(cx, |this, cx| {
+                this.open_repository(
+                    Location {
+                        root: root.clone(),
+                        file: None,
+                    },
+                    window,
+                    cx,
+                );
+            });
+        });
+        settle(visual, &workspace, |this| {
+            this.repository_watch_active
+                && !this.workspace_refreshing
+                && (view != WorkspaceView::Docs
+                    || (this.docs_tree_complete
+                        && !this.docs_tree_loading
+                        && this.doc_loading.is_none()))
+                && tree_row(this, "row-44.md").is_some()
+        });
+        Ok((root, workspace, visual.clone()))
+    }
+
+    #[cfg(target_os = "linux")]
+    fn tree_row<'a>(workspace: &'a Workspace, path: &str) -> Option<&'a TreeRow> {
+        workspace
+            .rows
+            .iter()
+            .find(|row| row.entry.path == Path::new(path))
+    }
+
+    #[cfg(target_os = "linux")]
+    #[::core::prelude::v1::test]
+    fn repository_updates_anchor_the_scrolled_file_tree() -> Result<()> {
+        for view in [WorkspaceView::Editor, WorkspaceView::Docs] {
+            let fixture = tempfile::tempdir()?;
+            let (root, workspace, mut visual) = watched_tree(&fixture, view)?;
+            let first = visual.debug_bounds("workspace-tree-row:row-00.md").unwrap();
+            let initial_offset = px(-344.);
+            visual.simulate_event(ScrollEvent {
+                position: first.center(),
+                delta: ScrollDelta::Pixels(point(px(0.), initial_offset)),
+                modifiers: Modifiers::none(),
+                touch_phase: TouchPhase::Moved,
+                source: ScrollSource::Pointer,
+            });
+            visual.update(|window, cx| {
+                workspace.update(cx, |this, cx| {
+                    this.focus_tree("row-15.md".into(), window, cx)
+                });
+            });
+            draw_tree_frame(&mut visual, Duration::ZERO);
+            let id = "workspace-tree-row:row-15.md";
+            let before = visual.debug_bounds(id).unwrap();
+            let offset = |visual: &mut VisualTestContext| {
+                visual.update(|_, cx| {
+                    workspace
+                        .read(cx)
+                        .tree_scroll
+                        .0
+                        .borrow()
+                        .base_handle
+                        .offset()
+                        .y
+                })
+            };
+            assert_eq!(offset(&mut visual), initial_offset);
+
+            let added = "00-external.md";
+            fs::write(root.join(added), "# Added above the viewport\n")?;
+            settle(&mut visual, &workspace, |this| {
+                tree_row(this, added).is_some()
+            });
+            assert_eq!(visual.debug_bounds(id), Some(before), "{view:?}");
+            assert_eq!(
+                offset(&mut visual),
+                initial_offset - tree_motion::ROW_HEIGHT
+            );
+            visual.update(|window, cx| {
+                let this = workspace.read(cx);
+                assert_eq!(this.tree_keyboard_path, Path::new("row-15.md"));
+                assert!(this.tree_focus.is_focused(window));
+            });
+
+            fs::remove_file(root.join(added))?;
+            settle(&mut visual, &workspace, |this| {
+                tree_row(this, added).is_none()
+            });
+            assert_eq!(visual.debug_bounds(id), Some(before), "{view:?}");
+            assert_eq!(offset(&mut visual), initial_offset);
+
+            // Delete the partially visible anchor and keep the next surviving row in place.
+            let top = visual.update(|_, cx| {
+                let index = (-initial_offset / tree_motion::ROW_HEIGHT) as usize;
+                workspace.read(cx).rows[index].entry.path.clone()
+            });
+            fs::remove_file(root.join(&top))?;
+            settle(&mut visual, &workspace, |this| {
+                this.rows.iter().all(|row| row.entry.path != top)
+            });
+            assert_eq!(visual.debug_bounds(id), Some(before), "{view:?}");
+            assert_eq!(
+                offset(&mut visual),
+                initial_offset + tree_motion::ROW_HEIGHT
+            );
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[::core::prelude::v1::test]
+    fn repository_refresh_preserves_an_expanding_tree_animation() -> Result<()> {
+        let fixture = tempfile::tempdir()?;
+        let (root, workspace, mut visual) = watched_tree(&fixture, WorkspaceView::Editor)?;
+        let id = "workspace-tree-row:row-00.md";
+        let initial = visual.debug_bounds(id).unwrap().top();
+        visual.update(|window, cx| {
+            workspace.update(cx, |this, cx| {
+                this.toggle_tree_directory("a".into(), window, cx)
+            });
+        });
+        settle_with_frame_step(&mut visual, &workspace, Duration::ZERO, |this| {
+            tree_row(this, "a/child-3.md").is_some()
+        });
+        assert_eq!(visual.debug_bounds(id).unwrap().top(), initial);
+
+        draw_tree_frame(&mut visual, Duration::from_millis(60));
+        let during = visual.debug_bounds(id).unwrap().top();
+        let end = initial + 5. * tree_motion::ROW_HEIGHT;
+        assert!(during > initial && during < end);
+
+        // Complete an unrelated refresh without advancing the animation clock.
+        let added = "zz-external.md";
+        fs::write(root.join(added), "# Added below the viewport\n")?;
+        visual.update(|window, cx| {
+            workspace.update(cx, |this, cx| {
+                this.refresh_tree_paths([PathBuf::new()], window, cx);
+            });
+        });
+        settle_with_frame_step(&mut visual, &workspace, Duration::ZERO, |this| {
+            tree_row(this, added).is_some()
+        });
+        assert_eq!(visual.debug_bounds(id).unwrap().top(), during);
+        draw_tree_frame(&mut visual, Duration::from_millis(45));
+        let continued = visual.debug_bounds(id).unwrap().top();
+        assert!(continued > during && continued < end);
+        draw_tree_frame(&mut visual, Duration::from_millis(75));
+        assert_eq!(visual.debug_bounds(id).unwrap().top(), end);
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[::core::prelude::v1::test]
+    fn externally_renamed_tree_keeps_expanded_descendants_in_the_first_frame() -> Result<()> {
+        let fixture = tempfile::tempdir()?;
+        let (root, workspace, mut visual) = watched_tree(&fixture, WorkspaceView::Editor)?;
+        for path in ["a", "a/nested"] {
+            visual.update(|window, cx| {
+                workspace.update(cx, |this, cx| {
+                    this.toggle_tree_directory(path.into(), window, cx);
+                });
+            });
+            let child = if path == "a" {
+                "a/nested"
+            } else {
+                "a/nested/deep.md"
+            };
+            settle(&mut visual, &workspace, |this| {
+                tree_row(this, child).is_some()
+            });
+            draw_tree_frame(&mut visual, Duration::from_millis(180));
+        }
+        visual.update(|window, cx| {
+            workspace.update(cx, |this, cx| {
+                this.focus_tree("a/nested/deep.md".into(), window, cx);
+            });
+        });
+        draw_tree_frame(&mut visual, Duration::ZERO);
+        let old = "workspace-tree-row:a/nested/deep.md";
+        let before = visual.debug_bounds(old).unwrap();
+        fs::rename(root.join("a"), root.join("renamed"))?;
+        settle_with_frame_step(&mut visual, &workspace, Duration::from_millis(16), |this| {
+            tree_row(this, "renamed").is_some()
+        });
+        visual.update(|window, cx| {
+            let this = workspace.read(cx);
+            for path in ["renamed", "renamed/nested"] {
+                assert!(tree_row(this, path).unwrap().expanded);
+            }
+            assert_eq!(this.tree_keyboard_path, Path::new("renamed/nested/deep.md"));
+            assert!(this.tree_focus.is_focused(window));
+        });
+        assert_eq!(visual.debug_bounds(old), None);
+        assert_eq!(
+            visual.debug_bounds("workspace-tree-row:renamed/nested/deep.md"),
+            Some(before)
+        );
+        Ok(())
     }
 
     #[::core::prelude::v1::test]
