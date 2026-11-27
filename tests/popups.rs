@@ -55,6 +55,85 @@ fn dropdown_motion_matches_the_preview() {
     assert_eq!(motion.sample(halfway, true), (1., false));
 }
 
+#[gpui::test]
+fn default_dialog_fades_with_four_pixels_of_travel_over_180_ms(cx: &mut gpui::TestAppContext) {
+    use gpui::{
+        AppContext as _, Context, IntoElement, ParentElement as _, Render, Styled, Window, div, px,
+    };
+    use gpui_component::{Root, Theme, WindowExt as _};
+
+    struct Probe;
+
+    impl Render for Probe {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div().size_full()
+        }
+    }
+
+    cx.update(gpui_component::init);
+    let (_, cx) = cx.add_window_view(|window, cx| {
+        let probe = cx.new(|_| Probe);
+        Root::new(probe, window, cx)
+    });
+    cx.simulate_resize(size(px(1000.), px(800.)));
+
+    let draw = |cx: &mut gpui::VisualTestContext| {
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+    };
+    let open = |cx: &mut gpui::VisualTestContext| {
+        cx.update(|window, cx| {
+            window.open_dialog(cx, |dialog, _, _| {
+                dialog.title("Push").child("Outgoing commit")
+            });
+        });
+        cx.run_until_parked();
+        draw(cx);
+        draw(cx);
+    };
+    let advance = |cx: &mut gpui::VisualTestContext, millis| {
+        cx.executor().advance_clock(Duration::from_millis(millis));
+        cx.run_until_parked();
+        draw(cx);
+    };
+
+    cx.update(|_, cx| {
+        Theme::update(cx, |theme| theme.font_size = px(24.));
+        cx.set_reduce_motion(false);
+    });
+    open(cx);
+    cx.update(|window, _| assert_eq!(window.rem_size(), px(24.)));
+    assert_eq!(cx.debug_bounds("dialog-0").unwrap().top(), px(76.));
+
+    advance(cx, 30);
+    let entering = cx.debug_bounds("dialog-0").unwrap().top();
+    assert!(entering > px(76.) && entering < px(80.));
+    advance(cx, 150);
+    let resting = cx.debug_bounds("dialog-0").unwrap();
+    assert_eq!(resting.top(), px(80.));
+
+    cx.simulate_keystrokes("escape");
+    draw(cx);
+    cx.update(|window, cx| assert!(!window.has_active_dialog(cx)));
+    assert_eq!(cx.debug_bounds("dialog-0"), Some(resting));
+    advance(cx, 30);
+    let leaving = cx.debug_bounds("dialog-0").unwrap().top();
+    assert!(
+        leaving > px(76.) && leaving < resting.top(),
+        "unexpected dialog top during exit: {leaving:?}"
+    );
+    advance(cx, 149);
+    assert!(cx.debug_bounds("dialog-0").is_some());
+    advance(cx, 1);
+    assert!(cx.debug_bounds("dialog-0").is_none());
+
+    cx.update(|_, cx| cx.set_reduce_motion(true));
+    open(cx);
+    assert_eq!(cx.debug_bounds("dialog-0"), Some(resting));
+    cx.simulate_keystrokes("escape");
+    draw(cx);
+    assert!(cx.debug_bounds("dialog-0").is_none());
+}
+
 #[test]
 fn scene_splits_quad_batches_at_backdrops_and_replays_the_order() {
     let area = bounds(0., 0., 64., 48.);

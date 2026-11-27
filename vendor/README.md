@@ -140,6 +140,10 @@ dialogs in a Wayland window after changes to paint order or focus handling.
 - Button dropdown menus use the same owning-dialog priority as Select. The
   Git interactive rebase test clicks an action where the menu overlaps its
   dialog and checks that Reword opens the commit message editor.
+- Dialog and AlertDialog default to a fade with up to 4 logical pixels of
+  vertical motion. The default theme uses 180 ms in each direction, and
+  reduced motion applies the final state immediately. The popup integration
+  test checks the painted dialog's travel and timing.
 - Select dropdowns open below when there is room for their search field and one
   row. The candidate viewport is limited by the window edge and scrolls under
   the fixed search field. Search results do not affect the side used for

@@ -521,7 +521,7 @@ impl Dialog {
         self
     }
 
-    /// Sets how the dialog enters, defaulting to [`DialogEntrance::SlideDown`].
+    /// Sets how the dialog enters, defaulting to [`DialogEntrance::FadeSlide`].
     ///
     /// This controls the surface and backdrop together, and closing animates
     /// both back out. Reduced motion skips both and shows the final state
@@ -654,13 +654,11 @@ impl RenderOnce for Dialog {
         };
         let y = y + layer_offset;
         let entrance = self.props.entrance;
-        let motion = cx.theme().motion_tokens();
         let closing = self.motion.is_some_and(|motion| motion.closing);
         let visibility = self
             .motion
             .map_or(1.0, |motion| motion.visibility.clamp(0., 1.));
         let fade_overlay = closing && self.props.overlay_visible;
-        let travel = motion.distance_short.to_pixels(window.rem_size());
         let width = self
             .props
             .width
@@ -882,7 +880,7 @@ impl RenderOnce for Dialog {
                                             if entrance == DialogEntrance::FadeSlide {
                                                 let mut surface = EntranceSurface::new(
                                                     surface.into_any_element(),
-                                                    travel,
+                                                    px(4.),
                                                     window_paddings.top + margin,
                                                 );
                                                 surface.progress = visibility;
@@ -1083,7 +1081,7 @@ pub(crate) mod tests {
     fn test_dialog_entrance_builder(cx: &mut TestAppContext) {
         cx.update(crate::init);
         cx.update(|cx| {
-            assert_eq!(Dialog::new(cx).props.entrance, DialogEntrance::SlideDown);
+            assert_eq!(Dialog::new(cx).props.entrance, DialogEntrance::FadeSlide);
             for entrance in [
                 DialogEntrance::SlideDown,
                 DialogEntrance::Fade,
@@ -1138,7 +1136,11 @@ pub(crate) mod tests {
         let cx = window(cx, size(px(1000.), px(800.)));
         cx.update(|_, cx| cx.set_reduce_motion(false));
         open(cx, |dialog, _, _| {
-            dialog.title("Closing").child("body").margin_top(px(300.))
+            dialog
+                .title("Closing")
+                .child("body")
+                .margin_top(px(300.))
+                .entrance(DialogEntrance::SlideDown)
         });
 
         cx.background_executor.advance_clock(*ANIMATION_DURATION);

@@ -4083,7 +4083,6 @@ impl Workspace {
             let save = workspace.clone();
             let save_path = path.clone();
             dialog
-                .entrance(gpui_component::dialog::DialogEntrance::Fade)
                 .centered()
                 .width(px(480.))
                 .close_button(false)
@@ -4545,7 +4544,6 @@ impl Workspace {
             let discard_path = path.clone();
             let save_path = path.clone();
             dialog
-                .entrance(gpui_component::dialog::DialogEntrance::Fade)
                 .centered()
                 .width(px(480.))
                 .close_button(false)

@@ -13,14 +13,14 @@ use serde::{Deserialize, Serialize};
 #[non_exhaustive]
 pub enum DialogEntrance {
     /// Slide down from the window top while fading in, preserving the legacy entrance.
-    #[default]
     SlideDown,
     /// Fade in at the final position without movement.
     Fade,
     /// Fade in while settling from just above the final position.
     ///
-    /// Travel comes from the theme's short motion distance and is limited by
-    /// the space above the resolved surface inside the window.
+    /// Travel is 4 logical pixels, limited by the space above the resolved
+    /// surface inside the window.
+    #[default]
     FadeSlide,
     /// Show the surface and backdrop immediately without entrance animation.
     None,
