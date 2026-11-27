@@ -2076,12 +2076,44 @@ fn git_ref_picker_keeps_checkout_first_and_browses_remote_refs_and_annotated_tag
             );
         });
     };
+    click(visual, "repository-menu-trigger");
+    let linked_row: &str =
+        Box::leak(format!("worktree-info:{}", crate::paths::display(&linked)).into_boxed_str());
+    let row = visual.debug_bounds(linked_row).unwrap();
+    visual.simulate_mouse_move(row.center(), None, Modifiers::default());
+    visual.executor().advance_clock(Duration::from_millis(550));
+    settle(visual);
+    click(visual, "hover-copy-branch");
+    assert_eq!(
+        visual
+            .read_from_clipboard()
+            .and_then(|item| item.text())
+            .as_deref(),
+        Some("a-first")
+    );
+    assert!(visual.debug_bounds(linked_row).is_some());
+    visual.simulate_keystrokes("escape");
+    settle(visual);
+
     click(visual, "git-branch-picker");
     assert!(visual.debug_bounds("git-ref-picker-popup").is_some());
     let current = visual.debug_bounds("git-ref:refs/heads/current").unwrap();
     let first = visual.debug_bounds("git-ref:refs/heads/a-first").unwrap();
     assert_eq!(current.size.height, first.size.height);
     assert!(current.bottom() <= first.top());
+    visual.simulate_mouse_move(first.center(), None, Modifiers::default());
+    visual.executor().advance_clock(Duration::from_millis(550));
+    settle(visual);
+    click(visual, "hover-copy-branch");
+    assert_eq!(
+        visual
+            .read_from_clipboard()
+            .and_then(|item| item.text())
+            .as_deref(),
+        Some("a-first")
+    );
+    assert!(visual.debug_bounds("git-ref-picker-popup").is_some());
+    assert_branch(visual, "refs/heads/current");
     assert!(
         visual
             .debug_bounds("git-ref-worktree:refs/heads/a-first")

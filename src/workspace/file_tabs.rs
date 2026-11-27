@@ -10,7 +10,6 @@ use gpui_component::{
     menu::{ContextMenuExt, PopupMenuItem},
     popover::{Popover, PopoverState},
     scroll::{ScrollableMask, Scrollbar, ScrollbarMode, popup_scrollbar},
-    tooltip::{ManagedTooltipExt as _, Tooltip},
     v_flex,
 };
 use gpui_kit_assets::IconName;
@@ -156,6 +155,7 @@ impl Workspace {
         } else {
             paths::display(path)
         };
+        let info = super::hover_info::FileInfo::new(cx.weak_entity(), path.to_owned());
         let tab_group = SharedString::from(format!("editor-tab:{tooltip}"));
         let tab = h_flex()
             .id(SharedString::from(tooltip.clone()))
@@ -186,53 +186,53 @@ impl Workspace {
                     .hover(|style| style.bg(colors.hover).text_color(colors.ink))
             })
             .child(
-                h_flex()
-                    .id("select-tab")
-                    .debug_selector(move || debug_select)
-                    .role(Role::Tab)
-                    .aria_selected(active)
-                    .aria_label(tooltip.clone())
-                    .tab_index(0)
-                    .tab_stop(active)
-                    .flex_1()
-                    .min_w_0()
-                    .h_full()
-                    .cursor_pointer()
-                    .text_size(px(12.))
-                    .managed_tooltip_restarting_at(Placement::Bottom, move |_, cx| {
-                        cx.new(|_| Tooltip::new(tooltip.clone())).into()
-                    })
-                    .on_mouse_down(MouseButton::Left, {
-                        let select = select.clone();
-                        cx.listener(move |this, _, window, cx| {
-                            this.activate_tab(&select, window, cx);
+                info.attach(
+                    h_flex()
+                        .id("select-tab")
+                        .debug_selector(move || debug_select)
+                        .role(Role::Tab)
+                        .aria_selected(active)
+                        .aria_label(tooltip.clone())
+                        .tab_index(0)
+                        .tab_stop(active)
+                        .flex_1()
+                        .min_w_0()
+                        .h_full()
+                        .cursor_pointer()
+                        .text_size(px(12.))
+                        .on_mouse_down(MouseButton::Left, {
+                            let select = select.clone();
+                            cx.listener(move |this, _, window, cx| {
+                                this.activate_tab(&select, window, cx);
+                            })
                         })
-                    })
-                    // Only a double click pins the preview tab; activation already
-                    // happened on mouse down.
-                    .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
-                        if event.click_count() > 1 {
-                            this.keep_tab(&select, cx);
-                        }
-                    }))
-                    .child(div().flex_shrink_0().mr_1().child(file_type_icon(
-                        self.repository.as_deref(),
-                        &self.config.file_associations,
-                        path,
-                        colors,
-                        12.,
-                    )))
-                    .child(
-                        div()
-                            .truncate()
-                            .min_w_0()
-                            .when(self.tabs.is_preview(path), Styled::italic)
-                            .child(label.to_owned()),
-                    )
-                    .when(
-                        self.tab_is_dirty(path) || self.tab_needs_attention(path),
-                        |tab| tab.child(dirty_mark(colors, self.tab_needs_attention(path))),
-                    ),
+                        // Only a double click pins the preview tab; activation already
+                        // happened on mouse down.
+                        .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
+                            if event.click_count() > 1 {
+                                this.keep_tab(&select, cx);
+                            }
+                        }))
+                        .child(div().flex_shrink_0().mr_1().child(file_type_icon(
+                            self.repository.as_deref(),
+                            &self.config.file_associations,
+                            path,
+                            colors,
+                            12.,
+                        )))
+                        .child(
+                            div()
+                                .truncate()
+                                .min_w_0()
+                                .when(self.tabs.is_preview(path), Styled::italic)
+                                .child(label.to_owned()),
+                        ),
+                    Placement::Bottom,
+                )
+                .when(
+                    self.tab_is_dirty(path) || self.tab_needs_attention(path),
+                    |tab| tab.child(dirty_mark(colors, self.tab_needs_attention(path))),
+                ),
             )
             .child(tab_close_button(
                 path,

@@ -5,6 +5,11 @@ use gpui_component::{
 };
 
 use super::*;
+use crate::{
+    paths,
+    repository::Worktree,
+    workspace::hover_info::{BranchHover, Info},
+};
 
 const ROW_HEIGHT: Pixels = px(29.);
 const RECENT_LIMIT: usize = 32;
@@ -48,9 +53,45 @@ struct RefChoice {
     group: Group,
     current: bool,
     tracking: Option<git::Tracking>,
+    oid: Option<String>,
 }
 
 impl RefChoice {
+    fn hover_info(&self, worktree: Option<&Worktree>) -> Info {
+        let mut info = Info::new(self.name.clone());
+        info.badge = if self.current {
+            Some(t!("git.current_worktree").into())
+        } else {
+            worktree.map(|tree| worktree_label(tree.main).into())
+        };
+        info.commit(self.oid.as_deref());
+        if let Some(tree) = worktree {
+            info.row(t!("hover.worktree_path"), paths::display(&tree.root));
+        }
+        if let Some(tracking) = &self.tracking {
+            info.row(
+                t!("hover.upstream"),
+                branch_name(&tracking.reference).to_owned(),
+            );
+            if tracking.gone {
+                info.row(t!("hover.tracking"), t!("git.upstream_gone"));
+            } else {
+                info.row(
+                    t!("hover.tracking"),
+                    format!(
+                        "{} · {}",
+                        t!("git.ref_ahead", count = tracking.ahead),
+                        t!("git.ref_behind", count = tracking.behind),
+                    ),
+                );
+            }
+        }
+        if self.reference != "HEAD" && self.group != Group::Tags {
+            info.branch_to_copy = Some(self.name.clone());
+        }
+        info
+    }
+
     fn tooltip(&self, worktree: Option<bool>) -> SharedString {
         let mut details = vec![self.name.to_string()];
         if self.current {
@@ -142,7 +183,8 @@ struct RefList {
     selected: String,
     cursor: Option<IndexPath>,
     expanded: [bool; 2],
-    worktrees: HashMap<String, bool>,
+    worktrees: HashMap<String, Worktree>,
+    branch_hover: BranchHover,
 }
 
 impl RefList {
@@ -269,14 +311,14 @@ impl ListDelegate for RefList {
             Row::Ref(index) => {
                 let choice = &self.refs[index];
                 let name = choice.reference.clone();
-                let worktree = self.worktrees.get(&name).copied();
-                let label = choice.tooltip(worktree);
+                let worktree = self.worktrees.get(&name);
+                let label = choice.tooltip(worktree.map(|tree| tree.main));
                 let badge_selector = format!("git-ref-worktree:{name}");
                 RefRow {
                     id: SharedString::from(format!("git-ref:{name}")).into(),
                     selector: format!("git-ref:{name}"),
                     label: label.clone(),
-                    tooltip: Some(label),
+                    tooltip: Some((choice.hover_info(worktree), self.branch_hover.clone())),
                     expanded: None,
                     committed: name == self.selected,
                     keyboard: false,
@@ -427,7 +469,7 @@ struct RefRow {
     id: ElementId,
     selector: String,
     label: SharedString,
-    tooltip: Option<SharedString>,
+    tooltip: Option<(Info, BranchHover)>,
     expanded: Option<bool>,
     committed: bool,
     keyboard: bool,
@@ -467,9 +509,7 @@ impl RenderOnce for RefRow {
             })
             .when(self.committed, |row| row.font_semibold())
             .when_some(self.expanded, |row, expanded| row.aria_expanded(expanded))
-            .when_some(self.tooltip, |row, label| {
-                row.managed_tooltip(move |window, cx| Tooltip::new(label.clone()).build(window, cx))
-            })
+            .when_some(self.tooltip, |row, (info, hover)| info.attach(row, hover))
             .child(self.body)
     }
 }
@@ -502,6 +542,7 @@ impl RefPicker {
                         cursor: None,
                         expanded: [false; 2],
                         worktrees: HashMap::new(),
+                        branch_hover: BranchHover::default(),
                     },
                     window,
                     cx,
@@ -543,6 +584,7 @@ impl RefPicker {
                 },
                 current: branch.reference == checkout,
                 tracking: branch.tracking.clone(),
+                oid: Some(branch.oid.clone()),
             })
             .collect::<Vec<_>>();
         if !refs.iter().any(|item| item.current) {
@@ -556,6 +598,7 @@ impl RefPicker {
                 group: Group::Local,
                 current: true,
                 tracking: None,
+                oid: history.head.clone(),
             });
         }
         let recent_rank = |reference: &str| {
@@ -573,18 +616,19 @@ impl RefPicker {
         });
         let mut tags = history
             .refs
-            .values()
-            .flatten()
-            .filter(|item| item.tag)
-            .map(|item| &item.label)
+            .iter()
+            .flat_map(|(oid, items)| items.iter().map(move |item| (item, oid)))
+            .filter(|(item, _)| item.tag)
+            .map(|(item, oid)| (&item.label, oid))
             .collect::<Vec<_>>();
         tags.sort_unstable();
-        refs.extend(tags.into_iter().map(|tag| RefChoice {
+        refs.extend(tags.into_iter().map(|(tag, oid)| RefChoice {
             reference: format!("refs/tags/{tag}"),
             name: tag.clone().into(),
             group: Group::Tags,
             current: false,
             tracking: None,
+            oid: Some(oid.clone()),
         }));
 
         self.list.update(cx, |list, cx| {
@@ -626,17 +670,24 @@ impl GitPanel {
                 cx.notify();
             });
             let repo = self.repository.clone();
+            let root = repo.root.clone();
             self.ref_picker.worktree_task = cx.spawn_in(window, async move |panel, cx| {
                 let trees = cx.background_spawn(async move { repo.worktrees() }).await;
                 if let Ok(trees) = trees {
-                    let badges = trees
+                    let worktrees = trees
                         .into_iter()
                         .filter(|tree| tree.available)
-                        .filter_map(|tree| tree.branch.map(|branch| (branch, tree.main)))
+                        .filter_map(|tree| {
+                            let reference = tree
+                                .branch
+                                .clone()
+                                .or_else(|| (tree.root == root).then(|| "HEAD".to_owned()));
+                            reference.map(|reference| (reference, tree))
+                        })
                         .collect();
                     _ = panel.update(cx, |panel, cx| {
                         panel.ref_picker.list.update(cx, |list, cx| {
-                            list.delegate_mut().worktrees = badges;
+                            list.delegate_mut().worktrees = worktrees;
                             cx.notify();
                         });
                     });
@@ -711,8 +762,10 @@ impl GitPanel {
                 }
             }))
             .child(if enabled {
+                let branch_hover = list.read(cx).delegate().branch_hover.clone();
                 let list = list.clone();
                 Popover::new("git-ref-picker")
+                    .overlay_closable(false)
                     .dropdown_motion()
                     .scrollable(false)
                     .offset(px(4.))
@@ -725,8 +778,9 @@ impl GitPanel {
                         this.set_ref_picker_open(open, window, cx);
                     }))
                     .trigger(button)
-                    .content(move |_, _, _| {
-                        div()
+                    .content(move |_, _, cx| {
+                        let menu = div()
+                            .id("git-ref-picker-content")
                             .debug_selector(|| "git-ref-picker-popup".into())
                             .child(
                                 List::new(&list)
@@ -734,7 +788,8 @@ impl GitPanel {
                                     .paddings(Edges::all(px(4.)))
                                     .max_h(height)
                                     .search_placeholder(t!("git.search_branches")),
-                            )
+                            );
+                        branch_hover.dismiss_menu_on_outside(menu, cx.weak_entity())
                     })
                     .into_any_element()
             } else {

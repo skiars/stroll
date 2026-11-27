@@ -480,6 +480,39 @@ impl From<Repository> for RepositoryInfo {
     }
 }
 
+#[derive(Serialize, Deserialize)]
+pub(crate) struct FileDetails {
+    pub(crate) size: u64,
+    pub(crate) modified: Option<std::time::SystemTime>,
+}
+
+#[cfg(feature = "desktop")]
+pub(crate) fn file_details(repo: Option<&Repository>, path: &Path) -> Result<FileDetails> {
+    if path.is_absolute() {
+        return file_details_at(&resolve_local_file(path)?);
+    }
+    let repo = repo.context(t!("storage.no_local_path"))?;
+    if let Some(ssh) = &repo.ssh {
+        ensure!(
+            ssh.supports_file_details(),
+            "Remote file details unavailable"
+        );
+        return ssh.call(crate::remote::Request::FileDetails(
+            crate::remote::RepoPath::from_local(path)?,
+        ));
+    }
+    file_details_at(&repo.resolve(path)?)
+}
+
+pub(crate) fn file_details_at(path: &Path) -> Result<FileDetails> {
+    let metadata = fs::metadata(path)?;
+    ensure!(metadata.is_file(), t!("storage.regular_file"));
+    Ok(FileDetails {
+        size: metadata.len(),
+        modified: metadata.modified().ok(),
+    })
+}
+
 pub(crate) fn resolve_file(root: &Path, path: &Path) -> Result<PathBuf> {
     ensure!(
         !path.as_os_str().is_empty()

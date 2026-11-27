@@ -17,7 +17,10 @@ use std::{
     sync::Arc,
 };
 
-use super::Workspace;
+use super::{
+    Workspace,
+    hover_info::{Card, FileInfo},
+};
 use crate::image_viewer::{self, Preview};
 
 impl Workspace {
@@ -154,18 +157,29 @@ pub(super) fn hover_image(
     dismiss_on_diff_scroll: Option<ImageHoverDismiss>,
     read: impl Fn() -> anyhow::Result<Vec<u8>> + Send + Sync + 'static,
     path: std::path::PathBuf,
+    info: Option<FileInfo>,
 ) -> Stateful<gpui::Div> {
-    hover_image_source(
+    hover_image_with_info(
         trigger,
         dismiss_on_diff_scroll,
         ImageHoverSource::new(path, read),
+        info,
     )
 }
 
 pub(super) fn hover_image_source(
     trigger: Stateful<gpui::Div>,
     dismiss_on_diff_scroll: Option<ImageHoverDismiss>,
+    source: ImageHoverSource,
+) -> Stateful<gpui::Div> {
+    hover_image_with_info(trigger, dismiss_on_diff_scroll, source, None)
+}
+
+fn hover_image_with_info(
+    trigger: Stateful<gpui::Div>,
+    dismiss_on_diff_scroll: Option<ImageHoverDismiss>,
     ImageHoverSource { read, path }: ImageHoverSource,
+    info: Option<FileInfo>,
 ) -> Stateful<gpui::Div> {
     const MAX_SIZE: Size<Pixels> = size(px(320.), px(240.));
     let beside_tree = dismiss_on_diff_scroll.is_none();
@@ -201,6 +215,7 @@ pub(super) fn hover_image_source(
         // The tooltip provider calls its builder again during animation and redraw.
         let view = OnceCell::new();
         let dismiss = dismiss_on_diff_scroll.clone();
+        let info = info.clone();
         let request = TooltipRequest::new(bounds, move |window, cx| {
             view.get_or_init(|| {
                 let read = read.clone();
@@ -208,6 +223,11 @@ pub(super) fn hover_image_source(
                 let scale = window.scale_factor();
                 let renderer = cx.svg_renderer();
                 let inset = (HOVER_PADDING + px(1.)) * 2.;
+                let info = info.as_ref().map(|info| {
+                    let card = info.build(window, cx);
+                    card.update(cx, |card, _| card.embed(dimensions.width));
+                    card
+                });
                 let hover = cx.new(|cx| {
                     cx.on_release(|hover: &mut ImageHover, cx| {
                         if let Some(Ok(image)) = hover.image.take() {
@@ -233,6 +253,7 @@ pub(super) fn hover_image_source(
                     });
                     ImageHover {
                         dimensions,
+                        info,
                         image: None,
                         task,
                         closed: false,
@@ -258,6 +279,7 @@ pub(super) fn hover_image_source(
 
 struct ImageHover {
     dimensions: Size<Pixels>,
+    info: Option<gpui::Entity<Card>>,
     image: Option<anyhow::Result<Arc<RenderImage>>>,
     task: Task<()>,
     closed: bool,
@@ -279,7 +301,7 @@ impl Render for ImageHover {
             Some(Err(_)) => div().child(t!("image.open_failed")).into_any_element(),
             None => div().child(t!("image.loading")).into_any_element(),
         };
-        div()
+        let preview = div()
             .debug_selector(|| "image-hover-preview".into())
             .flex()
             .items_center()
@@ -287,8 +309,16 @@ impl Render for ImageHover {
             .w(width)
             .h(height)
             .p(HOVER_PADDING)
-            .popover_style(cx)
-            .child(content)
-            .into_any_element()
+            .child(content);
+        if let Some(info) = &self.info {
+            gpui_component::v_flex()
+                .w(width)
+                .popover_style(cx)
+                .child(info.clone())
+                .child(preview)
+                .into_any_element()
+        } else {
+            preview.popover_style(cx).into_any_element()
+        }
     }
 }

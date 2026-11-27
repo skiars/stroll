@@ -61,6 +61,7 @@ pub(crate) const PUSH_BRANCHES_VERSION: u32 = 35;
 pub(crate) const WORKTREE_REMOVAL_PREVIEW_VERSION: u32 = 37;
 pub(crate) const RECREATE_DOCUMENT_VERSION: u32 = 38;
 pub(crate) const SOURCE_HISTORY_VERSION: u32 = 39;
+pub(crate) const FILE_DETAILS_VERSION: u32 = 40;
 const MAX_FRAME: usize = 40 * 1024 * 1024;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -232,6 +233,7 @@ pub(crate) enum Request {
         id: String,
     },
     Exists(RepoPath),
+    FileDetails(RepoPath),
     Openable(Vec<Option<String>>),
     Read(RepoPath, bool),
     ReadResource {

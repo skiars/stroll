@@ -88,6 +88,8 @@ struct Connection {
     #[cfg(feature = "desktop")]
     image_diff_resource: std::sync::OnceLock<bool>,
     #[cfg(feature = "desktop")]
+    file_details: std::sync::OnceLock<bool>,
+    #[cfg(feature = "desktop")]
     worktree_lsp: std::sync::OnceLock<bool>,
     repository_events: crate::git::watch::RepoEvents,
     #[cfg(feature = "desktop")]
@@ -321,6 +323,14 @@ impl SshSession {
     }
 
     #[cfg(feature = "desktop")]
+    pub(crate) fn supports_file_details(&self) -> bool {
+        *self.0.file_details.get_or_init(|| {
+            let version = super::FILE_DETAILS_VERSION;
+            self.call::<u32>(Request::Hello(version)).ok() == Some(version)
+        })
+    }
+
+    #[cfg(feature = "desktop")]
     pub fn supports_revision_comparison(&self) -> bool {
         self.0.supports_revision_comparison()
     }
@@ -471,6 +481,8 @@ impl Connection {
             image_diff: Default::default(),
             #[cfg(feature = "desktop")]
             image_diff_resource: Default::default(),
+            #[cfg(feature = "desktop")]
+            file_details: Default::default(),
             #[cfg(feature = "desktop")]
             worktree_lsp: Default::default(),
             repository_events: Default::default(),

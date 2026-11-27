@@ -115,6 +115,7 @@ pub(super) struct RepositoryUi {
     unavailable: BTreeSet<PathBuf>,
     recents_task: Task<()>,
     worktrees: Vec<Worktree>,
+    branch_hover: super::hover_info::BranchHover,
     worktree_error: Option<String>,
     worktrees_loading: bool,
     worktree_task: Task<()>,
@@ -339,6 +340,7 @@ impl RepositoryUi {
             unavailable: BTreeSet::new(),
             recents_task: Task::ready(()),
             worktrees: Vec::new(),
+            branch_hover: Default::default(),
             worktree_error: None,
             worktrees_loading: false,
             worktree_task: Task::ready(()),
@@ -1457,13 +1459,15 @@ impl Workspace {
             .unwrap_or_else(|| &self.repository_snapshot.as_deref().unwrap_or(repo).branch)
             .to_owned();
         let label = format!("{name} · {branch}");
+        let branch_hover = ui.branch_hover.clone();
+        let dismissible = ui.opening.is_none();
         Popover::new("repository-menu")
             .dropdown_motion()
             .anchor(Anchor::TopLeft)
             .offset(px(4.))
-            .p(px(6.))
+            .p_0()
             .scrollable(false)
-            .overlay_closable(ui.opening.is_none())
+            .overlay_closable(false)
             .open(ui.menu_open)
             .track_focus(&ui.menu_focus)
             .on_open_change(cx.listener(|this, &open, window, cx| {
@@ -1534,9 +1538,16 @@ impl Workspace {
                     .child(icon(IconName::ChevronDown, colors.muted, 14.)),
             )
             .content(move |_, window, cx| {
-                workspace
+                let content = workspace
                     .update(cx, |this, cx| this.repository_menu(window, cx, colors))
-                    .map_or_else(|_| div().into_any_element(), IntoElement::into_any_element)
+                    .map_or_else(|_| div().into_any_element(), IntoElement::into_any_element);
+                div()
+                    .id("repository-menu-content")
+                    .p(px(6.))
+                    .child(content)
+                    .when(dismissible, |menu| {
+                        branch_hover.dismiss_menu_on_outside(menu, cx.weak_entity())
+                    })
             })
             .into_any_element()
     }
@@ -1596,7 +1607,22 @@ impl Workspace {
                 } else {
                     Cow::Borrowed("")
                 };
-                picker_row(
+                let mut info = super::hover_info::Info::new(tree.reference.clone());
+                info.badge = Some(if status.is_empty() {
+                    t!("git.worktree_badge").into()
+                } else {
+                    status.clone().into()
+                });
+                info.commit(tree.head.as_deref());
+                info.row(t!("hover.worktree_path"), tooltip.clone());
+                info.branch_to_copy = tree.branch.as_deref().map(|branch| {
+                    branch
+                        .strip_prefix("refs/heads/")
+                        .unwrap_or(branch)
+                        .to_owned()
+                        .into()
+                });
+                let row = picker_row(
                     format!("worktree:{tooltip}"),
                     IconName::GitBranch,
                     tree.reference.clone(),
@@ -1607,7 +1633,6 @@ impl Workspace {
                 )
                 .flex_none()
                 .disabled(!tree.available || opening)
-                .tooltip(tooltip)
                 .when_some(focus, |button, focus| button.track_focus(focus))
                 .child(
                     div()
@@ -1617,7 +1642,16 @@ impl Workspace {
                 )
                 .on_click(cx.listener(move |this, _, window, cx| {
                     this.open_directory_path(root.clone(), window, cx)
-                }))
+                }));
+                info.attach(
+                    div()
+                        .id(SharedString::from(format!("worktree-info:{tooltip}")))
+                        .debug_selector(move || format!("worktree-info:{tooltip}"))
+                        .flex_none()
+                        .w_full()
+                        .child(row),
+                    ui.branch_hover.clone(),
+                )
             })
             .collect();
         let recent_rows: Vec<_> = recents

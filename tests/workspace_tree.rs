@@ -14,7 +14,7 @@ use stroll::{
 };
 
 #[test]
-fn modified_file_row_does_not_show_a_status_tooltip() -> anyhow::Result<()> {
+fn modified_file_row_shows_the_file_info_card() -> anyhow::Result<()> {
     let temp = tempfile::tempdir()?;
     let repo = temp.path().join("example");
     fs::create_dir(&repo)?;
@@ -105,6 +105,10 @@ fn modified_file_row_does_not_show_a_status_tooltip() -> anyhow::Result<()> {
                 .as_solid()
                 .is_some_and(|color| color.a > 0. && color.a < 1.)
     });
-    assert!(popup.is_none(), "unexpected tooltip surface");
+    let card = popup.expect("file information card should appear on hover");
+    let scale = cx.update_window(handle.into(), |_, window, _| window.scale_factor())?;
+    assert!(card.bounds.size.width >= px(300.).scale(scale));
+    assert!(card.bounds.size.height >= px(60.).scale(scale));
+    assert!(card.bounds.left() > position.x.scale(scale));
     Ok(())
 }

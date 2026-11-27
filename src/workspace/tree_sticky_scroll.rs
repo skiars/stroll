@@ -81,6 +81,7 @@ pub(super) fn overlay(
     scroll: ScrollHandle,
     workspace: WeakEntity<Workspace>,
     active: Option<PathBuf>,
+    in_workspace: bool,
     colors: Palette,
     gradient: Option<PaneGradient>,
 ) -> impl IntoElement {
@@ -137,12 +138,18 @@ pub(super) fn overlay(
                     colors,
                     cx,
                 );
+                let element = element.top(pinned.height - ROW_HEIGHT);
+                let menu = if in_workspace {
+                    file_tree::tree_menu
+                } else {
+                    file_tree::document_tree_menu
+                };
                 overlay = overlay.child(
                     div()
                         .w_full()
                         .h(pinned.height)
                         .overflow_hidden()
-                        .child(element.relative().top(pinned.height - ROW_HEIGHT)),
+                        .child(menu(element, Some(row.entry.clone()), workspace.clone())),
                 );
             }
             let black = Hsla::black();
@@ -198,7 +205,7 @@ fn directory_row(
     workspace: &WeakEntity<Workspace>,
     colors: Palette,
     cx: &App,
-) -> Div {
+) -> Stateful<Div> {
     let path = &row.entry.path;
     let full_path = paths::display(path);
     let name = file_name(path);
@@ -207,13 +214,7 @@ fn directory_row(
     } else {
         name.to_owned()
     };
-    let icon_color = if selected {
-        colors.accent
-    } else if row.dimmed {
-        colors.muted
-    } else {
-        colors.ink.blend(colors.muted.opacity(0.25))
-    };
+    let icon_color = file_tree::directory_icon_color(row, selected, colors);
     let collapse_id = format!("workspace-tree-sticky-collapse:{full_path}");
     let jump_id = format!("workspace-tree-sticky-row:{full_path}");
     let collapsed = path.clone();
@@ -221,60 +222,51 @@ fn directory_row(
     let collapse_target = workspace.clone();
     let jump_target = workspace.clone();
 
-    h_flex()
-        .h(ROW_HEIGHT)
-        .w_full()
-        .gap(px(5.))
-        .pl(file_tree::tree_indent(row.depth))
-        .pr_2()
-        .hover(|style| style.bg(colors.hover))
-        .when(selected, |row| {
-            row.bg(colors.accent.opacity(0.15))
-                .text_color(colors.accent)
-                .font_semibold()
-        })
-        .children(row.guides.element(colors.muted))
-        .child(
-            h_flex()
-                .id(SharedString::from(collapse_id.clone()))
-                .debug_selector(move || collapse_id.clone())
-                .h_full()
-                .flex_shrink_0()
-                .cursor_pointer()
-                .child(folder_icons::folder_icon(path, true, icon_color, colors))
-                .on_click(move |_, window, cx| {
-                    _ = collapse_target.update(cx, |this, cx| {
-                        this.navigate_sticky_directory(&collapsed, true, window, cx)
-                    });
-                }),
-        )
-        .child(
-            h_flex()
-                .id(SharedString::from(jump_id.clone()))
-                .debug_selector(move || jump_id.clone())
-                .h_full()
-                .flex_1()
-                .min_w_0()
-                .cursor_pointer()
-                .child(
-                    div()
-                        .min_w_0()
-                        .truncate()
-                        .text_size(px(file_name_font_size(cx)))
-                        .when(row.dimmed && !selected, |name| {
-                            name.text_color(colors.muted)
-                        })
-                        .child(label),
-                )
-                .managed_tooltip(move |window, cx| {
-                    Tooltip::new(full_path.clone()).build(window, cx)
-                })
-                .on_click(move |_, window, cx| {
-                    _ = jump_target.update(cx, |this, cx| {
-                        this.navigate_sticky_directory(&jumped, false, window, cx)
-                    });
-                }),
-        )
+    file_tree::tree_row(
+        format!("workspace-tree-sticky:{full_path}"),
+        row,
+        selected,
+        colors,
+    )
+    .child(
+        h_flex()
+            .id(SharedString::from(collapse_id.clone()))
+            .debug_selector(move || collapse_id.clone())
+            .h_full()
+            .flex_shrink_0()
+            .cursor_pointer()
+            .child(folder_icons::folder_icon(path, true, icon_color, colors))
+            .on_click(move |_, window, cx| {
+                _ = collapse_target.update(cx, |this, cx| {
+                    this.navigate_sticky_directory(&collapsed, true, window, cx)
+                });
+            }),
+    )
+    .child(
+        h_flex()
+            .id(SharedString::from(jump_id.clone()))
+            .debug_selector(move || jump_id.clone())
+            .h_full()
+            .flex_1()
+            .min_w_0()
+            .cursor_pointer()
+            .child(
+                div()
+                    .min_w_0()
+                    .truncate()
+                    .text_size(px(file_name_font_size(cx)))
+                    .when(row.dimmed && !selected, |name| {
+                        name.text_color(colors.muted)
+                    })
+                    .child(label),
+            )
+            .managed_tooltip(move |window, cx| Tooltip::new(full_path.clone()).build(window, cx))
+            .on_click(move |_, window, cx| {
+                _ = jump_target.update(cx, |this, cx| {
+                    this.navigate_sticky_directory(&jumped, false, window, cx)
+                });
+            }),
+    )
 }
 
 impl Workspace {

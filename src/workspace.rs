@@ -17,6 +17,7 @@ mod find;
 mod folder_icons;
 mod git_history;
 mod git_panel;
+mod hover_info;
 mod image_preview;
 mod image_tab;
 mod inlay_hints;
@@ -4863,6 +4864,7 @@ impl Workspace {
                     self.tree_scroll.0.borrow().base_handle.clone(),
                     weak.clone(),
                     active.clone(),
+                    in_workspace,
                     colors,
                     gradient.clone(),
                 )
@@ -4922,17 +4924,20 @@ impl Workspace {
                 let status_color = in_workspace
                     .then(|| status.decoration_color(&entry, colors, cx))
                     .flatten();
-                let icon_color = if selected {
-                    colors.accent
-                } else if directory && !dimmed {
-                    colors.ink.blend(colors.muted.opacity(0.25))
-                } else {
-                    colors.muted
-                };
+                let directory_color = file_tree::directory_icon_color(row, selected, colors);
                 let entry_icon = if directory {
-                    folder_icons::folder_icon(&entry.path, row.expanded, icon_color, colors)
+                    folder_icons::folder_icon(&entry.path, row.expanded, directory_color, colors)
                 } else if entry.symlink {
-                    icon(IconName::Link, icon_color, file_tree::TREE_ICON_SIZE).into_any_element()
+                    icon(
+                        IconName::Link,
+                        if selected {
+                            colors.accent
+                        } else {
+                            colors.muted
+                        },
+                        file_tree::TREE_ICON_SIZE,
+                    )
+                    .into_any_element()
                 } else {
                     file_type_icon(
                         repository.as_deref(),
@@ -4943,22 +4948,8 @@ impl Workspace {
                     )
                     .into_any_element()
                 };
-                let element = h_flex()
-                    .id(SharedString::from(row_id.clone()))
-                    .debug_selector(move || row_id.clone())
-                    .relative()
-                    .h(tree_motion::ROW_HEIGHT)
-                    .w_full()
-                    .gap(file_tree::TREE_LABEL_GAP)
-                    .pl(file_tree::tree_indent(row.depth))
-                    .pr(file_tree::TREE_END_PADDING)
+                let element = file_tree::tree_row(row_id, row, selected, colors)
                     .cursor_pointer()
-                    .hover(|style| style.bg(colors.hover))
-                    .when(selected, |row| {
-                        row.bg(colors.accent.opacity(0.15))
-                            .text_color(colors.accent)
-                            .font_semibold()
-                    })
                     .when(
                         in_workspace
                             && !directory
@@ -4975,7 +4966,6 @@ impl Workspace {
                             this.tree_click(clicked.clone(), event, window, cx)
                         });
                     })
-                    .children(row.guides.element(colors.muted))
                     .child(entry_icon)
                     .child(
                         div()
@@ -4987,6 +4977,8 @@ impl Workspace {
                             .when_some(status_color, |name, color| name.text_color(color))
                             .child(name),
                     );
+                let info = (!directory)
+                    .then(|| hover_info::FileInfo::new(weak.clone(), entry.path.clone()));
                 let element = if in_workspace
                     && !directory
                     && !entry.symlink
@@ -5002,7 +4994,10 @@ impl Workspace {
                             repo.read_workspace_image(&path, false, cache.as_ref())
                         },
                         entry.path.clone(),
+                        info,
                     )
+                } else if let Some(info) = info {
+                    info.attach(element, Placement::Right)
                 } else {
                     element
                 };

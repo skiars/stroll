@@ -21,6 +21,40 @@ pub(super) fn tree_indent(depth: usize) -> Pixels {
     px(TREE_GUTTER + TREE_INDENT * depth.min(MAX_TREE_DEPTH) as f32)
 }
 
+pub(super) fn tree_row(
+    id: String,
+    row: &TreeRow,
+    selected: bool,
+    colors: Palette,
+) -> Stateful<Div> {
+    h_flex()
+        .id(SharedString::from(id.clone()))
+        .debug_selector(move || id.clone())
+        .relative()
+        .h(tree_motion::ROW_HEIGHT)
+        .w_full()
+        .gap(TREE_LABEL_GAP)
+        .pl(tree_indent(row.depth))
+        .pr(TREE_END_PADDING)
+        .hover(|style| style.bg(colors.hover))
+        .when(selected, |row| {
+            row.bg(colors.accent.opacity(0.15))
+                .text_color(colors.accent)
+                .font_semibold()
+        })
+        .children(row.guides.element(colors.muted))
+}
+
+pub(super) fn directory_icon_color(row: &TreeRow, selected: bool, colors: Palette) -> Hsla {
+    if selected {
+        colors.accent
+    } else if row.dimmed {
+        colors.muted
+    } else {
+        colors.ink.blend(colors.muted.opacity(0.25))
+    }
+}
+
 #[derive(Default)]
 pub(super) struct TreeHorizontalScroll {
     pub(super) handle: ScrollHandle,
@@ -2243,6 +2277,25 @@ mod tests {
             assert_eq!(pinned_b.left(), folder.right() + px(5.));
             assert!(visual.debug_bounds(c_id).is_none());
 
+            visual.simulate_mouse_down(pinned_b.center(), MouseButton::Right, Modifiers::default());
+            visual.simulate_mouse_up(pinned_b.center(), MouseButton::Right, Modifiers::default());
+            settle(visual, &workspace, |_| true);
+            assert!(visual.debug_bounds("popup-menu-surface").is_some());
+            if view == WorkspaceView::Docs {
+                visual.simulate_keystrokes("up up enter");
+                settle(visual, &workspace, |_| true);
+                assert_eq!(
+                    visual
+                        .read_from_clipboard()
+                        .and_then(|item| item.text())
+                        .as_deref(),
+                    Some("a/b")
+                );
+            } else {
+                visual.simulate_keystrokes("escape");
+                settle(visual, &workspace, |_| true);
+            }
+
             visual.update(|window, _| {
                 let scale = window.scale_factor();
                 let quads = window.painted_quads();
@@ -2605,6 +2658,14 @@ mod tests {
             .center();
         let hover_delay = visual
             .update(|_, cx| gpui_component::tooltip::TooltipDefaults::global(cx).show_delay());
+        let tab = visual.debug_bounds("select-tab:notes.txt").unwrap();
+        visual.simulate_mouse_move(tab.center(), None, Modifiers::default());
+        visual
+            .executor()
+            .advance_clock(hover_delay + Duration::from_millis(32));
+        settle(visual, &workspace, |this| this.active_file().is_some());
+        assert!(visual.debug_bounds("hover-info").is_some());
+
         visual.simulate_mouse_move(image_row, None, Modifiers::default());
         visual
             .executor()
@@ -2613,6 +2674,7 @@ mod tests {
         let hover = visual
             .debug_bounds("image-hover-preview")
             .expect("tree image hover");
+        assert!(visual.debug_bounds("hover-info").unwrap().bottom() <= hover.top());
         assert!(hover.left() > image_row.x);
         assert_eq!(hover.size, size(px(320.), px(240.)));
         assert!(visual.debug_bounds("image-hover-loaded").is_some());
