@@ -231,6 +231,8 @@ pub(crate) struct DocumentLinePosition {
 #[serde(default)]
 pub(crate) struct GitSession {
     pub reference: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub recent_branches: Vec<String>,
     pub query: String,
     pub selection: Option<GitSelection>,
     pub history: Option<HistoryPosition>,

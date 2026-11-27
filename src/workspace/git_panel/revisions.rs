@@ -3,7 +3,7 @@ use std::cell::{OnceCell, RefCell};
 use gpui_component::{
     IndexPath, WindowExt as _,
     menu::{DropdownMenu, PopupMenuItem},
-    select::SelectDelegate,
+    select::{Select, SelectDelegate, SelectItem, SelectState},
 };
 
 use super::*;

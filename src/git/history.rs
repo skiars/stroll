@@ -58,6 +58,37 @@ pub(crate) struct History {
     pub changes: super::WorktreeStatus,
 }
 
+#[cfg(feature = "desktop")]
+impl History {
+    pub(crate) fn has_browsable_ref(&self, reference: &str) -> bool {
+        if reference == "HEAD" {
+            return self.checkout.is_none();
+        }
+        reference == self.checkout.as_deref().unwrap_or("HEAD")
+            || self.browsable_ref_oid(reference).is_some()
+    }
+
+    pub(crate) fn browsable_ref_oid(&self, reference: &str) -> Option<&str> {
+        if reference == "HEAD" {
+            return self.head.as_deref();
+        }
+        if let Some(tag) = reference.strip_prefix("refs/tags/") {
+            return self
+                .refs
+                .iter()
+                .find(|(_, refs)| {
+                    refs.iter()
+                        .any(|reference| reference.tag && reference.label == tag)
+                })
+                .map(|(oid, _)| oid.as_str());
+        }
+        self.branches
+            .iter()
+            .find(|branch| branch.reference == reference)
+            .map(|branch| branch.oid.as_str())
+    }
+}
+
 #[derive(serde::Serialize, serde::Deserialize)]
 pub(crate) struct CommitPage {
     pub commits: Vec<Commit>,

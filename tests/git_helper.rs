@@ -1394,7 +1394,7 @@ fn helper_manages_worktrees_and_branches_independently() {
 }
 
 #[test]
-fn helper_reviews_and_cleans_only_the_selected_stale_worktree() {
+fn helper_reviews_and_deletes_only_the_selected_stale_worktree() {
     let repo = fixture();
     let root = repo.path();
     let checkouts = tempfile::tempdir().unwrap();
@@ -1412,7 +1412,7 @@ fn helper_reviews_and_cleans_only_the_selected_stale_worktree() {
         std::fs::write(path.join("local.txt"), "keep").unwrap();
     }
     let mut helper = Helper::start();
-    assert_eq!(helper.ok(json!({"Hello": 36})), 36);
+    assert_eq!(helper.ok(json!({"Hello": 37})), 37);
     helper.ok(json!({"OpenWorkspace": root}));
     let management = helper.ok(json!("GitManagement"));
     let tree = management["trees"]
@@ -1428,31 +1428,26 @@ fn helper_reviews_and_cleans_only_the_selected_stale_worktree() {
         preview["entries"],
         json!([["", "a.txt"], ["", "b with space.txt"], ["", "local.txt"]])
     );
-    let destination = checkouts.path().join("stale.stroll-saved");
-    assert_eq!(
-        preview["action"]["MoveDirectory"]["destination"],
-        json!(destination)
-    );
+    assert!(preview["action"]["DeleteStaleDirectory"]["reason"].is_string());
+    let saved = checkouts.path().join("stale.stroll-saved");
+    std::fs::create_dir(&saved).unwrap();
+    std::fs::write(saved.join("local.txt"), "previously saved").unwrap();
 
-    std::fs::create_dir(&destination).unwrap();
+    std::fs::write(stale.join("new.txt"), "created after preview").unwrap();
     let confirm = |preview| json!({"ManageGit": {"RemoveReviewedTree": preview}});
     assert!(helper.call(confirm(preview)).get("Err").is_some());
     assert!(stale.join("local.txt").is_file());
 
     let preview = helper.ok(preview_request);
-    let updated_destination = checkouts.path().join("stale.stroll-saved-2");
-    assert_eq!(
-        preview["action"]["MoveDirectory"]["destination"],
-        json!(updated_destination)
-    );
+    assert_eq!(preview["entry_count"], 4);
     helper.ok(confirm(preview));
     assert!(!stale.exists());
     assert!(other.join("local.txt").is_file());
     assert_eq!(
-        std::fs::read_to_string(updated_destination.join("local.txt")).unwrap(),
-        "keep"
+        std::fs::read_to_string(saved.join("local.txt")).unwrap(),
+        "previously saved"
     );
-    assert!(destination.is_dir());
+    assert!(!checkouts.path().join("stale.stroll-saved-2").exists());
     let management = helper.ok(json!("GitManagement"));
     let trees = management["trees"].as_array().unwrap();
     assert!(

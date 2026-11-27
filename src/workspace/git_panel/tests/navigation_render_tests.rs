@@ -1939,6 +1939,155 @@ fn narrow_worktree_summary_commits_and_expands_the_full_message_inline() {
 }
 
 #[::core::prelude::v1::test]
+fn git_ref_picker_keeps_checkout_first_and_browses_remote_refs_and_annotated_tags() {
+    let fixture = tempfile::tempdir().unwrap();
+    let root = fixture.path().join("repo");
+    fs::create_dir(&root).unwrap();
+    git(&root, &["init", "-qb", "current"]);
+    git(&root, &["commit", "--allow-empty", "-qm", "Tagged commit"]);
+    git(&root, &["tag", "-am", "Release", "release/v1"]);
+    git(&root, &["branch", "a-first"]);
+    git(&root, &["branch", "z-recent"]);
+    let linked = fixture.path().join("linked");
+    git(
+        &root,
+        &["worktree", "add", "-q", linked.to_str().unwrap(), "a-first"],
+    );
+    git(&root, &["remote", "add", "origin", "."]);
+    git(&root, &["update-ref", "refs/remotes/origin/other", "HEAD"]);
+    git(&root, &["commit", "--allow-empty", "-qm", "New work"]);
+
+    let mut app = TestAppContext::build_with_text_system(
+        TestDispatcher::new(0),
+        None,
+        gpui_platform::current_platform(true).text_system(),
+    );
+    app.update(|cx| {
+        gpui_component::init(cx);
+        cx.set_reduce_motion(true);
+    });
+    let store = Arc::new(Store::new(fixture.path().join("state")).unwrap());
+    let config = crate::config::ConfigFile::load(Some(fixture.path().join("config.toml")));
+    let mut workspace = None;
+    let (_, visual) = app.add_window_view(|window, cx| {
+        let view =
+            cx.new(|cx| Workspace::with_config(store, config, WorkspaceView::Git, window, cx));
+        workspace = Some(view.clone());
+        gpui_component::Root::new(view, window, cx)
+    });
+    let workspace = workspace.unwrap();
+    visual.simulate_resize(size(px(960.), px(600.)));
+    visual.update(|window, cx| {
+        workspace.update(cx, |workspace, cx| {
+            workspace.open_repository(
+                Location {
+                    root: root.clone(),
+                    file: None,
+                },
+                window,
+                cx,
+            );
+        });
+    });
+    settle(visual);
+
+    let click = |visual: &mut VisualTestContext, selector| {
+        let position = visual.debug_bounds(selector).unwrap().center();
+        visual.simulate_click(position, Modifiers::default());
+        settle(visual);
+    };
+    let assert_branch = |visual: &mut VisualTestContext, expected| {
+        visual.update(|_, cx| {
+            assert_eq!(
+                workspace.read(cx).git.as_ref().unwrap().read(cx).branch,
+                expected
+            );
+        });
+    };
+    click(visual, "git-branch-picker");
+    assert!(visual.debug_bounds("git-ref-picker-popup").is_some());
+    let current = visual.debug_bounds("git-ref:refs/heads/current").unwrap();
+    let first = visual.debug_bounds("git-ref:refs/heads/a-first").unwrap();
+    assert_eq!(current.size.height, first.size.height);
+    assert!(current.bottom() <= first.top());
+    assert!(
+        visual
+            .debug_bounds("git-ref-worktree:refs/heads/a-first")
+            .is_some()
+    );
+    assert!(
+        visual
+            .debug_bounds("git-ref:refs/remotes/origin/other")
+            .is_none()
+    );
+    assert!(
+        visual
+            .debug_bounds("git-ref:refs/tags/release/v1")
+            .is_none()
+    );
+    click(visual, "git-ref-tags");
+    assert!(
+        visual
+            .debug_bounds("git-ref:refs/tags/release/v1")
+            .is_some()
+    );
+    click(visual, "git-ref-remote");
+    assert!(
+        visual
+            .debug_bounds("git-ref:refs/remotes/origin/other")
+            .is_some()
+    );
+
+    click(visual, "git-ref:refs/heads/z-recent");
+    assert_branch(visual, "refs/heads/z-recent");
+    click(visual, "git-branch-picker");
+    let current = visual.debug_bounds("git-ref:refs/heads/current").unwrap();
+    let recent = visual.debug_bounds("git-ref:refs/heads/z-recent").unwrap();
+    let first = visual.debug_bounds("git-ref:refs/heads/a-first").unwrap();
+    assert!(current.bottom() <= recent.top() && recent.bottom() <= first.top());
+
+    visual.simulate_input("origin/other");
+    settle(visual);
+    assert!(
+        visual
+            .debug_bounds("git-ref:refs/remotes/origin/other")
+            .is_some()
+    );
+    visual.simulate_keystrokes("enter");
+    settle(visual);
+    assert_branch(visual, "refs/remotes/origin/other");
+
+    click(visual, "git-branch-picker");
+    visual.simulate_input("no-such-reference");
+    settle(visual);
+    visual.simulate_keystrokes("ctrl-a");
+    visual.simulate_input("release/v1");
+    settle(visual);
+    assert!(
+        visual
+            .debug_bounds("git-ref:refs/tags/release/v1")
+            .is_some()
+    );
+    visual.simulate_keystrokes("enter");
+    settle(visual);
+    assert_branch(visual, "refs/tags/release/v1");
+    visual.update(|_, cx| {
+        let panel = workspace.read(cx).git.as_ref().unwrap().read(cx);
+        assert_eq!(panel.commits[0].subject.as_ref(), "Tagged commit");
+        assert_eq!(
+            panel.session(cx).unwrap().recent_branches,
+            ["refs/heads/z-recent"]
+        );
+    });
+    let head = Command::new("git")
+        .current_dir(&root)
+        .args(["branch", "--show-current"])
+        .output()
+        .unwrap();
+    assert_eq!(String::from_utf8_lossy(&head.stdout).trim(), "current");
+}
+
+#[::core::prelude::v1::test]
 fn git_management_removes_a_worktree_and_keeps_its_branch_in_the_branch_tab() {
     let fixture = tempfile::tempdir().unwrap();
     let root = fixture.path().join("repo");
@@ -1969,7 +2118,7 @@ fn git_management_removes_a_worktree_and_keeps_its_branch_in_the_branch_tab() {
         gpui_component::Root::new(view, window, cx)
     });
     let workspace = workspace.unwrap();
-    visual.simulate_resize(size(px(960.), px(680.)));
+    visual.simulate_resize(size(px(960.), px(480.)));
     visual.update(|window, cx| {
         workspace.update(cx, |workspace, cx| {
             workspace.open_repository(
@@ -2017,9 +2166,17 @@ fn git_management_removes_a_worktree_and_keeps_its_branch_in_the_branch_tab() {
     }
 
     click(visual, "git-management");
+    let dialog_bounds = |visual: &mut VisualTestContext| visual.debug_bounds("dialog-0").unwrap();
+    let origin = dialog_bounds(visual).origin;
+    let assert_position = |bounds: Bounds<Pixels>| {
+        assert_eq!(bounds.left(), origin.x);
+        assert!((bounds.top() - origin.y).abs() < px(1.), "{bounds:?}");
+    };
     click(visual, "git-worktree-remove:0");
     assert!(visual.debug_bounds("git-management-apply").is_none());
     click(visual, "git-worktree-remove:1");
+    let clean_confirmation = dialog_bounds(visual);
+    assert_position(clean_confirmation);
     assert!(
         visual
             .debug_bounds("git-worktree-removal-details")
@@ -2030,7 +2187,13 @@ fn git_management_removes_a_worktree_and_keeps_its_branch_in_the_branch_tab() {
     fs::write(root.join(".git/info/exclude"), "ignored.tmp\n").unwrap();
     let ignored = linked.join("ignored.tmp");
     fs::write(&ignored, "ignored\n").unwrap();
+    for index in 0..12 {
+        fs::write(linked.join(format!("extra-{index}.txt")), "untracked\n").unwrap();
+    }
     click(visual, "git-management-apply");
+    let updated_confirmation = dialog_bounds(visual);
+    assert_position(updated_confirmation);
+    assert!(updated_confirmation.size.height > clean_confirmation.size.height);
     assert!(untracked.is_file());
     assert!(
         visual
@@ -2038,14 +2201,17 @@ fn git_management_removes_a_worktree_and_keeps_its_branch_in_the_branch_tab() {
             .is_some()
     );
     click(visual, "git-management-cancel");
+    assert_position(dialog_bounds(visual));
     assert!(untracked.is_file());
     assert!(ignored.is_file());
     click(visual, "git-worktree-remove:1");
     click(visual, "git-management-apply");
+    assert_position(dialog_bounds(visual));
     assert!(!linked.exists());
     git(&root, &["show-ref", "--verify", "refs/heads/topic"]);
 
     click(visual, "git-management-branches");
+    assert_position(dialog_bounds(visual));
     click(visual, "git-branch-delete:1");
     assert!(visual.debug_bounds("git-management-apply").is_none());
     assert!(
@@ -2059,6 +2225,7 @@ fn git_management_removes_a_worktree_and_keeps_its_branch_in_the_branch_tab() {
     );
 
     let stale = fixture.path().join("stale");
+    let saved = fixture.path().join("stale.stroll-saved");
     git(
         &root,
         &["worktree", "add", "--detach", stale.to_str().unwrap()],
@@ -2076,12 +2243,13 @@ fn git_management_removes_a_worktree_and_keeps_its_branch_in_the_branch_tab() {
             .is_some()
     );
     assert!(stale.join("local.txt").is_file());
+    click(visual, "git-management-cancel");
+    assert_eq!(fs::read_to_string(stale.join("local.txt")).unwrap(), "keep");
+    assert!(!saved.exists());
+    click(visual, "git-worktree-remove:1");
     click(visual, "git-management-apply");
     assert!(!stale.exists());
-    assert_eq!(
-        fs::read_to_string(fixture.path().join("stale.stroll-saved/local.txt")).unwrap(),
-        "keep"
-    );
+    assert!(!saved.exists());
     assert!(visual.debug_bounds("git-worktree-remove:1").is_none());
 }
 
@@ -2278,6 +2446,7 @@ fn git_push_reviews_edits_to_the_destination_and_pull_runs_directly() {
     let pending_footer = visual.debug_bounds("git-push-footer").unwrap();
     settle(visual);
     assert_eq!(visual.debug_bounds("git-push-footer"), Some(pending_footer));
+    let push_origin = visual.debug_bounds("dialog-0").unwrap().origin;
     update_preview(visual, "preview-only");
     let hint = visual.debug_bounds("git-push-new-target").unwrap();
     let field = visual.debug_bounds("git-push-branch").unwrap();
@@ -2286,6 +2455,11 @@ fn git_push_reviews_edits_to_the_destination_and_pull_runs_directly() {
     update_preview(visual, "invalid branch");
     assert!(visual.debug_bounds("git-push-error").is_some());
     click(visual, "git-push-cancel");
+    click(visual, "git-management");
+    let management_origin = visual.debug_bounds("dialog-0").unwrap().origin;
+    assert_eq!(management_origin.x, push_origin.x);
+    assert!((management_origin.y - push_origin.y).abs() < px(1.));
+    click(visual, "git-management-close");
     click(visual, push_button);
     click(visual, "git-push-cancel");
     // Reopening advances the modal layer id. Both mouse and keyboard completion must still work.

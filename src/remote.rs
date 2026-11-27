@@ -58,7 +58,7 @@ pub(crate) const GIT_MANAGEMENT_VERSION: u32 = 32;
 pub(crate) const WORKTREE_REMOVAL_VERSION: u32 = 33;
 pub(crate) const PUSH_REVIEW_VERSION: u32 = 34;
 pub(crate) const PUSH_BRANCHES_VERSION: u32 = 35;
-pub(crate) const WORKTREE_REMOVAL_PREVIEW_VERSION: u32 = 36;
+pub(crate) const WORKTREE_REMOVAL_PREVIEW_VERSION: u32 = 37;
 const MAX_FRAME: usize = 40 * 1024 * 1024;
 
 #[derive(Clone, Debug, Eq, PartialEq)]

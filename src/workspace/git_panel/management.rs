@@ -1,7 +1,9 @@
 use gpui_component::{
     Icon, ThemeMode, WindowExt as _,
     button::{ButtonCustomVariant, DropdownButton},
+    dialog::Dialog,
     notification::Notification,
+    window_paddings,
 };
 
 use super::*;
@@ -13,6 +15,17 @@ use crate::workspace::{topbar_segment, topbar_segments};
 
 mod push;
 use push::PushDialog;
+
+const GIT_OPERATION_DIALOG_TOP: Pixels = px(80.);
+const GIT_OPERATION_DIALOG_PADDING: Pixels = px(16.);
+
+fn git_operation_dialog(surface: Dialog) -> Dialog {
+    surface
+        .margin_top(GIT_OPERATION_DIALOG_TOP)
+        .py(GIT_OPERATION_DIALOG_PADDING)
+        .width(px(620.))
+        .close_button(false)
+}
 
 struct ActionColors {
     manage: Hsla,
@@ -136,11 +149,9 @@ impl Form {
             Self::Confirm(title, ..) => Cow::Owned(title.to_string()),
             Self::RemoveTree { preview, .. } => {
                 match preview.as_ref().map(|preview| &preview.action) {
-                    Some(WorktreeRemovalAction::MoveDirectory { .. }) => {
-                        t!("git.move_worktree_and_remove_record")
-                    }
                     Some(WorktreeRemovalAction::RemoveRecord) => t!("git.remove_worktree_record"),
-                    _ => t!("git.remove_worktree"),
+                    Some(_) => t!("git.delete_worktree_directory"),
+                    None => t!("git.remove_worktree"),
                 }
             }
         }
@@ -193,11 +204,8 @@ impl ManagementDialog {
         if needs_data {
             dialog.update(cx, |dialog, cx| dialog.load(backend, window, cx));
         }
-        window.open_dialog(cx, move |surface, window, _| {
-            surface
-                .centered()
-                .width((window.viewport_size().width - px(28.)).clamp(px(260.), px(550.)))
-                .close_button(false)
+        window.open_dialog(cx, move |surface, _, _| {
+            git_operation_dialog(surface)
                 .child(dialog.clone())
                 .on_ok(|_, _, _| false)
         });
@@ -564,7 +572,7 @@ impl ManagementDialog {
                 .child(label.clone())
                 .child(Input::new(&self.fields[index]).aria_label(label))
         };
-        let mut body = v_flex().gap_2();
+        let mut body = v_flex().min_h_0().gap_2();
         body = match form {
             Form::Tree => body
                 .child(field(0, t!("git.branch_name")))
@@ -604,6 +612,7 @@ impl ManagementDialog {
         };
         body.child(
             h_flex()
+                .flex_shrink_0()
                 .justify_end()
                 .gap_2()
                 .child(
@@ -661,15 +670,11 @@ fn worktree_removal_details(
     let text = |value, color| message(value, color).px_1().py_1();
     let path = crate::paths::display(&preview.path);
     let detail = match &preview.action {
-        WorktreeRemovalAction::DeleteDirectory => {
+        WorktreeRemovalAction::DeleteDirectory
+        | WorktreeRemovalAction::DeleteStaleDirectory { .. } => {
             t!("git.worktree_delete_directory_detail", path = path)
         }
         WorktreeRemovalAction::RemoveRecord => t!("git.worktree_remove_record_detail", path = path),
-        WorktreeRemovalAction::MoveDirectory { destination, .. } => t!(
-            "git.worktree_move_directory_detail",
-            path = path,
-            destination = crate::paths::display(destination)
-        ),
     };
     let mut body = v_flex()
         .debug_selector(|| "git-worktree-removal-details".into())
@@ -679,7 +684,7 @@ fn worktree_removal_details(
         .gap_1()
         .child(text(detail, colors.ink))
         .child(text(Cow::Owned(preview.reference.clone()), colors.muted));
-    if let WorktreeRemovalAction::MoveDirectory { reason, .. } = &preview.action
+    if let WorktreeRemovalAction::DeleteStaleDirectory { reason } = &preview.action
         && !reason.is_empty()
     {
         body = body.child(text(
@@ -699,7 +704,9 @@ fn worktree_removal_details(
     if preview.entries.is_empty() {
         let status = match preview.action {
             WorktreeRemovalAction::DeleteDirectory => Some(t!("git.clean_worktree")),
-            WorktreeRemovalAction::MoveDirectory { .. } => Some(t!("git.worktree_empty_directory")),
+            WorktreeRemovalAction::DeleteStaleDirectory { .. } => {
+                Some(t!("git.worktree_empty_directory"))
+            }
             WorktreeRemovalAction::RemoveRecord => None,
         };
         if let Some(status) = status {
@@ -776,6 +783,15 @@ fn row(
 impl Render for ManagementDialog {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = Palette::for_mode(cx.theme().mode);
+        let viewport_height = window.viewport_size().height;
+        let paddings = window_paddings(window);
+        // Leave room below the anchor so tall content scrolls in place.
+        let content_height = viewport_height
+            - paddings.top
+            - paddings.bottom
+            - GIT_OPERATION_DIALOG_TOP
+            - (GIT_OPERATION_DIALOG_PADDING + px(1.)) * 2.
+            - cx.theme().spacing_tokens().lg;
         let can_create = !self.pending && !self.loading && self.data.is_some();
         let form = self.form.as_ref();
         let label = match self.page {
@@ -832,6 +848,8 @@ impl Render for ManagementDialog {
             .id("git-management-dialog")
             .gap_2()
             .w_full()
+            .max_h(content_height.max(px(64.)))
+            .overflow_y_scroll()
             .child(
                 h_flex()
                     .gap_2()
@@ -875,14 +893,14 @@ impl Render for ManagementDialog {
                 body.child(message(t!("git.management_loading"), colors.muted))
             })
             .when_some(form, |body, form| {
-                body.child(self.form_body(form, colors, window.viewport_size().height, cx))
+                body.child(self.form_body(form, colors, viewport_height, cx))
             })
             .when_some(
                 self.data.as_ref().filter(|_| form.is_none()),
                 |body, data| {
                     let list = v_flex()
                         .id("git-management-rows")
-                        .max_h((window.viewport_size().height * 0.58).min(px(430.)))
+                        .max_h((viewport_height * 0.58).min(px(430.)))
                         .overflow_y_scroll();
                     let list = match self.page {
                         Page::Trees => list.children(

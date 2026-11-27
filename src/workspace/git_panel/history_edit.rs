@@ -725,9 +725,6 @@ impl GitPanel {
                             .as_ref()
                             .and_then(|history| history.checkout.clone())
                     {
-                        panel.branches.update(cx, |state, cx| {
-                            state.set_selected_value(&branch, window, cx);
-                        });
                         panel.selection = Some(Selection::Worktree(mode));
                         panel.select_branch(branch, window, cx);
                     } else {

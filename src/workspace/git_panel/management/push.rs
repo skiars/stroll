@@ -114,10 +114,7 @@ impl PushDialog {
         dialog.update(cx, |this, cx| this.load_options(window, cx));
         window.open_dialog(cx, move |surface, _, _| {
             let cancel = dialog.clone();
-            surface
-                .margin_top(px(80.))
-                .width(px(620.))
-                .close_button(false)
+            git_operation_dialog(surface)
                 .overlay_closable(false)
                 .child(dialog.clone())
                 .on_cancel(move |_, _, cx| {

@@ -1,7 +1,5 @@
 use std::{
-    ffi::OsString,
     fs,
-    io::ErrorKind,
     path::{Path, PathBuf},
 };
 
@@ -11,18 +9,15 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::{local_worktrees, read, worktree_commit_can_be_removed};
-use crate::{paths, repository::files::rename_no_replace};
+use crate::paths;
 
 const PREVIEW_LIMIT: usize = 12;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub(crate) enum WorktreeRemovalAction {
     DeleteDirectory,
+    DeleteStaleDirectory { reason: String },
     RemoveRecord,
-    MoveDirectory {
-        destination: PathBuf,
-        reason: String,
-    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -102,7 +97,7 @@ pub(crate) fn preview_worktree_removal(
     let (action, entries, entry_count, fingerprint) = if tree.missing {
         (WorktreeRemovalAction::RemoveRecord, Vec::new(), 0, [0; 32])
     } else if let Some(reason) = &tree.prunable {
-        // Avoid moving a symlink or a directory reached through a replaced ancestor.
+        // Reject a symlink or a directory reached through a replaced ancestor.
         ensure!(
             path.symlink_metadata()?.is_dir()
                 && paths::simplified(&path.canonicalize()?) == path_key,
@@ -131,32 +126,8 @@ pub(crate) fn preview_worktree_removal(
                 (String::new(), name)
             })
             .collect();
-        let mut suffix = 1;
-        let destination = loop {
-            let mut candidate: OsString = path.as_os_str().to_owned();
-            if suffix == 1 {
-                candidate.push(".stroll-saved");
-            } else {
-                candidate.push(format!(".stroll-saved-{suffix}"));
-            }
-            let candidate = PathBuf::from(candidate);
-            match candidate.symlink_metadata() {
-                Err(error) if error.kind() == ErrorKind::NotFound => {
-                    if !trees
-                        .iter()
-                        .any(|tree| paths::simplified(&tree.root) == paths::simplified(&candidate))
-                    {
-                        break candidate;
-                    }
-                }
-                Err(error) => return Err(error.into()),
-                Ok(_) => {}
-            }
-            suffix += 1;
-        };
         (
-            WorktreeRemovalAction::MoveDirectory {
-                destination,
+            WorktreeRemovalAction::DeleteStaleDirectory {
                 reason: reason.clone(),
             },
             entries,
@@ -207,8 +178,9 @@ pub(super) fn apply_worktree_removal(root: &Path, preview: &WorktreeRemovalPrevi
             remove_worktree(root, path, preview.entry_count > 0)
         }
         WorktreeRemovalAction::RemoveRecord => remove_worktree(root, path, false),
-        WorktreeRemovalAction::MoveDirectory { destination, .. } => {
-            rename_no_replace(path, destination)?;
+        WorktreeRemovalAction::DeleteStaleDirectory { .. } => {
+            // Git rejects removal when the directory exists without a valid .git link.
+            fs::remove_dir_all(path)?;
             let remove_record = || {
                 ensure!(
                     local_worktrees(root)?.iter().any(|tree| {
@@ -225,8 +197,8 @@ pub(super) fn apply_worktree_removal(root: &Path, preview: &WorktreeRemovalPrevi
             };
             remove_record().map_err(|error| {
                 anyhow::anyhow!(t!(
-                    "git.worktree_moved_cleanup_failed",
-                    destination = paths::display(destination),
+                    "git.worktree_deleted_cleanup_failed",
+                    path = paths::display(path),
                     error = error
                 ))
             })
