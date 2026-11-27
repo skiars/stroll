@@ -3,11 +3,12 @@ mod mermaid;
 use rust_i18n::t;
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::{Arc, Mutex},
 };
 
 use anyhow::{Context, Result, ensure};
+use gpui::prelude::FluentBuilder as _;
 use gpui::{
     App, Image, ImageContent, ImageFormat, InteractiveElement as _, IntoElement, ObjectFit,
     ParentElement as _, ParsedSvg, SharedString, Styled, StyledImage as _, WeakEntity, Window,
@@ -91,10 +92,20 @@ struct GraphicRequest {
     diagram_fonts: Option<mermaid::DiagramFonts>,
 }
 
+#[derive(Clone)]
+struct DiagramPresentation {
+    picture: Picture<Arc<ParsedSvg>>,
+    scale: f32,
+    width: f32,
+    dark: bool,
+    fonts: Option<mermaid::DiagramFonts>,
+}
+
 #[derive(Default)]
 struct GeneratedGraphics {
     images: HashMap<GraphicRequest, GraphicState>,
     diagram_widths: HashMap<usize, f32>,
+    diagrams: HashMap<usize, DiagramPresentation>,
     pending: usize,
     reader: Option<WeakEntity<DocReader>>,
 }
@@ -120,23 +131,38 @@ impl Graphics {
         self.generated.lock().unwrap().reader = Some(reader);
     }
 
-    pub(crate) fn reuse_ready(&self, previous: &Self) {
-        let images = previous
-            .generated
-            .lock()
-            .unwrap()
-            .images
-            .iter()
-            .filter(|(request, state)| {
-                matches!(state, GraphicState::Ready(_))
-                    && self
-                        .sources
-                        .get(&request.kind)
-                        .is_some_and(|sources| sources.contains_key(request.source.as_ref()))
-            })
-            .map(|(request, state)| (request.clone(), state.clone()))
-            .collect::<Vec<_>>();
-        self.generated.lock().unwrap().images.extend(images);
+    pub(crate) fn reuse_ready(&self, previous: &Self, remap: impl Fn(usize) -> Option<usize>) {
+        let previous = previous.generated.lock().unwrap();
+        let mut generated = self.generated.lock().unwrap();
+        generated.images.extend(
+            previous
+                .images
+                .iter()
+                .filter(|(request, state)| {
+                    matches!(state, GraphicState::Ready(_))
+                        && self
+                            .sources
+                            .get(&request.kind)
+                            .is_some_and(|sources| sources.contains_key(request.source.as_ref()))
+                })
+                .map(|(request, state)| (request.clone(), state.clone())),
+        );
+        let offsets: HashSet<_> = self
+            .sources
+            .get(&GraphicKind::Diagram)
+            .into_iter()
+            .flat_map(|sources| sources.values().flatten().copied())
+            .collect();
+        for (&old, &width) in &previous.diagram_widths {
+            if let Some(offset) = remap(old)
+                && offsets.contains(&offset)
+            {
+                generated.diagram_widths.insert(offset, width);
+                if let Some(diagram) = previous.diagrams.get(&old) {
+                    generated.diagrams.insert(offset, diagram.clone());
+                }
+            }
+        }
     }
 
     fn state(&self, request: &GraphicRequest) -> GraphicState {
@@ -328,22 +354,34 @@ impl GraphicPlugin {
     ) -> gpui::AnyElement {
         let offset = node.source_range().map_or(0, |range| range.start);
         let available = self.graphics.diagram_width(offset);
+        let fallback = self
+            .graphics
+            .generated
+            .lock()
+            .unwrap()
+            .diagrams
+            .get(&offset)
+            .filter(|diagram| {
+                diagram.dark == request.dark && diagram.fonts == request.diagram_fonts
+            })
+            .cloned();
         let mut next = None;
+        let mut completed = None;
         let picture = match self.graphics.state(&request) {
             GraphicState::Pending => {
                 next = Some(request);
-                div().h(px(24.)).into_any_element()
+                None
             }
-            GraphicState::Ready(Ok(original)) => {
+            GraphicState::Ready(Ok(original)) if available > 0. => {
                 let reflowed = if mermaid::should_reflow(available, &original) {
-                    let request = GraphicRequest {
+                    let reflow = GraphicRequest {
                         reflowed: true,
-                        ..request
+                        ..request.clone()
                     };
-                    match self.graphics.state(&request) {
+                    match self.graphics.state(&reflow) {
                         GraphicState::Ready(Ok(picture)) => Some(picture),
                         GraphicState::Pending => {
-                            next = Some(request);
+                            next = Some(reflow);
                             None
                         }
                         _ => None,
@@ -351,36 +389,68 @@ impl GraphicPlugin {
                 } else {
                     None
                 };
-                let (picture, scale) = mermaid::fit(available, original, reflowed);
-                let width = picture.width * scale;
-                let height = picture.height * scale;
-                let image = div().flex_shrink_0().child(
-                    picture
-                        .element(scale)
-                        .id(("document-mermaid-raster", offset)),
-                );
-                let image = if width <= available + 0.5 {
-                    image.mx_auto()
+                if next.is_none() || fallback.is_none() {
+                    // Keep the original layout available while a first-time reflow runs.
+                    // A previously published layout stays in place on subsequent updates.
+                    let (picture, scale) = mermaid::fit(available, original, reflowed);
+                    let presentation = DiagramPresentation {
+                        picture,
+                        scale,
+                        width: available,
+                        dark: request.dark,
+                        fonts: request.diagram_fonts,
+                    };
+                    if next.is_none() {
+                        completed = Some(presentation.clone());
+                    }
+                    Some(Ok(presentation))
                 } else {
-                    image
-                };
+                    None
+                }
+            }
+            GraphicState::Ready(Ok(_)) => None,
+            state => Some(Err(state)),
+        };
+        let picture = match picture.or_else(|| fallback.map(Ok)) {
+            None => div().h(px(24.)).into_any_element(),
+            Some(Err(state)) => graphic_error(node.as_text(), state, cx).into_any_element(),
+            Some(Ok(diagram)) => {
+                let width = diagram.picture.width * diagram.scale;
+                let height = diagram.picture.height * diagram.scale;
+                let overflows = width > diagram.width + 0.5;
+                let image = div()
+                    .flex_shrink_0()
+                    .child(
+                        diagram
+                            .picture
+                            .element(diagram.scale)
+                            .id(("document-mermaid-raster", offset)),
+                    )
+                    .when(!overflows, |image| image.mx_auto());
                 div()
                     .flex()
                     .w_full()
                     .min_w_0()
-                    .h(px(height + if width > available + 0.5 { 8. } else { 0. }))
+                    .h(px(height + if overflows { 8. } else { 0. }))
                     .overflow_x_content_scrollbar()
                     .id(("document-mermaid-scroll", offset))
                     .child(image)
                     .into_any_element()
             }
-            state => graphic_error(node.as_text(), state, cx).into_any_element(),
         };
         let graphics = self.graphics.clone();
         let measure = canvas(
             |_, _, _| (),
             move |bounds, (), window, cx| {
                 if !bounds.intersect(&window.content_mask().bounds).is_empty() {
+                    if let Some(diagram) = &completed {
+                        graphics
+                            .generated
+                            .lock()
+                            .unwrap()
+                            .diagrams
+                            .insert(offset, diagram.clone());
+                    }
                     graphics.observe_diagram_width(
                         offset,
                         f32::from(bounds.size.width),
@@ -603,6 +673,49 @@ mod tests {
             count += 1;
         }
         assert_eq!(count, 7);
+    }
+
+    #[test]
+    fn mermaid_preview_keeps_the_published_layout_for_shifted_and_edited_blocks() -> Result<()> {
+        let original = "flowchart LR; A --> B";
+        let mut previous = Graphics::default();
+        previous.prepare(GraphicKind::Diagram, original, 12);
+        let picture = mermaid::diagram(original, false, false)?;
+        let renderer = gpui::SvgRenderer::new(Arc::new(()));
+        let svg = Arc::new(renderer.parse_svg(picture.image.bytes())?);
+        {
+            let mut generated = previous.generated.lock().unwrap();
+            generated.diagram_widths.insert(12, 443.);
+            generated.diagrams.insert(
+                12,
+                DiagramPresentation {
+                    picture: Picture {
+                        image: svg.clone(),
+                        width: picture.width,
+                        height: picture.height,
+                        baseline: picture.baseline,
+                        reflowable: picture.reflowable,
+                    },
+                    width: 443.,
+                    scale: 0.75,
+                    dark: false,
+                    fonts: None,
+                },
+            );
+        }
+
+        for source in [original, "flowchart LR; A --> C"] {
+            let mut replacement = Graphics::default();
+            replacement.prepare(GraphicKind::Diagram, source, 22);
+            replacement.reuse_ready(&previous, |offset| Some(offset + 10));
+            assert_eq!(replacement.diagram_width(22), 443.);
+            let generated = replacement.generated.lock().unwrap();
+            let presentation = &generated.diagrams[&22];
+            assert_eq!(presentation.scale, 0.75);
+            assert!(Arc::ptr_eq(&presentation.picture.image, &svg));
+            assert!(!generated.diagrams.contains_key(&12));
+        }
+        Ok(())
     }
 
     #[test]

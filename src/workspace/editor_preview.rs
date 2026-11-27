@@ -647,6 +647,10 @@ impl Workspace {
             Some(preview) => (true, preview.reader.take()),
             None => (false, None),
         };
+        let previous = reader
+            .as_ref()
+            .and_then(|reader| reader.as_ref().ok())
+            .map(|reader| reader.read(cx).source_text());
         let repo = self.repository.clone();
         let remote = repo
             .as_ref()
@@ -666,10 +670,15 @@ impl Workspace {
                     .timer(Duration::from_millis(120))
                     .await;
             }
-            let text = snapshot.clone();
-            let result = cx
+            let text = snapshot.to_string();
+            let (result, edits) = cx
                 .background_executor()
-                .spawn(async move { docs::PreparedDocument::from_editor(text.to_string(), remote) })
+                .spawn(async move {
+                    let edits = previous.map(|previous| {
+                        super::repo_sync::ReloadEdits::new(Rope::from(previous.as_ref()), &text)
+                    });
+                    (docs::PreparedDocument::from_editor(text, remote), edits)
+                })
                 .await;
             let Ok(Some((reader, pending_parse))) = this.update_in(cx, |this, window, cx| {
                 let preview = this.editor_previews.markdown.get_mut(&key)?;
@@ -698,7 +707,7 @@ impl Workspace {
                     reader
                 });
                 let pending_parse =
-                    reader.update(cx, |reader, cx| reader.wait_for_editor_preview_parse(cx));
+                    reader.update(cx, |reader, cx| reader.wait_for_document_parse(cx));
                 Some((reader, pending_parse))
             }) else {
                 return;
@@ -727,8 +736,13 @@ impl Workspace {
                 let typography = this.config.current().docs;
                 reader.update(cx, |reader, cx| {
                     reader.set_typography(typography, cx);
-                    if let Some(Ok(previous)) = &preview.reader {
-                        reader.inherit_editor_preview(previous, window, cx);
+                    if let (Some(Ok(previous)), Some(edits)) = (&preview.reader, &edits) {
+                        reader.inherit_document(
+                            previous,
+                            |offset| edits.map_anchor(&snapshot, offset),
+                            window,
+                            cx,
+                        );
                     }
                 });
                 preview.reader = Some(Ok(reader.clone()));
@@ -993,6 +1007,10 @@ impl Workspace {
     }
 }
 
+#[cfg(all(test, target_os = "linux"))]
+#[path = "editor_preview/reload_tests.rs"]
+mod reload_tests;
+
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 mod tests {
     use super::*;
@@ -1000,7 +1018,7 @@ mod tests {
     use std::time::Instant;
 
     #[track_caller]
-    fn settle(
+    pub(super) fn settle(
         visual: &mut VisualTestContext,
         workspace: &Entity<Workspace>,
         ready: impl Fn(&Workspace, &App) -> bool,
@@ -1118,7 +1136,7 @@ mod tests {
         open_markdown_preview_fixture(cx, fixture, MARKDOWN_SCROLL_FIXTURE)
     }
 
-    fn open_markdown_preview_fixture<'a>(
+    pub(super) fn open_markdown_preview_fixture<'a>(
         cx: &'a mut TestAppContext,
         fixture: &Path,
         source: &str,
@@ -1977,7 +1995,7 @@ mod tests {
 
         settle(&mut visual, &workspace, |this, cx| {
             this.active_markdown_preview()
-                .is_some_and(|reader| reader.read(cx).editor_preview_parsed(cx))
+                .is_some_and(|reader| reader.read(cx).document_parsed(cx))
         });
         visual.simulate_event(ScrollEvent {
             position: preview.center(),
@@ -2005,7 +2023,7 @@ mod tests {
             let blank_published = blank_published.clone();
             cx.observe(&workspace, move |workspace, cx| {
                 let preview = workspace.read(cx).active_markdown_preview();
-                if preview.is_none_or(|reader| !reader.read(cx).editor_preview_parsed(cx)) {
+                if preview.is_none_or(|reader| !reader.read(cx).document_parsed(cx)) {
                     blank_published.set(true);
                 }
             })
@@ -2015,7 +2033,7 @@ mod tests {
             this.active_markdown_preview().is_some_and(|reader| {
                 let reader = reader.read(cx);
                 reader.source_text().as_ref() == draft_markdown
-                    && reader.editor_preview_parsed(cx)
+                    && reader.document_parsed(cx)
                     && reader.session_position(cx).is_some()
             })
         });

@@ -15,14 +15,14 @@ use std::ops::Range;
 
 static NEXT_DOCUMENT_SCAN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
-pub(super) struct ReloadEdits {
+pub(crate) struct ReloadEdits {
     before: Rope,
     edits: Vec<(Range<usize>, String)>,
     changes: Vec<(Range<usize>, usize)>,
 }
 
 impl ReloadEdits {
-    pub(super) fn new(before: Rope, after: &str) -> Self {
+    pub(crate) fn new(before: Rope, after: &str) -> Self {
         let original = before.to_string();
         let diff = TextDiff::configure()
             .timeout(Duration::from_millis(25))
@@ -46,27 +46,36 @@ impl ReloadEdits {
         }
     }
 
+    pub(crate) fn map_offset(&self, after: &Rope, offset: usize, after_insert: bool) -> usize {
+        language_actions::map_language_edit_offset(
+            &self.before,
+            after,
+            &self.changes,
+            offset,
+            after_insert,
+        )
+    }
+
+    pub(crate) fn map_anchor(&self, after: &Rope, offset: usize) -> (usize, bool) {
+        let deleted = self
+            .changes
+            .iter()
+            .any(|(range, length)| *length == 0 && range.contains(&offset));
+        (self.map_offset(after, offset, true), deleted)
+    }
+
     fn apply(&self, editor: &mut EditorState, window: &mut Window, cx: &mut Context<EditorState>) {
         let viewport = editor.viewport_anchor();
         let scroll = editor.scroll_offset();
-        let map = |after: &Rope, offset, right| {
-            language_actions::map_language_edit_offset(
-                &self.before,
-                after,
-                &self.changes,
-                offset,
-                right,
-            )
-        };
         editor.edit_ranges_mapping_selection_ranges(
             &self.edits,
             None,
             |after, selection| {
-                let start = map(after, selection.start, true);
+                let start = self.map_offset(after, selection.start, true);
                 let end = if selection.is_empty() {
                     start
                 } else {
-                    map(after, selection.end, false).max(start)
+                    self.map_offset(after, selection.end, false).max(start)
                 };
                 start..end
             },
@@ -74,7 +83,7 @@ impl ReloadEdits {
             cx,
         );
         if let Some((position, inset)) = viewport {
-            let offset = map(
+            let offset = self.map_offset(
                 editor.text(),
                 self.before.position_to_offset(&position),
                 true,
@@ -128,6 +137,7 @@ impl Workspace {
         self.clear_editor_commit_markers(cx);
         self.tree_status_task = Task::ready(());
         self.doc_sync = Task::ready(());
+        self.doc_refresh_after_open = None;
         self.repository_snapshot = None;
         self.tree_load_pending.clear();
         self.tree_reveal = None;
@@ -500,6 +510,7 @@ impl Workspace {
             );
         } else if let Some(path) = self.standalone.clone() {
             self.sync_document_paths(vec![path], window, cx);
+            self.refresh_selected_document(window, cx);
         }
     }
 
@@ -893,10 +904,8 @@ impl Workspace {
             self.load_commit_markers(false, window, cx);
         }
         self.queue_workspace_refresh(changes.clone(), window, cx);
-        if self.view == WorkspaceView::Docs
-            && let Some(path) = self.session.document.clone().filter(|path| changed(path))
-        {
-            self.sync_document_reader(repo, path, window, cx);
+        if self.session.document.as_deref().is_some_and(changed) {
+            self.refresh_selected_document(window, cx);
         }
         let images: Vec<_> = self
             .images
@@ -937,56 +946,151 @@ impl Workspace {
             }
         }
     }
-    fn sync_document_reader(
-        &mut self,
-        repo: &Arc<Repository>,
-        path: PathBuf,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let reader = self.doc.clone();
-        let current = reader
-            .as_ref()
-            .map(|reader| reader.read(cx).source_text().to_string());
-        let repo = repo.clone();
-        let origin = repo.clone();
-        let source = path.clone();
-        let read = cx.background_spawn(async move {
-            match repo.bytes_if_present(&source) {
-                Ok(Some(bytes)) => crate::repository::decode_markdown(bytes).map(Some),
-                Ok(None) => Ok(None),
-                Err(error) => Err(error),
+    pub(super) fn refresh_selected_document(&mut self, window: &Window, cx: &mut Context<Self>) {
+        if self.view != WorkspaceView::Docs {
+            return;
+        }
+        let Some(path) = self.session.document.clone() else {
+            return;
+        };
+        if let Some(open) = &self.doc_loading {
+            if open.path == path {
+                self.doc_refresh_after_open = Some(path);
             }
+            return;
+        }
+        if self
+            .doc
+            .as_ref()
+            .is_some_and(|reader| reader.read(cx).path != path)
+        {
+            return;
+        }
+        let previous = self
+            .doc
+            .as_ref()
+            .map(|reader| reader.read(cx).source_text());
+        let origin = self.repository.clone();
+        let repo = origin.clone();
+        let local_text = self
+            .local_document_text(&path)
+            .filter(|_| self.standalone.is_none());
+        let root = repo.as_ref().map_or_else(
+            || path.parent().unwrap_or(Path::new("")).to_owned(),
+            |repo| repo.root.clone(),
+        );
+        let current = path.clone();
+        enum DocumentReload {
+            Missing,
+            Unchanged,
+            Updated(Box<docs::PreparedDocument>, Rope, Option<ReloadEdits>),
+        }
+        let load = cx.background_spawn(async move {
+            let source = if let Some(local_text) = local_text {
+                Ok(Some(local_text.to_string()))
+            } else {
+                docs::read_for_reload(repo.as_deref(), &current)
+            };
+            source.and_then(|source| {
+                let Some(source) = source else {
+                    return Ok(DocumentReload::Missing);
+                };
+                if previous.as_ref().is_some_and(|old| old.as_ref() == source) {
+                    return Ok(DocumentReload::Unchanged);
+                }
+                let after = Rope::from(source.as_str());
+                let edits = previous.map(|old| ReloadEdits::new(Rope::from(old.as_ref()), &source));
+                let remote = repo
+                    .as_ref()
+                    .filter(|_| !current.is_absolute())
+                    .and_then(|repo| repo.remote_resources());
+                let document = docs::PreparedDocument::from_source(source, remote)?;
+                Ok(DocumentReload::Updated(Box::new(document), after, edits))
+            })
         });
+        // Replacing the waiter prevents older requests from publishing after a new write.
         self.doc_sync = cx.spawn_in(window, async move |this, cx| {
-            let Ok(source) = read.await else { return };
-            if current == source && reader.is_some() {
+            let can_publish = |this: &Self| {
+                this.view == WorkspaceView::Docs
+                    && match (&this.repository, &origin) {
+                        (Some(current), Some(origin)) => Arc::ptr_eq(current, origin),
+                        (None, None) => true,
+                        _ => false,
+                    }
+                    && this.session.document.as_ref() == Some(&path)
+                    && this.doc_loading.is_none()
+            };
+            let result = load.await;
+            let Ok(Some((reader, pending, after, edits))) =
+                this.update_in(cx, |this, window, cx| {
+                    if !can_publish(this) {
+                        return None;
+                    }
+                    let (document, after, edits) = match result {
+                        Ok(DocumentReload::Updated(document, after, edits)) => {
+                            (*document, after, edits)
+                        }
+                        Ok(DocumentReload::Unchanged) => {
+                            if this.doc_error.take().is_some() {
+                                cx.notify();
+                            }
+                            return None;
+                        }
+                        Ok(DocumentReload::Missing) => {
+                            this.doc_error = Some(t!("workspace.tree_file_missing").into_owned());
+                            cx.notify();
+                            return None;
+                        }
+                        Err(error) => {
+                            this.doc_error = Some(format!("{error:#}"));
+                            cx.notify();
+                            return None;
+                        }
+                    };
+                    let workspace = cx.weak_entity();
+                    let reader = cx.new(|cx| {
+                        DocReader::new(root, path.clone(), document, None, workspace, window, cx)
+                    });
+                    let pending =
+                        reader.update(cx, |reader, cx| reader.wait_for_document_parse(cx));
+                    Some((reader, pending, after, edits))
+                })
+            else {
+                return;
+            };
+            if let Some((_subscription, parsed)) = pending
+                && parsed.await.is_err()
+            {
                 return;
             }
             _ = this.update_in(cx, |this, window, cx| {
-                if this
-                    .repository
-                    .as_ref()
-                    .is_none_or(|repo| !Arc::ptr_eq(repo, &origin))
-                    || this.view != WorkspaceView::Docs
-                    || this.session.document.as_deref() != Some(&path)
-                    || this.doc != reader
-                {
+                if !can_publish(this) {
                     return;
                 }
-                this.capture_document_position(cx);
-                this.doc = None;
-                if source.is_some() {
-                    let (fragment, position) = this
-                        .doc_loading
-                        .take()
-                        .map(|pending| (pending.fragment, pending.position))
-                        .unwrap_or_default();
-                    this.open_doc_at(path, fragment, position, None, window, cx);
-                } else if this.doc_loading.is_none() {
-                    this.doc_error = Some(t!("workspace.tree_file_missing").into_owned());
-                    cx.notify();
-                }
+                let typography = this.config.current().docs;
+                reader.update(cx, |reader, cx| {
+                    reader.set_typography(typography, cx);
+                    reader.set_outline_layout(
+                        this.outline_width,
+                        this.outline_visibility,
+                        this.standalone.is_some(),
+                    );
+                    if let (Some(previous), Some(edits)) = (&this.doc, &edits) {
+                        reader.inherit_document(
+                            previous,
+                            |offset| edits.map_anchor(&after, offset),
+                            window,
+                            cx,
+                        );
+                    } else {
+                        reader.restore_position(this.session.documents.get(&path).copied());
+                    }
+                });
+                this.update_document_title(&path, reader.read(cx).document_title());
+                cx.observe(&reader, |_, _, cx| cx.notify()).detach();
+                this.doc = Some(reader);
+                this.doc_error = None;
+                cx.notify();
             });
         });
     }

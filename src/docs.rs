@@ -202,6 +202,12 @@ impl PreparedDocument {
         Ok(document)
     }
 
+    pub(crate) fn from_source(source: String, remote: Option<RemoteResources>) -> Result<Self> {
+        let mut document = Self::new(source)?;
+        document.remote = remote;
+        Ok(document)
+    }
+
     pub(crate) fn has_fragment(&self, fragment: &str) -> bool {
         self.html_anchors.contains_key(fragment)
             || heading_index(&self.headings, fragment).is_some()
@@ -608,6 +614,10 @@ pub struct DocReader {
 }
 
 impl DocReader {
+    pub(crate) fn document_title(&self) -> Option<&str> {
+        self.document.title()
+    }
+
     pub(crate) fn source_text(&self) -> SharedString {
         self.document.source.clone()
     }
@@ -716,7 +726,7 @@ impl DocReader {
         self.show_outline = Some(false);
     }
 
-    pub(crate) fn editor_preview_parsed(&self, cx: &App) -> bool {
+    pub(crate) fn document_parsed(&self, cx: &App) -> bool {
         self.text.read(cx).rendered_text().source() == self.document.source.as_ref()
     }
 
@@ -898,11 +908,11 @@ impl DocReader {
         self.cancel_editor_scroll_navigation(cx);
     }
 
-    pub(crate) fn wait_for_editor_preview_parse(
+    pub(crate) fn wait_for_document_parse(
         &self,
         cx: &mut App,
     ) -> Option<(Subscription, oneshot::Receiver<()>)> {
-        if self.editor_preview_parsed(cx) {
+        if self.document_parsed(cx) {
             return None;
         }
         let source = self.document.source.clone();
@@ -918,42 +928,51 @@ impl DocReader {
         Some((subscription, parsed))
     }
 
-    pub(crate) fn inherit_editor_preview(
+    pub(crate) fn inherit_document(
         &mut self,
         previous: &Entity<Self>,
+        remap: impl Fn(usize) -> (usize, bool),
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let previous = previous.read(cx);
-        let position = previous.session_position(cx).map(|mut position| {
-            let old = previous.document.source.as_bytes();
-            let new = self.document.source.as_bytes();
-            let prefix = old.iter().zip(new).take_while(|(a, b)| a == b).count();
-            let suffix = old[prefix..]
-                .iter()
-                .rev()
-                .zip(new[prefix..].iter().rev())
-                .take_while(|(a, b)| a == b)
-                .count();
-            let remap = |offset| {
-                if offset > prefix && offset >= old.len() - suffix {
-                    new.len() - (old.len() - offset)
-                } else {
-                    offset
+        let text = self.text.read(cx);
+        let position = previous
+            .session_position(cx)
+            .or(previous.pending_position)
+            .map(|mut position| {
+                if let Some(offset) = position.source_offset {
+                    let (offset, deleted) = remap(offset);
+                    position.source_offset = Some(offset);
+                    if deleted {
+                        let preceding = text.block_for_source_offset(offset);
+                        let next = preceding.map_or(0, |block| block + 1);
+                        if preceding
+                            .is_none_or(|block| text.source_offset_for_block(block) != Some(offset))
+                            && let Some(start) = (next..text.list_state().item_count())
+                                .find_map(|block| text.source_offset_for_block(block))
+                        {
+                            position.source_offset = Some(start);
+                        }
+                        position.inset = 0.;
+                    }
                 }
-            };
-            position.source_offset = position.source_offset.map(remap);
-            if let Some(line) = &mut position.line {
-                line.source_offset = remap(line.source_offset);
-            }
-            position
-        });
+                position.line = position.line.and_then(|mut line| {
+                    let (offset, deleted) = remap(line.source_offset);
+                    line.source_offset = offset;
+                    (!deleted).then_some(line)
+                });
+                position
+            });
         let focused = previous.text.read(cx).focus_handle().is_focused(window);
         let display = previous.displayed_images.clone();
         self.image_thumbnails = previous.image_thumbnails.clone();
         self.document
             .graphics
-            .reuse_ready(&previous.document.graphics);
+            .reuse_ready(&previous.document.graphics, |offset| {
+                let (offset, deleted) = remap(offset);
+                (!deleted).then_some(offset)
+            });
         display.update(cx, |display, _| display.clear_block_tracking());
         self.image_subscription = cx.observe(&display, Self::refresh_image_layout);
         self.displayed_images = display;
@@ -2061,6 +2080,26 @@ fn copy_button(code: SharedString) -> Button {
         })
 }
 
+pub(crate) fn read_for_reload(repo: Option<&Repository>, path: &Path) -> Result<Option<String>> {
+    if let Some(repo) = repo.filter(|_| !path.is_absolute()) {
+        return repo
+            .bytes_if_present(path)?
+            .map(decode_markdown)
+            .transpose();
+    }
+    match read_local_resource(path, false, None) {
+        Ok(bytes) => decode_markdown(bytes).map(Some),
+        Err(error)
+            if error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+        {
+            Ok(None)
+        }
+        Err(error) => Err(error),
+    }
+}
+
 pub(crate) fn load_local(path: &Path) -> Result<PreparedDocument> {
     let bytes = read_local_resource(path, false, ResourceCache::for_desktop().as_ref())?;
     PreparedDocument::new(decode_markdown(bytes)?)
@@ -2089,9 +2128,7 @@ pub fn load(repo: &Repository, path: &Path) -> Result<PreparedDocument> {
     let source = read()
         .and_then(decode_markdown)
         .with_context(|| t!("docs.read_failed", path = paths::display(path)).into_owned())?;
-    let mut document = PreparedDocument::new(source)?;
-    document.remote = remote;
-    Ok(document)
+    PreparedDocument::from_source(source, remote)
 }
 
 #[cfg(test)]

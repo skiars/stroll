@@ -3680,7 +3680,7 @@ fn measure_table_columns(
     node_cx: &NodeContext,
     window: &mut Window,
     cx: &mut App,
-) -> Vec<f32> {
+) -> (Vec<f32>, Vec<f32>) {
     let text_styles = TableTextStyles::new(&node_cx.style, window);
     let rem_size = window.rem_size();
     let mono_family = cx.theme().tokens.typography.mono.clone();
@@ -3720,13 +3720,14 @@ fn measure_table_columns(
     // unchanged. Keep callbacks outside the cache lock and do not retain their
     // widths: a loaded image or a plugin can get narrower as well as wider.
     let mut col_w = measured.widths.clone();
+    let mut fixed = vec![0_f32; col_count];
     for &(row_ix, ix) in &measured.custom_cells {
         let cell = &table.children[row_ix].children[ix];
         let items = cell.children.inline_flow_items(None, &[], &[], node_cx, cx);
         let header = table.is_header_row(row_ix) || table.is_header_cell(row_ix, ix);
         let style = text_styles.cell_refinement(header).clone();
-        let width = window.with_text_style(Some(style), |window| {
-            super::inline_flow::intrinsic_width(&items, window, cx)
+        let (width, minimum) = window.with_text_style(Some(style), |window| {
+            super::inline_flow::intrinsic_widths(&items, window, cx)
         });
         let border = if ix + 1 < col_count {
             CELL_BORDER_PX
@@ -3734,8 +3735,11 @@ fn measure_table_columns(
             0.
         };
         col_w[ix] = col_w[ix].max(f32::from(width) + CELL_PAD_PX + border);
+        if minimum > Pixels::ZERO {
+            fixed[ix] = fixed[ix].max(f32::from(minimum) + CELL_PAD_PX + border);
+        }
     }
-    col_w
+    (col_w, fixed)
 }
 
 // The first measurement still visits all ordinary cells. This cache avoids
@@ -4307,14 +4311,6 @@ impl BlockNode {
         window: &mut Window,
         cx: &mut App,
     ) -> impl IntoElement {
-        // A scrolling column stops shrinking (and the table starts to scroll)
-        // at a floor scaled to its content: roughly the width at which the
-        // text wraps to `CELL_WRAP_MAX_LINES` lines, clamped between the two
-        // bounds so moderate columns can still wrap meaningfully while one
-        // huge column cannot push the scroll threshold arbitrarily high.
-        const CELL_WRAP_MAX_LINES: f32 = 2.0;
-        const CELL_WRAP_MIN_PX: f32 = 160.0;
-        const CELL_WRAP_MAX_PX: f32 = 480.0;
         const TABLE_BORDER_PX: f32 = 2.0; // the frame's border_1, left + right
 
         let table = match item {
@@ -4329,7 +4325,7 @@ impl BlockNode {
             .map(|row| row.children.len())
             .max()
             .unwrap_or(0);
-        let col_w = measure_table_columns(table, col_count, node_cx, window, cx);
+        let (col_w, fixed) = measure_table_columns(table, col_count, node_cx, window, cx);
         let scroll = matches!(style.table().overflow.x, Some(Overflow::Scroll));
         let nowrap = style.table_cell().text.white_space == Some(WhiteSpace::Nowrap);
         let rem_size = window.rem_size();
@@ -4349,8 +4345,11 @@ impl BlockNode {
                 let floor = if scroll && nowrap {
                     w
                 } else if scroll {
-                    (w / CELL_WRAP_MAX_LINES)
-                        .clamp(CELL_WRAP_MIN_PX, CELL_WRAP_MAX_PX)
+                    // Text and images wrap or fit within the cell. Fixed
+                    // inline elements need their full width to stay reachable.
+                    (fixed[ix] + padding_delta)
+                        .max(wrap_min_px)
+                        .max(CELL_PAD_PX + padding_delta + f32::from(text_size))
                         .min(w)
                 } else {
                     w.min(wrap_min_px)
@@ -5583,7 +5582,7 @@ mod tests {
             let mut cached = None;
             for expected in [400, 600, 10, 400] {
                 width.store(expected, std::sync::atomic::Ordering::Relaxed);
-                let measured = measure_table_columns(&table, 1, &node_cx, window, cx)[0];
+                let measured = measure_table_columns(&table, 1, &node_cx, window, cx).0[0];
                 let current = cached_column_widths(&table);
                 assert_eq!(
                     measured,
@@ -5739,7 +5738,7 @@ mod tests {
             let cached =
                 window.with_text_style(Some(style.subtract(&Default::default())), |window| {
                     let (widths, shaped) = record_shaped_lines(|| {
-                        measure_table_columns(&table, 2, &node_cx, window, cx)
+                        measure_table_columns(&table, 2, &node_cx, window, cx).0
                     });
                     assert_eq!(widths, vec![40960. + CELL_PAD_PX + CELL_BORDER_PX, 184.]);
                     assert!(shaped.iter().any(|line| line == &long));
@@ -5753,7 +5752,7 @@ mod tests {
                     let cloned = table.clone();
                     for same in [&table, &cloned] {
                         let (again, shaped) = record_shaped_lines(|| {
-                            measure_table_columns(same, 2, &node_cx, window, cx)
+                            measure_table_columns(same, 2, &node_cx, window, cx).0
                         });
                         assert_eq!(again, widths);
                         assert!(shaped.is_empty());
@@ -5762,13 +5761,14 @@ mod tests {
 
                     // A different column count changes which cells draw borders.
                     assert_eq!(
-                        measure_table_columns(&cloned, 3, &node_cx, window, cx),
+                        measure_table_columns(&cloned, 3, &node_cx, window, cx).0,
                         vec![widths[0], widths[1] + CELL_BORDER_PX, CELL_MIN_PX]
                     );
                     assert!(!Arc::ptr_eq(&cached, &cached_column_widths(&cloned)));
                     assert!(Arc::ptr_eq(&cached, &cached_column_widths(&table)));
                     assert!(
                         measure_table_columns(&Table::default(), 0, &node_cx, window, cx)
+                            .0
                             .is_empty()
                     );
                     cached
@@ -5782,7 +5782,7 @@ mod tests {
             window.with_text_style(
                 Some(cached.text_styles.body.subtract(&Default::default())),
                 |window| {
-                    measure_table_columns(&table, 2, &node_cx, window, cx);
+                    measure_table_columns(&table, 2, &node_cx, window, cx).0;
                     assert!(!Arc::ptr_eq(&cached, &cached_column_widths(&table)));
                 },
             );
@@ -5848,7 +5848,7 @@ mod tests {
                     ..Default::default()
                 };
                 window.with_text_style(Some(style.subtract(&Default::default())), |window| {
-                    let widths = measure_table_columns(&table, 2, &node_cx, window, cx);
+                    let widths = measure_table_columns(&table, 2, &node_cx, window, cx).0;
                     for (width, expected) in widths.iter().zip(expected) {
                         assert!((width - expected).abs() < 0.01, "{width} != {expected}");
                     }
@@ -5857,7 +5857,7 @@ mod tests {
                         assert!(!Arc::ptr_eq(&previous, &cached));
                     }
                     assert_eq!(
-                        measure_table_columns(&table, 2, &node_cx, window, cx),
+                        measure_table_columns(&table, 2, &node_cx, window, cx).0,
                         widths
                     );
                     assert!(Arc::ptr_eq(&cached, &cached_column_widths(&table)));
@@ -5891,7 +5891,7 @@ mod tests {
                     };
                     assert!(table.column_widths_cache.0.lock().unwrap().is_none());
                     assert_eq!(
-                        measure_table_columns(table, 1, &node_cx, window, cx),
+                        measure_table_columns(table, 1, &node_cx, window, cx).0,
                         vec![expected]
                     );
                     let cached = cached_column_widths(table);
@@ -5939,7 +5939,7 @@ mod tests {
             cx.set_global(theme);
             let font_size = window.text_style().font_size.to_pixels(window.rem_size());
             (
-                measure_table_columns(&table, 1, &node_cx, window, cx),
+                measure_table_columns(&table, 1, &node_cx, window, cx).0,
                 font_size,
             )
         });
@@ -5998,7 +5998,7 @@ mod tests {
             };
             window.with_text_style(Some(style.subtract(&Default::default())), |window| {
                 assert_eq!(
-                    measure_table_columns(&table, 1, &node_cx, window, cx),
+                    measure_table_columns(&table, 1, &node_cx, window, cx).0,
                     vec![100. + CELL_PAD_PX]
                 );
             });

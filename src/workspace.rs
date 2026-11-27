@@ -903,6 +903,7 @@ pub struct Workspace {
     doc_error: Option<String>,
     doc_task: Task<()>,
     doc_sync: Task<()>,
+    doc_refresh_after_open: Option<PathBuf>,
     open_documents_list: bool,
     open_documents_scroll: UniformListScrollHandle,
     document_list_selection: usize,
@@ -1130,6 +1131,7 @@ impl Workspace {
             doc_error: None,
             doc_task: Task::ready(()),
             doc_sync: Task::ready(()),
+            doc_refresh_after_open: None,
             open_documents_list: false,
             open_documents_scroll: UniformListScrollHandle::new(),
             document_list_selection: 0,
@@ -1182,6 +1184,7 @@ impl Workspace {
             if window.is_window_active() {
                 if this.repository_watch_active {
                     this.sync_document_paths(this.files.keys().cloned().collect(), window, cx);
+                    this.refresh_selected_document(window, cx);
                 } else {
                     this.rescan_workspace(window, cx);
                 }
@@ -2187,6 +2190,9 @@ impl Workspace {
                     self.open_doc(path, None, window, cx);
                 }
             }
+            if self.doc.is_some() && self.doc_loading.is_none() {
+                self.refresh_selected_document(window, cx);
+            }
             self.focus_document_content(window, cx);
         } else if view == WorkspaceView::Git {
             self.open_git_panel(window, cx);
@@ -2348,6 +2354,19 @@ impl Workspace {
         }
     }
 
+    fn update_document_title(&mut self, path: &Path, title: Option<&str>) {
+        if let Some(entry) = self
+            .session
+            .open_documents
+            .as_mut()
+            .and_then(|docs| docs.iter_mut().find(|entry| entry.path == path))
+            && entry.title.as_deref() != title
+        {
+            entry.title = title.map(str::to_owned);
+            self.session_revision += 1;
+        }
+    }
+
     fn open_doc_at(
         &mut self,
         path: PathBuf,
@@ -2458,6 +2477,8 @@ impl Workspace {
                 Self::prepare_document(repo.as_deref(), &path, &store, local_text)
             })
         });
+        self.doc_sync = Task::ready(());
+        self.doc_refresh_after_open = None;
         self.doc_loading = Some(DocumentOpen {
             navigation,
             path,
@@ -2476,6 +2497,7 @@ impl Workspace {
                 else {
                     return;
                 };
+                let refresh = this.doc_refresh_after_open.take().as_ref() == Some(&path);
                 match result {
                     Ok(document) => {
                         if navigation.is_some() {
@@ -2492,16 +2514,7 @@ impl Workspace {
                             this.session.select_document(&path);
                             this.session_revision += 1;
                         }
-                        if let Some(entry) = this
-                            .session
-                            .open_documents
-                            .as_mut()
-                            .and_then(|docs| docs.iter_mut().find(|entry| entry.path == path))
-                            && entry.title.as_deref() != document.title()
-                        {
-                            entry.title = document.title().map(str::to_owned);
-                            this.session_revision += 1;
-                        }
+                        this.update_document_title(&path, document.title());
                         this.docs_tree_reveal = (!path.is_absolute()).then(|| path.clone());
                         this.locator_visit(&path);
                         let workspace = cx.entity().downgrade();
@@ -2557,6 +2570,9 @@ impl Workspace {
                             this.show_error(error, window, cx);
                         }
                     }
+                }
+                if refresh {
+                    this.refresh_selected_document(window, cx);
                 }
                 cx.notify();
             });
@@ -3619,8 +3635,7 @@ impl Workspace {
             self.reveal_active_tab();
         }
         if changed_local_doc {
-            self.capture_document_position(cx);
-            self.doc = None;
+            self.refresh_selected_document(window, cx);
         }
         if active && self.view == WorkspaceView::Editor {
             self.refresh_editor_git_marks(&path, window, cx);
@@ -3878,31 +3893,8 @@ impl Workspace {
                             if wrote && !path.is_absolute() {
                                 this.refresh_git_after_save(&path, window, cx);
                             }
-                            if this.standalone.is_some()
-                                && (this
-                                    .doc
-                                    .as_ref()
-                                    .is_some_and(|doc| doc.read(cx).path == path)
-                                    || this
-                                        .doc_loading
-                                        .as_ref()
-                                        .is_some_and(|doc| doc.path == path))
-                            {
-                                this.capture_document_position(cx);
-                                this.doc = None;
-                                this.doc_task = Task::ready(());
-                                this.doc_loading = None;
-                                this.doc_error = None;
-                                if this.view == WorkspaceView::Docs {
-                                    this.open_doc(path.clone(), None, window, cx);
-                                }
-                            } else if this
-                                .doc
-                                .as_ref()
-                                .is_some_and(|doc| doc.read(cx).path == path)
-                            {
-                                this.capture_document_position(cx);
-                                this.doc = None;
+                            if this.session.document.as_ref() == Some(&path) {
+                                this.refresh_selected_document(window, cx);
                             }
                             if close && !this.tab_is_dirty(&path) {
                                 if close_from_dialog {

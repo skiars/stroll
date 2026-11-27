@@ -44,6 +44,10 @@ example and benchmark targets. The application tests live in `tests/`.
   Run the `docs::tests::markdown_` reader tests and the `documents` and
   `smooth_scroll` integration tests.
 
+- Scrollable Markdown tables fit wrap-capable cells to the available width
+  and reserve full width for fixed inline elements and no-wrap cells.
+  Run the narrow-table and wide-block reader tests with the document suite.
+
 - Markdown prose companions render below native paragraphs, headings, and
   table cells at their source offsets. The companion stays outside the
   source selection, search, and anchor model. Run the `document_translation`

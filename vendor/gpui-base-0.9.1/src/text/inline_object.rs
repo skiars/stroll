@@ -104,6 +104,10 @@ impl MeasuredInlineObject {
         result
     }
 
+    pub(super) fn fixed_width(&self) -> Pixels {
+        self.content.as_ref().map_or(px(0.), |_| self.metrics.size.width)
+    }
+
     pub fn fit_text(mut self, width: Option<Pixels>) -> Self {
         // GPUI has no general subtree scale. Only our own plain-text fallback
         // can be proportionally fitted; custom elements retain their real size.
