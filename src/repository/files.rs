@@ -221,6 +221,17 @@ fn create_entry(path: &Path, directory: bool) -> Result<()> {
     Ok(())
 }
 
+fn tree_destination_error(error: anyhow::Error) -> anyhow::Error {
+    if error
+        .downcast_ref::<std::io::Error>()
+        .is_some_and(|error| error.kind() == std::io::ErrorKind::AlreadyExists)
+    {
+        anyhow::anyhow!(t!("workspace.tree_destination_exists"))
+    } else {
+        error
+    }
+}
+
 fn create_with_parents(root: &Path, path: &Path, directory: bool) -> Result<()> {
     validate_operation_path(path)?;
     let mut parts = path.components().peekable();
@@ -282,7 +293,8 @@ impl Repository {
             ));
         }
         if let FileOperation::Create { directory } = operation {
-            return create_with_parents(&self.root, path, directory);
+            return create_with_parents(&self.root, path, directory)
+                .map_err(tree_destination_error);
         }
         let target = operation_path(&self.root, path)?;
         match operation {
@@ -295,7 +307,7 @@ impl Repository {
                 );
                 let destination = target.with_file_name(name);
                 if target != destination {
-                    rename_no_replace(&target, &destination)?;
+                    rename_no_replace(&target, &destination).map_err(tree_destination_error)?;
                 }
             }
             FileOperation::Delete { version } => {

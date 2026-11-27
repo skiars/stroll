@@ -967,6 +967,7 @@
   "workspace.tree_operation_busy": "A file in this location is being saved or updated. Try again when it is ready.",
   "workspace.tree_invalid_create_path": "Enter a valid relative path.",
   "workspace.tree_invalid_name": "Enter a valid file or folder name.",
+  "workspace.tree_entry_name": "File or folder name",
   "workspace.tree_entry_changed": "This entry changed on disk. Reopen the operation and try again.",
   "workspace.tree_unsupported": "This type of entry is unsupported.",
   "workspace.tree_same_file": "Choose a destination other than the original file.",

@@ -27,6 +27,21 @@ pub(super) fn tree_row(
     selected: bool,
     colors: Palette,
 ) -> Stateful<Div> {
+    tree_row_base(id, row.depth, row.guides, colors.muted)
+        .hover(|style| style.bg(colors.hover))
+        .when(selected, |row| {
+            row.bg(colors.accent.opacity(0.15))
+                .text_color(colors.accent)
+                .font_semibold()
+        })
+}
+
+pub(super) fn tree_row_base(
+    id: String,
+    depth: usize,
+    guides: TreeGuides,
+    guide_color: Hsla,
+) -> Stateful<Div> {
     h_flex()
         .id(SharedString::from(id.clone()))
         .debug_selector(move || id.clone())
@@ -34,15 +49,9 @@ pub(super) fn tree_row(
         .h(tree_motion::ROW_HEIGHT)
         .w_full()
         .gap(TREE_LABEL_GAP)
-        .pl(tree_indent(row.depth))
+        .pl(tree_indent(depth))
         .pr(TREE_END_PADDING)
-        .hover(|style| style.bg(colors.hover))
-        .when(selected, |row| {
-            row.bg(colors.accent.opacity(0.15))
-                .text_color(colors.accent)
-                .font_semibold()
-        })
-        .children(row.guides.element(colors.muted))
+        .children(guides.element(guide_color))
 }
 
 pub(super) fn directory_icon_color(row: &TreeRow, selected: bool, colors: Palette) -> Hsla {
@@ -193,8 +202,14 @@ pub(super) struct TreeEdit {
     directory: bool,
     version: Option<EntryVersion>,
     input: Entity<InputState>,
+    error: Option<TreeEditError>,
     return_focus: Option<FocusHandle>,
     _subscription: Subscription,
+}
+
+struct TreeEditError {
+    value: String,
+    message: SharedString,
 }
 
 impl TreeEdit {
@@ -212,27 +227,73 @@ impl TreeEdit {
 
     pub(super) fn element(
         &self,
-        depth: usize,
-        guides: TreeGuides,
-        guide_color: Hsla,
+        row: Stateful<Div>,
+        colors: Palette,
+        font_size: Pixels,
         busy: bool,
         workspace: WeakEntity<Workspace>,
     ) -> AnyElement {
-        h_flex()
-            .relative()
-            .h(tree_motion::ROW_HEIGHT)
-            .w_full()
-            .pl(tree_indent(depth))
-            .pr_2()
-            .on_key_down(move |event, window, cx| {
-                if event.keystroke.key == "escape" && !busy {
-                    cx.stop_propagation();
-                    _ = workspace.update(cx, |this, cx| this.finish_tree_edit(window, cx));
-                }
-            })
-            .children(guides.element(guide_color))
-            .child(Input::new(&self.input).small().disabled(busy).w_full())
-            .into_any_element()
+        let outside = workspace.clone();
+        let border = if self.error.is_some() {
+            colors.danger
+        } else {
+            colors.accent
+        };
+        row.on_mouse_down_out(move |_, window, cx| {
+            _ = outside.update(cx, |this, cx| this.finish_tree_edit(window, cx));
+        })
+        .on_key_down(move |event, window, cx| {
+            if event.keystroke.key == "escape" && !busy {
+                cx.stop_propagation();
+                _ = workspace.update(cx, |this, cx| this.finish_tree_edit(window, cx));
+            }
+        })
+        .child(
+            div()
+                .relative()
+                .flex_1()
+                .min_w_0()
+                .child(
+                    Input::new(&self.input)
+                        .small()
+                        .appearance(false)
+                        .readonly(busy)
+                        .aria_label(t!("workspace.tree_entry_name").into_owned())
+                        .h(px(24.))
+                        .w_full()
+                        .pl(px(2.))
+                        .text_size(font_size)
+                        .border_1()
+                        .border_color(border)
+                        .rounded_sm(),
+                )
+                .when_some(
+                    self.error.as_ref().map(|error| error.message.clone()),
+                    |field, message| {
+                        field.child(
+                            div().absolute().top_0().left_full().child(deferred(
+                                anchored().offset(point(px(4.), px(0.))).child(
+                                    div()
+                                        .id("tree-edit-error")
+                                        .debug_selector(|| "tree-edit-error".into())
+                                        .max_w(px(300.))
+                                        .px_2()
+                                        .py_1()
+                                        .bg(colors.elevated)
+                                        .text_color(colors.ink)
+                                        .text_size(font_size)
+                                        .border_1()
+                                        .border_color(colors.danger)
+                                        .rounded_sm()
+                                        .shadow_sm()
+                                        .child(message),
+                                ),
+                            )),
+                        )
+                    },
+                ),
+        )
+        .into_any_element()
     }
 }
 
@@ -629,7 +690,7 @@ impl Workspace {
         });
     }
 
-    pub(super) fn reveal_tree_path(&mut self, path: &Path, cx: &mut Context<Self>) {
+    pub(super) fn reveal_tree_path(&mut self, path: &Path, cx: &mut Context<Self>) -> bool {
         let expanded = if self.view == WorkspaceView::Docs {
             &mut self.docs_expanded
         } else {
@@ -648,6 +709,9 @@ impl Workspace {
         if let Some(index) = self.rows.iter().position(|row| row.entry.path == path) {
             self.scroll_tree_row_into_view(index);
             cx.notify();
+            true
+        } else {
+            false
         }
     }
 
@@ -842,6 +906,7 @@ impl Workspace {
                 self.tree_motion.get_mut().start();
                 self.expanded.clear();
                 self.tree_reveal = None;
+                self.cancel_tree_operation_reveal();
                 self.rebuild_tree();
                 cx.notify();
             }
@@ -859,18 +924,44 @@ impl Workspace {
         if self.tree_busy || self.tree_edit.is_some() {
             return;
         }
+        self.cancel_tree_operation_reveal();
         let value = if version.is_some() {
             file_name(&path)
         } else {
             ""
         };
+        let selection_end = if directory {
+            value.len()
+        } else {
+            Path::new(value)
+                .file_stem()
+                .map_or(value.len(), |stem| stem.len())
+        };
         let input = cx.new(|cx| InputState::new(window, cx).default_value(value.to_owned()));
         let return_focus = window.focused(cx);
-        let subscription = cx.subscribe_in(&input, window, |this, _, event, window, cx| {
-            if matches!(event, InputEvent::PressEnter { .. }) {
-                this.submit_tree_edit(window, cx);
-            }
-        });
+        let subscription =
+            cx.subscribe_in(
+                &input,
+                window,
+                |this, input, event, window, cx| match event {
+                    InputEvent::PressEnter { .. } => this.submit_tree_edit(window, cx),
+                    InputEvent::Change => {
+                        if let Some(edit) = &mut this.tree_edit
+                            && edit
+                                .error
+                                .as_ref()
+                                .is_some_and(|error| input.read(cx).value().as_ref() != error.value)
+                        {
+                            edit.error = None;
+                            cx.notify();
+                        }
+                    }
+                    InputEvent::Blur if this.tree_edit.is_some() => {
+                        this.finish_tree_edit(window, cx)
+                    }
+                    _ => {}
+                },
+            );
         if version.is_none() && !path.as_os_str().is_empty() {
             self.expanded.insert(path.clone());
             self.load_expanded_tree_directories(window, cx);
@@ -881,21 +972,25 @@ impl Workspace {
             directory,
             version,
             input,
+            error: None,
             return_focus,
             _subscription: subscription,
         };
         if let Some((index, _, _)) = edit.row(&self.rows) {
-            self.tree_scroll.scroll_to_item(index, ScrollStrategy::Top);
+            self.tree_scroll
+                .scroll_to_item(index, ScrollStrategy::Nearest);
         }
         edit.input.read(cx).focus_handle(cx).focus(window, cx);
-        edit.input
-            .update(cx, |state, cx| state.select_all(window, cx));
+        edit.input.update(cx, |state, cx| {
+            state.set_selected_range(0..selection_end, cx)
+        });
         self.tree_edit = Some(edit);
         cx.notify();
     }
 
     pub(super) fn finish_tree_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(edit) = self.tree_edit.take()
+            && edit.input.read(cx).focus_handle(cx).is_focused(window)
             && let Some(focus) = edit.return_focus
         {
             focus.focus(window, cx);
@@ -905,14 +1000,28 @@ impl Workspace {
     }
 
     fn submit_tree_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(edit) = self.tree_edit.as_ref() else {
+        let Some(edit) = self.tree_edit.as_mut().filter(|_| !self.tree_busy) else {
             return;
         };
         let name = edit.input.read(cx).value().to_string();
         let (path, operation) = match &edit.version {
             Some(version) => {
                 if !valid_name(&name) {
-                    toast::error(window, cx, t!("workspace.tree_invalid_name"));
+                    edit.error = Some(TreeEditError {
+                        value: name,
+                        message: t!("workspace.tree_invalid_name").into_owned().into(),
+                    });
+                    cx.notify();
+                    return;
+                }
+                if edit
+                    .path
+                    .file_name()
+                    .is_some_and(|current| current == name.as_str())
+                {
+                    let path = edit.path.clone();
+                    self.finish_tree_edit(window, cx);
+                    self.focus_tree(path, window, cx);
                     return;
                 }
                 (
@@ -926,7 +1035,11 @@ impl Workspace {
             None => {
                 let parts = || name.split(|ch| ch == '/' || cfg!(windows) && ch == '\\');
                 if !parts().all(valid_name) {
-                    toast::error(window, cx, t!("workspace.tree_invalid_create_path"));
+                    edit.error = Some(TreeEditError {
+                        value: name,
+                        message: t!("workspace.tree_invalid_create_path").into_owned().into(),
+                    });
+                    cx.notify();
                     return;
                 }
                 let mut path = edit.path.clone();
@@ -1095,6 +1208,9 @@ impl Workspace {
             .unwrap_or_default();
         self.cancel_file_open();
         self.tree_busy = true;
+        if let Some(edit) = &mut self.tree_edit {
+            edit.error = None;
+        }
         let target = path.clone();
         let working = repo.clone();
         let task = cx.background_spawn(async move { working.operate(&target, operation) });
@@ -1111,7 +1227,21 @@ impl Workspace {
                 this.tree_busy = false;
                 match result {
                     Ok(()) => {
+                        let editing = this.view == WorkspaceView::Editor
+                            && this.repository_ui.opening.is_none()
+                            && !this.confirming_close
+                            && this.tree_edit.as_ref().is_some_and(|edit| {
+                                edit.input.read(cx).focus_handle(cx).is_focused(window)
+                            });
+                        if editing {
+                            this.tree_reveal = None;
+                        }
                         this.finish_tree_edit(window, cx);
+                        let reveal = if create {
+                            Some(path.clone())
+                        } else {
+                            action.clone().flatten()
+                        };
                         if let Some(action) = action {
                             if let Some(destination) = action {
                                 this.relocate_tree_path(&path, &destination, affected, window, cx);
@@ -1119,14 +1249,23 @@ impl Workspace {
                                 this.remove_tree_path(&repo, &path, affected, window, cx);
                             }
                         }
+                        if editing && let Some(target) = reveal {
+                            this.tree_operation_reveal =
+                                Some(repo_sync::TreeOperationReveal::new(&target));
+                            if !open {
+                                this.tree_focus.focus(window, cx);
+                            }
+                        }
                         let parents = path.ancestors().skip(1);
                         if create {
-                            if this.view == WorkspaceView::Editor {
-                                this.reveal_tree_path(&path, cx);
-                            }
                             this.refresh_tree_paths(parents.map(Path::to_owned), window, cx);
-                            if open && this.view == WorkspaceView::Editor {
-                                this.open_file(path, false, window, cx);
+                            if open && editing {
+                                this.request_file(
+                                    path,
+                                    FileOpen::Tree { preview: false },
+                                    window,
+                                    cx,
+                                );
                             }
                         } else {
                             this.refresh_tree_paths(
@@ -1137,7 +1276,14 @@ impl Workspace {
                         }
                     }
                     Err(error) => {
-                        this.show_error(error, window, cx);
+                        if let Some(edit) = &mut this.tree_edit {
+                            edit.error = Some(TreeEditError {
+                                value: edit.input.read(cx).value().to_string(),
+                                message: format!("{error:#}").into(),
+                            });
+                        } else {
+                            this.show_error(error, window, cx);
+                        }
                         this.rescan_workspace(window, cx);
                     }
                 }
@@ -3277,7 +3423,10 @@ mod tests {
                 .success()
         );
         fs::create_dir(root.join("base"))?;
-        fs::write(root.join("base/keep.txt"), "keep")?;
+        for index in 0..1024 {
+            fs::create_dir(root.join(format!("base/folder-{index:04}")))?;
+            fs::write(root.join(format!("base/file-{index:04}.txt")), "")?;
+        }
 
         let mut cx = TestAppContext::single();
         cx.update(gpui_component::init);
@@ -3308,8 +3457,35 @@ mod tests {
         });
         let listed =
             |this: &Workspace, path: &Path| this.rows.iter().any(|row| row.entry.path == path);
+        let assert_visible = |visual: &mut VisualTestContext, selector: &'static str| {
+            let row = visual
+                .debug_bounds(selector)
+                .unwrap_or_else(|| panic!("missing {selector}"));
+            let viewport = visual.update(|_, cx| {
+                workspace
+                    .read(cx)
+                    .tree_scroll
+                    .0
+                    .borrow()
+                    .base_handle
+                    .bounds()
+            });
+            let sticky_bottom = visual
+                .debug_bounds("workspace-tree-sticky-row:base")
+                .expect("the parent directory should be pinned")
+                .bottom();
+            assert!(row.top() >= sticky_bottom && row.bottom() <= viewport.bottom());
+            row
+        };
         settle(visual, &workspace, |this| listed(this, Path::new("base")));
-        for (name, directory) in [("deep/folders", true), ("deep/folders/note.txt", false)] {
+        for (name, directory, selector) in [
+            (
+                "zz-new/子目录.d",
+                true,
+                "workspace-tree-row:base/zz-new/子目录.d",
+            ),
+            ("zz-初稿.txt", false, "workspace-tree-row:base/zz-初稿.txt"),
+        ] {
             visual.update(|window, cx| {
                 workspace.update(cx, |this, cx| {
                     this.begin_tree_edit("base".into(), directory, None, window, cx);
@@ -3319,10 +3495,120 @@ mod tests {
             visual.simulate_keystrokes("enter");
             let path = Path::new("base").join(name);
             settle(visual, &workspace, |this| {
-                listed(this, &path) && (directory || this.tabs.active() == Some(path.as_path()))
+                this.tree_keyboard_path == path && (directory || this.tabs.active() == Some(&path))
             });
-            assert_eq!(root.join(path).is_dir(), directory);
+            assert_visible(visual, selector);
+            assert_eq!(root.join(&path).is_dir(), directory);
+            visual.update(|window, cx| {
+                let this = workspace.read(cx);
+                assert_eq!(this.tree_focus.is_focused(window), directory);
+                if !directory {
+                    assert!(
+                        this.active_file()
+                            .unwrap()
+                            .editor
+                            .read(cx)
+                            .focus_handle(cx)
+                            .is_focused(window)
+                    );
+                }
+            });
         }
+
+        let file = Path::new("base/zz-初稿.txt");
+        let before = assert_visible(visual, "workspace-tree-row:base/zz-初稿.txt");
+        let begin_rename = |visual: &mut VisualTestContext, path: &Path| {
+            visual.update(|window, cx| {
+                workspace.update(cx, |this, cx| {
+                    this.focus_tree(path.to_owned(), window, cx);
+                    this.tree_key_action(TreeAction::Rename, window, cx);
+                });
+            });
+            settle(visual, &workspace, |this| this.tree_edit.is_some());
+        };
+        begin_rename(visual, file);
+        assert_eq!(visual.debug_bounds("workspace-tree-edit").unwrap(), before);
+        visual.update(|window, cx| {
+            let this = workspace.read(cx);
+            let input = this.tree_edit.as_ref().unwrap().input.read(cx);
+            assert!(input.focus_handle(cx).is_focused(window));
+            assert_eq!(input.selected_range(), 0.."zz-初稿".len());
+        });
+        visual.simulate_input("bad/name");
+        visual.simulate_keystrokes("enter");
+        draw_tree_frame(visual, Duration::ZERO);
+        visual.update(|_, cx| {
+            let edit = workspace.read(cx).tree_edit.as_ref().unwrap();
+            assert_eq!(edit.input.read(cx).value().as_ref(), "bad/name.txt");
+            assert_eq!(
+                edit.error.as_ref().unwrap().message.as_ref(),
+                t!("workspace.tree_invalid_name").as_ref()
+            );
+        });
+        assert!(visual.debug_bounds("tree-edit-error").is_some());
+        assert_eq!(visual.debug_bounds("workspace-tree-edit").unwrap(), before);
+        let select_all = if cfg!(target_os = "macos") {
+            "cmd-a"
+        } else {
+            "ctrl-a"
+        };
+        visual.simulate_keystrokes(select_all);
+        visual.simulate_input("file-0000.txt");
+        visual.simulate_keystrokes("enter");
+        settle(visual, &workspace, |this| {
+            !this.tree_busy && this.tree_edit.as_ref().unwrap().error.is_some()
+        });
+        visual.update(|_, cx| {
+            let this = workspace.read(cx);
+            let edit = this.tree_edit.as_ref().unwrap();
+            assert_eq!(
+                edit.error.as_ref().unwrap().message.as_ref(),
+                t!("workspace.tree_destination_exists").as_ref()
+            );
+            assert_eq!(edit.input.read(cx).value().as_ref(), "file-0000.txt");
+        });
+        assert!(root.join(file).is_file());
+
+        visual.simulate_keystrokes(select_all);
+        visual.simulate_input("aaaa-终稿.txt");
+        visual.simulate_keystrokes("enter");
+        let renamed = Path::new("base/aaaa-终稿.txt");
+        settle(visual, &workspace, |this| {
+            this.tree_keyboard_path == renamed && listed(this, renamed)
+        });
+        let renamed_row = assert_visible(visual, "workspace-tree-row:base/aaaa-终稿.txt");
+        assert!(root.join(renamed).is_file());
+        assert!(!root.join(file).exists());
+
+        begin_rename(visual, renamed);
+        visual.simulate_input("cancelled");
+        visual.simulate_click(
+            point(renamed_row.right() + px(20.), renamed_row.center().y),
+            Modifiers::default(),
+        );
+        settle(visual, &workspace, |this| this.tree_edit.is_none());
+        assert!(root.join(renamed).is_file());
+        assert!(!root.join("base/cancelled.txt").exists());
+
+        begin_rename(visual, Path::new("base/zz-new/子目录.d"));
+        visual.update(|_, cx| {
+            let input = workspace
+                .read(cx)
+                .tree_edit
+                .as_ref()
+                .unwrap()
+                .input
+                .read(cx);
+            assert_eq!(input.selected_range(), 0.."子目录.d".len());
+        });
+        visual.simulate_input("new-dir");
+        visual.simulate_keystrokes("enter");
+        let renamed_dir = Path::new("base/zz-new/new-dir");
+        settle(visual, &workspace, |this| {
+            this.tree_keyboard_path == renamed_dir && listed(this, renamed_dir)
+        });
+        assert_visible(visual, "workspace-tree-row:base/zz-new/new-dir");
+        assert!(root.join(renamed_dir).is_dir());
         Ok(())
     }
 
@@ -3969,6 +4255,11 @@ mod tests {
             "f2"
         });
         settle(visual, &workspace, |this| this.tree_edit.is_some());
+        visual.simulate_keystrokes(if cfg!(target_os = "macos") {
+            "cmd-a"
+        } else {
+            "ctrl-a"
+        });
         visual.simulate_input("keyboard.tt");
         visual.simulate_keystrokes("left space");
         visual.simulate_input("x");

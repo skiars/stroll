@@ -967,6 +967,7 @@
   "workspace.tree_operation_busy": "此位置有文件正在保存或更新。请等待操作完成后重试。",
   "workspace.tree_invalid_create_path": "请输入有效的相对路径。",
   "workspace.tree_invalid_name": "请输入有效的文件名或目录名。",
+  "workspace.tree_entry_name": "文件或目录名称",
   "workspace.tree_entry_changed": "此条目已在磁盘上发生变化。请重新发起操作。",
   "workspace.tree_unsupported": "不支持此类型的条目。",
   "workspace.tree_same_file": "请选择与原文件不同的保存位置。",

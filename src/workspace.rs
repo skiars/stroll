@@ -850,6 +850,7 @@ pub struct Workspace {
     tree_status_task: Task<()>,
     tree_load_pending: BTreeSet<PathBuf>,
     tree_reveal: Option<PathBuf>,
+    tree_operation_reveal: Option<repo_sync::TreeOperationReveal>,
     tree_selected: Option<PathBuf>,
     docs_tree_task: Task<()>,
     docs_tree_reveal: Option<PathBuf>,
@@ -1081,6 +1082,7 @@ impl Workspace {
             tree_status_task: Task::ready(()),
             tree_load_pending: BTreeSet::new(),
             tree_reveal: None,
+            tree_operation_reveal: None,
             tree_selected: None,
             docs_tree_task: Task::ready(()),
             docs_tree_reveal: None,
@@ -1269,6 +1271,7 @@ impl Workspace {
         {
             return;
         }
+        self.cancel_tree_operation_reveal();
         self.repository_ui.error = None;
         self.repository_ui.menu_error = None;
         let from_menu = self.repository_ui.menu_open;
@@ -2169,6 +2172,7 @@ impl Workspace {
         self.cancel_file_open();
         self.tree_scroll = UniformListScrollHandle::new();
         self.tree_horizontal = Default::default();
+        self.tree_operation_reveal = None;
         if view != WorkspaceView::Docs
             && let Some(doc) = &self.doc
         {
@@ -2743,6 +2747,13 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         if !matches!(request, FileOpen::Startup | FileOpen::Restore { .. }) {
+            if self
+                .tree_operation_reveal
+                .as_ref()
+                .is_some_and(|reveal| reveal.path.as_ref() != path)
+            {
+                self.cancel_tree_operation_reveal();
+            }
             self.cancel_document_navigation(cx);
         }
         if !matches!(request, FileOpen::Startup | FileOpen::Restore { .. })
@@ -4926,6 +4937,7 @@ impl Workspace {
         let hover_edge = tree_hover_edge.clone();
         let probe_paths = Rc::new(RefCell::new(Vec::new()));
         let probed = self.file_probes.checked.clone();
+        let font_size = px(file_name_font_size(cx));
         let list = tree_motion::tree_list(
             cx.entity(),
             "file-tree",
@@ -4935,15 +4947,22 @@ impl Workspace {
             frame,
             move |index, visual, cx| {
                 let mut row_index = index;
+                let mut editing = false;
                 if let Some((edit_index, depth, replace, guides)) = inline {
-                    if index == edit_index {
+                    editing = index == edit_index;
+                    if editing && !replace {
                         return weak
                             .read_with(cx, |this, _| {
                                 this.tree_edit.as_ref().map(|edit| {
                                     edit.element(
-                                        depth,
-                                        guides,
-                                        colors.muted,
+                                        file_tree::tree_row_base(
+                                            "workspace-tree-edit".into(),
+                                            depth,
+                                            guides,
+                                            colors.muted,
+                                        ),
+                                        colors,
+                                        font_size,
                                         this.tree_busy,
                                         weak.clone(),
                                     )
@@ -4960,6 +4979,7 @@ impl Workspace {
                 let entry = row.entry.clone();
                 let directory = entry.directory;
                 if in_workspace
+                    && !editing
                     && !directory
                     && !entry.symlink
                     && !visual.exiting
@@ -5024,6 +5044,23 @@ impl Workspace {
                     )
                     .into_any_element()
                 };
+                if editing {
+                    return weak
+                        .read_with(cx, |this, _| {
+                            this.tree_edit.as_ref().map(|edit| {
+                                let row = file_tree::tree_row_base(
+                                    "workspace-tree-edit".into(),
+                                    row.depth,
+                                    row.guides,
+                                    colors.muted,
+                                )
+                                .child(entry_icon);
+                                edit.element(row, colors, font_size, this.tree_busy, weak.clone())
+                            })
+                        })
+                        .ok()
+                        .flatten();
+                }
                 let element = file_tree::tree_row(row_id, row, selected, colors)
                     .cursor_pointer()
                     .when(
@@ -5048,7 +5085,7 @@ impl Workspace {
                             .min_w_0()
                             .when(horizontal, |name| name.whitespace_nowrap().flex_shrink_0())
                             .when(!horizontal, |name| name.truncate())
-                            .text_size(px(file_name_font_size(cx)))
+                            .text_size(font_size)
                             .when(dimmed, |name| name.text_color(colors.muted))
                             .when_some(status_color, |name, color| name.text_color(color))
                             .child(name),
@@ -5200,6 +5237,7 @@ impl Workspace {
                             } else {
                                 this.expanded.clear();
                                 this.tree_reveal = None;
+                                this.cancel_tree_operation_reveal();
                             }
                             this.rebuild_tree();
                             cx.notify();

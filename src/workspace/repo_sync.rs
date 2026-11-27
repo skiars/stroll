@@ -15,6 +15,20 @@ use std::ops::Range;
 
 static NEXT_DOCUMENT_SCAN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
+pub(super) struct TreeOperationReveal {
+    pub(super) path: Rc<Path>,
+    refreshed: bool,
+}
+
+impl TreeOperationReveal {
+    pub(super) fn new(path: &Path) -> Self {
+        Self {
+            path: Rc::from(path),
+            refreshed: false,
+        }
+    }
+}
+
 pub(crate) struct ReloadEdits {
     before: Rope,
     edits: Vec<(Range<usize>, String)>,
@@ -141,6 +155,7 @@ impl Workspace {
         self.repository_snapshot = None;
         self.tree_load_pending.clear();
         self.tree_reveal = None;
+        self.tree_operation_reveal = None;
         self.tree_selected = None;
         self.tree_keyboard_path.clear();
         self.tree_clipboard = None;
@@ -196,6 +211,13 @@ impl Workspace {
     pub(super) fn reveal_file_in_tree(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let active = self.tabs.active().filter(|path| !path.is_absolute());
         if self.tree_selected.as_deref() != active {
+            if self
+                .tree_operation_reveal
+                .as_ref()
+                .is_some_and(|reveal| !active.is_some_and(|path| path.starts_with(&reveal.path)))
+            {
+                self.tree_operation_reveal = None;
+            }
             self.tree_selected = active.map(Path::to_owned);
             self.tree_reveal = self.tree_selected.clone();
         }
@@ -210,6 +232,19 @@ impl Workspace {
         }
     }
 
+    pub(super) fn cancel_tree_operation_reveal(&mut self) {
+        if let Some(reveal) = self.tree_operation_reveal.take() {
+            if self
+                .loading_file
+                .as_ref()
+                .is_some_and(|(path, _)| path == reveal.path.as_ref())
+            {
+                self.cancel_file_open();
+            }
+            self.tree_reveal = None;
+        }
+    }
+
     fn finish_tree_reveal(
         &mut self,
         attempted: &BTreeSet<PathBuf>,
@@ -220,6 +255,17 @@ impl Workspace {
             || !self.session.panels.editor_tree
             || self.tree_edit.is_some()
         {
+            return;
+        }
+        if let Some(reveal) = &self.tree_operation_reveal {
+            if !reveal.refreshed {
+                return;
+            }
+            let path = self.tree_operation_reveal.take().unwrap().path;
+            self.tree_reveal = None;
+            if self.reveal_tree_path(&path, cx) {
+                self.tree_keyboard_path = path.to_path_buf();
+            }
             return;
         }
         let Some(path) = self
@@ -243,7 +289,10 @@ impl Workspace {
                     .any(|entry| entry.path == pair[1] && entry.directory == directory)
             });
             if !listed {
-                if attempted.contains(pair[0]) || !repo.lazy_tree {
+                if !repo.lazy_tree
+                    || (attempted.contains(pair[0])
+                        && !self.workspace_refresh_pending.directories.contains(pair[0]))
+                {
                     self.tree_reveal = None;
                     return;
                 }
@@ -572,6 +621,18 @@ impl Workspace {
                 invalidate.insert(path);
             }
         }
+        let operation_path = self
+            .tree_operation_reveal
+            .as_ref()
+            .filter(|reveal| !reveal.refreshed)
+            .map(|reveal| reveal.path.clone());
+        // A refresh already in flight cannot acknowledge an operation queued after it began.
+        if let Some(path) = &operation_path {
+            for parent in path.ancestors().skip(1) {
+                invalidate.remove(parent);
+                directories.insert(parent.to_owned());
+            }
+        }
         if status_needed && (refresh_all || !directories.is_empty()) {
             directories.extend(
                 self.expanded
@@ -754,6 +815,17 @@ impl Workspace {
                         }
                     }
                     this.workspace_refreshing = false;
+                    if let Some(reveal) = &mut this.tree_operation_reveal
+                        && operation_path
+                            .as_ref()
+                            .is_some_and(|path| Rc::ptr_eq(path, &reveal.path))
+                    {
+                        if error.is_some() {
+                            this.tree_operation_reveal = None;
+                        } else {
+                            reveal.refreshed = true;
+                        }
+                    }
                     if let Some(error) = error {
                         this.tree_reveal = None;
                         if repo.ssh.as_ref().is_some_and(|ssh| ssh.failure().is_some()) {

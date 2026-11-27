@@ -163,6 +163,7 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.cancel_tree_operation_reveal();
         self.tree_keyboard_path = path;
         self.tree_focus.focus(window, cx);
         cx.notify();
