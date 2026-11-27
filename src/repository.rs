@@ -480,6 +480,93 @@ impl From<Repository> for RepositoryInfo {
     }
 }
 
+pub(crate) const FILE_KIND_BATCH: usize = 64;
+
+fn unicode_encoding(bytes: &[u8]) -> Option<FileReadIssue> {
+    for (prefix, issue) in [
+        (&b"\xff\xfe\0\0"[..], FileReadIssue::Utf32),
+        (b"\0\0\xfe\xff", FileReadIssue::Utf32),
+        (b"\xff\xfe", FileReadIssue::Utf16),
+        (b"\xfe\xff", FileReadIssue::Utf16),
+    ] {
+        if bytes.starts_with(prefix) {
+            return Some(issue);
+        }
+    }
+    None
+}
+
+fn has_binary_prefix(bytes: &[u8]) -> bool {
+    [
+        b"\x7fELF".as_slice(),
+        b"\0asm",
+        b"PK\x03\x04",
+        b"%PDF-",
+        b"\x1f\x8b",
+        b"!<arch>\n",
+    ]
+    .iter()
+    .any(|magic| bytes.starts_with(magic))
+        || bytes.contains(&0)
+}
+
+fn probe_binary_at(path: &Path) -> Result<bool> {
+    let mut options = File::options();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let file = options.open(path)?;
+    ensure!(file.metadata()?.is_file(), t!("storage.regular_file"));
+    let mut bytes = Vec::new();
+    file.take(4096).read_to_end(&mut bytes)?;
+    Ok(unicode_encoding(&bytes).is_none() && has_binary_prefix(&bytes))
+}
+
+impl Repository {
+    pub(crate) fn probe_binary_local(&self, path: &Path) -> bool {
+        self.resolve(path)
+            .and_then(|path| probe_binary_at(&path))
+            .unwrap_or(false)
+    }
+}
+
+#[cfg(feature = "desktop")]
+pub(crate) fn probe_binary_files(
+    repo: Option<&Repository>,
+    paths: &[PathBuf],
+) -> Result<Vec<bool>> {
+    if let Some(ssh) = repo.and_then(|repo| repo.ssh.as_ref())
+        && paths.iter().all(|path| !path.is_absolute())
+    {
+        if !ssh.supports_file_kind() {
+            return Ok(vec![false; paths.len()]);
+        }
+        let paths = paths
+            .iter()
+            .map(|path| crate::remote::RepoPath::from_local(path))
+            .collect::<Result<Vec<_>>>()?;
+        let matches: Vec<Option<crate::remote::BinaryMatch>> =
+            ssh.call(crate::remote::Request::FileKinds(paths))?;
+        return Ok(matches.into_iter().map(|result| result.is_some()).collect());
+    }
+    Ok(paths
+        .iter()
+        .map(|path| {
+            if path.is_absolute() {
+                resolve_local_file(path)
+                    .and_then(|path| probe_binary_at(&path))
+                    .unwrap_or(false)
+            } else {
+                repo.filter(|repo| repo.ssh.is_none())
+                    .is_some_and(|repo| repo.probe_binary_local(path))
+            }
+        })
+        .collect())
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub(crate) enum FileReadIssue {
     Binary,
@@ -776,33 +863,16 @@ impl Document {
     }
 
     pub(crate) fn decode(bytes: Vec<u8>) -> Result<Self> {
-        for (prefix, issue) in [
-            (&b"\xff\xfe\0\0"[..], FileReadIssue::Utf32),
-            (b"\0\0\xfe\xff", FileReadIssue::Utf32),
-            (b"\xff\xfe", FileReadIssue::Utf16),
-            (b"\xfe\xff", FileReadIssue::Utf16),
-        ] {
-            if bytes.starts_with(prefix) {
-                return Err(issue.into());
-            }
+        if let Some(issue) = unicode_encoding(&bytes) {
+            return Err(issue.into());
         }
-        if [
-            b"\x7fELF".as_slice(),
-            b"\0asm",
-            b"PK\x03\x04",
-            b"%PDF-",
-            b"\x1f\x8b",
-        ]
-        .iter()
-        .any(|magic| bytes.starts_with(magic))
-        {
+        if has_binary_prefix(&bytes) {
             return Err(FileReadIssue::Binary.into());
         }
         let bom = bytes.starts_with(b"\xef\xbb\xbf");
         let disk = std::str::from_utf8(if bom { &bytes[3..] } else { &bytes });
         let disk = match disk {
-            Ok(disk) if !disk.contains('\0') => disk,
-            _ if bytes.contains(&0) => return Err(FileReadIssue::Binary.into()),
+            Ok(disk) => disk,
             _ => return Err(FileReadIssue::UnsupportedEncoding.into()),
         };
         let baseline = digest(&bytes);

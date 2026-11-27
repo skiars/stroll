@@ -1155,6 +1155,8 @@ impl Workspace {
         if from == to {
             return;
         }
+        self.file_probes
+            .invalidate(|path| path.starts_with(from) || path.starts_with(to));
         let repo = self.repository.clone();
         let map = |path: &Path| {
             path.strip_prefix(from).map_or_else(
@@ -1345,6 +1347,7 @@ impl Workspace {
         if let Some(history) = self.source_history_mut() {
             history.remove(target);
         }
+        self.file_probes.invalidate(|path| path.starts_with(target));
         Rc::make_mut(&mut self.file_formats).retain(|path, _| !path.starts_with(target));
         for path in paths {
             self.file_information.remove(&path);
@@ -2496,8 +2499,20 @@ mod tests {
         );
         let binary = Path::new("program");
         let large = Path::new("large.txt");
+        let elf = Path::new("large-program");
+        let script = Path::new("script");
         fs::write(root.join(binary), b"\0binary")?;
-        fs::File::create(root.join(large))?.set_len(MAX_FILE_BYTES + 1)?;
+        fs::write(root.join(elf), b"\x7fELF\x02\x01")?;
+        fs::OpenOptions::new()
+            .write(true)
+            .open(root.join(elf))?
+            .set_len(MAX_FILE_BYTES + 1)?;
+        fs::write(root.join(script), "#!/bin/sh\nexit 0\n")?;
+        let mut text_file = fs::File::create(root.join(large))?;
+        for _ in 0..MAX_FILE_BYTES / 4096 {
+            text_file.write_all(&[b'x'; 4096])?;
+        }
+        text_file.write_all(b"\n")?;
         let mut cx = TestAppContext::build_with_text_system(
             TestDispatcher::new(0),
             None,
@@ -2529,7 +2544,16 @@ mod tests {
             });
         });
         settle(visual, &workspace, |this| {
-            this.rows.iter().any(|row| row.entry.path == binary)
+            this.file_formats.get(elf) == Some(&file_icons::KnownFormat::Binary)
+        });
+        visual.update(|_, cx| {
+            let this = workspace.read(cx);
+            assert_eq!(
+                this.file_formats.get(binary),
+                Some(&file_icons::KnownFormat::Binary)
+            );
+            assert!(!this.file_formats.contains_key(script));
+            assert!(this.tabs.paths().is_empty());
         });
 
         for (selector, path, expected) in [
@@ -2537,6 +2561,11 @@ mod tests {
             (
                 "workspace-tree-row:large.txt",
                 large,
+                FileReadIssue::TooLarge(MAX_FILE_BYTES + 1),
+            ),
+            (
+                "workspace-tree-row:large-program",
+                elf,
                 FileReadIssue::TooLarge(MAX_FILE_BYTES + 1),
             ),
         ] {
@@ -2560,8 +2589,15 @@ mod tests {
         }
         visual.update(|_, cx| {
             let this = workspace.read(cx);
-            assert_eq!(this.tabs.paths().len(), 2);
-            assert!(this.file_formats.get(binary) == Some(&file_icons::KnownFormat::Binary));
+            assert_eq!(this.tabs.paths().len(), 3);
+            assert_eq!(
+                this.file_formats.get(binary),
+                Some(&file_icons::KnownFormat::Binary)
+            );
+            assert_eq!(
+                this.file_formats.get(elf),
+                Some(&file_icons::KnownFormat::Binary)
+            );
             assert!(!this.file_formats.contains_key(large));
         });
         Ok(())
@@ -2780,6 +2816,11 @@ mod tests {
             .debug_bounds("image-hover-loaded")
             .expect("SVG hover handoff");
         assert!(tiny_preview.size.width <= px(24.) && tiny_preview.size.height <= px(16.));
+        let tiny_surface = visual.debug_bounds("image-hover-surface").unwrap();
+        assert!(
+            tiny_surface.size.width < px(240.) && tiny_surface.size.height < px(140.),
+            "{tiny_surface:?}"
+        );
 
         visual.simulate_mouse_move(image_row, None, Modifiers::default());
         visual
@@ -2789,10 +2830,16 @@ mod tests {
         let hover = visual
             .debug_bounds("image-hover-preview")
             .expect("tree image hover");
-        assert!(visual.debug_bounds("hover-info").unwrap().bottom() <= hover.top());
-        assert!(hover.left() > image_row.x);
-        assert_eq!(hover.size, size(px(320.), px(240.)));
-        assert!(visual.debug_bounds("image-hover-loaded").is_some());
+        assert!(hover.bottom() <= visual.debug_bounds("hover-info").unwrap().top());
+        let surface = visual.debug_bounds("image-hover-surface").unwrap();
+        let tree = visual.debug_bounds("workspace-file-tree-viewport").unwrap();
+        assert!(
+            (px(6.)..=px(11.)).contains(&(surface.left() - tree.right())),
+            "{surface:?} {tree:?}"
+        );
+        let loaded = visual.debug_bounds("image-hover-loaded").unwrap();
+        assert!(loaded.size.width <= px(310.) && loaded.size.height < px(200.));
+        assert!((px(4.)..=px(6.)).contains(&(loaded.top() - surface.top())));
 
         // A redraw while the pointer stays put must keep the decoded image visible.
         settle(visual, &workspace, |this| this.active_file().is_some());

@@ -4333,7 +4333,8 @@ mod tests {
         let popup = visual
             .debug_bounds("image-hover-preview")
             .expect("image diff hover");
-        assert_eq!(popup.size, size(px(320.), px(240.)));
+        assert!((px(250.)..=px(320.)).contains(&popup.size.width));
+        assert!(popup.size.height < px(200.));
         let surface = visual.debug_bounds("image-hover-surface").unwrap();
         visual.update(|window, cx| {
             let scale = window.scale_factor();

@@ -263,6 +263,7 @@ impl Server {
                             | super::SOURCE_HISTORY_VERSION
                             | super::FILE_DETAILS_VERSION
                             | super::READ_EDITOR_VERSION
+                            | super::FILE_KIND_VERSION
                     ),
                     "SSH workspace protocol version mismatch. Update the remote helper."
                 );
@@ -552,6 +553,21 @@ impl Server {
                 &repo.resolve(path.as_path())?,
             )?),
             Request::ReadEditor(path) => value(repo.read_editor_disk(path.as_path())?),
+            Request::FileKinds(paths) => {
+                ensure!(
+                    paths.len() <= crate::repository::FILE_KIND_BATCH,
+                    "Too many file kinds requested"
+                );
+                value(
+                    paths
+                        .iter()
+                        .map(|path| {
+                            repo.probe_binary_local(path.as_path())
+                                .then_some(super::BinaryMatch::Binary)
+                        })
+                        .collect::<Vec<_>>(),
+                )
+            }
             Request::ReadForSync(path) => value(repo.bytes_if_present(path.as_path())?.map(Bytes)),
             Request::Read(path, asset) => value(Bytes(repo.bytes(path.as_path(), asset)?)),
             Request::ReadResource {

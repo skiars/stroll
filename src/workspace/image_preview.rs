@@ -67,13 +67,18 @@ impl Workspace {
     }
 }
 
+pub(super) struct DecodedPreview {
+    pub(super) image: Arc<RenderImage>,
+    original: Size<u32>,
+}
+
 pub(super) fn decode_preview(
     path: &Path,
     bytes: &[u8],
     renderer: SvgRenderer,
     max_width: u32,
     max_height: u32,
-) -> anyhow::Result<Arc<RenderImage>> {
+) -> anyhow::Result<DecodedPreview> {
     use gpui::ImageFormat as GpuiFormat;
     use image::ImageFormat::*;
     let format = match image_viewer::format(path) {
@@ -85,13 +90,19 @@ pub(super) fn decode_preview(
                 .min(1.);
             let dimension =
                 |length: Pixels| DevicePixels((length.as_f32() * scale).round().max(1.) as i32);
-            return Ok(renderer.render_parsed(
-                &svg,
-                SvgSize::ExactSize(size(
-                    dimension(intrinsic.width),
-                    dimension(intrinsic.height),
-                )),
-            )?);
+            return Ok(DecodedPreview {
+                image: renderer.render_parsed(
+                    &svg,
+                    SvgSize::ExactSize(size(
+                        dimension(intrinsic.width),
+                        dimension(intrinsic.height),
+                    )),
+                )?,
+                original: size(
+                    intrinsic.width.as_f32().round() as u32,
+                    intrinsic.height.as_f32().round() as u32,
+                ),
+            });
         }
         Some(GpuiFormat::Png) => Png,
         Some(GpuiFormat::Jpeg) => Jpeg,
@@ -114,6 +125,7 @@ pub(super) fn decode_preview(
     let orientation = decoder.orientation()?;
     let mut image = image::DynamicImage::from_decoder(decoder)?;
     image.apply_orientation(orientation);
+    let original = size(image.width(), image.height());
     let mut frame = if image.width() > max_width || image.height() > max_height {
         image.thumbnail(max_width, max_height).into_rgba8()
     } else {
@@ -122,7 +134,10 @@ pub(super) fn decode_preview(
     for pixel in frame.pixels_mut() {
         pixel.0.swap(0, 2);
     }
-    Ok(Arc::new(RenderImage::new([image::Frame::new(frame)])))
+    Ok(DecodedPreview {
+        image: Arc::new(RenderImage::new([image::Frame::new(frame)])),
+        original,
+    })
 }
 
 #[derive(Clone, Default)]
@@ -136,7 +151,7 @@ impl ImageHoverDismiss {
                 hover.closed = true;
                 hover.task = Task::ready(());
                 if let Some(Ok(image)) = hover.image.take() {
-                    _ = window.drop_image(image);
+                    _ = window.drop_image(image.image);
                 }
                 cx.notify();
             });
@@ -144,7 +159,24 @@ impl ImageHoverDismiss {
     }
 }
 
-const HOVER_PADDING: Pixels = px(6.);
+const HOVER_PADDING: Pixels = px(4.);
+const INLINE_ICON_MAX: u32 = 48;
+
+fn display_size(image: &RenderImage, scale: f32) -> Size<Pixels> {
+    let pixels = image.size(0);
+    size(
+        px(pixels.width.0 as f32 / scale),
+        px(pixels.height.0 as f32 / scale),
+    )
+}
+
+pub(super) fn preview_image(image: Arc<RenderImage>, size: Size<Pixels>) -> impl IntoElement {
+    img(image)
+        .debug_selector(|| "image-hover-loaded".into())
+        .w(size.width)
+        .h(size.height)
+        .object_fit(ObjectFit::Contain)
+}
 
 #[derive(Clone)]
 pub(super) struct ImageHoverSource {
@@ -199,10 +231,18 @@ fn hover_image_with_info(
         if !window.is_pointer_motion() {
             return None;
         }
-        let arrow = ArrowHover::new(bounds, Placement::Right, window);
+        let arrow = info.as_ref().map_or_else(
+            || ArrowHover::new(bounds, Placement::Right, window),
+            |info| info.arrow(bounds, Placement::Right, window),
+        );
+        let image_height = if info.is_some() {
+            (arrow.height - px(110.)).max(px(32.))
+        } else {
+            arrow.height
+        };
         let dimensions = size(
             MAX_SIZE.width.min(arrow.width),
-            MAX_SIZE.height.min(arrow.height),
+            MAX_SIZE.height.min(image_height),
         );
         if dimensions.width < px(32.) || dimensions.height < px(32.) {
             return None;
@@ -219,16 +259,12 @@ fn hover_image_with_info(
                 let path = path.clone();
                 let scale = window.scale_factor();
                 let renderer = cx.svg_renderer();
-                let inset = (HOVER_PADDING + px(1.)) * 2.;
-                let info = info.as_ref().map(|info| {
-                    let card = info.build(None, cx);
-                    card.update(cx, |card, _| card.embed(dimensions.width));
-                    card
-                });
+                const INSET: Pixels = px(10.);
+                let info = info.as_ref().map(|info| info.build(None, cx));
                 let hover = cx.new(|cx| {
                     cx.on_release(|hover: &mut ImageHover, cx| {
                         if let Some(Ok(image)) = hover.image.take() {
-                            cx.defer(move |cx| cx.drop_image(image, None));
+                            cx.defer(move |cx| cx.drop_image(image.image, None));
                         }
                     })
                     .detach();
@@ -237,13 +273,30 @@ fn hover_image_with_info(
                             &path,
                             &read()?,
                             renderer,
-                            ((dimensions.width - inset).as_f32() * scale).ceil() as u32,
-                            ((dimensions.height - inset).as_f32() * scale).ceil() as u32,
+                            ((dimensions.width - INSET).as_f32() * scale).floor() as u32,
+                            ((dimensions.height - INSET).as_f32() * scale).floor() as u32,
                         )
                     });
                     let task = cx.spawn(async move |this, cx| {
                         let result = load.await;
                         _ = this.update(cx, |this: &mut ImageHover, cx| {
+                            if let (Some(card), Ok(preview)) = (&this.info, &result) {
+                                let icon = preview.original.width <= INLINE_ICON_MAX
+                                    && preview.original.height <= INLINE_ICON_MAX;
+                                card.update(cx, |card, cx| {
+                                    card.set_preview(
+                                        preview.original,
+                                        icon.then(|| {
+                                            (
+                                                preview.image.clone(),
+                                                display_size(&preview.image, scale),
+                                            )
+                                        }),
+                                    );
+                                    cx.notify();
+                                });
+                                this.inline = icon;
+                            }
                             this.image = Some(result);
                             cx.notify();
                         });
@@ -253,6 +306,7 @@ fn hover_image_with_info(
                         arrow,
                         info,
                         image: None,
+                        inline: false,
                         task,
                         closed: false,
                     }
@@ -275,7 +329,8 @@ struct ImageHover {
     dimensions: Size<Pixels>,
     arrow: ArrowHover,
     info: Option<gpui::Entity<Card>>,
-    image: Option<anyhow::Result<Arc<RenderImage>>>,
+    image: Option<anyhow::Result<DecodedPreview>>,
+    inline: bool,
     task: Task<()>,
     closed: bool,
 }
@@ -285,43 +340,51 @@ impl Render for ImageHover {
         if self.closed {
             return div().into_any_element();
         }
-        let width = self.dimensions.width;
-        let height = self.dimensions.height;
-        let content = match &self.image {
-            Some(Ok(image)) => {
-                let pixels = image.size(0);
-                let device_scale = window.scale_factor();
-                img(image.clone())
-                    .debug_selector(|| "image-hover-loaded".into())
-                    .w(px(pixels.width.0 as f32 / device_scale))
-                    .h(px(pixels.height.0 as f32 / device_scale))
-                    .max_w_full()
-                    .max_h_full()
-                    .object_fit(ObjectFit::Contain)
-                    .into_any_element()
+        let inset = (HOVER_PADDING + px(1.)) * 2.;
+        let (preview, image_width) = match &self.image {
+            Some(Ok(preview)) if !self.inline => {
+                let size = display_size(&preview.image, window.scale_factor());
+                (
+                    Some(preview_image(preview.image.clone(), size).into_any_element()),
+                    size.width,
+                )
             }
-            Some(Err(_)) => div().child(t!("image.open_failed")).into_any_element(),
-            None => div().child(t!("image.loading")).into_any_element(),
+            Some(Ok(_)) => (None, px(0.)),
+            Some(Err(_)) => (
+                Some(div().child(t!("image.open_failed")).into_any_element()),
+                px(160.),
+            ),
+            None => (
+                Some(div().child(t!("image.loading")).into_any_element()),
+                px(100.),
+            ),
         };
-        let preview = div()
-            .debug_selector(|| "image-hover-preview".into())
-            .flex()
-            .items_center()
-            .justify_center()
-            .w(width)
-            .h(height)
-            .min_h_0()
-            .overflow_hidden()
-            .p(HOVER_PADDING)
-            .child(content);
+        let width = (image_width + inset)
+            .max(if self.info.is_some() {
+                px(204.)
+            } else {
+                px(28.)
+            })
+            .min(self.dimensions.width);
         self.arrow
             .surface(window, cx)
             .debug_selector(|| "image-hover-surface".into())
             .relative()
             .w(width)
+            .min_h(px(28.))
             .max_h(self.arrow.height)
+            .justify_center()
+            .p(HOVER_PADDING)
+            .gap(HOVER_PADDING)
+            .children(preview.map(|content| {
+                div()
+                    .flex()
+                    .debug_selector(|| "image-hover-preview".into())
+                    .justify_center()
+                    .min_h_0()
+                    .child(content)
+            }))
             .children(self.info.clone())
-            .child(preview)
             .into_any_element()
     }
 }

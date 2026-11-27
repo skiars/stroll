@@ -92,6 +92,8 @@ struct Connection {
     #[cfg(feature = "desktop")]
     editor_read: std::sync::OnceLock<bool>,
     #[cfg(feature = "desktop")]
+    file_kind: std::sync::OnceLock<bool>,
+    #[cfg(feature = "desktop")]
     worktree_lsp: std::sync::OnceLock<bool>,
     repository_events: crate::git::watch::RepoEvents,
     #[cfg(feature = "desktop")]
@@ -341,6 +343,14 @@ impl SshSession {
     }
 
     #[cfg(feature = "desktop")]
+    pub(crate) fn supports_file_kind(&self) -> bool {
+        *self.0.file_kind.get_or_init(|| {
+            let version = super::FILE_KIND_VERSION;
+            self.call::<u32>(Request::Hello(version)).ok() == Some(version)
+        })
+    }
+
+    #[cfg(feature = "desktop")]
     pub fn supports_revision_comparison(&self) -> bool {
         self.0.supports_revision_comparison()
     }
@@ -495,6 +505,8 @@ impl Connection {
             file_details: Default::default(),
             #[cfg(feature = "desktop")]
             editor_read: Default::default(),
+            #[cfg(feature = "desktop")]
+            file_kind: Default::default(),
             #[cfg(feature = "desktop")]
             worktree_lsp: Default::default(),
             repository_events: Default::default(),

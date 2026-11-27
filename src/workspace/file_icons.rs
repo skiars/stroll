@@ -10,10 +10,19 @@ use crate::{
 
 use super::{Palette, associated_highlight, audio_preview, icon, language_for};
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum KnownFormat {
     Text,
     Binary,
+}
+
+impl KnownFormat {
+    pub(super) fn binary_label(self) -> Option<gpui::SharedString> {
+        match self {
+            Self::Binary => Some(rust_i18n::t!("file_details.binary_type").into()),
+            Self::Text => None,
+        }
+    }
 }
 
 pub(super) fn file_type_icon(

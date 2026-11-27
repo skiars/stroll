@@ -63,6 +63,7 @@ pub(crate) const RECREATE_DOCUMENT_VERSION: u32 = 38;
 pub(crate) const SOURCE_HISTORY_VERSION: u32 = 39;
 pub(crate) const FILE_DETAILS_VERSION: u32 = 40;
 pub(crate) const READ_EDITOR_VERSION: u32 = 41;
+pub(crate) const FILE_KIND_VERSION: u32 = 42;
 const MAX_FRAME: usize = 40 * 1024 * 1024;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -213,6 +214,13 @@ mod base64_bytes {
 }
 
 #[derive(Serialize, Deserialize)]
+pub(crate) enum BinaryMatch {
+    // Accept the original version 42 response from an already installed helper.
+    #[serde(alias = "Elf")]
+    Binary,
+}
+
+#[derive(Serialize, Deserialize)]
 pub(crate) enum Request {
     Hello(u32),
     Browse {
@@ -236,6 +244,7 @@ pub(crate) enum Request {
     Exists(RepoPath),
     FileDetails(RepoPath),
     ReadEditor(RepoPath),
+    FileKinds(Vec<RepoPath>),
     Openable(Vec<Option<String>>),
     Read(RepoPath, bool),
     ReadResource {

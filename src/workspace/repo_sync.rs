@@ -1032,9 +1032,21 @@ impl Workspace {
                     || changes
                         .paths
                         .iter()
+                        .chain(&changes.ignored_paths)
+                        .any(|changed| path.starts_with(changed))
+                    || changes
+                        .local_paths
+                        .iter()
                         .any(|changed| path.starts_with(changed)))
         };
-        if !changes.paths.is_empty() || changes.refs || changes.rescan {
+        if !changes.paths.is_empty()
+            || !changes.ignored_paths.is_empty()
+            || !changes.local_paths.is_empty()
+            || changes.refs
+            || changes.rescan
+        {
+            self.file_probes.invalidate(changed);
+            cx.notify();
             Rc::make_mut(&mut self.file_formats).retain(|path, _| !changed(path));
             if self.loading_file.is_none()
                 && self.view == WorkspaceView::Editor

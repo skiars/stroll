@@ -1,4 +1,6 @@
-use crate::repository::{FileDetails, FileReadIssue, MAX_FILE_BYTES, file_details};
+use crate::repository::{
+    FileDetails, FileReadIssue, MAX_FILE_BYTES, file_details, probe_binary_files,
+};
 
 use super::*;
 
@@ -11,6 +13,7 @@ pub(super) enum EditorLoad {
 pub(super) struct FileInformation {
     pub(super) issue: FileReadIssue,
     pub(super) metadata: Option<FileDetails>,
+    format: Option<file_icons::KnownFormat>,
 }
 
 impl EditorLoad {
@@ -28,9 +31,22 @@ impl EditorLoad {
                 match Document::recover_uneditable(repo, path, store, issue)? {
                     Some(draft) => draft,
                     None => {
+                        let format = match issue {
+                            FileReadIssue::Binary => Some(file_icons::KnownFormat::Binary),
+                            FileReadIssue::TooLarge(_) => {
+                                probe_binary_files(repo, &[path.to_owned()])
+                                    .is_ok_and(|matches| matches.first() == Some(&true))
+                                    .then_some(file_icons::KnownFormat::Binary)
+                            }
+                            FileReadIssue::Utf16 | FileReadIssue::Utf32 => {
+                                Some(file_icons::KnownFormat::Text)
+                            }
+                            _ => None,
+                        };
                         return Ok(Self::Details(FileInformation {
                             issue,
                             metadata: file_details(repo, path).ok(),
+                            format,
                         }));
                     }
                 }
@@ -83,15 +99,8 @@ impl Workspace {
                 }
             }
             EditorLoad::Details(details) if !self.files.contains_key(path) => {
-                let format = match details.issue {
-                    FileReadIssue::Binary => Some(file_icons::KnownFormat::Binary),
-                    FileReadIssue::Utf16 | FileReadIssue::Utf32 => {
-                        Some(file_icons::KnownFormat::Text)
-                    }
-                    _ => None,
-                };
                 let formats = Rc::make_mut(&mut self.file_formats);
-                if let Some(format) = format {
+                if let Some(format) = details.format {
                     formats.insert(path.to_owned(), format);
                 } else {
                     formats.remove(path);
@@ -130,6 +139,9 @@ impl Workspace {
             }
             _ => details.metadata.as_ref().map(|metadata| metadata.size),
         };
+        let kind = details
+            .format
+            .and_then(file_icons::KnownFormat::binary_label);
         let modified = details
             .metadata
             .as_ref()
@@ -195,6 +207,9 @@ impl Workspace {
                             .pt_3()
                             .gap_2()
                             .child(row(t!("hover.path").into(), display.clone().into()))
+                            .when_some(kind, |list, kind| {
+                                list.child(row(t!("hover.file_type").into(), kind))
+                            })
                             .when_some(size, |list, size| {
                                 list.child(row(
                                     t!("hover.size").into(),

@@ -119,7 +119,7 @@ fn diff_images(
                 (THUMBNAIL_SIZE.width * scale).as_f32().ceil() as u32,
                 (THUMBNAIL_SIZE.height * scale).as_f32().ceil() as u32,
             ) {
-                Ok(image) => {
+                Ok(preview) => {
                     let backend = backend.clone();
                     let repository = repository.clone();
                     let detail = detail.clone();
@@ -136,7 +136,10 @@ fn diff_images(
                             .map(|bytes| bytes.0)
                             .context(t!("git.missing_snapshot"))
                     });
-                    DiffImage::Ready(DiffThumbnail { image, hover })
+                    DiffImage::Ready(DiffThumbnail {
+                        image: preview.image,
+                        hover,
+                    })
                 }
                 Err(_) => DiffImage::Failed,
             },

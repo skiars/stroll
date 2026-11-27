@@ -12,6 +12,7 @@ mod editor_preview;
 mod file_details;
 mod file_drop;
 mod file_icons;
+mod file_probe;
 mod file_tabs;
 mod file_tree;
 mod find;
@@ -63,7 +64,7 @@ use repository_ui::RepositoryUi;
 use settings::SettingsWindow;
 
 use std::{
-    cell::Cell,
+    cell::{Cell, RefCell},
     collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
     env, fs,
     path::{Path, PathBuf},
@@ -891,6 +892,7 @@ pub struct Workspace {
     files: HashMap<PathBuf, OpenFile>,
     file_information: HashMap<PathBuf, FileInformation>,
     file_formats: Rc<HashMap<PathBuf, file_icons::KnownFormat>>,
+    file_probes: file_probe::FileProbes,
     tab_scroll: ScrollHandle,
     tab_viewport_width: Pixels,
     tabs_overflow: bool,
@@ -1121,6 +1123,7 @@ impl Workspace {
             files: HashMap::new(),
             file_information: HashMap::new(),
             file_formats: Rc::default(),
+            file_probes: Default::default(),
             tab_scroll: ScrollHandle::new(),
             tab_viewport_width: px(0.),
             tabs_overflow: false,
@@ -1829,6 +1832,7 @@ impl Workspace {
         self.files.clear();
         self.file_information.clear();
         self.file_formats = Rc::default();
+        self.file_probes = Default::default();
         self.language_action_groups.clear();
         self.git_history = Default::default();
         self.language_rename = Task::ready(());
@@ -4840,6 +4844,8 @@ impl Workspace {
         gradient: Option<PaneGradient>,
         corner: Pixels,
     ) -> impl IntoElement {
+        use gpui_component::ElementExt as _;
+
         let rows = self.rows.clone();
         let in_workspace = self.view == WorkspaceView::Editor;
         let drag_repo = self
@@ -4911,6 +4917,10 @@ impl Workspace {
             px(0.)
         };
         let formats = self.file_formats.clone();
+        let tree_hover_edge = Rc::new(Cell::new(None));
+        let hover_edge = tree_hover_edge.clone();
+        let probe_paths = Rc::new(RefCell::new(Vec::new()));
+        let probed = self.file_probes.checked.clone();
         let list = tree_motion::tree_list(
             cx.entity(),
             "file-tree",
@@ -4918,7 +4928,7 @@ impl Workspace {
             &self.tree_scroll,
             horizontal,
             frame,
-            move |index, _, cx| {
+            move |index, visual, cx| {
                 let mut row_index = index;
                 if let Some((edit_index, depth, replace, guides)) = inline {
                     if index == edit_index {
@@ -4944,6 +4954,37 @@ impl Workspace {
                 let row = &rows[row_index];
                 let entry = row.entry.clone();
                 let directory = entry.directory;
+                if in_workspace
+                    && !directory
+                    && !entry.symlink
+                    && !visual.exiting
+                    && !formats.contains_key(&entry.path)
+                    && !probed.borrow().contains(&entry.path)
+                    && language_for(&entry.path) == "text"
+                    && !crate::image_viewer::is_image(&entry.path)
+                    && !audio_preview::is_audio(&entry.path)
+                    && let Some(repo) = &repository
+                {
+                    let mut paths = probe_paths.borrow_mut();
+                    if paths.is_empty() {
+                        let pending = probe_paths.clone();
+                        let repo = repo.clone();
+                        let weak = weak.clone();
+                        cx.defer(move |cx| {
+                            let paths = std::mem::take(&mut *pending.borrow_mut());
+                            _ = weak.update(cx, |this, cx| {
+                                if this
+                                    .repository
+                                    .as_ref()
+                                    .is_some_and(|current| Arc::ptr_eq(current, &repo))
+                                {
+                                    this.probe_visible_files(paths, cx);
+                                }
+                            });
+                        });
+                    }
+                    paths.push(entry.path.clone());
+                }
                 let selected = active.as_ref() == Some(&entry.path);
                 let dimmed = row.dimmed && !selected;
                 let view = weak.clone();
@@ -5007,8 +5048,10 @@ impl Workspace {
                             .when_some(status_color, |name, color| name.text_color(color))
                             .child(name),
                     );
-                let info = (!directory)
-                    .then(|| hover_info::FileInfo::new(weak.clone(), entry.path.clone()));
+                let info = (!directory).then(|| {
+                    hover_info::FileInfo::new(weak.clone(), entry.path.clone())
+                        .at_tree_edge(hover_edge.clone())
+                });
                 let element = if in_workspace
                     && !directory
                     && !entry.symlink
@@ -5198,6 +5241,10 @@ impl Workspace {
                             .child(
                                 div()
                                     .id("workspace-file-tree-viewport")
+                                    .debug_selector(|| "workspace-file-tree-viewport".into())
+                                    .on_prepaint(move |bounds, _, _| {
+                                        tree_hover_edge.set(Some(bounds))
+                                    })
                                     .size_full()
                                     .when(horizontal, |viewport| {
                                         viewport
@@ -6462,7 +6509,16 @@ pub(crate) fn compact_icon_button(
     name: IconName,
     label: impl Into<SharedString>,
 ) -> Button {
-    icon_button(id, name, label)
+    let label = label.into();
+    compact_icon_control(id, name, label.clone()).tooltip(label)
+}
+
+fn compact_icon_control(
+    id: impl Into<ElementId>,
+    name: IconName,
+    label: impl Into<SharedString>,
+) -> Button {
+    toolbar_icon_button(id, name, label)
         .with_size(px(16.))
         .size(px(24.))
 }

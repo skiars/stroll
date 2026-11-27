@@ -2064,7 +2064,10 @@ fn git_ref_picker_keeps_checkout_first_and_browses_remote_refs_and_annotated_tag
     settle(visual);
 
     let click = |visual: &mut VisualTestContext, selector| {
-        let position = visual.debug_bounds(selector).unwrap().center();
+        let position = visual
+            .debug_bounds(selector)
+            .unwrap_or_else(|| panic!("missing {selector}"))
+            .center();
         visual.simulate_click(position, Modifiers::default());
         settle(visual);
     };
@@ -2091,8 +2094,11 @@ fn git_ref_picker_keeps_checkout_first_and_browses_remote_refs_and_annotated_tag
     draw_frame(visual);
     assert!(visual.debug_bounds("hover-copy-branch").is_some());
     settle(visual);
-    let copy = visual.debug_bounds("hover-copy-branch").unwrap().center();
-    visual.simulate_mouse_move(copy, None, Modifiers::default());
+    let copy = visual.debug_bounds("hover-copy-branch").unwrap();
+    assert_eq!(copy.size, size(px(24.), px(24.)));
+    visual.simulate_mouse_move(copy.center(), None, Modifiers::default());
+    visual.executor().advance_clock(Duration::from_millis(650));
+    settle(visual);
     click(visual, "hover-copy-branch");
     assert_eq!(
         visual
