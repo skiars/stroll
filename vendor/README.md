@@ -379,6 +379,10 @@ dialogs in a Wayland window after changes to paint order or focus handling.
   `cargo test --release --locked --test popups lsp_hover_stays_open`
   to verify pointer handoff across editors, selection, button layout, clipboard
   content, and dismissal.
+- The LSP hover fits its horizontal position and width to the content area of
+  client-decorated windows. Run `cargo test --release --locked --test editor_popup_bounds
+  lsp_hover_fits_inside_the_visible_frame_at_the_right_edge` to check placement
+  in a narrow client-decorated window.
 
 - Tab accepts the selected item in the shared editor completion menu through
   the same edit path as Enter. With no list candidate it retains inline

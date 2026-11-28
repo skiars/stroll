@@ -150,6 +150,25 @@ fn hover_stays_in_the_editor_pane_and_preserves_pointer_handoff(cx: &mut TestApp
     );
 }
 
+#[cfg(target_os = "linux")]
+#[gpui::test]
+fn lsp_hover_fits_inside_the_visible_frame_at_the_right_edge(cx: &mut TestAppContext) {
+    let (editor, _, visual) = setup(cx, false, Duration::ZERO);
+    visual.update(|window, _| window.request_decorations(gpui::WindowDecorations::Client));
+    visual.simulate_resize(size(px(460.), px(470.)));
+    draw(visual);
+
+    let symbol = visual.update(|_, cx| editor.read(cx).range_to_bounds(&(13..26)).unwrap());
+    visual.simulate_mouse_move(symbol.center(), None, Default::default());
+    advance(visual, 150);
+    advance(visual, 151);
+
+    let pane = visual.debug_bounds("editor-pane").unwrap();
+    let popup = visual.debug_bounds("hover-popover-content").unwrap();
+    assert_eq!(popup.right(), pane.right() - px(8.));
+    assert_eq!(popup.left(), pane.left() + px(8.));
+}
+
 #[gpui::test]
 fn long_hover_uses_the_available_space_in_the_editor_pane(cx: &mut TestAppContext) {
     let (editor, _, visual) = setup(cx, false, Duration::ZERO);

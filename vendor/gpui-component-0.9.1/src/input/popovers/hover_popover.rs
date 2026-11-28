@@ -24,6 +24,7 @@ use crate::{
     },
     scroll::{ScrollbarMode, popup_scrollbar},
     text::{MarkdownExtensions, MarkdownNode, TextView},
+    window_border::window_content_insets,
 };
 
 pub struct HoverPopover {
@@ -656,8 +657,10 @@ impl Element for Popover {
         let trigger_bounds = self.trigger_bounds(cx)?;
         let viewport = window.viewport_size();
         let vertical = editor_popup_vertical_bounds(self.editor.read(cx), window);
-        let margin = CARET_POPUP_MARGIN;
-        let max_width = self.width_limit.end.min(viewport.width - margin * 2);
+        let frame_insets = window_content_insets(window);
+        let left = frame_insets.left + CARET_POPUP_MARGIN;
+        let right = viewport.width - frame_insets.right - CARET_POPUP_MARGIN;
+        let max_width = self.width_limit.end.min(right - left);
         let height = vertical.end - vertical.start;
         if max_width <= px(0.) || height <= px(2.) {
             return None;
@@ -680,6 +683,7 @@ impl Element for Popover {
 
         let mut popover = div()
             .id("hover-popover-content")
+            .debug_selector(|| "hover-popover-content".into())
             .flex_none()
             .occlude()
             .popover_style(cx)
@@ -719,10 +723,7 @@ impl Element for Popover {
             point(trigger_bounds.left(), y)
         });
         let origin = point(
-            origin.x.clamp(
-                margin,
-                (viewport.width - popover_size.width - margin).max(margin),
-            ),
+            origin.x.clamp(left, (right - popover_size.width).max(left)),
             origin
                 .y
                 .clamp(vertical.start, vertical.end - popover_size.height),
