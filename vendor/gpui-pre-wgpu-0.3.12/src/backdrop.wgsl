@@ -67,7 +67,16 @@ fn fragment(@builtin(position) position: vec4f) -> @location(0) vec4f {
     }
     let local = position.xy - params.origin;
     let uv = clamp(local / (f32(params.scale) * size), min_uv, max_uv);
-    let blurred = textureSampleLevel(source, linear_sampler, uv, 0.);
+    var blurred = textureSampleLevel(source, linear_sampler, uv, 0.);
+    // Transparent shadow samples contribute no color. Keep the destination's
+    // existing opacity and scale the filtered color to match it.
+    if blurred.a < unfiltered.a {
+        if blurred.a > 0. {
+            blurred = vec4f(blurred.rgb * (unfiltered.a / blurred.a), unfiltered.a);
+        } else {
+            blurred = unfiltered;
+        }
+    }
     let half_size = (params.bounds.zw - params.bounds.xy) * 0.5;
     let point = position.xy - (params.bounds.xy + half_size);
     let top = select(params.corners.x, params.corners.y, point.x >= 0.);

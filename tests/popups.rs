@@ -299,6 +299,37 @@ fn gpu_blurs_underlying_pixels_inside_clip_and_leaves_foreground_sharp() -> anyh
 
 #[cfg(target_os = "linux")]
 #[test]
+fn gpu_backdrop_preserves_opaque_pixels_near_a_transparent_window_edge() -> anyhow::Result<()> {
+    use gpui::DevicePixels;
+    use gpui_wgpu::WgpuHeadlessRenderer;
+
+    let mut renderer = WgpuHeadlessRenderer::new()?;
+    let mut scene = Scene::default();
+    scene.insert_primitive(solid(bounds(0., 0., 100., 96.), 0x406080));
+    let mut effect = blur(bounds(24., 14., 72., 68.));
+    effect.radius = ScaledPixels(20.);
+    scene.insert_backdrop_blur(effect);
+    scene.finish();
+
+    let image = renderer
+        .render_scene_to_transparent_image(&scene, size(DevicePixels(140), DevicePixels(96)))?;
+    let edge = image.get_pixel(94, 48).0;
+    assert_eq!(
+        edge[3], 255,
+        "opaque backdrop near the window edge: {edge:?}"
+    );
+    for (actual, expected) in edge[..3].iter().zip([0x40, 0x60, 0x80]) {
+        assert!(
+            actual.abs_diff(expected) <= 3,
+            "flat backdrop color: {edge:?}"
+        );
+    }
+    assert_eq!(image.get_pixel(102, 48).0, [0; 4], "transparent margin");
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn gpu_matches_css_blur_spread_and_keeps_the_outer_shadow_outside() -> anyhow::Result<()> {
     use gpui::{DevicePixels, PlatformHeadlessRenderer, Shadow};
     use gpui_wgpu::WgpuHeadlessRenderer;

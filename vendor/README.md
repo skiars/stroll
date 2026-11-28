@@ -313,6 +313,10 @@ dialogs in a Wayland window after changes to paint order or focus handling.
   translucent popup arrow joins at multiple scales. Commit preview tests also verify the
   shared Popover material at the viewport edge, animated Tooltip entry and exit, and pointer pass-through.
   Also check scrolling inside and outside overlays in a native Wayland session.
+- The wgpu backdrop filter preserves the opacity of the underlying scene when
+  sampling transparent window shadows. The popup pixel regression uses a
+  transparent render target to check that an opaque edge keeps its color and
+  alpha beside a transparent margin.
 - On Windows, run `cargo test --release --locked --test popups --test smooth_scroll`
   in a desktop session to exercise DirectX readback and mouse wheel interpolation.
 - Run `cargo test --release --locked --lib staging_keeps_the_diff_viewport_and_checkbox_colors`

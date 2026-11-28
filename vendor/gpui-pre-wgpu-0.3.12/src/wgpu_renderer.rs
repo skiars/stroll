@@ -3016,7 +3016,12 @@ impl WgpuHeadlessRenderer {
         Ok(())
     }
 
-    fn render(&mut self, scene: &Scene, size: Size<DevicePixels>) -> anyhow::Result<()> {
+    fn render(
+        &mut self,
+        scene: &Scene,
+        size: Size<DevicePixels>,
+        clear_color: wgpu::Color,
+    ) -> anyhow::Result<()> {
         self.check_gpu_errors()?;
         self.ensure_render_target(size)?;
         let view = self
@@ -3026,8 +3031,19 @@ impl WgpuHeadlessRenderer {
             .view
             .clone();
         self.core
-            .render_frame(scene, &view, size, false, wgpu::Color::BLACK)?;
+            .render_frame(scene, &view, size, false, clear_color)?;
         Ok(())
+    }
+
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn render_scene_to_transparent_image(
+        &mut self,
+        scene: &Scene,
+        size: Size<DevicePixels>,
+    ) -> anyhow::Result<image::RgbaImage> {
+        self.render(scene, size, wgpu::Color::TRANSPARENT)?;
+        self.read_image()
     }
 
     /// Copies the current render target back to the CPU. Dimensions come from the
@@ -3152,12 +3168,12 @@ impl gpui::PlatformHeadlessRenderer for WgpuHeadlessRenderer {
         scene: &Scene,
         size: Size<DevicePixels>,
     ) -> anyhow::Result<image::RgbaImage> {
-        self.render(scene, size)?;
+        self.render(scene, size, wgpu::Color::BLACK)?;
         self.read_image()
     }
 
     fn render_scene(&mut self, scene: &Scene, size: Size<DevicePixels>) -> anyhow::Result<()> {
-        self.render(scene, size)
+        self.render(scene, size, wgpu::Color::BLACK)
     }
 
     fn sprite_atlas(&self) -> Arc<dyn gpui::PlatformAtlas> {
